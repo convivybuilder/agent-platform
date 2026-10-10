@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.session-follow-watchdog</string>
+
+    <!-- Notices a leaked `session-agent state` follower process (the follow flag,
+         one per tmux session when healthy). The 2026-08-12 incident: 101
+         followers live against ~8 legitimate, load average 209, the CI runner
+         starved into failing three unrelated PRs.
+         PR #392 fixed the two root causes; this is the third layer, catching a
+         recurrence — or a leak path neither anticipated — that would otherwise
+         run undetected again, the way this one did for three days. Files no
+         bug and kills nothing; a duplicate follower is the signal, threshold-free
+         by design (see the script's docstring). -->
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of session-follow-watchdog, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes session-follow-watchdog interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/session-follow-watchdog</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- EVERY 15 MINUTES, matching com.convivy.primary-checkout-check: one `ps` call
+         and a group-by is cheap enough that the cadence is set by how quickly a
+         leak should surface, not by cost. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/session-follow-watchdog.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/session-follow-watchdog.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

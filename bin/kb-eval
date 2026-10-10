@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""kb-eval: measure knowledge-index retrieval quality against a golden set (ARCH-121).
+
+Runs each golden query through the REAL kb_search (imported from bin/mcp-kb-server,
+so the eval can never drift from production retrieval) and scores recall@k + MRR.
+Breaks results down by query style (keyword vs natural-language) and target doc
+kind, and lists the misses. Writes a JSON summary the convivy-orient /kb dashboard
+reads.
+
+The golden set (eval/kb-golden.jsonl) is hand-authored to start; augment it from
+real kb-queries.jsonl traffic as it accrues. A case is one query + the doc id(s)
+that should be retrieved; recall@k counts a hit if ANY expected id lands in the
+top k, MRR uses the rank of the first expected id.
+
+Usage:
+  kb-eval [--golden PATH] [--k N] [--out PATH] [--json] [--no-write]
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import json
+import sys
+from datetime import datetime, timezone
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+GOLDEN_DEFAULT = REPO / "eval" / "kb-golden.jsonl"
+sys.path.insert(0, str(REPO / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, requires=("mcp", "yaml"))
+import builder_root as BR  # noqa: E402
+OUT_DEFAULT = BR.runs_root() / "scorecard" / "kb-eval.json"
+
+
+def load_kb_search():
+    """Import the production kb_search from bin/mcp-kb-server (no drift). Silence
+    its query telemetry so synthetic eval queries don't pollute kb-queries.jsonl."""
+    path = REPO / "bin" / "mcp-kb-server"
+    loader = SourceFileLoader("mcp_kb_server", str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("mcp_kb_server", loader))
+    loader.exec_module(mod)
+    mod.kb_telemetry = None  # eval queries are synthetic — keep them out of the live log
+    fn = mod.kb_search
+    return getattr(fn, "fn", fn)  # FastMCP FunctionTool exposes the raw callable as .fn
+
+
+def load_golden(path: Path) -> list[dict]:
+    cases = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            cases.append(json.loads(line))
+    return cases
+
+
+def kind_of(doc_id: str) -> str:
+    """e.g. 'shared/runbooks/foo' → 'runbooks' (the kind segment of the id)."""
+    parts = doc_id.split("/")
+    return parts[1] if len(parts) >= 2 else "?"
+
+
+def score_case(case: dict, search, k: int) -> dict:
+    query = case.get("query")
+    filters = case.get("filters") or {}
+    results = search(query=query, limit=k, **filters)
+    ranked = [r["id"] for r in results]
+    expect = set(case["expect"])
+    rank = next((i for i, doc_id in enumerate(ranked, start=1) if doc_id in expect), None)
+    return {
+        "id": case["id"],
+        "query": query,
+        "style": case.get("style", "keyword"),
+        "expect": case["expect"],
+        "expect_kind": kind_of(case["expect"][0]),
+        "rank": rank,
+        "rr": (1.0 / rank) if rank else 0.0,
+        "hit@1": rank == 1,
+        "hit@5": rank is not None and rank <= 5,
+        "hit@k": rank is not None and rank <= k,
+        "returned": len(ranked),
+        "top_ids": ranked[:5],
+    }
+
+
+def _block(rows: list[dict], k: int) -> dict:
+    n = len(rows)
+    if not n:
+        return {"n": 0}
+    return {
+        "n": n,
+        "recall@1": round(sum(r["hit@1"] for r in rows) / n, 3),
+        "recall@5": round(sum(r["hit@5"] for r in rows) / n, 3),
+        f"recall@{k}": round(sum(r["hit@k"] for r in rows) / n, 3),
+        "mrr": round(sum(r["rr"] for r in rows) / n, 3),
+    }
+
+
+def aggregate(scored: list[dict], k: int) -> dict:
+    by_style = {s: _block([r for r in scored if r["style"] == s], k)
+                for s in sorted({r["style"] for r in scored})}
+    by_kind = {kd: _block([r for r in scored if r["expect_kind"] == kd], k)
+               for kd in sorted({r["expect_kind"] for r in scored})}
+    return {"overall": _block(scored, k), "by_style": by_style, "by_kind": by_kind}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="kb-eval")
+    ap.add_argument("--golden", type=Path, default=GOLDEN_DEFAULT)
+    ap.add_argument("--k", type=int, default=10)
+    ap.add_argument("--out", type=Path, default=OUT_DEFAULT)
+    ap.add_argument("--json", action="store_true", help="print the JSON summary instead of the report")
+    ap.add_argument("--no-write", action="store_true", help="don't write the dashboard JSON")
+    args = ap.parse_args()
+
+    search = load_kb_search()
+    cases = load_golden(args.golden)
+    scored = [score_case(c, search, args.k) for c in cases]
+    agg = aggregate(scored, args.k)
+    misses = [
+        {"id": r["id"], "query": r["query"], "style": r["style"],
+         "expect": r["expect"], "top_ids": r["top_ids"]}
+        for r in scored if not r["hit@k"]
+    ]
+
+    summary = {
+        "generated": datetime.now(timezone.utc).isoformat(),
+        "golden_path": str(args.golden),
+        "k": args.k,
+        "cases": len(cases),
+        **agg,
+        "misses": misses,
+    }
+
+    if not args.no_write:
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+
+    if args.json:
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+
+    o = agg["overall"]
+    rk = f"recall@{args.k}"
+    print(f"KB retrieval eval — {len(cases)} cases, k={args.k}")
+    print(f"  overall:  recall@1 {o['recall@1']:.0%}   recall@5 {o['recall@5']:.0%}   {rk} {o[rk]:.0%}   MRR {o['mrr']:.3f}")
+    print("  by style:")
+    for s, b in agg["by_style"].items():
+        if b["n"]:
+            print(f"    {s:<9}(n={b['n']:>2}):  recall@1 {b['recall@1']:.0%}   recall@5 {b['recall@5']:.0%}   {rk} {b[rk]:.0%}   MRR {b['mrr']:.3f}")
+    print("  by kind:")
+    for kd, b in agg["by_kind"].items():
+        if b["n"]:
+            print(f"    {kd:<11}(n={b['n']:>2}):  {rk} {b[rk]:.0%}   MRR {b['mrr']:.3f}")
+    if misses:
+        print(f"\n  misses ({len(misses)}/{len(cases)}):")
+        for m in misses:
+            top = ", ".join(m["top_ids"][:3]) or "(nothing returned)"
+            print(f"    [{m['style']}] {m['query']!r}")
+            print(f"        want: {m['expect']}")
+            print(f"        got:  {top}")
+    if not args.no_write:
+        print(f"\nwrote {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,82 @@
+[
+  {
+    "url": "https://api.github.com/repos/convivy/agent-platform/pulls/601",
+    "id": 2001601,
+    "number": 601,
+    "state": "open",
+    "title": "feat(bosun): read PR state as the convivy-bosun App",
+    "user": {"login": "convivy-bosun[bot]", "id": 900601, "type": "Bot"},
+    "body": "## Summary\n\n- reads PR state\n",
+    "draft": false,
+    "head": {
+      "label": "convivy:agent/pr-state-capture",
+      "ref": "agent/pr-state-capture",
+      "sha": "1111111111111111111111111111111111aaaa"
+    },
+    "base": {"label": "convivy:main", "ref": "main", "sha": "0000000000000000000000000000000000main"},
+    "created_at": "2026-09-14T18:02:11Z",
+    "updated_at": "2026-09-16T01:10:44Z",
+    "closed_at": null,
+    "merged_at": null
+  },
+  {
+    "url": "https://api.github.com/repos/convivy/agent-platform/pulls/598",
+    "id": 2001598,
+    "number": 598,
+    "state": "open",
+    "title": "wip: draft pass at the PR-state signal shape",
+    "user": {"login": "convivy-bosun[bot]", "id": 900601, "type": "Bot"},
+    "body": "not ready\n",
+    "draft": true,
+    "head": {
+      "label": "convivy:agent/pr-state-shape-draft",
+      "ref": "agent/pr-state-shape-draft",
+      "sha": "2222222222222222222222222222222222bbbb"
+    },
+    "base": {"label": "convivy:main", "ref": "main", "sha": "0000000000000000000000000000000000main"},
+    "created_at": "2026-09-13T09:44:02Z",
+    "updated_at": "2026-09-15T22:03:19Z",
+    "closed_at": null,
+    "merged_at": null
+  },
+  {
+    "url": "https://api.github.com/repos/convivy/agent-platform/pulls/592",
+    "id": 2001592,
+    "number": 592,
+    "state": "closed",
+    "title": "fix(cost): type-check cost_source before the membership test",
+    "user": {"login": "convivy-platform-coder[bot]", "id": 900602, "type": "Bot"},
+    "body": "## Summary\n\nround 6 fix\n",
+    "draft": false,
+    "head": {
+      "label": "convivy:agent/platform-coder-implement-work-item-issue-01m1d1",
+      "ref": "agent/platform-coder-implement-work-item-issue-01m1d1",
+      "sha": "3333333333333333333333333333333333cccc"
+    },
+    "base": {"label": "convivy:main", "ref": "main", "sha": "0000000000000000000000000000000000main"},
+    "created_at": "2026-09-10T14:20:00Z",
+    "updated_at": "2026-09-15T20:31:07Z",
+    "closed_at": "2026-09-15T20:31:07Z",
+    "merged_at": "2026-09-15T20:31:07Z"
+  },
+  {
+    "url": "https://api.github.com/repos/convivy/agent-platform/pulls/587",
+    "id": 2001587,
+    "number": 587,
+    "state": "closed",
+    "title": "spike: alternate signal shape, abandoned",
+    "user": {"login": "example-user", "id": 1, "type": "User"},
+    "body": "abandoned in favor of #592\n",
+    "draft": false,
+    "head": {
+      "label": "convivy:spike/alt-signal-shape",
+      "ref": "spike/alt-signal-shape",
+      "sha": "4444444444444444444444444444444444dddd"
+    },
+    "base": {"label": "convivy:main", "ref": "main", "sha": "0000000000000000000000000000000000main"},
+    "created_at": "2026-09-08T11:00:00Z",
+    "updated_at": "2026-09-09T08:12:33Z",
+    "closed_at": "2026-09-09T08:12:33Z",
+    "merged_at": null
+  }
+]

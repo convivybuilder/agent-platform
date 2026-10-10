@@ -1,0 +1,23 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv
+venv/
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+# Coverage outputs — `pytest --cov` writes these; CI uploads coverage.json as the
+# `coverage` artifact, locally they're throwaway.
+.coverage
+coverage.json
+htmlcov/
+# Runtime profile individuation from `agentctl spawn` / `co` dispatch into this repo
+.claude/
+# Live launchd plist carries provider secrets (Phase C); only the .example is tracked
+launchd/com.convivy.llm-gateway.plist
+# Scratch PR description, root only. Anchored deliberately: unanchored, this would
+# also ignore docs/pr-body.md or any nested one, and lib/agent-platform/worktrees.py
+# treats a nested pr-body.md as real content rather than debris (_is_debris matches
+# the exact root path, and its tests assert docs/pr-body.md is NOT debris). An
+# unanchored line would drop such a file from `git add` with no error.
+/pr-body.md

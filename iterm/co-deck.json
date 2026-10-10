@@ -1,0 +1,59 @@
+{
+  "Profiles": [
+    {
+      "Name": "co-deck",
+      "Guid": "co-deck-2026-07-20",
+      "Dynamic Profile Parent Name": "Default",
+      "Semantic History": {
+        "action": "raw command",
+        "text": "$HOME/bin/open-md-link \\1 \\2"
+      },
+      "Background Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.992,
+        "Green Component": 0.984,
+        "Blue Component": 0.898,
+        "Alpha Component": 1.0
+      },
+      "Foreground Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.29,
+        "Green Component": 0.204,
+        "Blue Component": 0.114,
+        "Alpha Component": 1.0
+      },
+      "Cursor Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.831,
+        "Green Component": 0.686,
+        "Blue Component": 0.216,
+        "Alpha Component": 1.0
+      },
+      "Selection Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.937,
+        "Green Component": 0.894,
+        "Blue Component": 0.722,
+        "Alpha Component": 1.0
+      },
+      "Tab Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.831,
+        "Green Component": 0.686,
+        "Blue Component": 0.216,
+        "Alpha Component": 1.0
+      },
+      "Use Tab Color": true,
+      "Badge Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.831,
+        "Green Component": 0.686,
+        "Blue Component": 0.216,
+        "Alpha Component": 0.25
+      },
+      "Badge Text": "deck",
+      "Badge Max Width": 0.2,
+      "Badge Max Height": 0.04
+    }
+  ]
+}

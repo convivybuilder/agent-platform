@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# arch-review — daytime cost-shift packaging for an architect proposal pass
+# against a single product. ARCH-075.
+#
+# Subscription-billed: launches an interactive co session on the architect
+# agent inside the product repo. The session's initial prompt scopes the
+# work to a holistic-style proposal-only architectural review (NOT the
+# standard Sunday-sweep auto-execute flavor) and tells the agent to run
+# `mark-fresh <product> arch-review` when complete.
+#
+# When set: the next Sunday architectural sweep (within 72h) will skip this
+# product but still sweep the other products in PRODUCTS. Per-product, not
+# all-or-nothing.
+#
+# Scope: ARCH-075 chose "architect proposes only" — same shape as the
+# first-Sunday-of-quarter holistic assessment. Architect produces a proposal
+# doc against the product's flagged-area inputs (curator obs, telemetry
+# hot-spots, TODO(architect) annotations, sunday.jsonl). You review
+# interactively. Pursue-list is NOT auto-executed — you decide which
+# proposals to dispatch via planning-orchestrator later (or queue them
+# explicitly into <root>/agent-runs/queues/sunday.jsonl).
+#
+# Usage:
+#   arch-review <product>
+#
+#   product: constance | vivy | sous-chef
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: arch-review <constance|vivy|sous-chef>" >&2
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+product=$1
+
+case $product in
+    constance|vivy|sous-chef) ;;
+    *) echo "arch-review: invalid product '$product'" >&2; usage ;;
+esac
+
+# The product lives under the machine's root (company/decisions/0008), printed by
+# the bin/builder-root beside this file's real path; HOME does not move it.
+_self_path="${BASH_SOURCE[0]}"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+root="$("$(dirname "$_self_path")/builder-root" --root)" && [[ -n "$root" ]] \
+    || { echo "arch-review: cannot resolve the machine's root (bin/builder-root --root)" >&2; exit 1; }
+product_dir="$root/$product"
+[[ -d "$product_dir" ]] || { echo "arch-review: no product dir at $product_dir" >&2; exit 1; }
+
+prompt="Task: Run an architectural review for $product. Subscription-billed daytime cost-shift per ARCH-075 (replaces this product's slot in the next Sunday architectural sweep, for the next 72h).
+
+Scope (\"architect proposes only\" — same shape as the first-Sunday-of-quarter holistic assessment per overnight-orchestrator.md):
+
+Walk the standard architectural-review inputs:
+- curator's recent observations (last week of agent-runs)
+- runtime hot-spot telemetry
+- TODO(architect) annotations in the $product codebase
+- the operator's explicit queue entries at $root/agent-runs/queues/sunday.jsonl (filtered to this product)
+
+Produce a proposal document covering the architectural concerns you find: areas of code that should be restructured, abstractions that should be tightened, regressions of intent against existing ADRs, places where the platform's current shape is fighting the product's needs. For each concern: one paragraph describing the issue + one paragraph recommending the change (with the affected files/modules named) + the rough cost-shape (small refactor, medium restructuring, large rearchitecture).
+
+Stop at proposing. Do NOT auto-execute via refactorer/coder — the operator decides which proposals to pursue, on what timeline, and dispatches them via planning-orchestrator (or queues them into sunday.jsonl for the next Sunday sweep) on his terms.
+
+When the proposal doc is written and you've handed it to me, run \`mark-fresh $product arch-review\` from Bash before ending the session. The next Sunday architectural sweep will skip $product if it sees that marker within 72 hours (other products still get swept).
+
+If you find nothing worth proposing, the review is a valid no-op — say so plainly in the proposal doc, run mark-fresh, exit. \"Reviewed and clean\" is a real finding."
+
+cd "$product_dir"
+exec co arch "$prompt"

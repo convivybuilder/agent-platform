@@ -1,0 +1,289 @@
+#!/bin/sh
+# install-run-register-api — deploy-pin the run-register-api daemon
+# (platform/decisions/0059).
+#
+# WHY. com.convivy.run-register-api is a KeepAlive daemon whose ProgramArguments
+# used to be ~/.local/bin/run-register-api, a symlink into this checkout's
+# bin/. launchd re-reads a job's program on every restart — including an
+# unattended crash-restart — so whatever branch this checkout sat on was what
+# the daemon served next, with no restart of its own required to arm the
+# hazard. Its plist also lived inside the checkout at
+# launchd/com.convivy.run-register-api.plist, which is the sharper case (ADR-0059
+# rule 8): editing that file on a branch changes the job's arguments and
+# executable, and launchd acts on it at the next load or `kickstart` with no
+# process having to read anything.
+#
+# WHAT THIS DOES, per ADR-0059 rules 1, 2, 4, 6, 7, 8:
+#   1. Reads a git REF (default main), never the live working tree, via
+#      `git archive` — a `cp`/`rsync` of the checkout would ignore
+#      .gitignore and sweep credential files into the deploy area (rule 7).
+#   2. Extracts a COPY of exactly the files this daemon needs — bin/run-
+#      register-api and its lib/agent-platform/ dependencies, transitively
+#      (the /sessions route pulls in session_state.py and everything IT
+#      imports: session_lifecycle, session_input, claude_trust,
+#      tmux_transcript, private_crew, projects, signal_client, vault_plane,
+#      builder_root; the /runs/<run_id>/facts route pulls in review_protocol;
+#      the /runs/<run_id>/docs_fetched route pulls in fetched_documents —
+#      all stdlib-only, so this adds no new pip dependency to the venv build
+#      below) — into ~/.local/deploy/run-register-api/ (rule 2: copies, not
+#      symlinks).
+#   3. Builds a fresh venv inside that same deploy area, so the interpreter
+#      travels with the code rather than depending on the checkout's own
+#      .venv or launchd's inherited PATH (rule 4).
+#   4. Copies (never symlinks) the plist template out of the repo into
+#      ~/Library/LaunchAgents/, refusing to clobber a live plist that has
+#      drifted from the template unless --force is given — same idiom as
+#      install.sh phase 4 (rule 8).
+#
+# Idempotent and re-run-safe: each run replaces the whole deploy area
+# atomically (old directory renamed aside, new one moved into place, old one
+# removed) — never a partial merge of two commits' files.
+#
+# Does NOT load, unload, or kickstart the job. Re-run this after a merge to
+# refresh the deploy area, then bootstrap/kickstart by hand (printed at the
+# end) — an explicit step, not a deploy-on-merge watcher (ADR-0059 leaves
+# that choice open; this crew's answer is the explicit install, matching
+# ARCH-116's gateway-pin ritual).
+#
+# Must stay POSIX sh / bash-3.2-safe: tests/bash/lint.sh parses every bin/
+# script with a bash-or-/bin/sh shebang under /bin/bash -n on macOS 3.2.57.
+set -eu
+
+usage() {
+  cat >&2 <<'EOF'
+usage: install-run-register-api [--ref=<git-ref>] [--repo=<path>]
+                                 [--allow-non-main] [--force] [--status]
+
+  --ref=<git-ref>     Ref to install from (default: main).
+  --repo=<path>       Checkout to read the ref from (default: this script's
+                       own repo — resolved from argv[0], not the caller's cwd).
+  --allow-non-main    Required to install anything other than main (rule 6:
+                       the deploy area is installed from main).
+  --force             Overwrite a live plist that differs from the template.
+  --status            Print what commit is currently deployed and exit.
+EOF
+  exit 2
+}
+
+# Never derived from argv[0]: install.sh symlinks this script into ~/.local/bin
+# like any other tool (it is not in DEPLOY_PINNED_BINS), and rule 5 exists so an
+# operator can invoke it by name. Through that symlink `dirname "$0"/..` lands on
+# ~/.local rather than a checkout. So the default is agent-platform under the
+# machine's root, resolved below when --repo is absent. Same convention as
+# install-agent-platform-shared and install-decision-hooks.
+REPO=""
+ROOT_CONFIG=""
+REF="main"
+ALLOW_NON_MAIN=0
+PLIST_FORCE=0
+STATUS_ONLY=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --ref=*) REF="${arg#--ref=}" ;;
+    --repo=*) REPO="${arg#--repo=}" ;;
+    --allow-non-main) ALLOW_NON_MAIN=1 ;;
+    --force) PLIST_FORCE=1 ;;
+    --status) STATUS_ONLY=1 ;;
+    # FOR TESTS ONLY: a session-agent.env naming the machine's root, the one way a
+    # test moves the default checkout (company/decisions/0008).
+    --root-config=*) ROOT_CONFIG="${arg#--root-config=}" ;;
+    -h|--help) usage ;;
+    *) echo "install-run-register-api: unknown option: $arg" >&2; usage ;;
+  esac
+done
+
+# The default checkout is agent-platform under the machine's root
+# (company/decisions/0008), printed by the bin/builder-root beside this file's
+# real path (one hop through the ~/.local/bin link); HOME does not move it.
+if [ -z "$REPO" ]; then
+  _self_path="$0"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+  if [ -n "$ROOT_CONFIG" ]; then
+    _root="$("$(dirname "$_self_path")/builder-root" --root --config "$ROOT_CONFIG")" || _root=""
+  else
+    _root="$("$(dirname "$_self_path")/builder-root" --root)" || _root=""
+  fi
+  if [ -z "$_root" ]; then
+    echo "install-run-register-api: cannot resolve the machine's root (bin/builder-root --root); pass --repo" >&2
+    exit 2
+  fi
+  REPO="$_root/agent-platform"
+fi
+
+DEPLOY_DIR="$HOME/.local/deploy/run-register-api"
+LAUNCH_AGENTS="$HOME/Library/LaunchAgents"
+PLIST_NAME="com.convivy.run-register-api.plist"
+
+say() { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
+
+# --- --status: answer "what commit is this service serving", per ADR-0059's
+# closing requirement, and exit. No install side effects. -------------------
+if [ "$STATUS_ONLY" -eq 1 ]; then
+  if [ -f "$DEPLOY_DIR/DEPLOYED_COMMIT" ]; then
+    cat "$DEPLOY_DIR/DEPLOYED_COMMIT"
+    exit 0
+  fi
+  echo "install-run-register-api: nothing deployed yet at $DEPLOY_DIR" >&2
+  exit 1
+fi
+
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "install-run-register-api: $REPO is not a git checkout" >&2
+  exit 1
+}
+
+SHA="$(git -C "$REPO" rev-parse "$REF" 2>/dev/null)" || {
+  echo "install-run-register-api: '$REF' does not resolve to a commit in $REPO" >&2
+  exit 1
+}
+
+if [ "$REF" != "main" ] && [ "$ALLOW_NON_MAIN" -ne 1 ]; then
+  echo "install-run-register-api: REFUSING to install ref '$REF' (resolves to $SHA)." >&2
+  echo "  ADR-0059 rule 6: the deploy area installs from main. Pass --allow-non-main" >&2
+  echo "  to install a different ref anyway (e.g. to verify a branch before merge)." >&2
+  exit 1
+fi
+
+command -v python3.11 >/dev/null 2>&1 || {
+  echo "install-run-register-api: python3.11 not found on PATH" >&2
+  exit 1
+}
+
+say "Installing run-register-api from $REF ($SHA) in $REPO"
+
+# --- stage the release in a sibling dir, never in place ---------------------
+# git archive reads the commit object, not the working tree, so an untracked
+# or gitignored file on disk (credentials, scratch state) is invisible to it —
+# this is what makes it safe where `cp -r`/`rsync` would not be (rule 7).
+mkdir -p "$(dirname "$DEPLOY_DIR")"
+# Clean staging on ANY exit, success or failure. Without this a failed install
+# leaves .new/ (and now .new.tar) beside the live deploy area, which the next
+# run must clear and which reads to a human as a half-deployed state. The
+# live area is never touched here — only the staging siblings.
+_cleanup_stage() { rm -rf "$DEPLOY_DIR.new" "$DEPLOY_DIR.new.tar"; }
+# A signal handler that does not exit is a shell trap in both senses: sh runs the
+# body and then RESUMES at the next command. So INT/TERM exit explicitly.
+trap _cleanup_stage EXIT
+trap '_cleanup_stage; exit 130' INT
+trap '_cleanup_stage; exit 143' TERM
+STAGE="$DEPLOY_DIR.new"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+
+# Staged through a file rather than piped: /bin/sh has no `pipefail`, so in
+# `git archive ... | tar -x` a failing archive is invisible — tar exits 0 on
+# empty input and only a LATER command failing on the missing files catches it.
+# That is fail-closed by accident. As two commands, `set -e` catches the
+# archive itself (security-reviewer, run-1c59735b).
+ARCHIVE="$STAGE.tar"
+rm -f "$ARCHIVE"
+# THE PROJECT REGISTRY IS DELIBERATELY NOT ARCHIVED HERE. `projects.py` reads it
+# from an absolute path into the live checkout, so this daemon always filters
+# `/runs` and `/sessions` on the CURRENT privacy registry rather than on whatever
+# a reinstall happened to capture.
+#
+# That was not always true, and the reason it changed is worth keeping. This
+# deploy is a copy, so the old `__file__`-relative read resolved inside the
+# deploy: `projects.private_slugs()` raised, `_resolve_registry_snapshot` caught
+# it, and both routes failed closed — `/runs` reporting every run private,
+# `/sessions` an empty list. Shipping a COPY of the registry would have fixed the
+# crash and opened a worse hole: a project marked `private: true` after the
+# install would read as PUBLIC to Library via `/runs` and Orient via `/sessions`
+# until someone reinstalled, with nothing anywhere showing an error. The operator's call
+# (2026-09-05) was that it has to be read live.
+#
+# BOTH ROUTES DEPEND ON THIS. `do_GET` resolves one snapshot per request and
+# hands it to `_runs_payload` and `_sessions_payload` alike, and the sessions row
+# filter reads `snapshot["private_slugs"]` (run-register-api:495,506). An earlier
+# revision of this comment claimed `/sessions` was insulated because it reached
+# the registry through `private_crew.py`. It is not: that module is imported
+# transitively through `session_state.py`, but only to build fields `_session_row`
+# never serves.
+git -C "$REPO" archive "$SHA" -- \
+    bin/run-register-api \
+    lib/agent-platform/registry.py \
+    lib/agent-platform/agent_policy.py \
+    lib/agent-platform/telemetry.py \
+    lib/agent-platform/review_protocol.py \
+    lib/agent-platform/fetched_documents.py \
+    lib/agent-platform/private_crew.py \
+    lib/agent-platform/projects.py \
+    lib/agent-platform/session_lifecycle.py \
+    lib/agent-platform/session_state.py \
+    lib/agent-platform/session_input.py \
+    lib/agent-platform/crew_key.py \
+    lib/agent-platform/slate.py \
+    lib/agent-platform/rollover_policy.py \
+    lib/agent-platform/claude_trust.py \
+    lib/agent-platform/tmux_transcript.py \
+    lib/agent-platform/signal_client.py \
+    lib/agent-platform/vault_plane.py \
+    lib/agent-platform/builder_root.py \
+  > "$ARCHIVE"
+tar -x -C "$STAGE" -f "$ARCHIVE"
+rm -f "$ARCHIVE"
+chmod +x "$STAGE/bin/run-register-api"
+
+say "Building pinned interpreter (python3.11 -m venv)"
+python3.11 -m venv "$STAGE/venv"
+
+{
+  echo "ref: $REF"
+  echo "commit: $SHA"
+  echo "installed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "installed_from: $REPO"
+} > "$STAGE/DEPLOYED_COMMIT"
+
+# --- swap: the deploy area is replaced as one unit, never merged with the
+# previous release, so a partial file mix across two commits can't happen. --
+# DISARM BEFORE THE SWAP. From here the script owns both directories and the
+# staging cleanup would destroy the wrong one: between the two `mv` calls below
+# the live path does not exist, and $DEPLOY_DIR.new IS the release. A trap firing
+# there would delete the only thing that can complete the swap forward, leaving
+# nothing live and only an orphaned .old.$$ nobody was told about. Before this
+# trap existed that same interruption left both directories intact and an
+# operator could finish or roll back by hand; the cleanup must not take that away
+# (reviewer run-46273971, security-reviewer run-e80a395d).
+trap - EXIT INT TERM
+
+OLD=""
+if [ -d "$DEPLOY_DIR" ]; then
+  OLD="$DEPLOY_DIR.old.$$"
+  mv "$DEPLOY_DIR" "$OLD"
+fi
+mv "$STAGE" "$DEPLOY_DIR"
+[ -n "$OLD" ] && rm -rf "$OLD"
+
+say "Deployed: $DEPLOY_DIR (commit $SHA)"
+
+# --- plist: rendered from the same ref, never the working tree, and never
+# clobbering a live plist that has drifted from the template (ARCH-342 idiom,
+# same as install.sh phase 4). The template (CQ-428) carries __HOME__ where
+# install.sh substitutes $HOME at install time; this script is install.sh's
+# own render step for its one deploy-pinned plist, same substitution. ---------
+mkdir -p "$LAUNCH_AGENTS"
+PLIST_STAGE="$LAUNCH_AGENTS/$PLIST_NAME.new"
+git -C "$REPO" show "$SHA:launchd/$PLIST_NAME" | sed "s|__HOME__|$HOME|g" > "$PLIST_STAGE"
+
+PLIST_LIVE="$LAUNCH_AGENTS/$PLIST_NAME"
+if [ -f "$PLIST_LIVE" ] && ! diff -q "$PLIST_LIVE" "$PLIST_STAGE" >/dev/null 2>&1 && [ "$PLIST_FORCE" -ne 1 ]; then
+  warn "live plist differs from the template — NOT overwritten (--force to replace):"
+  diff -u "$PLIST_LIVE" "$PLIST_STAGE" | sed 's/^/    /' || true
+  rm -f "$PLIST_STAGE"
+else
+  mv "$PLIST_STAGE" "$PLIST_LIVE"
+  say "Plist installed: $PLIST_LIVE"
+fi
+
+cat <<EOF
+
+Install complete. Nothing was loaded, unloaded, or kickstarted.
+
+To pick up this release (idempotent — safe to re-run):
+  launchctl bootout "gui/\$(id -u)/com.convivy.run-register-api" 2>/dev/null || true
+  launchctl bootstrap "gui/\$(id -u)" "$PLIST_LIVE"
+
+To check what commit is currently deployed:
+  $0 --status
+EOF

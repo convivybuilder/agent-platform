@@ -1,0 +1,89 @@
+#!/bin/sh
+# gateway-vkey — read one LiteLLM virtual key, FILE FIRST, Keychain second.
+#
+# WHY THE FILE COMES FIRST, and it is not convenience. macOS gives an
+# SSH-originated login its own security session, which cannot reach the login
+# keychain AT ALL — not "it is locked", and not only after a reboot. Measured
+# 2026-09-03: SSH_CONNECTION set and `security find-generic-password -w`
+# returning exit 36, while `who` showed a console login and login.keychain-db had
+# been written minutes earlier. Every co session on this machine arrives over SSH
+# or mosh, so Keychain is unreachable from where these launchers actually run.
+#
+# `agentctl` learned this first (PR #485). This is the same rule for the two
+# launchers the operator runs by hand, so all three consumers read one place.
+#
+# STRICT POSIX, VERIFIED WITH dash. The CI runner has no zsh, and its /bin/sh is
+# dash while macOS's is bash in posix mode — which accepts `[[` and made a first
+# cut pass locally and fail on the runner. `sh -n` on darwin proves nothing about
+# the runner; this file is checked with `dash -n` and run under dash in tests.
+#
+# EXIT: 0 with the key on stdout; 1 with a reason on stderr.
+# Usage: gateway-vkey <service-name>
+set -eu
+
+_svc="${1:?usage: gateway-vkey <service-name>}"
+# LLM_GATEWAY_CONFIG_DIR is the directory the mint writes to (default ~/.config/convivy).
+_file="${LLM_GATEWAY_CONFIG_DIR:-$HOME/.config/convivy}/litellm-keys.json"
+
+if [ -f "$_file" ]; then
+    _err=$(mktemp)
+    if _key=$(python3 - "$_file" "$_svc" 2>"$_err" <<'PY'
+import json, os, sys
+path, svc = sys.argv[1], sys.argv[2]
+st = os.stat(path)
+if st.st_mode & 0o077:
+    sys.exit(f"{path} is readable beyond its owner (mode {st.st_mode & 0o777:o}); "
+             f"it holds gateway credentials. Fix with: chmod 600 {path}")
+try:
+    data = json.load(open(path))
+except ValueError as exc:
+    sys.exit(f"{path} exists but is not valid JSON: {exc}")
+entry = (data or {}).get(svc)
+key = (entry or {}).get("key") if isinstance(entry, dict) else None
+if not key:
+    sys.exit("__ABSENT__")           # this service is simply not in the file
+if str(key).startswith("PASTE_"):
+    sys.exit(f"{path} still holds the {svc} placeholder; replace it with the real key")
+print(key)
+PY
+    ); then
+        rm -f "$_err"
+        printf '%s\n' "$_key"
+        exit 0
+    fi
+    # Only a MISSING ENTRY falls through to Keychain. A file that exists but is
+    # world-readable, malformed, or still holding a placeholder is an ERROR —
+    # falling back would surface as a confusing Keychain failure later and, on a
+    # machine where Keychain works, would hide a leaking credential file.
+    if ! grep -q '__ABSENT__' "$_err"; then
+        printf 'gateway-vkey: %s\n' "$(cat "$_err")" >&2
+        rm -f "$_err"
+        exit 1
+    fi
+    rm -f "$_err"
+fi
+
+# Keychain second — works from a console session, and on any machine that has
+# not adopted the file.
+if _key=$(security find-generic-password -w -s "$_svc" 2>/dev/null); then
+    printf '%s\n' "$_key"
+    exit 0
+fi
+
+printf 'gateway-vkey: could not read %s.\n' "$_svc" >&2
+printf '  Not in %s, and Keychain refused it.\n' "$_file" >&2
+printf '\n' >&2
+printf '  An SSH session cannot read the login keychain at all, so from a co\n' >&2
+printf '  session the file is the only path. To fix it, run this FROM A CONSOLE\n' >&2
+printf '  TERMINAL on this machine (not over SSH) to read the value:\n' >&2
+printf '\n' >&2
+printf '    security find-generic-password -w -s %s\n' "$_svc" >&2
+printf '\n' >&2
+printf '  then put it in %s, which looks like:\n' "$_file" >&2
+printf '\n' >&2
+printf '    {\n' >&2
+printf '      "%s": { "account": "...", "key": "<the value above>" }\n' "$_svc" >&2
+printf '    }\n' >&2
+printf '\n' >&2
+printf '  and make sure only you can read it:  chmod 600 %s\n' "$_file" >&2
+exit 1

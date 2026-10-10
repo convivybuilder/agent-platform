@@ -1,0 +1,59 @@
+{
+  "Profiles": [
+    {
+      "Name": "co-svc",
+      "Guid": "co-svc-2026-06-26",
+      "Dynamic Profile Parent Name": "Default",
+      "Semantic History": {
+        "action": "raw command",
+        "text": "$HOME/bin/open-md-link \\1 \\2"
+      },
+      "Background Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.941,
+        "Green Component": 0.973,
+        "Blue Component": 0.988,
+        "Alpha Component": 1.0
+      },
+      "Foreground Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.122,
+        "Green Component": 0.18,
+        "Blue Component": 0.239,
+        "Alpha Component": 1.0
+      },
+      "Cursor Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.008,
+        "Green Component": 0.518,
+        "Blue Component": 0.78,
+        "Alpha Component": 1.0
+      },
+      "Selection Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.792,
+        "Green Component": 0.902,
+        "Blue Component": 0.965,
+        "Alpha Component": 1.0
+      },
+      "Tab Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.008,
+        "Green Component": 0.518,
+        "Blue Component": 0.78,
+        "Alpha Component": 1.0
+      },
+      "Use Tab Color": true,
+      "Badge Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.008,
+        "Green Component": 0.518,
+        "Blue Component": 0.78,
+        "Alpha Component": 0.25
+      },
+      "Badge Text": "svc",
+      "Badge Max Width": 0.2,
+      "Badge Max Height": 0.04
+    }
+  ]
+}

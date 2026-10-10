@@ -1,0 +1,8 @@
+{
+  "_doc": "Template for $HOME/.config/convivy/operator.json (lib/agent-platform/operator_config.py). Every value below is synthetic; copy this file, rename it, and replace each value with this machine's real operator identity. Never commit the real file.",
+  "excluded_crews": ["private-a", "private-b"],
+  "operator_marker": "operator",
+  "roster_crew": "operator-crew",
+  "github_login": "operator-login",
+  "tailnet_host": "tailnet.example"
+}

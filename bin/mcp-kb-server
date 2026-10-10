@@ -1,0 +1,645 @@
+#!/usr/bin/env python3
+"""mcp-kb-server: stdio MCP server exposing the knowledge base for read and write.
+
+READ (per 01-knowledge-infra.md deliverable 2.8) — straight from the index:
+- kb_search: full-text search via docs_fts + structured filters on the docs table
+- kb_get:    fetch a single doc by id, with JSON-typed fields parsed back to lists
+- kb_list_topics: deduplicated list of topics across the corpus, optionally
+                  scoped to one project
+
+WRITE (ARCH-408) — every one a thin wrapper over `agentctl kb ...`:
+- kb_checkout / kb_release / kb_leases: 4h advisory leases
+- kb_update / kb_create:                sha-gated writes to main, policy-gated
+- kb_propose:                           the PR path for judgment-class changes
+
+The read tools open ~/.knowledge-index/index.db read-only. The write tools do
+not touch the database at all — they shell into the cage, which commits to git
+and then reindexes. Nothing here holds policy: the write lock, the content-sha
+precondition, the provenance table and the roster/profile PR-only rule all live
+in the cage, so that they apply to every caller rather than only to this one.
+
+(The index has two writers: knowledge-watcher, and `agentctl kb sync` since
+ARCH-408/#240. This server is not one of them.)
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, requires=("mcp",))
+from mcp.server.fastmcp import FastMCP  # noqa: E402
+
+DB_PATH = Path.home() / ".knowledge-index" / "index.db"
+
+# Query telemetry (ARCH-121): every tool call appends one JSON line to
+# kb-queries.jsonl (query, filters, result_count, hit_limit, empty, latency,
+# caller) so the convivy-orient /kb dashboard can measure retrieval
+# effectiveness. The shared helper lives in lib/knowledge; import it defensively
+# so a not-yet-installed copy degrades to no-telemetry, never a startup crash.
+sys.path.insert(0, str(Path.home() / ".local" / "lib" / "knowledge"))
+try:
+    import kb_telemetry
+except Exception:  # telemetry is optional — never block retrieval on it
+    kb_telemetry = None
+
+
+def _log_query(record: dict[str, Any]) -> None:
+    if kb_telemetry is not None:
+        kb_telemetry.append(kb_telemetry.QUERY_LOG, record)
+
+
+mcp = FastMCP("kb")
+
+
+def _connect() -> sqlite3.Connection:
+    """Open a read-only connection. URI mode so 'mode=ro' is honored."""
+    uri = f"file:{DB_PATH}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _parse_json_list(raw: str | None) -> list:
+    if not raw:
+        return []
+    try:
+        val = json.loads(raw)
+        return val if isinstance(val, list) else []
+    except json.JSONDecodeError:
+        return []
+
+
+def _row_to_full_doc(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "title": row["title"],
+        "kind": row["kind"],
+        "project": row["project"],
+        "status": row["status"],
+        "topics": _parse_json_list(row["topics"]),
+        "audience": _parse_json_list(row["audience"]),
+        "applies_to": _parse_json_list(row["applies_to"]),
+        "depends_on": _parse_json_list(row["depends_on"]),
+        "last_reviewed": row["last_reviewed"],
+        "authors": _parse_json_list(row["authors"]),
+        "body": row["body"],
+        "body_sha256": row["body_hash"],
+    }
+
+
+# FTS5 column-weighted BM25 ranking weights, in docs_fts column order
+# (id, title, body, topics). id/title/topics outweigh body so a doc surfaces
+# when its name or title is queried, not only when the words appear deep in prose.
+_BM25_WEIGHTS = "10.0, 8.0, 1.0, 4.0"
+
+# Function words dropped from a query so a natural-language question doesn't
+# AND/OR in words absent from every doc. Deliberately small — only true
+# stopwords, so domain terms like "setup" or "deploy" always survive.
+_STOPWORDS = frozenset("""
+a an the this that these those is are was were be been being am
+i me my we our you your he she it they them their its his her
+do does did how what when where which who whom why whose
+to of in on at by for with from into onto out up down over under off
+and or but nor if then else so as about than too very
+can could should would may might must shall will
+not no yes please
+""".split())
+
+
+def _build_match(query: str) -> str | None:
+    """Turn a free-text query into an FTS5 MATCH expression.
+
+    Lowercase, keep alphanumeric tokens, drop stopwords and 1-char tokens, then
+    OR-combine the survivors as quoted literals. OR (not the FTS5 default AND)
+    so a question-form query whose stopwords are absent from every doc still
+    retrieves on its content terms; the bm25 column weighting then floats the
+    docs matching more (and rarer, and title/id) terms to the top. Quoting each
+    term keeps an accidental FTS5 keyword (and/or/not/near) or stray punctuation
+    from parsing as an operator. Returns None when nothing meaningful survives,
+    so the caller falls back to a structured query."""
+    tokens = re.findall(r"[a-z0-9]+", query.lower())
+    seen: set[str] = set()
+    terms = [
+        t for t in tokens
+        if len(t) > 1 and t not in _STOPWORDS and not (t in seen or seen.add(t))
+    ]
+    if not terms:
+        return None
+    return " OR ".join(f'"{t}"' for t in terms)
+
+
+@mcp.tool()
+def kb_search(
+    query: str | None = None,
+    kind: str | None = None,
+    project: str | None = None,
+    audience: str | None = None,
+    applies_to: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Search the knowledge index.
+
+    Args:
+        query: full-text search across title/body/topics. If omitted, the
+            filters below run as a structured query.
+        kind: filter by doc kind (e.g. 'architecture', 'decision').
+        project: filter by project ('constance', 'vivy', 'shared', 'utility').
+        audience: filter to docs that list this agent in their audience array.
+        applies_to: filter to docs with this substring in any applies_to entry
+            (matches glob patterns by substring; e.g. 'src/auth' matches
+            'src/auth/**').
+        status: filter by status ('current', 'draft', 'deprecated', 'archived').
+            Defaults to current+draft if omitted, to keep archived/deprecated
+            content out of routine retrieval.
+        limit: max rows returned (default 20).
+
+    Returns:
+        List of {id, title, kind, project, snippet, body_sha256}. The snippet
+        is an FTS5 snippet around the query match when `query` is provided;
+        otherwise the first ~200 chars of the body. `body_sha256` is the
+        index's `body_hash` column (sha256 of the body alone) — see `kb_get`
+        for how it differs from `kb_writes.content_sha`.
+    """
+    t0 = time.perf_counter()
+    limit = max(1, min(int(limit or 20), 100))
+    conn = _connect()
+    try:
+        where: list[str] = []
+        params: list[Any] = []
+
+        # Rewrite a free-text query into an OR-combined FTS5 expression
+        # (_build_match). `match` is None when the query is empty or all
+        # stopwords; then the filters below run as a structured query.
+        match = _build_match(query) if query and query.strip() else None
+        fts = match is not None
+
+        if fts:
+            base = (
+                "SELECT d.id, d.title, d.kind, d.project, d.body, d.body_hash, "
+                "snippet(docs_fts, 2, '<<', '>>', '…', 24) AS snip "
+                "FROM docs_fts JOIN docs d ON d.rowid = docs_fts.rowid "
+                "WHERE docs_fts MATCH ?"
+            )
+            params.append(match)
+        else:
+            base = (
+                "SELECT id, title, kind, project, body, body_hash, "
+                "substr(body, 1, 240) AS snip "
+                "FROM docs WHERE 1=1"
+            )
+
+        if kind:
+            where.append("d.kind = ?" if fts else "kind = ?")
+            params.append(kind)
+        if project:
+            where.append("d.project = ?" if fts else "project = ?")
+            params.append(project)
+        if status:
+            where.append("d.status = ?" if fts else "status = ?")
+            params.append(status)
+        else:
+            # Default: hide archived/deprecated unless explicitly requested.
+            where.append(
+                "d.status IN ('current','draft')" if fts else "status IN ('current','draft')"
+            )
+        if audience:
+            # JSON list — match if the value appears as a string element.
+            col = "d.audience" if fts else "audience"
+            where.append(f"EXISTS (SELECT 1 FROM json_each({col}) je WHERE je.value = ?)")
+            params.append(audience)
+        if applies_to:
+            col = "d.applies_to" if fts else "applies_to"
+            where.append(
+                f"EXISTS (SELECT 1 FROM json_each({col}) je WHERE je.value LIKE ?)"
+            )
+            params.append(f"%{applies_to}%")
+
+        # Rank FTS hits by column-weighted BM25 (id/title/topics > body).
+        # Without this, FTS5 returns matches in rowid order — not by relevance,
+        # the main cause of the right doc landing far down the list.
+        order = f" ORDER BY bm25(docs_fts, {_BM25_WEIGHTS})" if fts else ""
+        clauses = (" AND " + " AND ".join(where)) if where else ""
+        sql = base + clauses + order + f" LIMIT {limit}"
+
+        rows = conn.execute(sql, params).fetchall()
+        results = []
+        for row in rows:
+            snip = row["snip"] or ""
+            if not fts:
+                snip = snip.strip().replace("\n", " ")
+                if len(row["body"]) > 240:
+                    snip += "…"
+            results.append({
+                "id": row["id"],
+                "title": row["title"],
+                "kind": row["kind"],
+                "project": row["project"],
+                "snippet": snip,
+                "body_sha256": row["body_hash"],
+            })
+        _log_query({
+            "tool": "kb_search",
+            "query": query,
+            "filters": {k: v for k, v in {
+                "kind": kind, "project": project, "audience": audience,
+                "applies_to": applies_to, "status": status,
+            }.items() if v},
+            "limit": limit,
+            "results": len(results),
+            "hit_limit": len(results) >= limit,
+            "empty": not results,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 2),
+        })
+        return results
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def kb_get(id: str) -> dict[str, Any] | None:
+    """Fetch a full doc by its frontmatter id.
+
+    Args:
+        id: the canonical doc id (e.g. 'constance/decisions/0001-foo').
+
+    Returns:
+        Full doc as a dict, or None if no such id is indexed. JSON-typed
+        fields (topics, audience, applies_to, depends_on, authors) are
+        returned as Python lists. `body_sha256` is the index's own
+        `body_hash` column (sha256 of `body` alone, written at index time by
+        `lib/knowledge/indexer.py`), read straight through rather than
+        recomputed here. `None` when the column is unset on a legacy row.
+
+        This is NOT `kb_writes.content_sha`, the `base_sha` `kb_checkout`
+        returns: that one hashes the whole file, frontmatter included, so a
+        frontmatter-only edit still invalidates a concurrent writer's base.
+        `body_sha256` covers the body text alone. Do not treat the two as
+        interchangeable.
+    """
+    t0 = time.perf_counter()
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM docs WHERE id = ?", (id,)).fetchone()
+        _log_query({
+            "tool": "kb_get",
+            "id": id,
+            "found": row is not None,
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 2),
+        })
+        return _row_to_full_doc(row) if row else None
+    finally:
+        conn.close()
+
+
+@mcp.tool()
+def kb_list_topics(project: str | None = None) -> list[str]:
+    """Return deduplicated, sorted list of topics across the corpus.
+
+    Args:
+        project: optional — restrict to one project's docs.
+
+    Returns:
+        Sorted list of unique topic strings.
+    """
+    t0 = time.perf_counter()
+    conn = _connect()
+    try:
+        if project:
+            rows = conn.execute(
+                "SELECT topics FROM docs WHERE project = ?", (project,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT topics FROM docs").fetchall()
+        topics: set[str] = set()
+        for row in rows:
+            for t in _parse_json_list(row["topics"]):
+                if isinstance(t, str) and t:
+                    topics.add(t)
+        result = sorted(topics)
+        _log_query({
+            "tool": "kb_list_topics",
+            "project": project,
+            "topics": len(result),
+            "latency_ms": round((time.perf_counter() - t0) * 1000, 2),
+        })
+        return result
+    finally:
+        conn.close()
+
+
+# --- write verbs (ARCH-408) --------------------------------------------------
+#
+# Five tools that let a co edit the KB without hand-building a worktree. Each is
+# a THIN wrapper over `agentctl kb ...`; none of them implements policy.
+#
+# That split is the point. The cage holds the write lock, the content-sha
+# precondition, the provenance policy and the roster/profile PR-only rule, and it
+# holds them for every caller — this server, a shell, a launchd job. A policy
+# check duplicated here would be a second copy to drift, and the copy an attacker
+# would simply route around by calling agentctl directly. So these marshal
+# arguments and report results, and nothing else.
+#
+# Reads stay read-only against the index; nothing here writes the database.
+#
+# On content: `--content` is LITERAL. It used to mean "text, unless it names a
+# file, in which case read that", and a boundary guard against that was a race
+# rather than a control — two processes each calling is_file() cannot agree when
+# a file can appear between them (security review, #247). The cage now takes
+# `--content-file` for the read-from-disk case, which these verbs never use, so
+# a document is whatever the caller passed and nothing else.
+
+AGENTCTL = str(Path.home() / ".local" / "bin" / "agentctl")
+
+# EVERY CALLER-SUPPLIED POSITIONAL GOES AFTER `--`. A path or id that looks like
+# an option would otherwise be parsed as one, and the cage has an option this
+# server deliberately does not expose: `--holder`, the identity every lease check
+# compares. Found by security review of PR 537: `also_delete=["--holder",
+# "session:<someone>"]` set the holder silently, and since a delete's whole
+# authorization is "the caller holds the lease", it deleted another holder's
+# checked-out document under their name. So options come first, then `--`, then
+# only the values the caller named as documents.
+
+
+PERSON_REFUSAL = (
+    "provenance 'person' is not available through this tool: it means a person "
+    "typed the change, which the cage accepts only with a verified Cloudflare "
+    "Access assertion, and a model has none to present. A person's route is the "
+    "Orient editor. Use 'in-session' for a decision the operator states in this "
+    "session, or kb_propose for anything else.")
+
+
+def _refuse_person(provenance: str) -> dict[str, Any] | None:
+    """The refusal for `provenance="person"`, or None. Decided here, before any
+    call to the cage, so the message names the editor as the route rather than
+    the cage's own (assertion-missing) refusal, which would send a model hunting
+    for an assertion."""
+    if provenance == "person":
+        return {"ok": False, "error": "refused-policy", "stderr": PERSON_REFUSAL}
+    return None
+
+
+def _run_kb(*args: str) -> dict[str, Any]:
+    """Run an `agentctl kb` subcommand and return a structured result.
+
+    Exit codes are surfaced verbatim rather than collapsed to ok/failed, because
+    they are the contract: 2 refused before acting, 3 leased, 4 refused by
+    policy, 5 stale base sha, 6 would break validation, 7 push race. A caller
+    that sees `stale` re-reads and retries; a caller that sees `refused-policy`
+    must take the PR path instead. Collapsing them would make those two look
+    the same.
+    """
+    # 2 (refused-before-acting) is verb-neutral: `apply` and `propose` exit 2
+    # when the convivy-library App's credential is missing or refused, and
+    # `merge` exits 2 for that and also for a PR it cannot read. The stderr says
+    # which; the name claims only what all three share, that nothing was done.
+    # A name like `no-identity` would send a caller who mistyped a PR number
+    # looking for a missing App key. 3/4/5/6 come from `apply` and `propose`
+    # alike; 7 (push-race) only from `apply`, since `propose` pushes a branch
+    # rather than main and reports a rejected branch push as a plain failure.
+    # Mapping it here regardless keeps one table for one meaning rather than a
+    # per-verb copy.
+    named = {2: "refused-before-acting", 3: "leased", 4: "refused-policy", 5: "stale",
+             6: "invalid", 7: "push-race", 8: "refused-assertion"}
+    try:
+        cp = subprocess.run([AGENTCTL, "kb", *args],
+                            capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"ok": False, "error": "cage-unreachable", "detail": str(e)}
+    out = {"ok": cp.returncode == 0, "exit_code": cp.returncode,
+           "stdout": cp.stdout.strip(), "stderr": cp.stderr.strip()}
+    if cp.returncode != 0:
+        out["error"] = named.get(cp.returncode, "failed")
+    return out
+
+
+@mcp.tool()
+def kb_checkout(id: str, note: str | None = None) -> dict[str, Any]:
+    """Lease a doc for editing and read it back with the sha to write against.
+
+    The lease stops two sessions doing work that will be thrown away; it does NOT
+    make the write safe on its own. The `content_sha` this returns is what does
+    that — pass it to kb_update/kb_create as `base_sha` and the write is refused
+    if main moved underneath you.
+
+    Args:
+        id: doc id ('shared/agents/architect'), or a repo-relative path: a .md
+            doc, or a .yaml profile under projects/<project>/profiles/ (which
+            only kb_propose can then change).
+        note: what you intend to change; shown to whoever hits the conflict.
+
+    Returns:
+        {ok, source_ref, exists, content, content_sha, lease} on success.
+        On conflict, error='leased' with the holder and expiry in stderr — wait
+        or coordinate rather than retrying, because the lease is someone's live
+        editing pass.
+    """
+    args = ["checkout"] + (["--note", note] if note else []) + ["--", id]
+    r = _run_kb(*args)
+    if r["ok"]:
+        try:
+            r.update(json.loads(r.pop("stdout")))
+        except json.JSONDecodeError:
+            r["ok"] = False
+            r["error"] = "unparseable-cage-output"
+    return r
+
+
+@mcp.tool()
+def kb_update(id: str, base_sha: str, provenance: str,
+              edits: list[dict] | None = None, content: str | None = None,
+              message: str | None = None) -> dict[str, Any]:
+    """Edit an existing doc, writing straight to main when policy allows it.
+
+    Give EITHER `edits` (a list of {old, new} exact anchors, each of which must
+    match exactly once) or `content` (a whole replacement body). Anchors are
+    preferred: they fail loudly when the doc has drifted, where a whole-body
+    write would silently discard whatever changed.
+
+    `base_sha` is a hard precondition, not a hint. It comes from kb_checkout, and
+    the write is refused with error='stale' if origin/main has moved on — that is
+    what stops two sessions' edits from silently overwriting one another.
+
+    The write is refused with error='leased' while ANOTHER holder has a live
+    lease on the doc, and stderr names the holder and its expiry. Check the doc
+    out first; that is where `base_sha` comes from anyway.
+
+    `provenance` says on what authority this is written:
+      in-session     a decision the operator states in this session — not a
+                      co's own correction, reflow, or reading, even with the
+                      operator present
+      proposal       does not write main at all — use kb_propose
+
+    `person` is refused here. It records that a person typed the change, which the
+    cage accepts only with a verified Cloudflare Access assertion, and a model has
+    none to present; a person's route is the Orient editor.
+
+    `verifier-pass`, `generated`, `keel` and `steward` are recognized values
+    but no longer write directly: a call naming any of the four is refused
+    and pointed at kb_propose.
+
+    Any `agents/` path (the roster) and any `profiles/` path are refused
+    under EVERY provenance; they take kb_propose. A bad commit there breaks agent
+    dispatch platform-wide, so that rule has no exceptions.
+    """
+    if (refused := _refuse_person(provenance)):
+        return refused
+    args = ["apply", "--base-sha", base_sha, "--provenance", provenance]
+    if edits is not None:
+        args += ["--edits", json.dumps(edits)]
+    if content is not None:
+        args += ["--content", content, "--allow-overwrite"]
+    if message:
+        args += ["--message", message]
+    return _run_kb(*args, "--", id)
+
+
+@mcp.tool()
+def kb_create(id: str, content: str, provenance: str,
+              message: str | None = None) -> dict[str, Any]:
+    """Create a doc that does not exist yet.
+
+    Same policy as kb_update, including that provenance `person` is refused: a
+    person's route is the Orient editor. The base-sha precondition is the sha of the empty
+    string, so a doc that turns out to already exist is refused as stale rather
+    than silently overwritten — creating over someone else's doc is exactly the
+    lost update the precondition exists to stop.
+
+    Args:
+        id: repo-relative path, e.g. 'projects/vivy/decisions/0069-thing.md'.
+        content: the full document, frontmatter included. It must satisfy the
+            repo's own validate.py — the cage runs it before committing and
+            refuses with error='invalid' rather than reddening knowledge CI.
+    """
+    if (refused := _refuse_person(provenance)):
+        return refused
+    empty_sha = hashlib.sha256(b"").hexdigest()
+    args = ["apply", "--base-sha", empty_sha,
+            "--provenance", provenance, "--content", content]
+    if message:
+        args += ["--message", message]
+    return _run_kb(*args, "--", id)
+
+
+@mcp.tool()
+def kb_propose(id: str, title: str, rationale: str | None = None,
+               edits: list[dict] | None = None, content: str | None = None,
+               base_sha: str | None = None, delete: bool = False,
+               also_delete: list[str] | None = None,
+               batch: list[dict] | None = None) -> dict[str, Any]:
+    """Open a PR for a change that may not be written directly.
+
+    This is the route for everything judgment-class: a restructure, a
+    deprecation, a new non-decision doc, anything autonomous without a verifier
+    PASS — and it is the ONLY route for roster and profile paths.
+
+    It exists so that "you may not write this directly" has an answer other than
+    "so build a worktree by hand", which is the ceremony this replaces. The
+    branch is built, validated, pushed and turned into a PR; the review cycle
+    then authorizes it, which is why this verb takes no provenance.
+
+    Refused with error='leased' while ANOTHER holder has a live lease on the
+    doc, the same as kb_update: a proposal is a change to a doc someone else is
+    working on, only a reviewed one.
+
+    `delete=True` proposes REMOVING `id` rather than changing it, and
+    `also_delete` names further paths removed in the same PR. Every path must be
+    a repo-relative path under projects/ that YOU have checked out with
+    kb_checkout (a .yaml profile included), and a delete takes no edits or
+    content. Release the leases once the PR is open.
+
+    `batch` CHANGES SEVERAL DOCUMENTS IN ONE PR: a list of
+    `{"id": <path>, "edits": [...] | "content": <text>, "base_sha"?: <sha>}`, for a
+    mechanical change across many documents that would otherwise be one PR and
+    one review cycle each. `id` must be one of the batch's paths, and nothing
+    else rides along (no edits, content, base_sha or delete). Every document needs
+    YOUR OWN kb_checkout, and every one is validated before any branch is built.
+
+    Returns {ok, stdout} where stdout is the PR URL.
+    """
+    args = ["propose", "--title", title]
+    if batch is not None:
+        # A `content` entry may replace its document, as a single `content` call
+        # does below with --allow-overwrite; the cage requires the flag per entry.
+        batch = [dict(item, allow_overwrite=True)
+                 if isinstance(item, dict) and item.get("content") is not None else item
+                 for item in batch]
+        # One argv element, so no entry can be read as an option.
+        args += ["--batch", json.dumps(batch)]
+    if delete:
+        args.append("--delete")
+    if rationale:
+        args += ["--rationale", rationale]
+    if base_sha:
+        args += ["--base-sha", base_sha]
+    if edits is not None:
+        args += ["--edits", json.dumps(edits)]
+    if content is not None:
+        args += ["--content", content, "--allow-overwrite"]
+    r = _run_kb(*args, "--", id, *(also_delete or []))
+    if r["ok"] and r.get("stdout", "").startswith("http"):
+        r["pr_url"] = r["stdout"]
+    return r
+
+
+@mcp.tool()
+def kb_merge(pr: int, dry_run: bool = False) -> dict[str, Any]:
+    """Merge a knowledge PR that kb_propose opened, once its review cycle passed.
+
+    The operator's rule of 2026-09-12: the Library merges its own knowledge PRs
+    and the operator leaves that loop, for `convivy/knowledge` only. The
+    merge refuses unless the library's bot account opened the PR (on a `kb/`
+    branch), the agent policy file at knowledge `origin/main` permits merging
+    every changed file (and none is under `projects/platform/policy/`), every
+    commit carries a KB-Write trailer, `agentctl review-status` is PASS at the
+    current head, no review role ran more rounds than that policy's
+    `review_rounds_per_role`, and every `Merge-after:` companion has merged. A
+    refusal lists every reason. A PR refused for its round count goes to the
+    operator.
+
+    `dry_run=True` checks every condition and reports without merging.
+
+    Returns {ok, stdout}; stdout names the merge commit or the refusals.
+    """
+    return _run_kb("merge", "--pr", str(int(pr)), *(["--dry-run"] if dry_run else []))
+
+
+@mcp.tool()
+def kb_release(id: str) -> dict[str, Any]:
+    """Drop a lease you hold, before its 4-hour expiry.
+
+    Session-end hygiene. The TTL is the backstop that stops a dead session
+    holding a doc forever; this is the polite path that frees it immediately.
+    Releasing a lease you do not hold is reported, not an error.
+    """
+    return _run_kb("release", "--", id)
+
+
+@mcp.tool()
+def kb_leases() -> dict[str, Any]:
+    """List active leases — who is editing what, and until when.
+
+    For working out who to wait for after a kb_checkout conflict, and for
+    spotting a session that died holding one.
+    """
+    r = _run_kb("leases", "--json")
+    if r["ok"]:
+        try:
+            r["leases"] = json.loads(r.pop("stdout"))
+        except json.JSONDecodeError:
+            r["leases"] = []
+    return r
+
+
+if __name__ == "__main__":
+    mcp.run()

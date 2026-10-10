@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.dependabot-review</string>
+
+    <!-- Reviews the open dependency PRs overnight, so the morning decision is one
+         paragraph rather than a dozen tabs.
+
+         Measured 2026-07-30: 73 dependabot PRs merged across vivy, constance and
+         sous-chef in 30 days. The operator's account was that dependabot plus nightly bugs
+         plus issues consumed roughly the first ten hours of his day.
+
+         Grouping (the dependabot.yml rewrites merged the same day) cut how OFTEN
+         the question is asked; within minutes of merging, vivy's next dependabot
+         pass produced two grouped PRs carrying 17 updates in place of 17 separate
+         ones. This job cuts what ANSWERING it costs.
+
+         EVERY THREE HOURS, at :15 past, starting 01:15. A dependabot PR is then
+         reviewed within a few hours of opening rather than waiting for the night,
+         which matters most for the two kinds that do not respect the weekly
+         cadence: a security advisory, which dependabot opens regardless of
+         schedule, and a major bump, which is deliberately excluded from the
+         weekly group and arrives whenever it is published.
+
+         A pass that finds nothing new costs one `gh pr list` per repo and
+         dispatches nothing, because re-review is suppressed per head: a PR
+         already carrying a reviewer stamp at its current commit is skipped. So
+         the weekly grouped PR is reviewed once, not eight times a day.
+
+         The slots avoid 03:15 deliberately. The fleet issue drain runs at 03:30
+         and dispatches planning-orchestrators; a dependabot pass started 15
+         minutes earlier could still be holding global registry slots when the
+         drain wants them. 04:15 sits after the drain and before the 05:30
+         pr-reconcile and the 06:00 morning report, so the overnight pass has
+         landed its verdicts by the time the operator reads what is waiting on him.
+
+         Contention is handled rather than avoided: the tool waits for a registry
+         slot before each dispatch (up to 15 minutes) instead of letting agentctl
+         refuse the spawn and silently skip the PR.
+
+         It does NOT merge, by design. Auto-merge was considered and dropped
+         because the required-status-check sets on these repos are far thinner
+         than the checks that run, so "merge when required CI is green" would have
+         merged on almost nothing (see signal
+         branch-protection-required-checks-thin-2026-07-30). ARCH-020 stands: the operator
+         is the human in the loop before merge.
+
+         PATH carries /opt/homebrew/bin for `gh`. -->
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of dependabot-review, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes dependabot-review interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/dependabot-review</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>1</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>16</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>19</integer><key>Minute</key><integer>15</integer></dict>
+        <dict><key>Hour</key><integer>22</integer><key>Minute</key><integer>15</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/dependabot-review.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/dependabot-review.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  weekly-kb-audit — the compensating control ARCH-408 attached to `in-session`
+  provenance, which grants a direct write to knowledge/main on the writing
+  agent's own attestation. Accepted on the condition that those writes get read
+  back in batch; this is what does the reading. It also re-reads who COULD
+  write — collaborators, teams, workflow permissions, and GitHub App
+  installations on the org — from GitHub's live settings, one level up from
+  the write-history read (issue_01KZQA9FK7F6GZS4E4NCQRH0YB).
+
+  Sunday 05:40. No checkout, no lock, no budget, no model, so the half-hour
+  after weekly-curation (05:10) is ordinary scheduling hygiene rather than
+  contention avoidance — an earlier version of this comment claimed a checkout
+  conflict that cannot happen. It DOES now make a live network call (the
+  access read authenticates to GitHub as the convivy-bosun App), which the
+  write-history read alone never did.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.convivy.weekly-kb-audit</string>
+  <!-- Deploy-pinned per platform/decisions/0059 rule 1
+       (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+       production USE of launch-weekly-kb-audit, not someone working on it, so this reads
+       a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+       (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+       that symlink still exists and still reaches the tree, for the person who
+       re-invokes launch-weekly-kb-audit interactively while working on it (rule 5).
+       bin/agent-platform-autopull refreshes the deploy area on every
+       origin/main advance; bin/install-agent-platform-shared is what actually
+       builds it. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/deploy/agent-platform-shared/bin/launch-weekly-kb-audit</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.local/deploy/agent-platform-shared</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd's PATH lacks ~/.local/bin (ARCH-086); the script resolves
+         agentctl absolutely, and this keeps git and python reachable. -->
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>5</integer>
+    <key>Minute</key>
+    <integer>40</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Convivy/agent-runs/weekly-kb-audit-launcher.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Convivy/agent-runs/weekly-kb-audit-launcher.err.log</string>
+</dict>
+</plist>

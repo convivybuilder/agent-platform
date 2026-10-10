@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.convivy.sshd-watchdog</string>
+  <!-- Auto-rebind the mini's sshd when it stops listening on :22 (ARCH-310).
+       ROOT LaunchDaemon in /Library/LaunchDaemons — re-enabling Remote Login
+       needs root. Runs the root-owned /usr/local/sbin/sshd-watchdog, NOT a
+       symlink into the user-writable repo tree. Install:
+         sudo bash sbin/install-sshd-watchdog.sh
+       (copies the script root:wheel 755, installs this plist, bootstraps the
+       system domain). StandardOut/Err live in the log base dir, NOT the events/
+       subdir, so they don't trigger the notify agent's WatchPaths. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/sbin/sshd-watchdog</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/sshd-watchdog/daemon.out</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/sshd-watchdog/daemon.err</string>
+</dict>
+</plist>

@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""session-agent — Deck's handle on a live co session, by tmux session name.
+
+Deck's rail rows are tmux names, so every verb here takes one. The state machine
+and the input mechanics live in `lib/agent-platform/` where they are tested; this
+is argv and JSON around them.
+
+WHY DECK CALLS THIS INSTEAD OF DOING IT ITSELF. The process tree, the run dirs
+and the hook logs are all on the mini, and Deck is on the laptop — it would be
+reaching across ssh for every one of them. Keeping the logic here also keeps a
+second implementation of the state transitions out of Swift, where it would drift
+from this one and could not be tested in Deck's suite.
+
+  session-agent state <name>            # one JSON object, then exit
+  session-agent state <name> --follow   # a line per state change; exits when its reader goes
+  session-agent states <name>...        # a brief state per name, keyed, for the rail
+  session-agent documents <name>        # the knowledge documents this session's checkout brought
+  session-agent rollover <name> veto|force|seek|clear  # Deck's write side (ADR-0069)
+  session-agent rollover-policy [--set key=value ...]  # read or edit the global policy
+  session-agent held-items <name> [--markdown]  # what this session holds for the operator (ADR-0069 Slice 7)
+  session-agent crews-root              # the root a --create-dir call may create under
+  session-agent send <name> --text -    # read a message on stdin, submit it
+  session-agent slate <name> [--all]    # this crew's Slate (platform/decisions/0091)
+  session-agent slate-note <name> --text -       # save a new draft note
+  session-agent slate-edit <name> <id> --text -  # edit a draft note or an ask's answer_draft
+  session-agent slate-delete <name> <id>         # delete a draft note
+  session-agent slate-send <name> <id>           # deliver a note or an ask's answer
+  session-agent key <name> <key>        # one named key
+  session-agent choose <name> <1-9>     # take an option on a numbered prompt
+  session-agent focus-free-text <name>  # highlight a multiselect's free-text row
+  session-agent submit <name>           # submit a multiselect question
+  session-agent interrupt <name>        # stop an in-flight response
+  session-agent unqueue <name>          # pull queued messages back out, safely
+  session-agent read-file <path>        # a file's exact bytes, contained to home/scratchpad
+  session-agent write-file <path>       # content on stdin, atomic, same containment
+
+`choose` finishes a permission prompt or a single-select question on its own. On
+a multiselect question it ticks one box, and `submit` is what closes the gate.
+
+A free-text answer is three verbs, and which one opens the field depends on the
+question: `choose` on a single-select, where the row's digit focuses it, and
+`focus-free-text` on a multiselect, where that same digit would tick the row
+instead. Then `type`, then `submit` on a multiselect or `key <name> enter` on a
+single-select.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "session_commands.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+import venv_bootstrap  # noqa: E402
+# `venv_bootstrap.ensure(..., requires=("yaml",), optional=True)` runs only in
+# the `commands` verb's branch below, not here at import time: `commands` is
+# the only verb that reaches `session_commands`'s `_frontmatter`, and
+# `session-agent state` is what Deck polls every tick — a subprocess probe and
+# a re-exec on every one of those ticks, for a module only `commands` needs,
+# would be paid for nothing.
+
+import session_commands as SC  # noqa: E402
+import session_crews as SCR  # noqa: E402
+import session_documents as SD  # noqa: E402
+import session_files as SF  # noqa: E402
+import session_input as SI  # noqa: E402
+import session_lifecycle as SL  # noqa: E402
+import session_state as SS  # noqa: E402
+import rollover_policy as RP  # noqa: E402
+import slate as S  # noqa: E402  (platform/decisions/0091: the Slate verbs, CQ-358)
+
+# How often the follow loop re-reads. Local to the mini, where a few stats are
+# free, so this is not the network cost a laptop-side poll would be. Deck holds
+# one connection that pushes rather than a round trip per interval.
+FOLLOW_INTERVAL_SECONDS = 0.75
+
+
+def _emit(obj: dict) -> None:
+    """One JSON object per line, flushed, so a follower's reader sees each state
+    as it happens rather than when a block buffer fills."""
+    print(json.dumps(obj, sort_keys=True), flush=True)
+
+
+def slate_send_log_path() -> Path:
+    """Where every `slate-send` logs its session, pane, transcript and result
+    (CQ-420 / issue_01M4BNS7KKGDWBPF1XFPV8XMPV) — so a send that reported
+    "answered" can be reconstructed afterward instead of taken on faith.
+    Under `~/.local/state/convivy`, the root `slate.py`'s own board files
+    already use, for the same reason: this is the operator's own record, not
+    disposable.
+
+    A function, re-reading `Path.home()` on every call, for the exact reason
+    `slate.state_root()` is one rather than a module constant: this module is
+    loaded once per test session (`session_agent_cli`), so a constant would
+    bake in whichever `$HOME` was live at that first import — not the one a
+    later test's `monkeypatch.setenv("HOME", ...)` points elsewhere.
+    """
+    return Path.home() / ".local" / "state" / "convivy" / "session-agent.log"
+
+
+def _log_slate_send(name: str, pane: str | None, transcript: Path | None,
+                    card_id: str, result: str) -> None:
+    """Append one line recording a `slate-send` attempt. Best-effort: a
+    failure to write this log must never be why a delivery that otherwise
+    succeeded or failed gets reported differently, so an `OSError` here is
+    swallowed rather than raised."""
+    try:
+        log_path = slate_send_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        line = {
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "session": name,
+            "pane": pane,
+            "transcript": str(transcript) if transcript is not None else None,
+            "card_id": card_id,
+            "result": result,
+        }
+        with log_path.open("a") as f:
+            f.write(json.dumps(line, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+
+def _follow(name: str, interval: float) -> int:
+    """Print what the follower yields. The loop itself lives in session_state,
+    where it is testable; this owns only the printing.
+
+    A `--follow` run outlives the reader on the other end more often than it
+    outlives the session: Deck quits, a pane closes, the ssh channel drops.
+    `_emit`'s `flush=True` means that shows up here, at the next write, as
+    `BrokenPipeError` — not later, at interpreter shutdown, where the
+    traceback would be harder to place. Catch it and exit quietly; a dead
+    reader is this loop's normal way to end, not a bug in it.
+    """
+    try:
+        for state in SS.follow_states(name, interval):
+            _emit(state)
+    except BrokenPipeError:
+        _recover_from_broken_pipe()
+    return 0
+
+
+def _held_items_markdown(items: dict) -> str:
+    """The `Held for the operator` block `handoff-leave` pastes verbatim
+    (ADR-0069 Slice 7) — the plain-text sibling of `held_items`'s JSON, the
+    same client-vs-handoff split `agentctl list --co-session` already draws
+    for the in-flight-runs section (Slice 4): a client reads JSON, a
+    handoff gets prose.
+
+    Every line is explicit about emptiness rather than omitted, so a
+    handoff that checked and found nothing reads differently from one that
+    never ran this at all — the same bar Slice 4's `(no active runs)` line
+    sets.
+    """
+    if items.get("outcome") != "ok":
+        return f"(could not read held items: {items.get('reason', 'unknown')})"
+
+    lines = []
+
+    draft = items.get("draft")
+    if draft:
+        lines.append(f"- Composer draft (unsent, in the pane): {draft!r}")
+    else:
+        lines.append("- Composer draft: none")
+
+    messages = items.get("held_messages")
+    if messages is None:
+        lines.append("- Queued messages: could not be read")
+    elif not messages:
+        lines.append("- Queued messages: none")
+    else:
+        lines.append(f"- Queued messages ({len(messages)}):")
+        for m in messages:
+            ts = m.get("queued_at") or "unknown time"
+            lines.append(f"  - [{ts}] {m.get('content')!r}")
+
+    rollover = items.get("rollover") or {}
+    lines.append(f"- Rollover state: {rollover.get('state', 'none')}")
+
+    return "\n".join(lines)
+
+
+def _recover_from_broken_pipe() -> None:
+    """Close and repoint stdout so nothing later in the process (including
+    Python's own shutdown flush) re-raises on the same dead pipe."""
+    try:
+        sys.stdout.close()
+    except (OSError, ValueError):
+        pass
+    try:
+        sys.stdout = open(os.devnull, "w")
+    except OSError:
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="verb", required=True)
+
+    p = sub.add_parser("state", help="what the session is doing")
+    p.add_argument("name")
+    p.add_argument("--follow", action="store_true",
+                   help="stream a line per state change instead of exiting")
+    p.add_argument("--interval", type=float, default=FOLLOW_INTERVAL_SECONDS)
+
+    p = sub.add_parser("states", help="a brief state per name, keyed, for the rail")
+    p.add_argument("names", nargs="+")
+
+    p = sub.add_parser(
+        "rollover",
+        help="veto, force, seek or clear a session's rollover (ADR-0069, Deck's write side)")
+    p.add_argument("name")
+    p.add_argument("action", choices=("veto", "force", "seek", "clear"))
+
+    p = sub.add_parser(
+        "rollover-policy",
+        help="read, or edit, the global rollover policy (~/.config/convivy/rollover.json)")
+    p.add_argument("--set", action="append", default=[], metavar="key=value",
+                   help="update one policy field (mode, seek_pct, floor_pct, "
+                        "seek_call_cap); repeatable. Refused if the result "
+                        "would leave floor_pct at or below seek_pct")
+
+    p = sub.add_parser(
+        "held-items",
+        help="what this session is holding for the operator right now: a "
+             "composer draft, held queued messages, and the rollover state "
+             "(ADR-0069 Slice 7)")
+    p.add_argument("name")
+    p.add_argument("--markdown", action="store_true",
+                   help="print the 'Held for the operator' block "
+                        "handoff-leave pastes verbatim, instead of JSON")
+
+    sub.add_parser("sessions",
+                   help="every non-scratch tmux session on this host, for "
+                        "grouping under a project")
+    sub.add_parser("ensure-server",
+                   help="make sure the default tmux server is running, started "
+                        "by the GUI-session keeper job. Exits 1 with the reason "
+                        "when it cannot be; a server already running passes")
+
+    sub.add_parser("crews",
+                   help="the crew specs new-crew writes, as one envelope for Deck")
+    sub.add_parser("crews-root",
+                   help="the root a --create-dir call may create under: the "
+                        "configured CREWS_ROOT, or ~/builder when nothing "
+                        "overrides it. Read-only; changes no behaviour")
+
+    p = sub.add_parser("commands",
+                       help="the slash commands and skills a session can invoke")
+    p.add_argument("name")
+
+    p = sub.add_parser(
+        "documents",
+        help="the knowledge documents this session's checkout brought, each "
+             "with its kind, from the record `knowledge-ctx use` wrote at "
+             "individuation time")
+    p.add_argument("name")
+
+    p = sub.add_parser("send", help="submit a message")
+    p.add_argument("name")
+    p.add_argument("--text", required=True,
+                   help="the message, or '-' to read it from stdin. Prefer '-': "
+                        "a message on argv is visible in the process table.")
+
+    p = sub.add_parser(
+        "slate", help="this crew's Slate: asks and notes (platform/decisions/0091)")
+    p.add_argument("name")
+    p.add_argument("--all", action="store_true",
+                   help="include resolved asks and sent notes too; the file "
+                        "always keeps both")
+
+    p = sub.add_parser("slate-note", help="save a new draft note on this crew's Slate")
+    p.add_argument("name")
+    p.add_argument("--text", required=True,
+                   help="the note's text, or '-' to read it from stdin. Prefer "
+                        "'-', for the reason `send` gives.")
+
+    p = sub.add_parser(
+        "slate-edit",
+        help="replace a draft note's text, or an open/answered ask's answer_draft")
+    p.add_argument("name")
+    p.add_argument("id")
+    p.add_argument("--text", required=True,
+                   help="the new text, or '-' to read it from stdin. Prefer "
+                        "'-', for the reason `send` gives.")
+
+    p = sub.add_parser("slate-delete", help="delete a draft note; refuses anything else")
+    p.add_argument("name")
+    p.add_argument("id")
+
+    p = sub.add_parser(
+        "slate-send",
+        help="deliver a draft note, or an ask's answer_draft as its answer")
+    p.add_argument("name")
+    p.add_argument("id")
+
+    p = sub.add_parser("type", help="type into a live picker without answering it")
+    p.add_argument("name")
+    p.add_argument("--text", required=True,
+                   help="the text, or '-' to read it from stdin. Prefer '-', for "
+                        "the reason `send` gives. Requires a blocked session: "
+                        "this pastes WITHOUT a trailing Enter, which only makes "
+                        "sense inside a picker.")
+    p.add_argument("--expect-gate", metavar="ID", default=None,
+                   help="the gateId the caller observed; the keystroke is refused "
+                        "if the live gate carries a different id")
+    p.add_argument("--expect-question", metavar="N", type=int, default=None,
+                   help="the questionIndex the caller observed; the keystroke is "
+                        "refused if the live index differs")
+
+    p = sub.add_parser("key", help="send one named key")
+    p.add_argument("name")
+    p.add_argument("key", choices=sorted(SI.KEYS))
+
+    p = sub.add_parser("choose", help="take an option on a numbered prompt")
+    p.add_argument("name")
+    p.add_argument("choice", type=int)
+    p.add_argument("--expect-gate", metavar="ID", default=None,
+                   help="the gateId the caller observed; the keystroke is refused "
+                        "if the live gate carries a different id")
+    p.add_argument("--expect-question", metavar="N", type=int, default=None,
+                   help="the questionIndex the caller observed; the keystroke is "
+                        "refused if the live index differs")
+
+    p = sub.add_parser(
+        "focus-free-text",
+        help="walk the highlight onto a multiselect's free-text row, so `type` "
+             "has somewhere to land. Needs a blocked session and a picker the "
+             "reader recognises; on a single-select question `choose` does this "
+             "with one digit and this verb is not wanted.")
+    p.add_argument("name")
+    p.add_argument("--expect-gate", metavar="ID", default=None,
+                   help="the gateId the caller observed; the walk is refused if "
+                        "the live gate carries a different id")
+    p.add_argument("--expect-question", metavar="N", type=int, default=None,
+                   help="the questionIndex the caller observed; the walk is "
+                        "refused if the live index differs")
+
+    p = sub.add_parser("submit", help="submit a multiselect question")
+    p.add_argument("name")
+    p.add_argument("--expect-gate", metavar="ID", default=None,
+                   help="the gateId the caller observed; the commit is refused if "
+                        "the live gate carries a different id")
+    p.add_argument("--expect-question", metavar="N", type=int, default=None,
+                   help="the questionIndex the caller observed; the commit is "
+                        "refused if the live index differs")
+
+    p = sub.add_parser("interrupt", help="stop an in-flight response")
+    p.add_argument("name")
+
+    p = sub.add_parser(
+        "unqueue",
+        help="pull Claude Code's queued messages back out of the queue. "
+             "Refuses rather than risking `Up`'s two blind failure modes: "
+             "recalling history into the box, or destroying a live draft.")
+    p.add_argument("name")
+
+    p = sub.add_parser("start", help="create a tmux session and run a command in it")
+    p.add_argument("name")
+    p.add_argument("--dir", default=None,
+                   help="working directory for the new session. Absolute; `~` is "
+                        "expanded here, because tmux receives it through argv "
+                        "rather than a shell and would take it literally.")
+    p.add_argument("--create-dir", action="store_true",
+                   help="create --dir (parents included) if it does not exist, "
+                        "instead of raising. Off by default: a catalog row's "
+                        "typo'd workingDirectory should keep failing loudly. Pass "
+                        "this only when the caller means the directory not to "
+                        "exist yet — today, only Deck's New Project flow.")
+    p.add_argument("--command", default=None,
+                   help=f"what to run once the session exists (default {SL.DEFAULT_COMMAND!r}). "
+                        "Typed into the session, so it must be one line. Prefer '-' "
+                        "to read it from stdin: a multi-word command on argv is "
+                        "joined and re-split by the remote shell over ssh.")
+
+    p = sub.add_parser("stop", help="end the agent in a session")
+    p.add_argument("name")
+    p.add_argument("--kill", action="store_true",
+                   help="also kill the tmux session. DESTRUCTIVE: its scrollback "
+                        "and anything else running in it go with it.")
+
+    p = sub.add_parser(
+        "reap-shells",
+        help="close idle Deck scratch shells (deck-shell-*). Never touches a "
+             "fleet session, an attached one, or one with anything running.")
+    p.add_argument("--idle-seconds", type=float,
+                   default=SL.SCRATCH_SHELL_IDLE_SECONDS,
+                   help="how long a shell must sit untouched to be reapable "
+                        f"(default {int(SL.SCRATCH_SHELL_IDLE_SECONDS)})")
+
+    p = sub.add_parser(
+        "read-file",
+        help="read a file's exact bytes, refused unless it resolves inside "
+             "this account's home or its Claude scratchpad")
+    p.add_argument("path", help="absolute path")
+
+    p = sub.add_parser(
+        "write-file",
+        help="write a file's exact bytes from stdin, atomically; refused "
+             "unless it resolves inside this account's home or its Claude "
+             "scratchpad. A symlink at the target is replaced, not written "
+             "through.")
+    p.add_argument("path", help="absolute path")
+
+    args = ap.parse_args()
+
+    try:
+        if args.verb == "state":
+            if args.follow:
+                return _follow(args.name, args.interval)
+            _emit(SS.session_state(args.name))
+            return 0
+
+        if args.verb == "states":
+            _emit(SS.session_states(args.names))
+            return 0
+
+        if args.verb == "rollover":
+            _emit(SS.rollover_command(args.name, args.action))
+            return 0
+
+        if args.verb == "rollover-policy":
+            try:
+                policy = RP.load_policy()
+                if args.set:
+                    updates = RP.parse_policy_updates(args.set)
+                    policy = RP.apply_policy_updates(policy, updates)
+                    RP.save_policy(policy)
+                    policy = RP.load_policy()  # report exactly what is now on disk
+            except RP.PolicyError as e:
+                print(f"session-agent: {e}", file=sys.stderr)
+                _emit({"ok": False, "error": str(e)})
+                return 1
+            _emit(policy)
+            return 0
+
+        if args.verb == "held-items":
+            items = SS.held_items(args.name)
+            if args.markdown:
+                print(_held_items_markdown(items))
+            else:
+                _emit(items)
+            return 0
+
+        if args.verb == "sessions":
+            _emit(SL.sessions())
+            return 0
+
+        if args.verb == "ensure-server":
+            # A refusal is a TmuxServerError (a LifecycleError), caught below:
+            # JSON on stdout, the reason on stderr, exit 1. The ssh aliases
+            # chain `attach || new` after this, so a refusal stops before any
+            # tmux process of the login's own is forked.
+            SL.ensure_default_server()
+            _emit({"ok": True})
+            return 0
+
+        if args.verb == "crews":
+            _emit(SCR.crews())
+            return 0
+
+        if args.verb == "crews-root":
+            _emit({"root": SL.creatable_root()})
+            return 0
+
+        if args.verb == "commands":
+            # Reach for a venv with PyYAML before anything below runs, so a
+            # command's description and a skill's declared name show up in
+            # Deck's menu on a Linux install whose system python lacks
+            # PyYAML. First thing in this branch, before the `session_state`
+            # read that follows: that read is a pure lookup (tmux, files),
+            # so a re-exec here loses no in-flight work. `optional=True`:
+            # when no venv serves it either, carry on regardless —
+            # `_frontmatter`'s own guarded `import yaml` is the last line of
+            # defence.
+            venv_bootstrap.ensure(__file__, requires=("yaml",), optional=True)
+            # The session's own cwd decides which project's commands apply, and
+            # `state` already resolves it — so this asks for it rather than
+            # making the caller pass a directory it would have to look up the
+            # same way. A session that cannot be read still has the user's
+            # commands to report, so a failed lookup is None, not an error.
+            try:
+                cwd = SS.session_state(args.name).get("cwd")
+            except Exception:  # noqa: BLE001 - reported as no cwd, never fatal
+                cwd = None
+            _emit(SC.loaded_commands(cwd))
+            return 0
+
+        if args.verb == "documents":
+            # Same resolution as `commands` above: the session's own cwd is
+            # what `.claude/` the record was written into, and a session that
+            # cannot be read has no cwd to read one from either.
+            try:
+                cwd = SS.session_state(args.name).get("cwd")
+            except Exception:  # noqa: BLE001 - reported as no_such_session, never fatal
+                cwd = None
+            _emit({"session": args.name, **SD.session_documents(cwd)})
+            return 0
+
+        if args.verb == "start":
+            # `--command -` reads the command from stdin, the same channel `send`
+            # uses for a message and for the same reason: over ssh, argv is joined
+            # with spaces and re-split by the remote shell, so `co -r` would arrive
+            # as two tokens and `co; rm -rf /` would run its second clause in the
+            # ssh control shell. On stdin the command arrives as one exact string.
+            command = sys.stdin.read() if args.command == "-" else args.command
+            _emit(SL.start(args.name, directory=args.dir, command=command,
+                           create_dir=args.create_dir))
+            return 0
+
+        if args.verb == "stop":
+            _emit(SL.stop(args.name, kill=args.kill))
+            return 0
+
+        if args.verb == "reap-shells":
+            _emit(SL.reap_scratch_shells(idle_seconds=args.idle_seconds))
+            return 0
+
+        if args.verb == "read-file":
+            # NOT `_emit`: this verb's stdout is a raw byte pipe replacing
+            # `ssh <target> cat <path>`, and JSON on it would be
+            # indistinguishable from a file that happens to start with `{`.
+            # A refusal is reported on stderr only, exactly as `cat` itself
+            # would report one, and nothing is written to stdout either way.
+            try:
+                content = SF.read_file(args.path)
+            except SF.FileAccessError as e:
+                print(f"session-agent: {e}", file=sys.stderr)
+                return 1
+            sys.stdout.buffer.write(content)
+            sys.stdout.buffer.flush()
+            return 0
+
+        if args.verb == "write-file":
+            content = sys.stdin.buffer.read()
+            SF.write_file(args.path, content)
+            _emit({"ok": True, "path": args.path, "bytes": len(content)})
+            return 0
+
+        if args.verb == "unqueue":
+            # A distinct shape from the pane-carrying verbs below
+            # (`{"messages": [...]}`, not `{"pane": ...}`), so this returns
+            # rather than falling into their shared `_emit` at the bottom —
+            # same reason `state`/`states`/`start`/`stop` return early above.
+            _emit({"ok": True, **SI.unqueue(args.name)})
+            return 0
+
+        if args.verb in ("slate", "slate-note", "slate-edit", "slate-delete", "slate-send"):
+            # One try/except scoped to these five verbs, the same shape
+            # `rollover-policy` above uses for its own `PolicyError` — rather
+            # than widening the shared `except` at the bottom of this
+            # function to `S.SlateError`/`ValueError`, which would also start
+            # swallowing an unrelated bug in any OTHER verb's own `ValueError`.
+            key = S.session_key(args.name)
+            try:
+                if args.verb == "slate":
+                    _emit({"ok": True, "session": args.name,
+                           "cards": S.list_cards(key, include_all=args.all)})
+                elif args.verb == "slate-note":
+                    text = sys.stdin.read() if args.text == "-" else args.text
+                    card_id = S.create_note(key, text)
+                    _emit({"ok": True, "card": S.get_card(key, card_id)})
+                elif args.verb == "slate-edit":
+                    text = sys.stdin.read() if args.text == "-" else args.text
+                    S.edit_card(key, args.id, text)
+                    _emit({"ok": True, "card": S.get_card(key, args.id)})
+                elif args.verb == "slate-delete":
+                    S.delete_note(key, args.id)
+                    _emit({"ok": True, "id": args.id})
+                else:  # slate-send
+                    card, message = S.prepare_send(key, args.id)
+                    # Resolved ONCE, before anything else, so the offset
+                    # read, the send and the delivery wait all target the
+                    # SAME pane — `SI.resolve_pane`'s docstring has the
+                    # rollover hazard this closes (CQ-420 pane agreement):
+                    # two live claude panes can share one tmux session, and
+                    # independently re-resolving for each step can pick
+                    # different ones.
+                    pane = SI.resolve_pane(args.name)
+                    # Read BEFORE the send, so `await_delivery` below
+                    # confirms against what the transcript gains from this
+                    # send, never a line already there (CQ-420).
+                    transcript, since = SI.transcript_offset(args.name, pane=pane)
+                    pane_id = SI.send_message(args.name, message, pane_id=pane[0])
+                    try:
+                        SI.await_delivery(args.name, message, transcript, since)
+                    except SI.InputError as e:
+                        # `str(e)` never carries the sent text (see
+                        # `await_delivery`'s docstring) — this log is the
+                        # operator's own durable record, and an ask's text
+                        # can quote private data.
+                        _log_slate_send(args.name, pane_id, transcript, args.id,
+                                        f"not confirmed: {e}")
+                        raise
+                    _log_slate_send(args.name, pane_id, transcript, args.id, "confirmed")
+                    # THE CARD CHANGES ONLY NOW, AFTER DELIVERY SUCCEEDED
+                    # (platform/decisions/0091). `answer` is the exact text
+                    # `prepare_send` already validated and put in the
+                    # message, carried through rather than re-read, so what
+                    # gets persisted can never drift from what was sent.
+                    answer = ((card.get("answer_draft") or "").strip()
+                              if card["kind"] == "ask" else None)
+                    updated = S.finalize_send(key, args.id, card["kind"], answer=answer)
+                    _emit({"ok": True, "card": updated, "pane": pane_id})
+                return 0
+            except (S.SlateError, ValueError, SI.InputError) as e:
+                _emit({"ok": False, "error": str(e)})
+                print(f"session-agent: {e}", file=sys.stderr)
+                return 1
+
+        if args.verb == "send":
+            text = sys.stdin.read() if args.text == "-" else args.text
+            pane = SI.send_message(args.name, text)
+        elif args.verb == "type":
+            text = sys.stdin.read() if args.text == "-" else args.text
+            pane = SI.type_text(args.name, text,
+                                expect_gate=args.expect_gate,
+                                expect_question=args.expect_question)
+        elif args.verb == "key":
+            pane = SI.send_key(args.name, args.key)
+        elif args.verb == "choose":
+            pane = SI.answer_choice(args.name, args.choice,
+                                    expect_gate=args.expect_gate,
+                                    expect_question=args.expect_question)
+        elif args.verb == "focus-free-text":
+            pane = SI.focus_free_text(args.name,
+                                      expect_gate=args.expect_gate,
+                                      expect_question=args.expect_question)
+        elif args.verb == "submit":
+            pane = SI.submit_choices(args.name,
+                                     expect_gate=args.expect_gate,
+                                     expect_question=args.expect_question)
+        else:
+            pane = SI.interrupt(args.name)
+
+        _emit({"ok": True, "pane": pane})
+        return 0
+
+    except (SI.InputError, SI.JoinError, SL.LifecycleError, SF.FileAccessError) as e:
+        # Reported as JSON on stdout as well as stderr, so a caller parsing this
+        # command's output gets a structured failure rather than a parse error
+        # on an empty line.
+        _emit({"ok": False, "error": str(e)})
+        print(f"session-agent: {e}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

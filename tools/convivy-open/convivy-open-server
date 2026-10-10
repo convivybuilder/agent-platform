@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Convivy open-server.
+
+Resolves Convivy-relative paths against *this* machine's base directory and
+opens them locally. The same script runs on both the mini and the laptop; only
+the base path differs, set per machine via the CONVIVY_OPEN_BASE env var:
+
+    mini   : CONVIVY_OPEN_BASE=<the machine's resolved root>
+    laptop : CONVIVY_OPEN_BASE=<the root's SMB-mounted mirror under /Volumes>
+
+Neither is hardcoded (company/decisions/0008): _default_base() below falls
+back to the mini's own builder_root.root() when that lib is installed, else
+to the laptop config resolve-open-base.sh writes from asking the mini over
+ssh (install-laptop.sh).
+
+The bot posts links like:
+    http://localhost:8765/open?p=agent-runs/2026-05-22/run-50d95758/dep-audit-report.md
+
+Clicking resolves `p` against CONVIVY_OPEN_BASE on whichever machine you click
+from, then runs `open <file>`. localhost == "the machine I'm clicking from",
+which is what gives you per-machine translation.
+
+On the laptop, if the configured base isn't present (mini not mounted), the
+server tries the SMB-suffix variants macOS creates alongside it when the same
+share is already mounted (the base's share name with a `-1`, `-2`, ... suffix)
+and, failing that, attempts to mount CONVIVY_OPEN_MOUNT before giving up.
+"""
+
+import glob
+import html
+import os
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs, unquote
+
+def _default_base():
+    """CONVIVY_OPEN_BASE's fallback when nothing sets the env var — this
+    machine's own resolved root (company/decisions/0008), never a fixed path.
+    Tries the mini's own builder_root first (this machine IS the mini when
+    that import succeeds); falls back to the laptop config
+    resolve-open-base.sh writes (install-laptop.sh), which read the mini's
+    root over ssh at install time. Empty when neither resolves, so the
+    existing "base not present" refusal fires rather than a guess."""
+    try:
+        sys.path.insert(0, os.path.expanduser("~/.local/lib/agent-platform"))
+        import builder_root as _br
+        return str(_br.root())
+    except Exception:
+        pass
+    try:
+        with open(os.path.expanduser("~/.config/convivy/convivy-open.env")) as f:
+            for line in f:
+                if line.startswith("CONVIVY_OPEN_BASE="):
+                    return line.strip().split("=", 1)[1]
+    except OSError:
+        pass
+    return ""
+
+
+def _first_line(s):
+    """The text before the first embedded LF or CR. The file-based lookups
+    (_default_base's config read, convivy-open's _cached()) read one physical
+    line by construction; CONVIVY_OPEN_BASE taken from the environment has no
+    such structure, so a multi-line value (e.g. install-laptop.sh's plist
+    interpolating an unvalidated config-file value verbatim) must be cut down
+    to match rather than trusted whole."""
+    return s.split("\n", 1)[0].split("\r", 1)[0]
+
+
+PORT = int(os.environ.get("CONVIVY_OPEN_PORT", "8765"))
+_env_base = os.environ.get("CONVIVY_OPEN_BASE")
+BASE = _first_line(_env_base) if _env_base else _default_base()
+if not os.path.isabs(BASE):
+    sys.stderr.write(
+        "convivy-open-server: CONVIVY_OPEN_BASE (%r) is not an absolute path; refusing to start.\n"
+        % BASE)
+    sys.exit(1)
+# Optional smb:// URL used to auto-mount on the laptop when BASE is missing.
+MOUNT_URL = os.environ.get("CONVIVY_OPEN_MOUNT", "")
+# Helper that opens a LOCAL markdown file at a given line (Typora ⌘F-on-snippet).
+# Used only when a request carries ?line=N; plain `open` otherwise. Falls back to
+# `open` if the helper is absent / Typora isn't installed (e.g. on the mini).
+LINE_OPENER = os.path.expanduser(
+    os.environ.get("CONVIVY_OPEN_LINE_CMD", "~/.local/bin/typora-goto"))
+
+
+def _candidate_bases():
+    """Base dirs that exist: the configured BASE first, then the SMB `-N`
+    siblings macOS creates when a share name is already taken."""
+    bases = []
+    if os.path.isdir(BASE):
+        bases.append(BASE)
+    parent, name = os.path.split(BASE.rstrip("/"))
+    grandparent, mountname = os.path.split(parent)
+    for cand in sorted(glob.glob(os.path.join(grandparent, mountname + "-*", name))):
+        if os.path.isdir(cand) and cand not in bases:
+            bases.append(cand)
+    return bases
+
+
+def _nonempty(d):
+    """True if dir d has at least one entry (a live mount); False if empty (a
+    stale mountpoint left after the share dropped) or unreadable."""
+    try:
+        with os.scandir(d) as it:
+            return any(True for _ in it)
+    except OSError:
+        return False
+
+
+def resolve_base(rel=None):
+    """Pick the base to resolve against, skipping stale/empty shadow mounts.
+
+    A configured BASE that exists but is EMPTY (the SMB share dropped, or macOS
+    remounted the live share at a `-N` suffix and left the old name as an empty
+    dir) must not shadow the live mount. Prefer: a candidate base that actually
+    contains `rel` (when given), then the first non-empty candidate. Return None
+    when nothing usable exists, so ensure_mounted() falls through to a remount."""
+    bases = _candidate_bases()
+    if rel:
+        for b in bases:
+            if os.path.exists(os.path.join(b, rel)):
+                return b
+    for b in bases:
+        if _nonempty(b):
+            return b
+    return None
+
+
+def ensure_mounted(rel=None):
+    """Resolve the base; if none is usable and a mount URL is configured, mount
+    it and retry. Passing `rel` lets resolve_base prefer the mount holding it."""
+    b = resolve_base(rel)
+    if b:
+        return b
+    if not MOUNT_URL:
+        return None
+    subprocess.run(["open", MOUNT_URL], check=False)
+    for _ in range(20):  # up to ~10s
+        time.sleep(0.5)
+        b = resolve_base(rel)
+        if b:
+            return b
+    return None
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def _send(self, code, body):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
+    def _page(self, title, detail):
+        return (
+            "<!doctype html><meta charset=utf-8>"
+            "<title>{t}</title>"
+            "<body style='font:15px -apple-system,sans-serif;padding:2em;color:#222'>"
+            "<h2>{t}</h2><p>{d}</p>"
+            "<p style='color:#888'>You can close this tab.</p>".format(
+                t=html.escape(title), d=html.escape(detail)
+            )
+        )
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path == "/health":
+            self._send(200, "ok")
+            return
+        if parsed.path != "/open":
+            self._send(404, self._page("Not found", parsed.path))
+            return
+
+        qs = parse_qs(parsed.query)
+        rel = unquote((qs.get("p") or [""])[0]).lstrip("/")
+        if not rel:
+            self._send(400, self._page("Missing path", "No ?p= parameter."))
+            return
+        line = unquote((qs.get("line") or [""])[0]).strip()
+
+        base = ensure_mounted(rel)
+        if not base:
+            self._send(
+                503,
+                self._page(
+                    "Convivy not available",
+                    "Base path '%s' isn't present. Mount the mini and retry." % BASE,
+                ),
+            )
+            return
+
+        # Resolve and confine to base (block ../ escapes).
+        target = os.path.realpath(os.path.join(base, rel))
+        base_real = os.path.realpath(base)
+        if not (target == base_real or target.startswith(base_real + os.sep)):
+            self._send(403, self._page("Refused", "Path escapes the Convivy root."))
+            return
+        if not os.path.exists(target):
+            self._send(404, self._page("File not found", target))
+            return
+
+        # With a line number, hand off to the line-opener (Typora ⌘F-on-snippet);
+        # it self-degrades to plain `open` for non-markdown / no Typora. Without a
+        # line, or if the helper is missing, use plain `open`.
+        want_line = line.isdigit() and int(line) > 0
+        if want_line and os.path.isfile(LINE_OPENER) and os.access(LINE_OPENER, os.X_OK):
+            cmd = [LINE_OPENER, target, line]
+            opened_label = "Opened %s:%s" % (os.path.basename(target), line)
+        else:
+            cmd = ["open", target]
+            opened_label = "Opened " + os.path.basename(target)
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            self._send(200, self._page(opened_label, target))
+        else:
+            # Headless / no GUI login session: report the path instead of a
+            # silent success, so the click isn't a no-op.
+            err = (result.stderr or "").strip() or "open failed (no GUI session?)"
+            self._send(
+                200,
+                self._page(
+                    "No GUI here — resolved path below",
+                    target + "   (" + err + ")   In a terminal: convivy-open " + target,
+                ),
+            )
+
+
+def main():
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    sys.stderr.write("convivy-open-server on http://127.0.0.1:%d  base=%s\n" % (PORT, BASE))
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.convivy.tailscale-watchdog</string>
+
+  <!-- Absolute paths throughout: launchd hands a job a thin PATH, and a
+       watchdog that fails to find its own interpreter is worse than none. -->
+  <!-- Deploy-pinned per platform/decisions/0059 rule 1
+       (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+       production USE of tailscale-watchdog, not someone working on it, so this reads
+       a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+       (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+       that symlink still exists and still reaches the tree, for the person who
+       re-invokes tailscale-watchdog interactively while working on it (rule 5).
+       bin/agent-platform-autopull refreshes the deploy area on every
+       origin/main advance; bin/install-agent-platform-shared is what actually
+       builds it.
+       argv[0] stays /bin/sh (rule 4 pins the INTERPRETER; the entry point here
+       is a shell script, not a python one, so the interpreter is already the
+       fixed system /bin/sh rather than something the deploy area builds) — only
+       argv[1], the script itself, moves to the deploy area's copy. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>__HOME__/.local/deploy/agent-platform-shared/bin/tailscale-watchdog</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+
+  <!-- RunAtLoad matters more than the interval: the reboot is the moment this
+       exists for, so it must check immediately on login rather than waiting a
+       minute. StartInterval then keeps it checking for the rest of the uptime. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <!-- NOT KeepAlive. This is a periodic check that exits, not a daemon; under
+       KeepAlive launchd would restart it the instant it finished and it would
+       run continuously instead of once a minute. -->
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/tailscale-watchdog/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/tailscale-watchdog/launchd.log</string>
+</dict>
+</plist>

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# mark-fresh — write a freshness marker for a packaged-task completion.
+#
+# Used by the daytime cost-shift commands (bug-sweep, bug-drain, arch-review)
+# per ARCH-075. The overnight orchestrator reads these markers at the top of
+# each gated phase; if the marker is < 72h old, the orchestrator skips the
+# phase for that product with a digest note (saving metered API spend after
+# the 2026-06-15 Anthropic billing split).
+#
+# Usage:
+#   mark-fresh <product> <task>
+#
+#   product: constance | vivy | sous-chef
+#   task:    bug-sweep | bug-fix | arch-review
+#
+# The launching script's initial prompt to the agent says: "When the task is
+# genuinely complete, run `mark-fresh <product> <task>` from Bash before
+# ending the session." So the marker reflects "agent says task done", not
+# "session exited cleanly". You can also run mark-fresh yourself manually to
+# override (or to suppress the next overnight without doing the work).
+
+set -euo pipefail
+
+# Run records live under builder_root.data_root() (company/decisions/0008):
+# BUILDER_ROOT when set, else the machine's root, printed by the sibling
+# bin/builder-root. One hop through a ~/.local/bin link reaches the real bin/.
+_self_path="${BASH_SOURCE[0]}"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+DATA_ROOT="${BUILDER_ROOT:-$("$(dirname "$_self_path")/builder-root")}" || exit 1
+FRESHNESS_DIR="$DATA_ROOT/agent-runs/freshness"
+
+usage() {
+    cat >&2 <<EOF
+Usage: mark-fresh <product> <task>
+
+  product: constance | vivy | sous-chef
+  task:    bug-sweep | bug-fix | arch-review
+
+The marker lives at:
+  $FRESHNESS_DIR/<product>.<task>.json
+
+Overnight reads these and skips the phase for that product if < 72h old.
+EOF
+    exit 1
+}
+
+[[ $# -eq 2 ]] || usage
+
+product=$1
+task=$2
+
+case $product in
+    constance|vivy|sous-chef) ;;
+    *) echo "mark-fresh: invalid product '$product' (constance | vivy | sous-chef)" >&2; exit 2 ;;
+esac
+
+case $task in
+    bug-sweep|bug-fix|arch-review) ;;
+    *) echo "mark-fresh: invalid task '$task' (bug-sweep | bug-fix | arch-review)" >&2; exit 2 ;;
+esac
+
+mkdir -p "$FRESHNESS_DIR"
+
+marker="$FRESHNESS_DIR/$product.$task.json"
+now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+now_epoch=$(date -u +%s)
+via=${MARK_FRESH_VIA:-interactive}
+
+cat > "$marker" <<EOF
+{
+  "product": "$product",
+  "task": "$task",
+  "completed_at": "$now_iso",
+  "completed_at_epoch": $now_epoch,
+  "via": "$via"
+}
+EOF
+
+echo "mark-fresh: $marker (via=$via, $now_iso)"

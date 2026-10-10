@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""budget-watchdog — periodic budget tripwire for overnight runs (ARCH-065).
+
+The spawn gate (`agentctl spawn`) only evaluates the budget at the moment a
+new worker is spawned. That misses two cases: (a) a long-lived orchestrator
+that keeps burning between spawns, and (b) a run that goes quiet/stuck and
+stops spawning entirely (the 2026-05-26 vivy failure — $9 on one run, no
+spawns, no alert). This watchdog closes both by re-evaluating the *live*
+budget (`budget.status()` = exact completed cost + in-flight estimate) on a
+timer, independent of any spawn.
+
+On the first soft/hard crossing it writes the day's first-crossing marker and
+fires the single Slack alert — sharing those markers with the spawn gate, so
+whichever observes the crossing first owns the one notification (no dupes).
+It does not kill anything: the hard cap's *enforcement* remains the spawn
+gate refusing new spawns once `status()` reports hard_crossed. The watchdog's
+job is timely notification + marker-setting.
+
+Launched detached by `launch-overnight` after it spawns the orchestrators;
+self-terminates once the overnight runs have all finished (or at a safety
+ceiling). Env overrides:
+  BUDGET_WATCHDOG_POLL_SECONDS   (default 180)
+  BUDGET_WATCHDOG_MAX_RUNTIME_MIN (default 480)
+  BUDGET_WATCHDOG_STARTUP_GRACE_MIN (default 15)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "budget.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+import budget as B  # noqa: E402
+import notify       # noqa: E402
+import signal_client  # noqa: E402
+
+import builder_root as BR  # noqa: E402
+LOG_FILE = BR.runs_root() / "overnight-launcher.log"
+
+POLL_SECONDS = int(os.environ.get("BUDGET_WATCHDOG_POLL_SECONDS", "180"))
+MAX_RUNTIME_MIN = float(os.environ.get("BUDGET_WATCHDOG_MAX_RUNTIME_MIN", "480"))
+STARTUP_GRACE_MIN = float(os.environ.get("BUDGET_WATCHDOG_STARTUP_GRACE_MIN", "15"))
+
+
+def log(msg: str) -> None:
+    ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    line = f"[{ts}] budget-watchdog: {msg}\n"
+    try:
+        with LOG_FILE.open("a") as f:
+            f.write(line)
+    except OSError:
+        pass
+    sys.stderr.write(line)
+
+
+def active_run_count() -> int:
+    """Runs with meta.json but no cost.json yet — i.e. still in flight today."""
+    d = B.today_dir()
+    if not d.exists():
+        return 0
+    n = 0
+    for rd in d.iterdir():
+        if not rd.is_dir() or not rd.name.startswith("run-"):
+            continue
+        if (rd / "meta.json").exists() and not (rd / "cost.json").exists():
+            n += 1
+    return n
+
+
+def _cap_alert_body(severity: str, pool: str, st: dict) -> str:
+    """Human-readable body for the structured cap-crossing alert.
+
+    Self-contained on purpose: the signal store IS the record now that Slack is
+    retired, so this body has to read correctly on the Alerts page alone rather
+    than as a pointer back to a message somewhere else."""
+    label = "HARD cap" if severity == "hard" else "soft budget"
+    threshold = st["hard_usd"] if severity == "hard" else st["soft_usd"]
+    tail = (" — new spawns are now refused." if severity == "hard"
+            else " — wind-down advised; spawns continue.")
+    return (f"{pool} {label} crossed: ${st['spent_today_usd']:.2f} "
+            f">= ${threshold:.2f} "
+            f"(completed ${st['completed_usd']:.2f} "
+            f"+ in-flight est ${st['estimated_inflight_usd']:.2f}){tail}")
+
+
+def check_and_alert() -> dict:
+    """Evaluate live budget per pool (ARCH-320); raise the single structured alert
+    on the first crossing of each pool's soft/hard cap, plus a phone push on hard
+    only (ARCH-269). Returns the overnight-pool status (the primary pool this
+    watchdog runs alongside) for the caller's logs."""
+    overnight = None
+    for pool in B.POOL_ORIGINS:
+        st = B.status(pool)
+        if pool == B.DEFAULT_POOL:
+            overnight = st
+        if st["hard_crossed"] and B.mark_crossed("hard", pool):
+            log(f"HARD cap crossed live [{pool}]: ${st['spent_today_usd']:.2f} "
+                f">= ${st['hard_usd']:.2f} (completed ${st['completed_usd']:.2f} "
+                f"+ est ${st['estimated_inflight_usd']:.2f}) — alerting + spawns now refused")
+            # Structured alert (ARCH-353 Build 2c), now the only written record:
+            # a cap crossing is alert-class by KIND, which is what lands it on
+            # /engineering/alerts rather than under /memory/reports beside the
+            # daily cost digest.
+            signal_client.post_alert(
+                "budget-cap", _cap_alert_body("hard", pool, st),
+                meta={"alert": "budget-cap", "severity": "hard", "pool": pool,
+                      "spent_usd": round(st["spent_today_usd"], 2),
+                      "threshold_usd": round(st["hard_usd"], 2)})
+            # Tiered phone push (ARCH-269): only the HARD cap pushes — a hard
+            # crossing means spawns are now refused, which is genuinely urgent.
+            # The soft branch below raises the alert signal without a push, so a
+            # wind-down still lands on /engineering/alerts without waking anyone.
+            # That tiering used to read as "soft is Slack-only"; with Slack gone
+            # the distinction is push vs no-push, and it is unchanged.
+            notify.push(
+                "budget-hard-cap",
+                f"{pool} HARD cap crossed: ${st['spent_today_usd']:.2f} "
+                f">= ${st['hard_usd']:.2f} — new spawns now refused",
+                spent_usd=round(st["spent_today_usd"], 2),
+                cap_usd=round(st["hard_usd"], 2),
+            )
+        elif st["soft_crossed"] and B.mark_crossed("soft", pool):
+            log(f"SOFT budget crossed live [{pool}]: ${st['spent_today_usd']:.2f} "
+                f">= ${st['soft_usd']:.2f} (completed ${st['completed_usd']:.2f} "
+                f"+ est ${st['estimated_inflight_usd']:.2f}) — alerting")
+            signal_client.post_alert(
+                "budget-cap", _cap_alert_body("soft", pool, st),
+                meta={"alert": "budget-cap", "severity": "soft", "pool": pool,
+                      "spent_usd": round(st["spent_today_usd"], 2),
+                      "threshold_usd": round(st["soft_usd"], 2)})
+    return overnight
+
+
+def _daemonize() -> None:
+    """Double-fork into a new session so the watchdog survives the launcher
+    (and launchd) exiting — same pattern as `agentctl spawn --detach`. The
+    grandchild redirects stdio to /dev/null (it logs to LOG_FILE instead)."""
+    if os.fork() > 0:
+        os._exit(0)
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    if os.fork() > 0:
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull, 0)
+    os.dup2(devnull, 1)
+    os.dup2(devnull, 2)
+    os.close(devnull)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="overnight budget tripwire")
+    ap.add_argument("--daemonize", action="store_true",
+                    help="double-fork into the background and return immediately")
+    args = ap.parse_args()
+    if args.daemonize:
+        _daemonize()
+
+    start = time.monotonic()
+    log(f"started (poll={POLL_SECONDS}s, max_runtime={MAX_RUNTIME_MIN}min, "
+        f"burn_rate=${B.burn_rate():.3f}/min)")
+    seen_active = False
+    while True:
+        elapsed_min = (time.monotonic() - start) / 60.0
+        st = check_and_alert()
+        active = active_run_count()
+        if active > 0:
+            seen_active = True
+
+        # Termination conditions.
+        if elapsed_min >= MAX_RUNTIME_MIN:
+            log(f"max runtime reached ({elapsed_min:.0f}min); exiting "
+                f"(live spend ${st['spent_today_usd']:.2f})")
+            return 0
+        if seen_active and active == 0:
+            log(f"all overnight runs finished; exiting "
+                f"(live spend ${st['spent_today_usd']:.2f})")
+            return 0
+        if not seen_active and elapsed_min >= STARTUP_GRACE_MIN:
+            log(f"no active runs appeared within {STARTUP_GRACE_MIN}min grace; "
+                f"exiting (nothing to watch)")
+            return 0
+
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

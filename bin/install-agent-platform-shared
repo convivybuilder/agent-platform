@@ -1,0 +1,792 @@
+#!/bin/sh
+# install-agent-platform-shared — deploy-pin the common bin/, lib/agent-platform/
+# and lib/knowledge/ set the Bosun's scheduled jobs run from
+# (platform/decisions/0059; issue_01M19RRWSS9ETR09N9M2BJPA0Q).
+#
+# WHY. The operator's ruling: "are we USING this, or WORKING ON it." A timer firing
+# unattended is USE — its job definition names a path, launchd starts whatever
+# file sits there at that instant, and a periodic job re-reading a branch on
+# every firing is the same hazard as a daemon holding one, just re-armed every
+# firing instead of every restart (ADR-0059 rule 1). A person re-invoking the
+# same binary's name at a prompt is still WORKING ON it — that is testing, and
+# rule 5 keeps `~/.local/bin/<name>` symlinked to the checkout for exactly that
+# case. This installer never touches that symlink farm; it only builds the
+# SEPARATE deploy area a repointed launchd plist now names.
+#
+# This generalizes agent-platform#468's install-run-register-api, which did
+# the same thing for the run-register-api daemon alone. The difference here is
+# scope: ONE shared tree for every scheduled job's bin/ and lib/agent-platform/
+# dependency, not 28 per-job installs — a per-job copy would multiply the
+# drift risk lib/link-farm.sh's own comment warns about, and multiply the
+# blast radius of any bug in the mechanics.
+#
+# WHAT THIS DOES, per ADR-0059 rules 1, 2, 4, 6, 7:
+#   1. Reads a git REF (default main), never the live working tree, via
+#      `git archive` — a `cp`/`rsync` of the checkout would ignore
+#      .gitignore and sweep gitignored credential files into the deploy area
+#      (rule 7).
+#   2. Extracts a COPY of the whole bin/, lib/agent-platform/ and lib/knowledge/
+#      trees, plus requirements.txt, into
+#      ~/.local/deploy/agent-platform-shared/ (rule 2: copies, not symlinks).
+#      lib/knowledge/ is included because knowledge-watcher resolves `indexer`
+#      relative to its own script path (Path(__file__).resolve().parent.parent
+#      / "lib" / "knowledge"), falling back to ~/.local/lib/knowledge — the
+#      symlink farm into the working checkout — if the deploy copy is absent.
+#   3. Builds a fresh venv inside that same deploy area (rule 4), so a
+#      python entry point's interpreter travels with the code rather than
+#      depending on whatever python3.11 happens to be on launchd's PATH.
+#      knowledge-watcher imports the third-party `watchdog` package, and
+#      lib/knowledge's modules import PyYAML, so the venv is no longer bare:
+#      `pip install -r requirements.txt` runs against the ARCHIVED commit's
+#      own requirements.txt (never the live checkout's, per rule 7), so it
+#      installs whatever that commit pins rather than this installer naming
+#      individual packages — the deploy venv and install.sh's knowledge venv
+#      (which installs the same file) cannot drift apart on a future
+#      dependency. A bare venv, install-run-register-api's precedent, is no
+#      longer this installer's invariant.
+#
+# Does NOT touch launchd or any plist. Refreshing CODE in the deploy area
+# needs no launchd interaction: a job definition names a path, and the next
+# firing reads whatever is there. Only a job DEFINITION change needs a
+# reload, and that is the one-time plist cutover, done by hand.
+#
+# Idempotent AND cheap on a no-op cycle: bin/agent-platform-autopull calls
+# this every ~10 minutes, so when the target ref is already what is deployed
+# (DEPLOYED_COMMIT matches), this exits immediately without touching the
+# filesystem. Atomic: stages in a sibling .new directory, then swaps it into
+# place with one mv, so a re-run never leaves a half-deployed mix of two
+# commits.
+#
+# REPO defaults to a hardcoded path, not one derived from $0: install.sh's
+# phase 2 symlinks every file in bin/ into ~/.local/bin unconditionally
+# (including installers), so `$(dirname "$0")`-style resolution breaks the
+# moment this is invoked by name through that symlink — exactly the bug
+# agent-platform#468's review found in install-run-register-api. The sibling
+# install-decision-hooks / install-knowledge-main-guard /
+# install-agent-platform-primary-guard scripts hardcode their target path for
+# the same reason; this follows that convention rather than $0.
+#
+# Must stay POSIX sh / bash-3.2-safe (tests/bash/lint.sh parses every bin/
+# script with a bash-or-/bin/sh shebang under /bin/bash -n on macOS 3.2.57).
+set -eu
+
+usage() {
+  cat >&2 <<'EOF'
+usage: install-agent-platform-shared [--ref=<git-ref>] [--repo=<path>]
+                                      [--deploy-dir=<path>] [--allow-non-main]
+                                      [--status]
+
+  --ref=<git-ref>     Ref to install from (default: main).
+  --repo=<path>       Checkout to read the ref from (default: agent-platform
+                       under the machine's root, from bin/builder-root --root;
+                       the checkout itself is never derived from argv[0], which
+                       breaks once this is invoked through a symlink).
+  --deploy-dir=<path> Where to build the deploy area (default:
+                       ~/.local/deploy/agent-platform-shared, which every
+                       deploy-pinned launchd job executes from). Point this
+                       somewhere scratch to verify a branch without touching
+                       production.
+  --allow-non-main    Required to install anything other than main (rule 6:
+                       the deploy area is installed from main). Installing a
+                       non-main ref into the DEFAULT deploy dir additionally
+                       requires naming that path with --deploy-dir, so putting
+                       a branch into production cannot happen by omission.
+  --status            Print what commit is currently deployed and exit.
+EOF
+  exit 2
+}
+
+REPO=""
+ROOT_CONFIG=""
+REF="main"
+ALLOW_NON_MAIN=0
+DEPLOY_DIR_ARG=""
+STATUS_ONLY=0
+
+# BOTH `--repo=<path>` and `--repo <path>` are accepted, and the space form is
+# why this loop is a while/shift rather than a `for arg`. It used to take only
+# the `=` form, and bin/agent-platform-autopull's refresh_deploy_area() calls
+# `--repo "$REPO"` — so every cycle exited 2 on "unknown option: --repo" and the
+# deploy area was never refreshed. 144 failures and zero successes between
+# 2026-08-31 and 2026-09-01, logged as "ACTION NEEDED" into a file nobody reads.
+# The caller is fixed too, but accepting the form a caller would naturally write
+# is what stops the next one rediscovering this.
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --ref=*) REF="${1#--ref=}" ;;
+    --repo=*) REPO="${1#--repo=}" ;;
+    --ref) [ "$#" -ge 2 ] || { echo "install-agent-platform-shared: --ref needs a value" >&2; usage; }
+            case "$2" in -*) echo "install-agent-platform-shared: --ref needs a value, got the flag '$2'" >&2; usage ;; esac
+           REF="$2"; shift ;;
+    --repo) [ "$#" -ge 2 ] || { echo "install-agent-platform-shared: --repo needs a value" >&2; usage; }
+            case "$2" in -*) echo "install-agent-platform-shared: --repo needs a value, got the flag '$2'" >&2; usage ;; esac
+            REPO="$2"; shift ;;
+    --deploy-dir=*) DEPLOY_DIR_ARG="${1#--deploy-dir=}" ;;
+    --deploy-dir) [ "$#" -ge 2 ] || { echo "install-agent-platform-shared: --deploy-dir needs a value" >&2; usage; }
+            case "$2" in -*) echo "install-agent-platform-shared: --deploy-dir needs a value, got the flag '$2'" >&2; usage ;; esac
+                  DEPLOY_DIR_ARG="$2"; shift ;;
+    --allow-non-main) ALLOW_NON_MAIN=1 ;;
+    --status) STATUS_ONLY=1 ;;
+    # FOR TESTS ONLY: a session-agent.env naming the machine's root, the one way a
+    # test moves the default checkout (company/decisions/0008).
+    --root-config=*) ROOT_CONFIG="${1#--root-config=}" ;;
+    -h|--help) usage ;;
+    *) echo "install-agent-platform-shared: unknown option: $1" >&2; usage ;;
+  esac
+  shift
+done
+
+# The default checkout is agent-platform under the machine's root
+# (company/decisions/0008), printed by the bin/builder-root beside this file's
+# real path; HOME does not move it. Resolved only when --repo is absent, and
+# autopull always passes --repo.
+if [ -z "$REPO" ]; then
+  _self_path="$0"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+  if [ -n "$ROOT_CONFIG" ]; then
+    _root="$("$(dirname "$_self_path")/builder-root" --root --config "$ROOT_CONFIG")" || _root=""
+  else
+    _root="$("$(dirname "$_self_path")/builder-root" --root)" || _root=""
+  fi
+  if [ -z "$_root" ]; then
+    echo "install-agent-platform-shared: cannot resolve the machine's root (bin/builder-root --root); pass --repo" >&2
+    exit 2
+  fi
+  REPO="$_root/agent-platform"
+fi
+
+# The production deploy area: what every deploy-pinned launchd job executes
+# from. Kept as its own name so the guard below can tell "the operator named
+# this path" from "the operator said nothing and got it by default".
+DEFAULT_DEPLOY_DIR="$HOME/.local/deploy/agent-platform-shared"
+DEPLOY_DIR="${DEPLOY_DIR_ARG:-$DEFAULT_DEPLOY_DIR}"
+
+say() { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
+# stderr, so a non-main deploy is visible even when a caller swallows stdout.
+warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
+
+# THE WATCHER IMPORTS lib/knowledge/knowledge.py ONCE, AT STARTUP. This script
+# used to end with "code-only refresh needs no launchd step", and for
+# com.convivy.knowledge-watcher that was exactly wrong: a refresh that changed
+# lib/knowledge/ swapped the files under a process that never re-read them. On
+# 2026-09-06 the watcher (pid 548, started Sep 2) was still refusing placard's
+# bead — "invalid project: placard", 612 rejections in its log — days after
+# the mirror had admitted it and this script had deployed it; the index was
+# right only because `agentctl kb sync` imports fresh on each run and
+# reconciles (issue_01M1WXDWRX620XB65F0AMAZRGJ; the 2026-08-01 incident, 483 of
+# 584 documents indexed with a seven-day-stale watcher, is the same shape).
+#
+# So a refresh that touched what the watcher imports restarts it, and the
+# restart is CHECKED AGAINST THE PROCESS rather than the kickstart's exit: a
+# pid that did not change is reported as a failed restart with the command to
+# run by hand. A previous commit this script cannot determine is treated as
+# "cannot tell" and restarts, since a restart costs one two-second full scan
+# and a missed one costs every new project's documents. A job that is not
+# loaded is left alone and said so. Nothing here fails the deploy: the code is
+# already in place, and the operator needs the fact, not a rollback.
+KNOWLEDGE_WATCHER_LABEL="com.convivy.knowledge-watcher"
+WATCHER_CODE_PATHS="lib/knowledge bin/knowledge-watcher"
+
+# A label the watcher is loaded under OTHER than $KNOWLEDGE_WATCHER_LABEL, if
+# any — found by suffix match against `launchctl list`'s full report. CQ-428
+# renamed the watcher's label from a personal namespace to com.convivy.*;
+# until `install.sh --migrate-labels` runs on this machine, the live job may
+# still be loaded under its old label. That old label named a person, so it
+# is never hardcoded here either (CQ-428's whole point is removing it, not
+# writing it again) — discovered the same way install.sh's own migration
+# discovers it.
+legacy_knowledge_watcher_label() {
+  launchctl list 2>/dev/null | awk -F'\t' -v new="$KNOWLEDGE_WATCHER_LABEL" '
+    NR > 1 && $3 != "" && $3 != new {
+      suffix = ".knowledge-watcher"
+      n = length($3); s = length(suffix)
+      if (n >= s && substr($3, n - s + 1) == suffix) { print $3; exit }
+    }'
+}
+
+restart_knowledge_watcher_if_needed() { # <previous-sha-or-empty> <new-sha>
+  prev=$1; new=$2
+  # FIRST FILTER, NOT THE WHOLE GUARD. DEPLOY_DIR_CANON and DEFAULT_DEPLOY_DIR
+  # are both derived from $HOME (line ~160), so a test that sandboxes HOME
+  # makes them equal to EACH OTHER without saying anything about what is
+  # actually loaded in launchd — `gui/$(id -u)/<label>` addresses the real
+  # per-user launchd domain regardless of what HOME the caller set. Cheap and
+  # catches the ordinary scratch-verify case (reviewer, #509 round 1), but a
+  # sandboxed HOME that happens to reproduce the default path was passing this
+  # check and then reaching the REAL launchctl print/kickstart below: the bash
+  # test suite kicked the live watcher roughly 200 times in an hour on
+  # 2026-09-13 this way. The second check below, against what the LOADED job
+  # actually runs, is what closes that.
+  if [ "$DEPLOY_DIR_CANON" != "$DEFAULT_DEPLOY_DIR_CANON" ]; then
+    say "knowledge-watcher: $DEPLOY_DIR is not the production deploy area — the production watcher is not restarted"
+    return 0
+  fi
+  changed=""
+  if [ -z "$prev" ]; then
+    changed="previous commit unknown"
+  else
+    # shellcheck disable=SC2086 # WATCHER_CODE_PATHS is a deliberate word list
+    diff_out=$(git -C "$REPO" diff --name-only "$prev" "$new" -- $WATCHER_CODE_PATHS 2>/dev/null) \
+      || changed="could not diff $prev..$new"
+    [ -n "$diff_out" ] && changed="$(printf '%s' "$diff_out" | head -3 | tr '\n' ' ')"
+  fi
+  if [ -z "$changed" ]; then
+    say "knowledge-watcher: $WATCHER_CODE_PATHS unchanged since ${prev} — not restarted"
+    return 0
+  fi
+  target="gui/$(id -u)/$KNOWLEDGE_WATCHER_LABEL"
+  # `|| true`: unlike the old `launchctl print | awk` pipeline (whose exit
+  # status was awk's, always 0), this is a bare assignment — under `set -eu`
+  # a non-zero exit here (which real launchctl gives for a label that is not
+  # loaded, and which the bash test suite's default stub also gives) would
+  # abort the whole install rather than taking the "not loaded" branch below.
+  print_out=$(launchctl print "$target" 2>/dev/null) || true
+  if [ -z "$print_out" ]; then
+    # CQ-428 fallback: this machine has not run the label migration yet.
+    legacy_label="$(legacy_knowledge_watcher_label)"
+    if [ -n "$legacy_label" ]; then
+      legacy_target="gui/$(id -u)/$legacy_label"
+      print_out=$(launchctl print "$legacy_target" 2>/dev/null) || true
+      if [ -n "$print_out" ]; then
+        target="$legacy_target"
+      fi
+    fi
+  fi
+  if [ -z "$print_out" ]; then
+    say "knowledge-watcher: code changed ($changed) but $KNOWLEDGE_WATCHER_LABEL is not loaded — nothing to restart"
+    return 0
+  fi
+  # THE SECOND CHECK: does the LOADED job actually run from this deploy area?
+  # Matched by SCRIPT, not by the resolved interpreter: `program =` (argv[0])
+  # goes through the venv's own symlink farm (venv/bin/python3 ->
+  # python3.11 -> /opt/homebrew/.../python3.11 — a real chain on this
+  # machine), which is an accident of how `python3.11 -m venv` lays out a
+  # venv, not a property of where the job actually runs from. An earlier
+  # version of this check resolved exactly one symlink hop against `program =`
+  # to work around that, which stayed right only because this venv's chain
+  # happens to leave the deploy area on the SECOND hop rather than the first —
+  # a venv one hop shorter would have made this guard refuse to restart a
+  # correctly-deployed watcher (reviewer, PR #565 round 2).
+  #
+  # `launchd/com.convivy.knowledge-watcher.plist` names the actual script as
+  # argv[1] (`.../bin/knowledge-watcher`), a literal path directly under
+  # DEPLOY_DIR with no symlinks in it at all. Rather than hardcode "argv[1] is
+  # the script" — the exact argv[0]-only assumption `bin/check-deploy-pinned-
+  # jobs` and platform/decisions/0059 exist to rule out (#469/ARCH-229: a
+  # completion check that read only ProgramArguments[0] missed jobs whose real
+  # script sat in argv[1]) — this walks every entry of the job's `arguments =
+  # { }` block, the same way `check-deploy-pinned-jobs`'s `parse_arguments_
+  # block`/`classify` do, and treats the job as running from this deploy area
+  # if ANY absolute argv entry resolves inside it. The interpreter entry can
+  # resolve wherever the system python happens to live; it's the script entry
+  # landing inside DEPLOY_DIR that this needs to see.
+  job_argv=$(printf '%s\n' "$print_out" | awk '
+    { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+    line == "arguments = {" { in_args = 1; next }
+    in_args && line == "}" { in_args = 0; next }
+    in_args && line != "" { print line }
+  ')
+  # RE-CANONICALIZE $DEPLOY_DIR HERE, rather than reusing DEPLOY_DIR_CANON:
+  # that was computed near the top of the script, when the deploy area is
+  # often not on disk yet (a first install has no ~/.local/deploy at all), so
+  # canonical_path's directory-doesn't-exist fallback left it as the literal,
+  # symlink-UNRESOLVED string (e.g. a macOS tmp path through /var, never
+  # walked to /private/var). By this point the swap above has completed, so
+  # $DEPLOY_DIR is real on disk and this resolves the same way the argv
+  # entries below do — comparing two forms of the same path that were
+  # canonicalized at different points in time is how a correctly-deployed job
+  # was found to be "not in DEPLOY_DIR" (round 1 of this fix, caught by
+  # scenario 25's own positive control before it reached the negative case it
+  # was written for).
+  deploy_dir_now=$(canonical_path "$DEPLOY_DIR")
+  job_in_deploy_dir=0
+  job_argv_last_real=""
+  if [ -n "$job_argv" ]; then
+    while IFS= read -r job_argv_entry; do
+      case "$job_argv_entry" in
+        /*) : ;;
+        *) continue ;;
+      esac
+      job_argv_entry_real=$(canonical_path "$job_argv_entry")
+      job_argv_last_real="$job_argv_entry_real"
+      case "$job_argv_entry_real" in
+        "$deploy_dir_now"/*) job_in_deploy_dir=1 ;;
+      esac
+    done <<EOF
+$job_argv
+EOF
+  fi
+  if [ "$job_in_deploy_dir" -ne 1 ]; then
+    say "knowledge-watcher: code changed ($changed) but the loaded $KNOWLEDGE_WATCHER_LABEL runs from ${job_argv_last_real:-an unresolved path}, not $DEPLOY_DIR — not restarted"
+    return 0
+  fi
+  before=$(printf '%s\n' "$print_out" | awk '/^\tpid = /{print $3}')
+  if [ -z "$before" ]; then
+    say "knowledge-watcher: code changed ($changed) but $KNOWLEDGE_WATCHER_LABEL is not loaded — nothing to restart"
+    return 0
+  fi
+  say "knowledge-watcher: code changed ($changed); restarting $KNOWLEDGE_WATCHER_LABEL (pid $before)"
+  launchctl kickstart -k "$target" 2>/dev/null || true
+  sleep 1
+  after=$(launchctl print "$target" 2>/dev/null | awk '/^\tpid = /{print $3}')
+  if [ -n "$after" ] && [ "$after" != "$before" ]; then
+    say "knowledge-watcher: restarted, pid $before -> $after"
+  else
+    warn "knowledge-watcher: kickstart did not produce a new pid (before $before, after ${after:-none}) — the running watcher still imports the previous lib/knowledge. Restart by hand: launchctl kickstart -k $target"
+  fi
+  return 0
+}
+
+# Absolute, symlink-resolved form of a path that MAY NOT EXIST YET — the deploy
+# dir is routinely being created by this very run, so `cd "$1" && pwd -P` alone
+# would fail on a first install.
+#
+# This exists because comparing deploy paths as literal strings is not a
+# comparison of directories. A trailing slash is the case that matters: shell
+# tab-completion appends one, so an operator completing the production path out
+# of this script's own usage text produces a string that is not byte-identical
+# to $DEFAULT_DEPLOY_DIR, and every string-equality check against it silently
+# says "not production". A relative spelling and a symlink pointing at
+# production do the same. `dirname`/`basename` normalise the trailing slash, and
+# `cd ... && pwd -P` resolves both relativity and symlinks.
+canonical_path() { # <path>
+  # Trailing slashes come off FIRST and unconditionally, before any test of what
+  # exists. The fallback branch below returns its input verbatim, so leaving the
+  # normalisation to dirname/basename meant a trailing slash survived whenever
+  # neither the path nor its parent existed yet — which is precisely a first
+  # install, the case that matters most. Found by running the test in the
+  # harness: a hand-run with the parent already created took the elif branch and
+  # looked fine.
+  _cp_in=$1
+  while [ "$_cp_in" != "/" ] && [ "${_cp_in%/}" != "$_cp_in" ]; do
+    _cp_in=${_cp_in%/}
+  done
+  _cp_dir=$(dirname "$_cp_in")
+  _cp_base=$(basename "$_cp_in")
+  if [ -d "$_cp_in" ]; then
+    (cd "$_cp_in" && pwd -P)
+  elif [ -d "$_cp_dir" ]; then
+    printf '%s/%s\n' "$(cd "$_cp_dir" && pwd -P)" "$_cp_base"
+  else
+    # Neither exists yet: nothing to resolve against, so the best available
+    # answer is the path as given, minus the trailing slashes stripped above.
+    # Comparisons then fall back to string equality, which is no worse than
+    # before this function existed.
+    printf '%s\n' "$_cp_in"
+  fi
+}
+
+DEPLOY_DIR_CANON=$(canonical_path "$DEPLOY_DIR")
+DEFAULT_DEPLOY_DIR_CANON=$(canonical_path "$DEFAULT_DEPLOY_DIR")
+
+# THE CANONICAL FORM IS THE INSTALL TARGET, not merely what the guards compare.
+# An earlier version of this canonicalized for comparison only and left
+# $DEPLOY_DIR as the operator typed it, which is worse than it sounds: a trailing
+# slash makes "$DEPLOY_DIR.new" resolve to `<target>/.new`, a subdirectory INSIDE
+# the target rather than a sibling of it, and the swap then fails on
+#   mv <target>/ <target>/.old.$$   ->   "Invalid argument"
+# because a directory cannot be moved into itself. That happens AFTER the pip
+# step, so the run does all its expensive work and dies at the last moment,
+# leaving staging debris inside the target. A trailing slash is what shell
+# tab-completion produces, so this is the ordinary case, not a contrived one.
+#
+# Normalising the target once, here, fixes the staging arithmetic and the guard
+# comparisons together, because both were failing on the same root cause: a path
+# that names the right directory in a form the script cannot compute with.
+DEPLOY_DIR="$DEPLOY_DIR_CANON"
+
+# Say, loudly, when the PRODUCTION deploy area is serving something other than
+# main. Fires only when the target really is production: a scratch --deploy-dir
+# verification is the safe path --deploy-dir exists to provide, and warning there
+# would be a false alarm — the fastest way to teach an operator to ignore the
+# real one.
+#
+# CALLED ON THE IDEMPOTENT FAST PATH TOO, not only after a fresh install. What
+# the operator needs to know is that production IS on a branch, which is a fact
+# about the current state rather than about whether this particular run changed
+# it. A re-run against an already-deployed branch used to exit silently on
+# "Already deployed", so the one command an operator would naturally repeat to
+# check was the one that told them nothing.
+warn_if_production_on_branch() { # <sha>
+  [ "$REF" = "main" ] && return 0
+  [ "$DEPLOY_DIR_CANON" = "$DEFAULT_DEPLOY_DIR_CANON" ] || return 0
+  warn "PRODUCTION IS NOW SERVING '$REF' ($1), NOT main."
+  warn "  Every deploy-pinned launchd job reads this area on its next firing."
+  warn "  Put it back when you are done verifying:"
+  warn "    $0 --ref=main"
+}
+
+# --- --status: answer "what commit is this deploy area serving", per
+# ADR-0059's closing requirement, and exit. No install side effects. --------
+if [ "$STATUS_ONLY" -eq 1 ]; then
+  if [ -f "$DEPLOY_DIR/DEPLOYED_COMMIT" ]; then
+    cat "$DEPLOY_DIR/DEPLOYED_COMMIT"
+    exit 0
+  fi
+  echo "install-agent-platform-shared: nothing deployed yet at $DEPLOY_DIR" >&2
+  exit 1
+fi
+
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || {
+  echo "install-agent-platform-shared: $REPO is not a git checkout" >&2
+  exit 1
+}
+
+SHA="$(git -C "$REPO" rev-parse "$REF" 2>/dev/null)" || {
+  echo "install-agent-platform-shared: '$REF' does not resolve to a commit in $REPO" >&2
+  exit 1
+}
+
+if [ "$REF" != "main" ] && [ "$ALLOW_NON_MAIN" -ne 1 ]; then
+  echo "install-agent-platform-shared: REFUSING to install ref '$REF' (resolves to $SHA)." >&2
+  echo "  ADR-0059 rule 6: the deploy area installs from main. Pass --allow-non-main" >&2
+  echo "  to install a different ref anyway (e.g. to verify a branch before merge)," >&2
+  echo "  and --deploy-dir=<scratch path> to do that without touching production." >&2
+  exit 1
+fi
+
+# A NON-MAIN REF MAY NOT REACH THE PRODUCTION DEPLOY AREA BY OMISSION.
+#
+# `--allow-non-main` exists to verify a branch before merge (rule 6), and until
+# now verifying and deploying to production were the same action, because the
+# target was always $DEFAULT_DEPLOY_DIR. On 2026-09-01 a worker did exactly the
+# sanctioned thing — ran this installer against its own worktree to check its
+# work — and every deploy-pinned launchd job served unmerged branch code until a
+# human noticed. Nothing reversed it: the refresh that would have is the one
+# that had been exiting 2 every cycle for a day.
+#
+# So verification now needs a target. --deploy-dir points it somewhere scratch,
+# and that is the whole fix. This is NOT a ban on putting a branch live, which is
+# a real thing to need in an emergency: it still works, but the operator must
+# name the production path explicitly. Typing it is the consent, so the outcome
+# can no longer be reached by leaving a flag off.
+if [ "$REF" != "main" ] && [ "$DEPLOY_DIR_CANON" = "$DEFAULT_DEPLOY_DIR_CANON" ] && [ -z "$DEPLOY_DIR_ARG" ]; then
+  echo "install-agent-platform-shared: REFUSING to install non-main ref '$REF' into the" >&2
+  echo "  PRODUCTION deploy area, which every deploy-pinned launchd job runs from:" >&2
+  echo "    $DEFAULT_DEPLOY_DIR" >&2
+  echo "" >&2
+  echo "  To verify this ref without touching production:" >&2
+  echo "    $0 --ref=$REF --allow-non-main --deploy-dir=\"\$(mktemp -d)/verify\"" >&2
+  echo "" >&2
+  echo "  If you really do mean to put a branch live, name the path explicitly:" >&2
+  echo "    $0 --ref=$REF --allow-non-main --deploy-dir=$DEFAULT_DEPLOY_DIR" >&2
+  exit 1
+fi
+
+# --- idempotent fast path: already deployed at this exact commit ----------
+if [ -f "$DEPLOY_DIR/DEPLOYED_COMMIT" ] \
+   && grep -q "^commit: $SHA\$" "$DEPLOY_DIR/DEPLOYED_COMMIT" 2>/dev/null; then
+  say "Already deployed at $SHA ($REF) — nothing to do"
+  warn_if_production_on_branch "$SHA"
+  exit 0
+fi
+
+# REFUSE TO DESTROY A DIRECTORY THAT IS NOT OURS.
+#
+# The swap below does `mv "$DEPLOY_DIR" "$OLD"` and later `rm -rf "$OLD"`, so
+# whatever sits at $DEPLOY_DIR is renamed out of the way and then permanently
+# deleted. That was safe while the path was a hardcoded constant. --deploy-dir
+# made it operator-supplied, and a mistyped or copy-pasted value — `--deploy-dir`
+# pointed at a checkout, a home directory, a project folder — would take
+# uncommitted work with it, in one command, with no confirmation
+# (security-reviewer run-628a8cae).
+#
+# Three states are safe to install over, and nothing else:
+#   * the path does not exist                    — a fresh scratch target
+#   * the path exists and is empty               — likewise
+#   * the path holds a well-formed DEPLOYED_COMMIT — a prior release
+#
+# WHAT THE MARKER CHECK IS, AND IS NOT. An earlier version of this comment said
+# DEPLOYED_COMMIT "is evidence of provenance, because this script is the only
+# thing that writes it". That claimed more than the code did: it tested only that
+# a file of that NAME existed, so any directory holding real content plus a file
+# called DEPLOYED_COMMIT — empty, garbage, anything — passed, and everything else
+# in it was renamed aside and deleted. Both reviewers caught the overclaim
+# (run-9fea0503, run-628a8cae).
+#
+# The check now requires the file to contain a `commit: <40 hex>` line, which is
+# what this script writes. That is an ACCIDENT FILTER, not a security boundary,
+# and the distinction is the honest one: anybody able to create a file in the
+# target can write those bytes. It is worth having because the case it defends
+# against is a mistake — an unrelated directory that happens to hold a file by
+# that name — and worthless against an actor with write access there, who could
+# delete the contents directly without this script's help.
+if [ -e "$DEPLOY_DIR" ]; then
+  if [ ! -d "$DEPLOY_DIR" ]; then
+    echo "install-agent-platform-shared: REFUSING — deploy dir exists and is not a directory:" >&2
+    echo "    $DEPLOY_DIR" >&2
+    exit 1
+  fi
+  # NEVER SUGGEST A PREDICTABLE WORLD-WRITABLE PATH FOR --deploy-dir. The refusal
+  # above used to print `--deploy-dir=/tmp/verify-$REF`, which is exactly the
+  # shape that makes the FIFO case below reachable by someone other than the
+  # operator: the path is guessable and /tmp is world-writable, so any other
+  # local process — and this host routinely runs many agent worktrees at once —
+  # can pre-create a marker there before the operator runs the command this
+  # script itself recommended. It now suggests a mktemp -d path, which is
+  # unguessable and owned by the caller (security-reviewer round 4).
+  #
+  # `-f` FIRST, and it is not redundant with the grep. A marker that is a FIFO
+  # makes `grep` block forever waiting for a writer, and this script is invoked by
+  # bin/agent-platform-autopull every ~10 minutes — a hang there wedges the job
+  # that keeps the deploy area current, which is a worse outcome than anything the
+  # marker check exists to prevent. `-f` is false for a FIFO, a directory and a
+  # device node, and follows symlinks, so it short-circuits every one of those
+  # before grep opens anything. Verified by creating each in turn: without this,
+  # the FIFO case hangs indefinitely; with it, all of them refuse and leave the
+  # directory untouched.
+  _marker="$DEPLOY_DIR/DEPLOYED_COMMIT"
+  if ! { [ -f "$_marker" ] && grep -qE '^commit: [0-9a-f]{40}$' "$_marker" 2>/dev/null; } \
+     && [ -n "$(ls -A "$DEPLOY_DIR" 2>/dev/null)" ]; then
+    echo "install-agent-platform-shared: REFUSING to install over a directory that is not" >&2
+    echo "  a deploy area this script created:" >&2
+    echo "    $DEPLOY_DIR" >&2
+    echo "" >&2
+    echo "  It is non-empty and carries no well-formed DEPLOYED_COMMIT marker (a" >&2
+    echo "  'commit: <40 hex>' line), so it does not look like something this installer" >&2
+    echo "  wrote. Installing would rename it aside and then delete it — losing whatever" >&2
+    echo "  is in it, including uncommitted work." >&2
+    echo "" >&2
+    echo "  Point --deploy-dir at a new or empty directory, or remove that one yourself" >&2
+    echo "  if you are certain it is disposable." >&2
+    exit 1
+  fi
+fi
+
+command -v python3.11 >/dev/null 2>&1 || {
+  echo "install-agent-platform-shared: python3.11 not found on PATH" >&2
+  exit 1
+}
+
+say "Installing agent-platform shared bin/lib from $REF ($SHA) in $REPO"
+
+# --- stage the release in a sibling dir, never in place --------------------
+# git archive reads the commit object, not the working tree, so an untracked
+# or gitignored file on disk (credentials, scratch state) is invisible to it —
+# this is what makes it safe where `cp -r`/`rsync` would not be (rule 7).
+mkdir -p "$(dirname "$DEPLOY_DIR")"
+# Clean staging on ANY exit, success or failure. Without this a failed install
+# leaves .new/ (and now .new.tar) beside the live deploy area, which the next
+# run must clear and which reads to a human as a half-deployed state. The
+# live area is never touched here — only the staging siblings.
+_cleanup_stage() { rm -rf "$DEPLOY_DIR.new" "$DEPLOY_DIR.new.tar"; }
+# A signal handler that does not exit is a shell trap in both senses: sh runs the
+# body and then RESUMES at the next command. So INT/TERM exit explicitly.
+trap _cleanup_stage EXIT
+trap '_cleanup_stage; exit 130' INT
+trap '_cleanup_stage; exit 143' TERM
+STAGE="$DEPLOY_DIR.new"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+
+# Staged through a file rather than piped: /bin/sh has no `pipefail`, so a
+# failing `git archive` is invisible in a pipe — tar exits 0 on empty input.
+# As two commands, `set -e` catches the archive itself.
+ARCHIVE="$STAGE.tar"
+rm -f "$ARCHIVE"
+# `eval` and `config` are here because deployed code resolves them RELATIVE TO
+# ITS OWN TREE, so a deploy that omits them does not fall back to the checkout —
+# it raises FileNotFoundError, every run, forever:
+#
+#   bin/kb-eval:29                  parents[1] / "eval" / "kb-golden.jsonl"
+#   lib/agent-platform/projects.py:51   parents[2] / "config" / "projects.json"
+#
+# The first is what prompted this change: the KB golden-set eval failed on every
+# run from 2026-08-31 for five days, against a deploy whose DEPLOYED_COMMIT was
+# current each time. THE SECOND WAS FOUND BY THE TEST BELOW ON ITS FIRST RUN and
+# was equally live — `projects.load()` from the deployed tree raised
+# FileNotFoundError on `<deploy>/config/projects.json`, and `bin/agentctl`,
+# `bin/link-project-inboxes`, `bin/transcript-capture` and `bin/run-register-api`
+# all import that module. Nobody had reported it.
+#
+# `lib/agent-platform/private_crew.py` reads the SAME registry and is deliberately
+# NOT covered by this: it uses an absolute `<root>/agent-platform/config/...`
+# path, because its docstring wants a privacy decision made from the live
+# registry rather than a pinned copy. That is a different trade and is left alone.
+#
+# THIS REPO DEPLOYS TWO WAYS AND THEY FAIL IN OPPOSITE DIRECTIONS, which is why
+# the gap survived being looked at. `~/.local/bin/agentctl` is a SYMLINK into the
+# working tree, where the hazard is that unmerged code goes live. This tree is a
+# COPY, where the hazard is the reverse: a path the copy does not enumerate is
+# absent silently and permanently. Reasoning about the second from the first
+# gets you a deploy that is current and incomplete at once.
+#
+# tests/test_deploy_archive_covers_runtime_paths.py holds this list to what the
+# deployed programs actually resolve, so the next such path fails a test rather
+# than a nightly job.
+# CHECKED BEFORE ARCHIVING, and the install REFUSES rather than proceeding. A
+# missing pathspec makes `git archive` fail with "did not match any files",
+# which names the path but not why anything wanted it — and a bare archive
+# failure here reads as a broken installer rather than as an incomplete commit.
+# Refusing loudly is the whole lesson of the outage this list was widened for:
+# the alternative to a clear refusal is not a working deploy, it is a deploy
+# that is current and incomplete at once.
+# ONE LIST, WORD-SPLIT INTO BOTH USES. It was written out twice — once here and
+# once on the `git archive` line — until a reviewer pointed out that nothing held
+# the two literals equal. The drift that matters is a path added to the check but
+# not the archive: the preflight would pass, the archive would omit it, and the
+# deploy would be silently incomplete. That is this file's own bug reproduced
+# between two of its own lines. Unquoted on purpose; splitting is the mechanism.
+# `config` is NOT here, and its absence is the point. `projects.py` reads the
+# registry from an absolute path into the live checkout, because a stale copy
+# would resolve a just-marked-private project as PUBLIC. Archiving it anyway
+# would put a file in the deploy that nothing reads and that looks authoritative
+# — the next person to find it would reasonably assume it is the one in use.
+DEPLOY_PATHS="bin lib/agent-platform lib/knowledge eval requirements.txt gateway/config.yaml tools/review-eval/variant-agents tools/review-eval/pre828-agents tools/review-eval/post828-agents tools/review-eval/fix832-agents"
+
+for _p in $DEPLOY_PATHS; do
+  if ! git -C "$REPO" cat-file -e "$SHA:$_p" 2>/dev/null; then
+    printf 'install-agent-platform-shared: %s is missing from %s.\n' "$_p" "$SHA" >&2
+    printf '  Every path in this list is read at runtime by the deployed tree,\n' >&2
+    printf '  which is a COPY: what it does not carry is absent, not fetched\n' >&2
+    printf '  from the checkout. Deploying without it would fail silently at\n' >&2
+    printf '  the next scheduled run instead of here.\n' >&2
+    exit 1
+  fi
+done
+
+git -C "$REPO" archive "$SHA" -- $DEPLOY_PATHS > "$ARCHIVE"
+tar -x -C "$STAGE" -f "$ARCHIVE"
+rm -f "$ARCHIVE"
+chmod +x "$STAGE"/bin/*
+
+say "Building pinned interpreter (python3.11 -m venv)"
+python3.11 -m venv "$STAGE/venv"
+
+# --- install dependencies into the STAGED venv, before the swap ------------
+# A network step, unlike every other line above it: `set -eu` is still armed
+# here (the trap disarm is below, after this), so a pip failure — offline,
+# PyPI down, a bad pin — aborts the whole script. The EXIT trap then removes
+# $STAGE, $DEPLOY_DIR (the previous release, if any) is never touched, and no
+# half-populated venv is ever swapped into place.
+say "Installing Python dependencies (pip install -r requirements.txt)"
+"$STAGE/venv/bin/pip" install --quiet -r "$STAGE/requirements.txt"
+
+# Captured NOW, while $STAGE still exists: `python3.11 -m venv` embeds an
+# absolute, symlink-RESOLVED path into every console-script shebang it writes
+# (pip, pip3, watchmedo, …), not the literal $STAGE string — on a host where
+# a path component of $STAGE is itself a symlink (e.g. macOS's /var ->
+# /private/var, which is what every tmp dir sits under) the embedded shebang
+# reads "/private/var/..." while $STAGE reads "/var/...", and a literal-string
+# rewrite below would silently match nothing. `pwd -P` gives the same
+# fully-resolved form pip wrote, so the rewrite below finds it regardless of
+# whether $STAGE's own path happens to cross a symlink.
+STAGE_REALPATH=$(cd "$STAGE" && pwd -P)
+
+{
+  echo "ref: $REF"
+  echo "commit: $SHA"
+  echo "installed_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "installed_from: $REPO"
+} > "$STAGE/DEPLOYED_COMMIT"
+
+# --- swap: the deploy area is replaced as one unit, never merged with the
+# previous release, so a partial file mix across two commits can't happen. --
+# DISARM BEFORE THE SWAP. From here the script owns both directories and the
+# staging cleanup would destroy the wrong one: between the two `mv` calls below
+# the live path does not exist, and $DEPLOY_DIR.new IS the release. A trap firing
+# there would delete the only thing that can complete the swap forward, leaving
+# nothing live and only an orphaned .old.$$ nobody was told about. Before this
+# trap existed that same interruption left both directories intact and an
+# operator could finish or roll back by hand; the cleanup must not take that away
+# (reviewer run-46273971, security-reviewer run-e80a395d).
+trap - EXIT INT TERM
+
+OLD=""
+if [ -d "$DEPLOY_DIR" ]; then
+  OLD="$DEPLOY_DIR.old.$$"
+  mv "$DEPLOY_DIR" "$OLD"
+fi
+mv "$STAGE" "$DEPLOY_DIR"
+
+# $OLD IS DELIBERATELY NOT DELETED YET. It used to be removed on the line after
+# this one, which was correct while nothing that could fail ran after the swap.
+# The venv/bin repoint below can fail — that is precisely why it carries a
+# post-condition assert — and a failure there leaves $DEPLOY_DIR live with a
+# partially rewritten venv. Deleting the previous release first would take away
+# the operator's only way back at exactly the moment they need it. So the
+# deletion moves below the assert, and the assert names $OLD on its way out
+# (reviewer run-fb2c600d).
+
+# --- repoint venv/bin files that embed the staging path ------------------
+# The venv was built at $STAGE ("$DEPLOY_DIR.new"), and `python3.11 -m venv`
+# writes that absolute path into several files that outlive the swap:
+#
+#   * console-script SHEBANGS (pip, pip3, watchmedo, …) — the line that makes
+#     the script executable at all;
+#   * VIRTUAL_ENV in activate / activate.csh / activate.fish — not on line 1,
+#     so a shebang-only rewrite leaves them naming a directory that no longer
+#     exists, and `source venv/bin/activate` then sets a broken environment.
+#
+# Nothing in the runtime path sources activate — the plists name
+# venv/bin/python3 directly — so only the shebangs are load-bearing. But the
+# staging path is the defect, not the shebang specifically, so the rewrite is
+# scoped to the defect: every occurrence in every TEXT file under venv/bin.
+# Fixing only what a test happened to name would leave the same bug one file
+# over, which is how it got missed the first time.
+#
+# `grep -Iq .` is the text test: -I treats a binary file as non-matching, so a
+# compiled entry point is skipped rather than corrupted by sed. Symlinks are
+# skipped first — python3/python3.11 point at the real interpreter outside the
+# venv, and rewriting through one would edit a file outside the deploy area.
+say "Repointing venv/bin staging paths to $DEPLOY_DIR"
+for f in "$DEPLOY_DIR"/venv/bin/*; do
+  [ -L "$f" ] && continue
+  [ -f "$f" ] || continue
+  grep -Iq . "$f" 2>/dev/null || continue
+  case "$(cat "$f" 2>/dev/null)" in
+    *"$STAGE_REALPATH"* | *"$STAGE"*)
+      sed -i.bak "s|$STAGE_REALPATH|$DEPLOY_DIR|g; s|$STAGE|$DEPLOY_DIR|g" "$f"
+      rm -f "$f.bak"
+      ;;
+  esac
+done
+
+# The rewrite must leave NOTHING naming the staging path. A silent miss here is
+# the whole failure mode, so assert it rather than trusting the loop.
+if grep -rlF "$STAGE" "$DEPLOY_DIR/venv/bin" >/dev/null 2>&1 \
+   || grep -rlF "$STAGE_REALPATH" "$DEPLOY_DIR/venv/bin" >/dev/null 2>&1; then
+  echo "install-agent-platform-shared: staging path still present under" >&2
+  echo "  $DEPLOY_DIR/venv/bin after the rewrite. The deploy area is live but" >&2
+  echo "  its venv scripts name a directory that no longer exists:" >&2
+  grep -rlF "$STAGE" "$DEPLOY_DIR/venv/bin" 2>/dev/null | sed 's/^/    /' >&2
+  grep -rlF "$STAGE_REALPATH" "$DEPLOY_DIR/venv/bin" 2>/dev/null | sed 's/^/    /' >&2
+  if [ -n "$OLD" ]; then
+    echo "  The PREVIOUS release is intact at:" >&2
+    echo "    $OLD" >&2
+    echo "  Roll back with:  rm -rf '$DEPLOY_DIR' && mv '$OLD' '$DEPLOY_DIR'" >&2
+  else
+    echo "  There was no previous release to fall back to (first install)." >&2
+  fi
+  exit 1
+fi
+
+# Everything after the swap succeeded, so the previous release is finally
+# disposable. This is the last statement that can leave the deploy area in a
+# state an operator would need to undo.
+PREV_SHA=""
+if [ -n "$OLD" ]; then
+  # Anchored to the same whole-line shape the marker check validates, so a
+  # marker with a crafted first line (`commit: --output=/path`) cannot hand
+  # git an option in place of a revision (security-reviewer, #509 round 1).
+  PREV_SHA=$(grep -E '^commit: [0-9a-f]{40}$' "$OLD/DEPLOYED_COMMIT" 2>/dev/null | head -1 | cut -d' ' -f2)
+  rm -rf "$OLD"
+fi
+
+say "Deployed: $DEPLOY_DIR (commit $SHA)"
+
+# A NON-MAIN INSTALL LEAVES PRODUCTION ON BRANCH CODE UNTIL SOMEONE PUTS IT BACK.
+# ADR-0059 rule 6 sanctions --allow-non-main for verifying a branch before merge,
+# and this is the live deploy area all 31 deploy-pinned jobs execute from — so
+# "verify" and "deploy to production" are the same action, and nothing here
+# reverses it. It happened while building this very change: a worker ran the
+# installer against its own worktree to check its work, and the deploy area
+# served unmerged branch code until a human noticed. autopull cannot undo it
+# either, since it only refreshes when the deployed commit differs from main and
+# it had been failing outright for a day (see refresh_deploy_area).
+#
+# So say so, loudly, with the command that restores main. This does not stop the
+# sanctioned use; it stops the sanctioned use from being silently permanent.
+warn_if_production_on_branch "$SHA"
+restart_knowledge_watcher_if_needed "$PREV_SHA" "$SHA"
+say "No plist loaded or unloaded; the knowledge-watcher is restarted only when its code changed (above)."
+say "Check what commit is currently deployed: $0 --status"

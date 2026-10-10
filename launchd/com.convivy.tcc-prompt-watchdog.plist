@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.convivy.tcc-prompt-watchdog</string>
+
+  <!-- Streams `/usr/bin/log stream` for a macOS TCC permission prompt on this
+       machine (issue_01M3Q1VHWARM4NKYRH44D0MYX5) and pushes one phone alert per
+       prompt, since the operator works remotely and nothing else notices a consent
+       dialog sitting on the machine's screen — at least five crew-session freezes
+       since 2026-09-27, one unanswered from 2026-09-28 23:13 MST to roughly
+       09:10 the next morning. Restarts the stream itself on exit (see
+       lib/agent-platform/tcc_prompt_watch.py); this KeepAlive restarts the
+       whole process if it dies outright. -->
+  <!-- Deploy-pinned per platform/decisions/0059 rule 1
+       (issue_01M19RRWSS9ETR09N9M2BJPA0Q): tcc-prompt-watchdog is a long-running
+       daemon (KeepAlive true), not a timer, so ADR-0059's rationale applies in
+       its sharper form — a daemon holds whatever branch it started from for as
+       long as it runs, where a timer at least re-reads on its next firing. This
+       reads a COPY installed from `main` into
+       ~/.local/deploy/agent-platform-shared/ (rules 2, 6, 7) instead of the
+       ~/.local/bin symlink into the checkout — that symlink still exists and
+       still reaches the tree, for the person who re-invokes tcc-prompt-watchdog
+       interactively while working on it (rule 5).
+       bin/agent-platform-autopull refreshes the deploy area on every
+       origin/main advance; bin/install-agent-platform-shared is what actually
+       builds it.
+       ProgramArguments names the deploy area's own pinned interpreter
+       explicitly (rule 4), not the shebang or launchd's PATH. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+    <string>__HOME__/.local/deploy/agent-platform-shared/bin/tcc-prompt-watchdog</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Convivy/agent-runs/tcc-prompt-watchdog.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Convivy/agent-runs/tcc-prompt-watchdog.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>

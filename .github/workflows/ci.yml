@@ -1,0 +1,413 @@
+name: ci
+
+# Phase A test foundation (substrate ARCH-098). Two jobs by necessity, not
+# preference: the python logic tests run anywhere, but the bash tests MUST run
+# on macOS — only there is /bin/bash the 3.2.57 build the mini ships, and the
+# 3.2 constraint (ARCH-082: a declare -A crash silently killed an overnight) is
+# the whole point of the bash job. Linux runners only have bash 5.x.
+#
+# Where the jobs run: `changes`, `lint`, `python`, and the bash job's Linux
+# fallback run on the self-hosted ci1 pool (the `convivy-linux` scale set). The
+# bash job's macOS run is on the self-hosted `convivy-macos-bash` runner
+# (the self-hosted runner on the Mac Studio, label `convivy-macos-bash:custom`,
+# registered 2026-10-07 — CQ-417), not a GitHub-hosted macOS
+# runner: the hosted macOS minutes bill at 10x Linux and this one job was
+# ~80% of the org's hosted Actions spend (195 min 2026-10-06, 271 by
+# mid-morning 2026-10-07). Runner setup and the cutover order are in
+# platform/runbooks/standing-up-the-linux-ci-box (step 10).
+
+#
+# `ready_for_review` is listed explicitly because it is NOT one of the default
+# `pull_request` types (opened/synchronize/reopened). Without it the full suite
+# would never fire when a draft PR is marked ready (substrate ARCH-364).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  # paths-filter lists a PR's changed files through the API; `pull-requests:
+  # read` is the minimum scope that grants it. The `changes` job's tree-skip
+  # step reuses this same scope to find the PR a push's merge commit came
+  # from (`commits/{sha}/pulls`).
+  pull-requests: read
+  # The same tree-skip step reads the PR head's own workflow runs and their
+  # jobs (`actions/runs?head_sha=`, `actions/runs/{id}/jobs`) to confirm the
+  # head's `bash`/`python` jobs OF THIS WORKFLOW already passed — scoped by
+  # workflow path, not by job name alone (scripts/ci/ci-tree-skip-decide's
+  # module docstring). This block replaces the GITHUB_TOKEN's default scopes
+  # entirely, so without this line that read comes back 403 and the step
+  # fails open (running the full suite) — safe, but it would never actually
+  # skip.
+  actions: read
+
+# Supersede in-flight runs for the same ref; only the newest commit is worth
+# testing. This matters more here than elsewhere because the macOS job below
+# bills at 10x the Linux rate, and GitHub does not bill the Linux jobs, which
+# run on ci1.
+concurrency:
+  # A PR groups by branch, so a new push supersedes the previous run. A push
+  # groups by COMMIT, so main commits never share a group and can neither cancel
+  # nor evict each other.
+  #
+  # `cancel-in-progress: false` alone does not achieve that. It stops a new run
+  # cancelling a RUNNING one, but a newer run still queues, and GitHub keeps only
+  # the most recently queued run per group — so a third merge arriving while the
+  # second is still pending evicts the second, which is recorded `cancelled`. That
+  # is the same end state the old comment forbade, reached by eviction rather than
+  # cancellation. Observed on selector 2026-07-19: 4da4c94e ran from 02:42:30,
+  # 45e80f01 queued 6s later, 78d4d55 arrived 8 minutes on and evicted it.
+  #
+  # Cost is concurrent runners during a merge burst. What it buys is the
+  # guarantee the old comment already promised: a completed CI result for every
+  # commit on main.
+  group: ci-${{ github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Does this PR touch anything that is not documentation? Seconds on the Linux
+  # runner, and the answer decides both which steps run below AND — uniquely in
+  # this repo — which RUNNER the bash job gets.
+  #
+  # WHY A SEPARATE JOB HERE, when the app repos run paths-filter as a step
+  # inside the job it gates. Because `runs-on` is evaluated before any step of
+  # that job exists, so a step-local output cannot reach it. Only a prior job's
+  # output can. That indirection is the entire point below.
+  changes:
+    runs-on: convivy-linux
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      # Whether this PR's changed files match anything in
+      # tests/bash/installer-test-inputs.txt — the four macOS bash test files
+      # that build fresh venvs and pip-install into them (issue_01M2F1XW1MJ7A30EK88NY4XRHD).
+      # Full rationale and the pattern list itself live in that one file, read
+      # by both this job and tests/bash/test_installer_test_inputs_coverage.sh
+      # (which always runs and fails if the list falls out of sync with what
+      # those four files actually reference). Same fail-safe polarity as
+      # `code` below: starts true, flips to false only after positively
+      # proving no changed path matches. A failure of one of the four on
+      # main, on a PR that skipped it, means this list is stale — the fix is
+      # to the list as well as to the code.
+      installer_tests: ${{ steps.filter.outputs.installer_tests }}
+      # Whether a `push` to main is a merge commit whose tree already passed,
+      # as a PR head, the same two check-runs this workflow is about to run
+      # again. Empty on every pull_request event (the step below only runs on
+      # push), which reads as not-'true' downstream — the fail-safe default.
+      tree_skip: ${{ steps.tree_skip.outputs.tree_skip }}
+      skip_pr: ${{ steps.tree_skip.outputs.skip_pr }}
+      skip_head: ${{ steps.tree_skip.outputs.skip_head }}
+      skip_run_url: ${{ steps.tree_skip.outputs.skip_run_url }}
+    steps:
+      # Needed to read tests/bash/installer-test-inputs.txt below. Cheap on the
+      # Linux runner; this job's cost was never the point of the gate.
+      - uses: actions/checkout@v6
+      # DELIBERATELY NOT dorny/paths-filter, though the other repos use it here.
+      # The idiom everyone reached for — a `**` catch-all followed by `!` doc
+      # negations — DOES NOT WORK in that action, and fails silently in the
+      # expensive direction. paths-filter matches with picomatch, which ORs an
+      # array of patterns: `**` alone matches every file and the negations never
+      # subtract, so the filter answers "code changed" for a README-only PR and
+      # the skip never fires.
+      #
+      # Not a guess. The first version of THIS job used that idiom, and its live
+      # log on a one-file README PR reads:
+      #     Detected 1 changed files
+      #     Filter code = true
+      #     Matching files:  README.md [modified]
+      # Reproduced locally: picomatch.isMatch('README.md', ['**','!**/*.md'])
+      # returns true.
+      #
+      # Compute it in shell instead, where the semantics are the ones written.
+      # No checkout needed — the API knows the changed files.
+      - name: Detect whether anything but docs changed, and whether an installer-test input changed
+        id: filter
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # FAIL SAFE BY CONSTRUCTION: start at "code changed" / "installer
+          # tests needed" and flip to false only after positively proving
+          # otherwise. Every error path — API failure, empty list, truncated
+          # page — leaves both true. A wrong `true` costs the money this job
+          # exists to save; a wrong `false` ships untested code.
+          code=true
+          installer_tests=true
+          files=""
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if files=$(gh api --paginate \
+                 "repos/${{ github.repository }}/pulls/${{ github.event.number }}/files" \
+                 --jq '.[].filename' 2>&1); then
+              n=$(printf '%s\n' "$files" | grep -c . || true)
+              if [ -n "$files" ] && [ "${n:-0}" -lt 3000 ]; then
+                # COUNT the changed paths that are NOT docs; zero means the PR
+                # is docs-only. `.github/**` is code by this rule, so a change
+                # to CI always runs CI.
+                #
+                # Counting rather than `grep -qv` on purpose. The -q/-v pair is
+                # not portable: on ugrep (a drop-in grep many of us have
+                # installed locally) `grep -qvE` returns 1 where GNU grep
+                # returns 0, which inverts this test. `grep -cv` agrees across
+                # GNU, BSD and ugrep. `|| true` because grep exits 1 on a zero
+                # count, which is the docs-only case we care about.
+                nondoc=$(printf '%s\n' "$files" | grep -cvE '(\.md$|^docs/|/decisions/|^LICENSE$)' || true)
+                if [ "${nondoc:-1}" -eq 0 ]; then
+                  code=false
+                fi
+
+                # installer_tests: same counting discipline as `code` above.
+                # tests/bash/installer-test-inputs.txt names every path (per
+                # test file, with why) that the four heavy macOS installer
+                # tests depend on; full derivation and the deliberate
+                # exclusions live in that file's own header comment.
+                patterns_file="tests/bash/installer-test-inputs.txt"
+                if [ -r "$patterns_file" ]; then
+                  active_patterns=$(mktemp)
+                  grep -vE '^[[:space:]]*(#|$)' "$patterns_file" > "$active_patterns"
+                  if [ -s "$active_patterns" ]; then
+                    hit=$(printf '%s\n' "$files" | grep -cE -f "$active_patterns" || true)
+                    if [ "${hit:-1}" -eq 0 ]; then
+                      installer_tests=false
+                    fi
+                  fi
+                  rm -f "$active_patterns"
+                fi
+              elif [ "${n:-0}" -ge 3000 ]; then
+                # GitHub's listFiles caps at 3000 entries, so a larger PR may
+                # arrive truncated and hide a code file. Do not inspect it.
+                echo "::notice::$n changed files (at the API cap); running the full suite"
+              fi
+            else
+              echo "::warning::could not list changed files; running the full suite"
+              echo "$files"
+              files=""
+            fi
+          fi
+          echo "Changed files:"
+          printf '%s\n' "${files:-<not a pull_request; full suite>}"
+          echo "code=$code"
+          echo "installer_tests=$installer_tests"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "installer_tests=$installer_tests" >> "$GITHUB_OUTPUT"
+
+      # Full rationale, and why a PR head's job runs must exclude any
+      # concluded `skipped` (the ARCH-364 draft-stage run every PR head
+      # carries alongside its real one) and be scoped to this workflow's own
+      # path rather than matched by job name alone, is in
+      # scripts/ci/ci-tree-skip-decide's module docstring. Its decision
+      # logic is unit-tested in tests/test_ci_tree_skip_decide.py; this step
+      # is thin I/O glue only, deliberately not inline shell — see that
+      # docstring's "WHY THIS IS A SEPARATE, UNIT-TESTED SCRIPT" section.
+      - name: Decide whether this push's merge tree already passed as a PR head
+        id: tree_skip
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/ci-tree-skip-decide
+
+  # The draft-stage lane: seconds, installs nothing but ruff, so a draft PR
+  # still gets a real signal while the review cycle works against it.
+  #
+  # Deliberately NOT docs-gated. It is ten seconds on the Linux runner, and
+  # ruff reads pyproject.toml and the scripts it lints — a "docs-only" PR that
+  # is really a config change should still meet it.
+  lint:
+    runs-on: convivy-linux
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11" # matches bin/agentctl's `#!/usr/bin/env python3.11`
+      - run: pip install ruff
+      - name: ruff (whole tree, including bin/ and scripts/ci/ scripts)
+        # `ruff check .` collects `*.py` ONLY, so every script in bin/ — which is
+        # where the platform actually lives, `agentctl` included — went unlinted
+        # while this step was labelled "whole tree". A genuine `F821 Undefined
+        # name` in bin/agentctl passed this job on 2026-07-25; it would have been
+        # a NameError on the first call of the new subcommand.
+        #
+        # bin/ holds zsh and bash scripts too, so the set cannot be a plain glob:
+        # ruff would try to parse them as Python. Select by shebang, which is the
+        # same test that decides what the interpreter is. scripts/ci/ joined
+        # the scan with ci-tree-skip-decide's move out of bin/ (that script is
+        # CI-only and does not belong on install.sh's symlinked PATH), so this
+        # step is what still catches a real bug in it before this same job's
+        # `bash`/`python` siblings would.
+        run: |
+          set -euo pipefail
+          ruff check .
+          grep -lE '^#!.*python' bin/* scripts/ci/* | xargs -r ruff check
+
+  # Skipped while the PR is a draft; runs on mark-ready as the merge gate
+  # (substrate ARCH-364). The `github.event_name` clause is defensive, not
+  # load-bearing. Actions coerces both null and false to 0, so on a `push`
+  # event — where `github.event.pull_request` is null — the draft check alone
+  # already evaluates true and runs this job on main. Keep the clause so the
+  # gate still reads correctly under a trigger whose payload carries a
+  # `pull_request` object shaped differently.
+  # THE DOCS GATE SITS ON THE STEPS, NEVER ON THE JOB. A job-level `if:` that
+  # evaluates false reports the job SKIPPED, and `agentctl review-status` fails
+  # any READY pr that has a skipped check (`_skipped_checks`) — it cannot tell
+  # "skipped because docs-only" from "skipped because the PR was a draft and the
+  # suite never ran", the false pass it was built to stop after convivy-deck #1.
+  # So a job-level docs gate would make every docs-only PR permanently
+  # unmergeable. Gating steps keeps the job reporting a real SUCCESS.
+  #
+  # The existing draft gate below stays at job level, which is correct: while a
+  # PR is a draft `review-status` blocks it anyway and tolerates its skips, and
+  # marking it ready re-fires the workflow for real (ARCH-364).
+  # A push whose merge tree matches an already-passed PR head (see the
+  # `changes` job's `tree_skip` step) skips this job's test steps too, on the
+  # same Linux runner it already uses — no runner swap needed here, since
+  # `python` was never the 10x-billed job the `bash` job's swap exists for.
+  python:
+    needs: changes
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: convivy-linux
+    steps:
+      - uses: actions/checkout@v6
+      - name: record tree-equality skip
+        if: needs.changes.outputs.tree_skip == 'true'
+        run: |
+          echo "Skipped: merge commit ${{ github.sha }} has the same tree as PR #${{ needs.changes.outputs.skip_pr }} head ${{ needs.changes.outputs.skip_head }}, whose run ${{ needs.changes.outputs.skip_run_url }} passed." >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/setup-python@v6
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        with:
+          python-version: "3.11" # matches bin/agentctl's `#!/usr/bin/env python3.11`
+      # The Linux runner's image has no Node, and tests/test_session_view.py's
+      # @needs_node tests skip silently without one. GitHub's hosted image ships
+      # Node 22, so pin the same major here.
+      - uses: actions/setup-node@v7
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        with:
+          node-version: "22"
+      # setup-node puts its npx under the runner tool cache, which lib/agent-platform/
+      # safe_path.py's fixed system list does not reach, so the npx tests would skip
+      # on the Linux runner. That list ends in /usr/local/bin, so link setup-node's
+      # npx there. The Linux runner runs jobs as root in a throwaway VM; a hosted
+      # runner does not, so it uses sudo.
+      - name: put setup-node's npx on the fixed system list
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: |
+          npx_path="$(command -v npx)"
+          if [ "$(id -u)" -eq 0 ]; then
+            ln -sf "$npx_path" /usr/local/bin/npx
+          else
+            sudo ln -sf "$npx_path" /usr/local/bin/npx
+          fi
+      - if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: pip install -r requirements-dev.txt
+      - name: pytest (with coverage)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: python -m pytest -rs --cov --cov-report=term-missing --cov-report=json
+      # `always()` publishes the number even when pytest fails, but it must not
+      # outlive the gate: with the suite skipped there is no coverage.json to
+      # upload, and the step would warn about a missing artifact on every docs PR
+      # or tree-equality skip.
+      - name: upload coverage artifact
+        if: always() && (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage
+          path: coverage.json
+          retention-days: 14
+
+  # Draft-gated like `python` above, and historically the highest-value gate
+  # in this file by Actions spend: before CQ-417 moved it to the self-hosted
+  # `convivy-macos-bash` runner (the self-hosted runner on the Mac Studio,
+  # label `convivy-macos-bash:custom`), GitHub-hosted macOS runners
+  # billed at 10x the Linux rate and this one job was ~80% of the org's
+  # hosted Actions spend (195 min 2026-10-06, 271 by mid-morning 2026-10-07).
+  # SKIPPING THE STEPS IS NOT ENOUGH HERE, WHICH MAKES THIS JOB THE WHOLE POINT.
+  # The bash suite finishes in ~15 seconds, so its cost is not the work — it is
+  # that the macOS runner spins at all. There is only the one self-hosted mac
+  # runner, so a docs-only PR that still booted it would queue behind (or
+  # block) whatever real bash-job run was already using it. Gating the steps
+  # alone would not avoid that.
+  #
+  # So swap the RUNNER instead. On a docs-only PR the job runs on the Linux
+  # runner with every step skipped: same job name, real SUCCESS, the shared
+  # self-hosted mac runner never touched.
+  # When any code changed it runs on the self-hosted mac runner exactly as
+  # before. `runs-on` takes an expression, and `needs.changes` is resolved
+  # before the runner is chosen — which is why `changes` had to be its own job.
+  #
+  # A tree-equality push skip (see the `changes` job) gets the SAME Linux
+  # swap, for the same reason: skipping only the steps would still tie up the
+  # one self-hosted mac runner for a run whose result is already known.
+  # `tree_skip` is only ever 'true' on a push (the step that sets it only runs
+  # there), so folding it into this docs-only ternary needs no separate
+  # event-name check.
+  #
+  # The `&&`/`||` pair is Actions' ternary: the left operand decides and the
+  # right is the fallback. `fromJSON` turns each branch's JSON-text literal
+  # into the actual runs-on value — every branch here is a plain string (a
+  # single ternary expression can only return one type, so even the
+  # single-string branches are written as JSON text and the whole thing
+  # decoded once at the end).
+  #
+  # The self-hosted runner on the Mac Studio carries exactly one label,
+  # `convivy-macos-bash:custom` —
+  # `gh api repos/convivy/agent-platform/actions/runners` confirmed no default
+  # `self-hosted` or `macOS` label on it, because it was registered with that
+  # one label on purpose. GitHub only assigns a job to a runner carrying every
+  # requested label, so requesting `self-hosted` or `macOS` alongside it left
+  # the bash job queued forever against an online, idle runner (CQ-417 revise,
+  # queued since 2026-10-07 20:10 UTC on commit e6ef9777). Request only the
+  # label the runner actually carries.
+  bash:
+    needs: changes
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # /bin/bash on the self-hosted mac runner is 3.2.57 — faithful to the
+    # mini (ARCH-082), confirmed each run by the "runner identity" step below.
+    # The Linux fallback never runs a bash step, so its bash 5.x is never
+    # exercised and the 3.2 guarantee is untouched.
+    runs-on: ${{ fromJSON((github.event_name == 'pull_request' && needs.changes.outputs.code == 'false' && '"convivy-linux"') || (needs.changes.outputs.tree_skip == 'true' && '"convivy-linux"') || '"convivy-macos-bash"') }}
+    steps:
+      # persist-credentials: false — this job now runs on a self-hosted
+      # runner whose work directory persists between jobs (unlike a
+      # GitHub-hosted runner's throwaway VM), so a checkout that left the
+      # GITHUB_TOKEN in .git/config would leave it sitting on disk for
+      # whatever job lands in that same directory next. clean: true is
+      # actions/checkout's own default; named explicitly so a persistent
+      # work directory reads as an intentional choice, not an oversight.
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          clean: true
+      - name: record tree-equality skip
+        if: needs.changes.outputs.tree_skip == 'true'
+        run: |
+          echo "Skipped: merge commit ${{ github.sha }} has the same tree as PR #${{ needs.changes.outputs.skip_pr }} head ${{ needs.changes.outputs.skip_head }}, whose run ${{ needs.changes.outputs.skip_run_url }} passed." >> "$GITHUB_STEP_SUMMARY"
+      - name: runner identity (confirms this ran on the self-hosted runner on the Mac Studio, not a hosted runner)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: |
+          echo "runner name: $RUNNER_NAME"
+          /bin/bash --version
+      - name: bash lint (syntax + ARCH-082 bash-4 guard)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: /bin/bash tests/bash/lint.sh
+      - name: bash tests (under /bin/bash 3.2)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        # Skips exactly the four installer/deploy test files when this PR's
+        # changed files match no pattern in tests/bash/installer-test-inputs.txt
+        # (issue_01M2F1XW1MJ7A30EK88NY4XRHD — those four built fresh venvs and
+        # pip-installed into them dozens of times per run). Unset on every
+        # push (needs.changes.outputs.installer_tests is only computed for a
+        # pull_request event and defaults to the fail-safe 'true' otherwise,
+        # so `== 'false'` is never true on a push) and on every local run of
+        # run.sh, which is the point: nothing here changes push-to-main
+        # coverage or a developer's own invocation.
+        env:
+          SKIP_INSTALLER_TESTS: ${{ needs.changes.outputs.installer_tests == 'false' && 'true' || '' }}
+        run: /bin/bash tests/bash/run.sh
+      - name: runner isolation probe (CQ-417 — confirms ap-runner cannot reach the operator's data or other services' unauthenticated data)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        # OPERATOR_HOME is a repository variable (Settings > Secrets and
+        # variables > Actions > Variables), not a literal path in this
+        # workflow — see scripts/ci/runner-isolation-probe.sh's own check,
+        # which refuses when it is unset, empty or not a directory.
+        env:
+          OPERATOR_HOME: ${{ vars.OPERATOR_HOME }}
+        run: /bin/bash scripts/ci/runner-isolation-probe.sh

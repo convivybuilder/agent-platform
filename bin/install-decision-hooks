@@ -1,0 +1,91 @@
+#!/bin/sh
+# install-decision-hooks — wire the decision-record → #*-explanations notifier
+# into the substrate + knowledge repos (ARCH-170 piece B).
+#
+# Installs git hooks that call `decision-record-notify` so a committed/merged
+# decision record posts to its #*-explanations channel:
+#   • substrate  post-commit            (ARCH entries; steward commits on main)
+#   • knowledge  post-commit + post-merge (ADRs; local commits AND autopull merges)
+#
+# Idempotent: rewrites only hooks it manages (marker-guarded — never clobbers a
+# foreign hook) and seeds each repo's posted-state so the existing corpus does
+# NOT post; only records added after install fire. Run from install.sh or by hand.
+set -eu
+
+# FOR TESTS ONLY: --root-config=FILE names another session-agent.env, so a test can
+# install into a fake root. HOME does not move the root, and an environment
+# variable never does (company/decisions/0008). Any other argument is ignored, as
+# every argument was before.
+ROOT_CONFIG=""
+for arg in "$@"; do
+  case "$arg" in
+    --root-config=*) ROOT_CONFIG="${arg#--root-config=}" ;;
+  esac
+done
+
+NOTIFY="$HOME/.local/bin/decision-record-notify"
+# Run records live under builder_root.data_root() (company/decisions/0008):
+# BUILDER_ROOT when set, else the machine's root, printed by the sibling
+# bin/builder-root. One hop through a ~/.local/bin link reaches the real bin/,
+# where builder-root is, since the link farm has no builder-root until install.sh
+# reruns (review, PR 538). $0 rather than BASH_SOURCE: this is a /bin/sh script.
+_self_path="$0"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+DATA_ROOT="${BUILDER_ROOT:-$("$(dirname "$_self_path")/builder-root")}" || exit 1
+LOG="$DATA_ROOT/agent-runs/decision-notify.log"
+# The substrate and knowledge repos live under the machine's root, printed by the
+# same sibling bin/builder-root with --root; HOME does not move it. After the two
+# lines above, whose shape tests/bash/test_builder_root_shell.sh pins.
+if [ -n "$ROOT_CONFIG" ]; then
+  ROOT="$("$(dirname "$_self_path")/builder-root" --root --config "$ROOT_CONFIG")" || ROOT=""
+else
+  ROOT="$("$(dirname "$_self_path")/builder-root" --root)" || ROOT=""
+fi
+[ -n "$ROOT" ] || {
+  echo "  ! cannot resolve the machine's root (bin/builder-root --root)" >&2
+  exit 1
+}
+MARKER="# managed-by: agent-platform decision-record-notify (ARCH-170)"
+
+write_hook() {
+  # $1 repo root  $2 hook name  $3 source
+  hooks_dir="$1/.git/hooks"
+  hook="$hooks_dir/$2"
+  if [ ! -d "$hooks_dir" ]; then
+    echo "  ! $1 has no .git/hooks (not a git repo?) — skipping" >&2
+    return 0
+  fi
+  if [ -f "$hook" ] && ! grep -q "decision-record-notify" "$hook" 2>/dev/null; then
+    echo "  ! $hook exists and is not ours — leaving it, NOT installing" >&2
+    return 0
+  fi
+  cat >"$hook" <<EOF
+#!/bin/sh
+$MARKER
+# Best-effort: never blocks the commit/merge.
+"$NOTIFY" --source $3 --repo-root "$1" >>"$LOG" 2>&1 || true
+EOF
+  chmod +x "$hook"
+  echo "  ✓ $hook ($3)"
+}
+
+echo "Installing decision-record hooks..."
+write_hook "$ROOT/substrate" post-commit substrate
+write_hook "$ROOT/knowledge" post-commit knowledge
+write_hook "$ROOT/knowledge" post-merge  knowledge
+
+# Seed only on FIRST install (state file absent). Re-seeding on a later install.sh
+# run would mark an added-but-not-yet-posted record as posted, silently swallowing
+# it — so once a source is seeded/tracking, leave its state alone.
+STATE_DIR="$DATA_ROOT/agent-runs/decision-notify"
+seed_once() {  # $1 source  $2 repo root
+  if [ -f "$STATE_DIR/$1.json" ]; then
+    echo "  · $1 already seeded — leaving state as-is"
+  else
+    echo "  · seeding $1 (existing records marked posted; only new ones fire)"
+    "$NOTIFY" --source "$1" --repo-root "$2" --seed || true
+  fi
+}
+seed_once substrate "$ROOT/substrate"
+seed_once knowledge "$ROOT/knowledge"
+
+echo "Done. New ARCH entries / ADRs will post to #*-explanations going forward."

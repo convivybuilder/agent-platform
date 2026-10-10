@@ -1,0 +1,13 @@
+# Dev/test dependencies for the agent-platform Phase A test foundation
+# (substrate ARCH-098). Most runtime code has no third-party deps; these are
+# for the test harness + CI, plus the one runtime dep below that tests import.
+pytest>=8.0
+pytest-cov>=5.0   # CI emits coverage.json → the substrate code-health dashboard's Cov%
+ruff>=0.5
+# knowledge-ctx imports PyYAML at module load; the test harness loads that CLI
+# via importlib, so the dep must be present to exercise detect_project.
+pyyaml>=6.0
+# tests/test_deck_signature.py and tests/test_kb_apply.py import
+# lib/agent-platform/deck_signature.py, which needs cryptography (see
+# requirements.txt) directly since CI installs only this file, not mcp.
+cryptography==50.0.1

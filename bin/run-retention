@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Retention for `<root>/agent-runs`. Run by launchd, daily.
+
+Two independent mechanisms: thins run directories to their JSON facts past
+THIN_DAYS, and deletes whole day directories past PRUNE_DAYS — both keyed on
+the two-sided calendar band a day directory's own name is checked against.
+Policy and rationale live in `lib/agent-platform/run_retention.py`.
+
+Absolute interpreter path (ARCH-086): launchd gives this no useful PATH.
+
+Usage:
+  run-retention                 # thin + prune
+  run-retention --dry-run       # report what would go, touch nothing
+  run-retention --thin-days N   # override the thin window (testing)
+  run-retention --prune-days N  # override the prune window (testing)
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "run_retention.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, prefer_venv=True)
+import run_retention as R  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Retention for agent-runs.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report which day directories would be thinned/pruned; touches nothing")
+    ap.add_argument("--thin-days", type=int, default=R.THIN_DAYS,
+                    help=f"thin window in days (default {R.THIN_DAYS})")
+    ap.add_argument("--prune-days", type=int, default=R.PRUNE_DAYS,
+                    help=f"prune window in days (default {R.PRUNE_DAYS})")
+    args = ap.parse_args()
+
+    if args.thin_days < 1:
+        print("run-retention: --thin-days must be at least 1", file=sys.stderr)
+        return 2
+    if args.prune_days < 1:
+        print("run-retention: --prune-days must be at least 1", file=sys.stderr)
+        return 2
+
+    root = R.RUNS_ROOT
+    today = R.local_today()
+
+    if args.dry_run:
+        thin_doomed = [d.name for d in R.day_dir_candidates(root)
+                       if R.should_act(d.name, today, args.thin_days)]
+        prune_doomed = [d.name for d in R.day_dir_candidates(root)
+                        if R.should_act(d.name, today, args.prune_days)]
+        print(f"run-retention: dry run, thin {args.thin_days}d, prune {args.prune_days}d, "
+              f"today {today}")
+        print(f"  day dirs present: {len(R.day_dir_candidates(root))}")
+        print(f"  would thin: {thin_doomed or 'nothing'}")
+        print(f"  would prune: {prune_doomed or 'nothing'}")
+        return 0
+
+    stats = R.run(root, today, thin_days=args.thin_days, prune_days=args.prune_days)
+    t, p = stats["thinned"], stats["pruned"]
+    # One line always, even on a no-op pass — silence cannot be told from a job
+    # that never ran, never loaded, or crashed before its first delete.
+    print(f"run-retention: thinned {t['runs_thinned']} run dir(s) across {t['day_dirs']} "
+          f"day(s); pruned {p['days_deleted']} day dir(s) "
+          f"{p['deleted'] if p['deleted'] else ''}".rstrip())
+
+    errors = t.get("errors", 0) + p.get("errors", 0)
+    if errors:
+        print(f"run-retention: {errors} error(s) during this pass; see counts above",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

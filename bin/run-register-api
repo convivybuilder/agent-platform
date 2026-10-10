@@ -1,0 +1,948 @@
+#!/usr/bin/env python3
+"""run-register-api — serve the live active-runs register as JSON (Bosun's half
+of the live-status chain: Bosun -> Chart House (Library) -> Deck/Orient).
+
+The operator's decision (2026-08-20, via the Steward): "The Bosun should feed the Chart
+House live information, and the Chart House should serve near-live information.
+Setting up push is probably wasteful, so it should just be a chain pull —
+Orient/Deck from Chart House (Library), Chart House from Bosun." No push
+anywhere in the chain: the Library is the only caller, and Deck/Orient never
+reach this directly — the rule that Deck, Orient and agentctl are each a
+client of the Library and never of each other (company/overview/convivy-
+builder).
+
+SCOPE IS NARROWER THAN "LIVE RUN STATE" — deliberately. This serves exactly
+what `registry.list_runs()` holds (run_id, agent, task, started_at, repo,
+worktree, pid, parent_run) and nothing else:
+
+- No cost. The ledger is the Library's, already on its own Course; pulling cost
+  out of run directories here would build a second cost path days after that
+  ownership was decided. If a caller wants cost alongside process state, it
+  joins its own ledger — `/runs` itself doesn't reach into run meta.json at
+  all. The one exception is `/runs/<run_id>/facts` (ARCH-193 phase 2, added
+  2026-09-15): the Library's review-record write route has to decide
+  run-verified status without trusting the review-post caller, the same way
+  the merge gate's stamp authenticator already does, so this one route reads
+  back exactly the meta.json fields that check needs — see its own docstring.
+  A second exception, `/runs/<run_id>/docs_fetched` (issue_01M3BFGKYNHFN29R43PAZXRRHV,
+  added 2026-10-01), reads one run's `tool_calls.jsonl` for Deck's Dispatched
+  panel — see `fetched_documents.py` and that route's own docstring. A third,
+  `/runs/<run_id>/docs_given` (issue_01M464MZ31N7AFTBHRE6SXVQ6X, added
+  2026-10-09), reads one run's `docs_consulted.json` for Deck's "Documents it
+  was given" pane — see that route's own docstring.
+- No status/outcome/history. The register holds only what's CURRENTLY running;
+  a run disappears from it the moment it ends (registry.remove_run). This
+  answers "what is running right now, by whom, since when, under which
+  parent" and nothing about how anything turned out.
+- No epic/lease ownership. That's already in the Chart House.
+
+FRESHNESS: served fresh per request, no cache, no TTL — the same "read live,
+don't cache" pattern /engineering/roster already uses. registry.list_runs() is
+one flock'd JSON file read plus a local PID-liveness reap: sub-millisecond, no
+network call. Any staleness in the Bosun -> Chart House -> Deck/Orient chain is
+introduced above this service, not here.
+
+A UNIX SOCKET, NOT A LOOPBACK PORT — same posture as bin/session-view, and the
+same reason: macOS has no per-user loopback isolation, so a loopback port is
+reachable by any local account with no credential. A socket under the owner's
+home is enforced by filesystem permissions instead. No auth is built here
+speculatively (none is needed yet — the caller is local); the socket path is
+also what carries this over the wire once the Studio split makes the Chart
+House a different machine, the same way session-view is already reached today:
+
+    ssh -N -L 8789:<remote-home>/.local/run/run-register-api.sock <user>@<mini>
+    curl http://127.0.0.1:8789/runs
+
+<remote-home> is the remote user's home directory, <user> is the remote user
+name, and <mini> is the machine that runs the crews.
+
+The response is self-contained JSON (run_id/agent/task/etc as plain strings) —
+nothing in it requires the caller to have local filesystem access to resolve,
+so the shape survives being served over the wire without changes.
+
+Absolute interpreter path (ARCH-086): launchd gives this no useful PATH.
+
+A KeepAlive daemon, so it is deploy-pinned rather than symlinked
+(platform/decisions/0059 rule 1): the plist points at a copy under
+~/.local/deploy/run-register-api/ (installed by bin/install-run-register-api),
+never at this checkout. registry.py and telemetry.py travel with it as
+siblings under lib/agent-platform/ in that same deploy area, so the import
+below resolves them relative to THIS file rather than through
+~/.local/lib/agent-platform — that farm symlinks back into whichever branch
+the checkout is on, which is exactly the hazard rule 1 exists to remove.
+
+Usage:
+  run-register-api            # serve on the unix socket (KeepAlive daemon)
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import socket
+import socketserver
+import signal
+import sys
+from http.server import BaseHTTPRequestHandler
+from pathlib import Path
+from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import fetched_documents as FD  # noqa: E402
+import projects as PJ  # noqa: E402
+import registry as R  # noqa: E402
+import review_protocol as RP  # noqa: E402
+import session_lifecycle as SL  # noqa: E402
+import session_state as SS  # noqa: E402
+import telemetry as T  # noqa: E402
+
+SOCKET_PATH = Path.home() / ".local" / "run" / "run-register-api.sock"
+
+# Exactly the fields this endpoint is scoped to (module docstring) — an
+# explicit allowlist, not a passthrough of whatever registry.list_runs()
+# happens to return. registry.py is internal concurrency-admission state for
+# agentctl, not written with any awareness that its shape is also a
+# network-facing contract: a two-phase admission (reserve_slot, before
+# attach_pid fills in the real pid) stores a transient "reserved": True on the
+# entry, and a future field added there for a purely local purpose would leak
+# over this socket automatically with zero review here if this just spread
+# the run dict (security review on this epic's first PR, #417).
+RUN_FIELDS = ("run_id", "agent", "task", "started_at", "repo", "worktree",
+             "pid", "parent_run")
+
+# The per-run fields served from meta.json rather than the register:
+# `model` (what actually ran), `model_resolved` (what the dispatch intended,
+# before any fail-over) and `model_source` (how it was chosen). Kept
+# apart from RUN_FIELDS because the register entry holds neither.
+MODEL_SOURCES = ("roster", "override-typed", "override-co", "override-item",
+                 "override-unattributed", "failover")
+
+
+def _model_fields(run: dict) -> dict:
+    """`model`, `model_resolved` and `model_source` for one run, read from its `meta.json`.
+
+    Called only for a run `_run_is_private` has already cleared, so a private
+    run never reaches it. The read goes through `RP._read_meta_bounded` for
+    the reason `_run_is_private` documents (a run-writable file: symlink, FIFO,
+    oversized). An unreadable meta.json serves `None` for all three fields,
+    since `roster` would be a claim nothing supports. `model_resolved` is
+    `None` too when meta.json lacks the key.
+
+    Precedence, most specific first (issue_01M3NTZP9W8WEYWVERW2F9NARP):
+    - `model_override_channel` starting "work_item:", or `model_choice ==
+      "item_override"`, is `override-item`. The channel field predates the
+      choice value (PR #648) and absence of either falls through.
+    - `model_choice == "co_override"` is `override-co` (agentctl spawn --model
+      from a process whose own environment carried CLAUDECODE — an agent
+      session dispatched it).
+    - `model_choice == "typed_override"` is `override-typed` (agentctl spawn
+      --model from a process with no CLAUDECODE in its environment — a person
+      at a terminal, claimed rather than proven).
+    - `model_choice == "operator_override"` is `override-unattributed`: the
+      pre-provenance value written before this distinction existed. Nobody
+      recorded who chose those, so serving `override-typed` for them would
+      repeat the false attribution this three-way split exists to fix.
+    - `model_choice == "harness_fallback"`, or `model` differing from
+      `model_resolved`, is `failover`: `_respawn_in_place` rewrites `model`
+      and leaves `model_resolved` on what the roster asked for (ARCH-378).
+    - anything else is `roster`.
+    """
+    run_id = run.get("run_id")
+    started_at = run.get("started_at") if isinstance(run.get("started_at"), str) else None
+    meta = None
+    if run_id:
+        meta_path = SS._run_meta_path(str(run_id), started_at)
+        meta = RP._read_meta_bounded(meta_path) if meta_path is not None else None
+    if not isinstance(meta, dict):
+        return {"model": None, "model_resolved": None, "model_source": None}
+    model = meta.get("model")
+    resolved = meta.get("model_resolved")
+    choice = meta.get("model_choice")
+    channel = meta.get("model_override_channel")
+    if choice == "item_override" or (
+            isinstance(channel, str) and channel.startswith("work_item:")):
+        source = "override-item"
+    elif choice == "co_override":
+        source = "override-co"
+    elif choice == "typed_override":
+        source = "override-typed"
+    elif choice == "operator_override":
+        source = "override-unattributed"
+    elif choice == "harness_fallback" or (
+            isinstance(model, str) and isinstance(resolved, str) and model != resolved):
+        source = "failover"
+    else:
+        source = "roster"
+    return {"model": model if isinstance(model, str) else None,
+            "model_resolved": resolved if isinstance(resolved, str) else None,
+            "model_source": source}
+
+
+def _run_is_private(run: dict, snapshot: "dict | None") -> bool:
+    """True unless `run` is CONFIRMED to belong to a public dispatch — fail
+    closed, so an unreadable registry, an unreadable `meta.json`, or a `repo`
+    that is not even slug-shaped, excludes a row rather than serving it.
+
+    THE `meta.json` READ BELOW GOES THROUGH `RP._read_meta_bounded`, NOT A
+    PLAIN OPEN. That file sits inside the run's own writable directory —
+    this daemon's ARCH-193-phase-2 review found the identical exposure in
+    `review_protocol.resolve_run_facts` (see its docstring) and this function
+    reads the same file the same way, on every row of every `/runs` request,
+    so an unprotected read here was the wider blast radius of the two.
+
+    `repo` ALONE IS NOT ENOUGH — the same `--agents-dir` bypass
+    `session_state._crew_is_shareable` (session_state.py) already closed one
+    route over. `bin/agentctl`'s `resolve_agent()` honours `--agents-dir`
+    before it ever looks at `repo`, so `agentctl spawn <cfo-agent> --on
+    some-public-repo --agents-dir <root>/CFO/.claude/agents` writes
+    `repo: "some-public-repo"` into the registry while loading a black-box
+    crew's agent. The first round of this PR checked only `repo`
+    (`private_crew.is_private_slug`) and missed exactly this
+    (security-reviewer, round 2). A registry entry never carries
+    `agent_source` — only the run's own `meta.json` does — so it is read the
+    same way `session_state._agent_run_detail` reads it: composed from
+    `run_id`/`started_at` via `session_state._run_meta_path`, degrading to
+    `None` (the repo-only half of the check below) for a run with no
+    `run_id` or no readable `meta.json`.
+
+    **THE SLUG-SHAPE GUARD BELOW RUNS BEFORE EITHER HALF OF THAT CHECK, AND
+    IS NOT OPTIONAL.** A `repo` like `"../CFO"` or `"cfo "` fails
+    `dispatch_is_private`'s exact `repo.lower() in private_slugs()` match, so
+    the repo-only half never fires; with no `run_id` (or an unreadable
+    `meta.json`) `agent_source` is `None` too, so the agent_source half
+    answers `False` — a CLEAN return, not an exception. `_run_is_private`'s
+    `except Exception` below never sees that path, so the run was served
+    with its raw `repo`/`task`/`worktree` (correctness reviewer, round 4). A
+    round-3 version of this docstring called that window narrow-and-accepted
+    on the reasoning that every real dispatch writes `agent_source`; that
+    reasoning only covers the exception path, not this clean-`False` one, and
+    was wrong. `session_state._crew_is_shareable` already runs `repo` through
+    `_REPO_SLUG_RE` — an exact-match slug-shape guard — before it ever calls
+    `dispatch_is_private`; this function now reuses that same regex
+    (`SS._REPO_SLUG_RE`) the same way, so the two callers agree on what is
+    allowed to reach the comparison at all, instead of diverging the way this
+    function's pre-round-4 version did.
+
+    `projects.dispatch_is_private(repo, agent_source, ...)` is the single
+    comparison both `bin/agentctl` and `session_state._crew_is_shareable`
+    delegate to for the repo/agent_source match itself. It RAISES on an
+    unreadable registry rather than returning a tri-state UNKNOWN (its own
+    docstring: a caller that must fail closed one row at a time catches at
+    its own boundary rather than have the primitive swallow the error for
+    every caller). This is that boundary: any exception — an unreadable
+    registry, a malformed entry — is treated as private, never let propagate
+    and take the whole `/runs` route down, and never defaulted to public.
+
+    `snapshot` is the per-request registry snapshot `Handler.do_GET` resolves
+    once via `_resolve_registry_snapshot` — see that function's docstring for
+    why a fresh `private_slugs()`/`home_path()` read per row is unsafe under
+    this server's `ThreadingMixIn` concurrency. `None` means the registry
+    itself was unreadable at snapshot time, which fails closed the same as
+    any other unreadable-registry case: this run cannot be confirmed public.
+    """
+    repo = run.get("repo")
+    if not isinstance(repo, str) or not SS._REPO_SLUG_RE.match(repo):
+        return True
+    if snapshot is None:
+        return True
+    run_id = run.get("run_id")
+    started_at = run.get("started_at") if isinstance(run.get("started_at"), str) else None
+    agent_source = None
+    if run_id:
+        meta_path = SS._run_meta_path(str(run_id), started_at)
+        # RP._read_meta_bounded, NOT SS._read_json — meta.json lives inside the
+        # run's own writable directory, the exact exposure RP._read_meta_bounded's
+        # docstring describes (a symlink to /dev/zero, a FIFO with no writer, a
+        # many-gigabyte regular file). SS._read_json is a plain `open(path)` with
+        # no O_NOFOLLOW, no non-regular-file check and no size cap, and this call
+        # runs on every row of every /runs and /runs/<run_id>/facts request — any
+        # currently-registered run's poisoned meta.json would take this KeepAlive
+        # daemon down for every crew it serves, not just a request naming that run.
+        meta = RP._read_meta_bounded(meta_path) if meta_path is not None else None
+        agent_source = meta.get("agent_source") if isinstance(meta, dict) else None
+    try:
+        return PJ.dispatch_is_private(
+            repo, agent_source,
+            private_slugs_snapshot=snapshot["private_slugs"],
+            home_paths_snapshot=snapshot["homes"])
+    except Exception:
+        return True
+
+
+def _reload_project_registry() -> None:
+    """Clear `projects._load_raw`'s process-lifetime cache — called once, at
+    the top of `Handler.do_GET`, before dispatch to either route's payload
+    builder, rather than inside the builders themselves.
+
+    THIS CLEARS THE CACHE; IT DOES NOT PIN ANYTHING FOR THE CALLING REQUEST.
+    The next read after this call gets fresh data, but nothing stops a
+    *concurrent* request's own call to this function from clearing and
+    repopulating the same process-global cache again before this request has
+    finished reading it. `_resolve_registry_snapshot`, called right after this
+    at the top of `do_GET`, is what turns "fresh at some point" into "fixed
+    for the rest of this response" (round 4, reviewer + security-reviewer).
+
+    IT USED TO BE CALLED FROM EACH PAYLOAD BUILDER, ONE CALL PER ROUTE. That
+    is the same shape as the round-1 miss this file has already been bitten
+    by once: `/runs` shipped with no privacy filter at all because nothing
+    forced a route to build one, and "call `_reload_project_registry()` at
+    the top of your builder" is a convention a third route added later could
+    just as easily forget. Calling it here instead, before `do_GET` even
+    looks at `self.path`, means every route inherits a fresh registry by
+    structure — whether or not its own builder remembers to ask for one.
+
+    THIS ROUTE IS THE FIRST DAEMON TO REACH `projects.*`. `_load_raw` is
+    `@lru_cache(maxsize=None)` (projects.py), parsed once and held for the
+    life of the process — sound for every existing caller (bin/agentctl,
+    bin/link-project-inboxes, bin/transcript-capture), which are all
+    one-shot processes that exit before a stale answer could matter.
+    `run-register-api` is launchd's one `KeepAlive` daemon that imports it
+    (directly here, and via `session_state.py`'s own `import projects`), so
+    without this the registry snapshot a privacy decision is checked against
+    is frozen at this process's first call. Mark a crew `private: true` any
+    time after that — the exact ADR-0043 scenario this endpoint exists to
+    serve — and both `/runs` and `/sessions` would keep serving it until the
+    daemon is restarted. `private_crew.is_private_slug` avoided this by
+    re-opening the registry file on every call, by design; `projects.py`'s
+    cache carries no such contract, so the freshness has to be forced here
+    instead. The next daemon that starts importing `projects.py` needs this
+    too — nothing in that module enforces it on its own.
+    """
+    PJ._load_raw.cache_clear()
+
+
+def _resolve_registry_snapshot() -> "dict | None":
+    """Read `projects.private_slugs()` and `projects.home_path()` ONCE per
+    request, right after `_reload_project_registry`, and hand the SAME plain
+    dict to every payload builder — and, under `/sessions`, on down into
+    `_project_slug_for_cwd`.
+
+    EVERY PRIVACY DECISION THAT REACHES THIS RESPONSE reads this snapshot:
+    `_run_is_private` and `_sessions_payload`'s own row filter both take
+    their `private_slugs`/`homes` from here, never from a fresh call into
+    `projects.py`. That is narrower than round 4's own claim, which said no
+    function on the request path calls back into `projects.py` at all —
+    false. `_session_row` calls `SS.session_state(name)`, which
+    unconditionally runs `_crew_is_shareable` (building `agent_runs`) and
+    `_dispatched_by` (building `working_on_derived`), and BOTH call
+    `projects.dispatch_is_private` live, snapshot or no. It is harmless
+    today only because `_session_row` serves `agent_run_count` — a length,
+    not the shareability verdict — and `working_on`, never `agent_runs`
+    itself or `working_on_derived`. Serving `working_on_derived`, or any
+    field derived from `agent_runs` beyond its length, would reach that
+    live, unsnapshotted privacy read and reopen the exact staleness window
+    this function exists to close (reviewer + security-reviewer, round 5) —
+    see `_session_row`'s docstring, which repeats this for whoever edits
+    that function directly and would not otherwise see this one.
+
+    THIS BUILDS TWO SLUG -> PATH DICTS, DELIBERATELY DIFFERENT, because they
+    answer different questions and must not be unified into one filter for
+    tidiness:
+
+    - `homes`: every registered slug whose `home_path()` resolves, whether
+      or not the directory exists on disk right now. This is what
+      `_run_is_private` hands `dispatch_is_private` as `home_paths_snapshot`
+      for the agent_source containment check. A private crew's `home_dir`
+      not existing at this instant — not yet created, or briefly moved — is
+      not evidence that a dispatch into it is public, and filtering it out
+      here silently reopened the exact `--agents-dir` bypass round 2 and
+      round 4 closed, for any private slug whose directory happened to be
+      absent at request time (reviewer + security-reviewer, round 5).
+      `projects.home_path`'s own docstring is explicit that this is safe:
+      "Returns a Path even when the directory does not exist — existence is
+      the caller's question, not the registry's."
+    - `homes_on_disk`: the same, filtered to `is_dir()`. This is what
+      `_project_slug_for_cwd` walks, because it calls `os.path.samefile`,
+      which needs a real directory on both sides. Dropping a nonexistent
+      home here only under-reports a `/sessions` row for a project not yet
+      materialized on disk — it never weakens a privacy decision, since
+      `_project_slug_for_cwd` only ever answers "which project" for a row
+      already confirmed non-private.
+
+    THE RELOAD ALONE IS NOT ENOUGH — see `_reload_project_registry`'s
+    docstring. This server is `ThreadingUnixHTTPServer` with
+    `daemon_threads = True`, and Orient polls `/sessions` while the Library
+    polls `/runs`, so overlapping requests are the steady state. Before this
+    fix, `_sessions_payload` computed `private = PJ.private_slugs()` ONCE at
+    its own top, then called `_project_slug_for_cwd` per session row, which
+    called `PJ.load()`/`PJ.home_path()` FRESH on every iteration; a
+    concurrent request's own reload-and-repopulate landing between those two
+    reads meant a session's cwd could RESOLVE against a newer registry
+    generation than the PRIVACY set it was then checked against — so a crew
+    flipped private mid-response could still pass the check made against the
+    stale set. `projects.dispatch_is_private` had the identical shape one
+    level down, calling `private_slugs()` twice with no snapshot of its own
+    (reviewer + security-reviewer, round 4). Resolving everything here, before
+    either builder or any row loop runs, closes both windows at once.
+
+    A slug whose `home_path()` cannot be resolved — for ANY reason, whether
+    it RAISES (a malformed `home_dir`) or returns `None` (a registered
+    project missing its `home_dir` entirely) — is dropped from both dicts,
+    and if that slug is itself private, fails the WHOLE snapshot closed:
+    returns `None`, the same as an unreadable registry, rather than silently
+    proceeding with that one crew's containment check skipped while every
+    other slug's still applies. Enumerating the raise case and the
+    None-return case as two separate rules is what let the None-return case
+    ship unguarded the first time (security-reviewer, round 5; round 6 for
+    the None case). An unresolved home on a public slug only drops it from
+    `homes`/`homes_on_disk`, under-reporting a `/sessions` row the same way a
+    missing directory does, and affects no privacy decision.
+
+    `None` means the registry read itself failed (missing or corrupt
+    `config/projects.json`) — every caller downstream fails closed on that
+    the same way it already failed closed on the equivalent per-call
+    exception before this change: `_run_is_private` treats it as "cannot
+    confirm public," `_sessions_payload` serves an empty list.
+    """
+    try:
+        private_slugs = PJ.private_slugs()
+        homes: dict[str, Path] = {}
+        homes_on_disk: dict[str, Path] = {}
+        for slug in PJ.load():
+            try:
+                home = PJ.home_path(slug)
+            except Exception:
+                home = None
+            if home is None:
+                if slug in private_slugs:
+                    return None
+                continue
+            homes[slug] = home
+            if home.is_dir():
+                homes_on_disk[slug] = home
+        return {"private_slugs": private_slugs, "homes": homes,
+                "homes_on_disk": homes_on_disk}
+    except Exception:
+        return None
+
+
+def _runs_payload(snapshot: "dict | None") -> dict:
+    """The live register, read fresh — no cache, no TTL (see module docstring).
+
+    A private crew's run is dropped as a whole ROW, not redacted field by
+    field: `_run_is_private` is checked before the `RUN_FIELDS` projection
+    below, so a private run's task text and worktree never reach the
+    dict this function returns, let alone the response. The registry-cache
+    reload — and, as of round 4, the registry snapshot itself — happen once,
+    structurally, at the top of `Handler.do_GET`; this function makes no
+    `projects.py` call of its own, reading only the `snapshot` it is handed.
+    """
+    runs = [{**{k: run.get(k) for k in RUN_FIELDS}, **_model_fields(run)}
+            for run in R.list_runs() if not _run_is_private(run, snapshot)]
+    return {"generated_at": T.now_iso(), "runs": runs}
+
+
+# --- /runs/<run_id>/facts: a run's review-authentication facts, for the
+# Library's review-record write route to decide `run-verified` status without
+# trusting the `review-post` caller (issue_01M2K5HRWWVPWTC90NQTFEA8RK). Every
+# agentctl run is dispatched `bypassPermissions`, the exact forgery
+# `review_protocol.authenticate`'s docstring describes — taking these facts
+# from the caller's own payload would let it authenticate itself.
+_FACTS_PATH_RE = re.compile(r"^/runs/(.+)/facts$")
+
+
+def _facts_payload(run_id: str, snapshot: "dict | None") -> dict:
+    """`{found, agent, repo, review_sha, pr, review_role}`, read from `run_id`'s
+    own meta.json — covering an ENDED run as well as a live one, unlike `/runs`
+    (`registry.list_runs()`), which drops a run the moment it ends
+    (`registry.remove_run`). By the time the Library writes a review record
+    the reviewer run has almost always already finished, so this route
+    resolves the run directory directly rather than going through the
+    register.
+
+    EVERY FIELD BELOW IS SELF-REPORTED. `meta.json` is written inside the
+    run's own writable directory, by the run it describes — `found` plus a
+    matching `review_role` means "meta.json currently says this run was a
+    review-class run on this repo at this commit," not an attestation from
+    anything outside that run. This is enough to defeat REPLAY (the Library
+    checking a run-id that names someone else's run) and cross-role stamping
+    by an honest-but-buggy run; it does not defend against a run that
+    deliberately rewrites its own `agent`, `repo` or `review_sha` before this
+    route reads them, because no such forging run has been seen — see
+    `review_protocol.authenticate`'s docstring, which carries the same caveat
+    for the merge gate's use of these same facts.
+
+    `review_role` is `facts.agent`'s role base (`review_protocol._review_base`)
+    when it is review-class by exactly the rule `review_protocol.authenticate`
+    applies (`review_protocol.is_review_class`, the same `REVIEW_AGENTS` +
+    `INTERNAL_APP_PREFIXES` handling), else the empty string — so a
+    crew-prefixed reviewer (`hollis-reviewer`) reports the same role a bare
+    one does (`reviewer`), and a non-review agent (a coder) reports `""`. The
+    Library needs this to compare against a review record's own `role` field
+    without re-deriving the review-class test itself; computed via the shared
+    `review_protocol` functions rather than a second copy of the rule, so this
+    route and the merge gate's stamp authenticator can never disagree about
+    who counts as a reviewer.
+
+    `review_protocol.resolve_run_facts` IS THE SAME LOADER `bin/agentctl`
+    calls (`_resolve_run_facts`, delegating to this same function) to build
+    the `RunFacts` its merge gate checks a review stamp's authenticity
+    against. Calling it here rather than re-reading meta.json by hand means
+    the merge gate and the Library's write route can never disagree about
+    what a run's facts are — see `review_protocol.find_run_dir`'s docstring
+    for why a second copy of either function is the risk this closes.
+    `resolve_run_facts` validates `run_id` against the run-id shape BEFORE
+    any filesystem access, so an unknown id, `../`, an encoded traversal, an
+    absolute path, or an empty string all resolve to `found=False` here —
+    never a path that could walk outside RUNS_ROOT.
+
+    PRIVACY, applied exactly as `/runs` applies it: `_run_is_private` is the
+    same function `_runs_payload` above filters every row through, given the
+    same `repo`/`run_id`/`started_at` shape it already expects (that
+    function's own docstring: it re-derives `agent_source` from `run_id` +
+    `started_at` via `session_state._run_meta_path`, the `--agents-dir`
+    bypass check). A private crew's run answers ONLY `{"found": true,
+    "private": true}` — no agent, repo, review_sha, pr or review_role — so
+    the Library stores the record `unverified` without ever learning a
+    private crew's repository name, even indirectly through a field this
+    route would otherwise serve.
+    """
+    facts = RP.resolve_run_facts(run_id)
+    if not facts.found:
+        return {"found": False}
+    privacy_row = {"repo": facts.repo, "run_id": run_id, "started_at": facts.started_at}
+    if _run_is_private(privacy_row, snapshot):
+        return {"found": True, "private": True}
+    review_role = (RP._review_base(facts.agent)
+                   if RP.is_review_class(facts.agent, RP.REVIEW_AGENTS) else "")
+    return {"found": True, "agent": facts.agent, "repo": facts.repo,
+            "review_sha": facts.review_sha, "pr": facts.pr,
+            "review_role": review_role}
+
+
+# --- /runs/<run_id>/docs_fetched: the documents a dispatch run has read so
+# far, for Deck's Dispatched panel (issue_01M3BFGKYNHFN29R43PAZXRRHV) ---------
+#
+# A PER-RUN ROUTE, NOT A FIELD ON /runs — the same shape `/runs/<run_id>/facts`
+# already uses for "one more per-run detail beyond the register's 8-field
+# RUN_FIELDS contract", and for the same reason: Deck only needs this for the
+# ONE run someone has clicked on in the Dispatched panel, not for every row of
+# every poll. `/runs` is polled with no cache/TTL (module docstring); folding
+# a `tool_calls.jsonl` read into every row of every poll would multiply that
+# read by however many runs are live, for every caller, even though almost
+# none of those rows are ever expanded. A per-run route does that read only
+# when asked.
+_DOCS_FETCHED_PATH_RE = re.compile(r"^/runs/(.+)/docs_fetched$")
+
+
+def _docs_fetched_payload(run_id: str, snapshot: "dict | None") -> dict:
+    """`{found, docs_fetched, searches}` for a live or ended run, or
+    `{found: False}` for an unknown/malformed/ambiguous run-id — the derivation
+    itself lives in `fetched_documents.fetched_and_searched`, which reads
+    straight from the run's own `tool_calls.jsonl` rather than waiting for
+    `docs_consulted.json` (written only at finalize, empty for a still-running
+    run). `searches` is one row per successful knowledge or signal search, in
+    call order, with the query it was made with. Every string field in the
+    response is bounded before it is served, by `fetched_and_searched`:
+    `id` is skipped when it is longer than `_MAX_ID_LEN` or holds a C0 control
+    character or DEL; `query` is truncated to `_MAX_QUERY_LEN` characters with
+    each C0 control character or DEL replaced by a space; `searched_at` and
+    `fetched_at` are served as null when they are not strings, are longer than
+    `_MAX_TIMESTAMP_LEN`, or hold a C0 control character or DEL. C1 controls
+    (U+0080 to U+009F) are not bounded here; `json.dumps` escapes them on the
+    wire. `kind` and `tool` are fixed labels. The row count
+    is bounded by the 64 MiB read in `fetched_documents._read_tool_calls_bounded`,
+    since each row comes from one line of that read. The response has no byte
+    ceiling of its own. Searches are kept out of `docs_fetched` because a search
+    returns snippets, not documents the run read.
+
+    RESOLUTION AND PRIVACY GO THROUGH THE SAME SHARED PRIMITIVES
+    `_facts_payload` ABOVE USES, not a second copy: `RP.resolve_run_facts`
+    for the found/repo/started_at answer (its own docstring covers the
+    unknown-id, non-regular-meta.json, oversized-meta.json and
+    ambiguous-run-id cases this route must refuse the same way `/facts`
+    does), then `_run_is_private` — the identical function, given the
+    identical row shape `_facts_payload` builds — so a run private to
+    `/facts` is private here too, by construction rather than by two
+    reviewers independently getting the same check right.
+
+    THE ROUTE RESOLVES THE RUN DIRECTORY ONCE. `resolve_run_facts` makes the
+    one `find_run_dir` call, and the route reads `tool_calls.jsonl` from
+    `facts.run_dir`, the directory that resolution read meta.json from. The
+    route makes no second lookup. Both files are still opened by path:
+    `meta.json` in `resolve_run_facts`, `tool_calls.jsonl` in
+    `fetched_and_searched`. A process that replaces the run directory between
+    those two opens is not guarded against. No such swap has been seen. The
+    `agent_source` half of the privacy decision comes from a second,
+    date-composed lookup (`session_state._run_meta_path`, called from
+    `_run_is_private`), not from `facts.run_dir`.
+
+    RESIDUAL, PREDATING THIS ROUTE: privacy is decided by the shared
+    private-run check `_run_is_private` from the run's own meta.json, which
+    the run's user can write (on `/runs` the `repo` half comes from the
+    registry row instead), so a run that rewrites that file can be served as
+    public; the older `/facts` and `/runs` routes share the gap, and the
+    check's code is the reference for the exact conditions.
+
+    PRIVATE: `{"found": True, "private": True}`, with no `docs_fetched` or
+    `searches` key at all — matching `_facts_payload`'s private answer exactly,
+    so a private crew's fetched document ids and its search queries (free text
+    the agent typed, which can quote whatever it was working on) never reach
+    this response either.
+    """
+    facts = RP.resolve_run_facts(run_id)
+    if not facts.found:
+        return {"found": False}
+    privacy_row = {"repo": facts.repo, "run_id": run_id, "started_at": facts.started_at}
+    if _run_is_private(privacy_row, snapshot):
+        return {"found": True, "private": True}
+    docs_fetched, searches = FD.fetched_and_searched(facts.run_dir)
+    return {"found": True, "docs_fetched": docs_fetched, "searches": searches}
+
+
+# --- /runs/<run_id>/docs_given: the documents a dispatch run was GIVEN at
+# dispatch time, for Deck's "Documents it was given" pane
+# (issue_01M464MZ31N7AFTBHRE6SXVQ6X) ------------------------------------------
+#
+# A PER-RUN ROUTE, NOT A FIELD ON /runs, for the same reason `docs_fetched`
+# above is one: Deck only needs this for the one run someone has clicked on.
+#
+# THE GIVEN HALF, NOT THE FETCHED HALF. `docs_fetched` above derives live from
+# `tool_calls.jsonl`; this route instead serves `docs_consulted.json` as
+# `telemetry.write_docs_consulted` wrote it at dispatch time, inside
+# `bin/agentctl`'s `_spawn_dispatch`, unchanged. That file's own `docs` key is
+# the run's materialized given-set, one `{id, kind, body_sha256[, scope]}` row
+# per document (`telemetry.write_docs_consulted`'s own docstring); this route
+# does not pick that key out, read `profile`, `queried_at_runtime`, or
+# anything else inside the file apart — a change to that file's shape is
+# Deck's to read, not this route's to re-shape. A still-running dispatch whose
+# render never wrote the file, or wrote it with an empty `docs`, is served
+# exactly that: an empty `docs` array is not an absent file.
+_DOCS_GIVEN_PATH_RE = re.compile(r"^/runs/(.+)/docs_given$")
+
+
+def _docs_given_payload(run_id: str, snapshot: "dict | None") -> dict:
+    """`{found, docs_consulted}` for a run whose `docs_consulted.json` is
+    readable, `{found: True, docs_consulted: None}` for a found, public run
+    whose file is absent or unreadable, or `{found: False}` for an
+    unknown/malformed/ambiguous run-id.
+
+    RESOLUTION AND PRIVACY GO THROUGH THE SAME SHARED PRIMITIVES
+    `_facts_payload` AND `_docs_fetched_payload` ABOVE USE, not a second copy:
+    `RP.resolve_run_facts` for the found/repo/started_at answer, then
+    `_run_is_private` — the identical function, given the identical row shape
+    those two build — so a run private to `/facts` and `/docs_fetched` is
+    private here too, by construction.
+
+    PRIVATE: `{"found": True, "private": True}`, with no `docs_consulted` key
+    at all — matching the other two routes' private answer exactly, so a
+    private crew's given document ids never reach this response either.
+
+    THE FILE READ GOES THROUGH `RP._read_meta_bounded`, NOT A PLAIN OPEN —
+    the same no-follow, non-blocking, size-capped guard `_model_fields` and
+    `_run_is_private` above already apply to `meta.json`, itself a run-
+    writable file inside the same run directory. `docs_consulted.json` is
+    written once, at dispatch (`_spawn_dispatch`'s own call into
+    `write_docs_consulted`), not appended to for the run's whole life the way
+    `tool_calls.jsonl` is, but it sits in the same run-writable directory, so
+    a run that removes it and plants a symlink to `/dev/zero`, a FIFO with no
+    writer, or a many-gigabyte regular file in its place is refused by the
+    same `lstat` + `O_NOFOLLOW` + `O_NONBLOCK` + size cap, never read. That
+    refusal, and a plain missing file, both serve `docs_consulted: None` —
+    this route draws no distinction between "never written" and "unreadable,"
+    since a caller can only act on "I have it" or "I don't."
+    `RP._read_meta_bounded` returns the parsed JSON only when it is a dict;
+    this route serves that dict verbatim as `docs_consulted`, including its
+    `docs` key, with no further validation of what is inside it.
+    """
+    facts = RP.resolve_run_facts(run_id)
+    if not facts.found:
+        return {"found": False}
+    privacy_row = {"repo": facts.repo, "run_id": run_id, "started_at": facts.started_at}
+    if _run_is_private(privacy_row, snapshot):
+        return {"found": True, "private": True}
+    docs_consulted = RP._read_meta_bounded(facts.run_dir / "docs_consulted.json")
+    return {"found": True, "docs_consulted": docs_consulted}
+
+
+# --- /sessions: what each co session is doing, for Orient's /crews (the operator's
+# 2026-09-03 approval; Orient's render half is issue_01M1MBH9920RGQZMSES9BC1SB2).
+# The data is already collected — `session_lifecycle.sessions()` for the tmux
+# roster, `session_state.session_state()` for one session's state — so this is
+# a new projection over existing collectors, not a new collection mechanism.
+SESSION_FIELDS = ("session", "state", "alive", "progressing", "last_event_age",
+                  "ctx_pct", "agent_run_count", "working_on")
+WORKING_ON_FIELDS = ("text", "age", "since", "stale")
+
+
+def _project_slug_for_cwd(cwd, homes: "dict[str, Path]") -> "str | None":
+    """Which registered project's `home_dir` contains `cwd`, or None.
+
+    Mirrors `private_crew.private_home_for`'s own inode-based walk (a cwd can
+    reach a home directory through a different spelling — this machine's
+    case-insensitive boot volume, or a symlink) but generalized from "is this
+    cwd under any PRIVATE crew's home" to "is this cwd under ANY registered
+    project's home". That is the question the `/sessions` row filter needs
+    answered first, before it can even ask whether the resolved project is
+    private. Neither `private_crew.py` nor `projects.py` exposes this reverse
+    lookup today — `private_home_for` only ever walks the private subset, and
+    `projects.py` only goes slug -> path, never path -> slug — so this is new
+    rather than a second copy of an existing primitive.
+
+    `homes` is `_resolve_registry_snapshot`'s `homes_on_disk` — every
+    registered project (not only the private ones) whose `home_dir` both
+    resolves and exists on disk right now, never `homes` itself. This
+    function calls `os.path.samefile`, which needs a real directory on both
+    sides, so the existence filter belongs here rather than at the snapshot
+    shared with the privacy check (see `_resolve_registry_snapshot`'s
+    docstring for why those two must stay different dicts). This function
+    makes no `PJ.load()`/`PJ.home_path()` call of its own. It used to:
+    calling both fresh on every session row meant a cwd resolved here could
+    reflect a NEWER registry generation than the privacy set
+    `_sessions_payload` checked it against moments later, under this
+    server's threaded concurrency (reviewer + security-reviewer, round 4).
+    An empty or `None` `homes` answers None, the same fail-closed result an
+    unreadable registry produced before — `_resolve_registry_snapshot`
+    already turned that exception into this state.
+
+    None on anything else unresolvable: no cwd, a cwd that does not exist on
+    disk, or no registered project's home_dir contains it.
+    """
+    if not isinstance(cwd, str) or not cwd:
+        return None
+    if not homes:
+        return None
+    try:
+        here = os.path.realpath(cwd)
+        if not os.path.isdir(here):
+            return None
+    except OSError:
+        return None
+    seen = 0
+    while seen < 64:
+        for slug, home in homes.items():
+            try:
+                if os.path.samefile(here, home):
+                    return slug
+            except OSError:
+                continue
+        parent = os.path.dirname(here)
+        if parent == here:
+            return None
+        here = parent
+        seen += 1
+    return None
+
+
+def _session_row(name: str) -> dict:
+    """One session's Orient-facing row, built field by field from
+    `session_state()`'s output — never a spread, never a nested sub-object,
+    never a forwarded array. `session_state()`'s own payload carries the
+    dispatch prompt this route must never leak at THREE separate paths
+    (`agent_runs[].task`, `vitals.agent_runs[].task`,
+    `working_on_derived.text` — a truncation of the same string, hiding
+    under a key named after a field that IS meant for display). Two
+    reviewers hunting for exactly that string each missed at least one copy.
+    Naming every scalar here, one at a time, means a field left out of this
+    builder cannot appear in the response at all, and a field forgotten from
+    `SESSION_FIELDS` is a blank column in Orient rather than a silent leak.
+
+    `working_on`, not `working_on_derived`: a working-on line is text the co
+    wrote about itself for someone watching its pane — authored for display.
+    `working_on_derived` is assembled from dispatch prompts and recent
+    session text for a purpose nobody wrote it to be read for; it is the
+    field that defeated both reviewers above and it is never served here.
+
+    `SS.session_state(name)` itself calls `projects.dispatch_is_private`
+    LIVE and unsnapshotted, twice over — once building `agent_runs` (via
+    `_crew_is_shareable`), once building `working_on_derived` (via
+    `_dispatched_by`) — with no awareness of this route's per-request
+    registry snapshot at all (see `_resolve_registry_snapshot`'s docstring).
+    That is harmless ONLY as long as this function keeps doing what it does
+    above: taking `agent_run_count` as a length rather than reading
+    `agent_runs` itself, and never touching `working_on_derived`. Add either
+    one here and this route starts serving a privacy decision made against a
+    registry generation nothing else in this request was checked against.
+    """
+    state = SS.session_state(name)
+    vitals = state.get("vitals") or {}
+    agent_runs = state.get("agent_runs") or []
+    working_on = state.get("working_on") or {}
+    return {
+        "session": name,
+        "state": state.get("state"),
+        "alive": state.get("alive"),
+        "progressing": state.get("progressing"),
+        "last_event_age": state.get("last_event_age"),
+        "ctx_pct": vitals.get("ctx_pct"),
+        "agent_run_count": len(agent_runs) if isinstance(agent_runs, list) else 0,
+        "working_on": {
+            "text": working_on.get("text"),
+            "age": working_on.get("age"),
+            "since": working_on.get("since"),
+            "stale": working_on.get("stale"),
+        },
+    }
+
+
+def _sessions_payload(snapshot: "dict | None") -> dict:
+    """Every session backing a registered, non-private project — an
+    ALLOWLIST, not an exclusion of black-box crews, and the two are not the
+    same filter here. The live tmux session list also holds the operator's
+    personal-assistant surfaces (`ask`, `ask--audio`, `Car`, `Tennis`) —
+    not projects at all, and for these the session NAME is itself the
+    content (`ask--audio` names its own topic). `is_private_slug` answers
+    `False`, not `UNKNOWN`, for a name that is not in the registry at all —
+    an "exclude when private" filter would read that `False` as "safe to
+    serve" and pass every one of these straight through. So a row is served
+    only when the session's cwd resolves (via `_project_slug_for_cwd`, by
+    `home_dir`, not by matching the tmux session name to a slug) to a slug
+    that IS in the registry, and that slug is not in `projects.
+    private_slugs()`.
+
+    A session whose cwd cannot be resolved to a registered project is
+    OMITTED, not served as an unscoped row. This can under-report: an idle
+    session may carry no cwd at all, so a real crew could be briefly absent
+    from this list. If that turns out to drop live crews in practice, the
+    fix is an explicit session-to-project field in the registry, not a
+    looser filter here — left to whoever hits it.
+
+    `snapshot` is the per-request registry snapshot `Handler.do_GET` resolves
+    once via `_resolve_registry_snapshot` — `private_slugs` for the row
+    filter below, `homes_on_disk` threaded on into `_project_slug_for_cwd`,
+    so both the cwd resolution and the privacy check for every row in this
+    one response are judged against the SAME registry generation (round 4,
+    reviewer + security-reviewer; see `_resolve_registry_snapshot`'s
+    docstring for the staleness window that closed, and for why cwd
+    resolution reads the on-disk subset rather than the same `homes` dict
+    the privacy check uses). `None` means the registry read itself failed —
+    an unreadable registry means NO row can be confirmed non-private, so
+    this answers an empty list rather than letting the exception crash the
+    request or, worse, skipping the filter and serving every session
+    unfiltered. This function makes no `projects.py` call of its own.
+    """
+    if snapshot is None:
+        return {"generated_at": T.now_iso(), "sessions": []}
+    private = snapshot["private_slugs"]
+    homes = snapshot["homes_on_disk"]
+    listed = SL.sessions().get("sessions") or []
+    rows = []
+    for entry in listed:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        slug = _project_slug_for_cwd(entry.get("path"), homes)
+        if slug is None or slug in private:
+            continue
+        try:
+            rows.append(_session_row(name))
+        except Exception:  # noqa: BLE001 — one bad session must not sink the batch
+            continue
+    return {"generated_at": T.now_iso(), "sessions": rows}
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send_json(self, code: int, obj: dict) -> None:
+        raw = json.dumps(obj).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        # No X-Frame-Options, unlike session-view's HTML responses: framing
+        # protection defends against an HTML page being embedded and tricked
+        # into interaction, which doesn't apply to a JSON response nothing
+        # renders as a page. nosniff is the header that matters here — it
+        # stops a browser from reinterpreting this as something else.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802
+        # Structural, not per-builder: see _reload_project_registry's
+        # docstring for why this sits here rather than in each payload
+        # builder (the round-1 miss that shipped /runs with no privacy
+        # filter at all was exactly this shape — a route that has to
+        # remember to do its own setup).
+        _reload_project_registry()
+        # Resolved ONCE, here, and threaded through as a plain argument —
+        # the reload above clears the shared cache but pins nothing for THIS
+        # request; see _resolve_registry_snapshot's docstring for the
+        # cross-thread staleness that a reload alone left open (round 4).
+        snapshot = _resolve_registry_snapshot()
+        path = urlparse(self.path).path
+        if path == "/runs":
+            return self._send_json(200, _runs_payload(snapshot))
+        m = _FACTS_PATH_RE.match(path)
+        if m:
+            return self._send_json(200, _facts_payload(m.group(1), snapshot))
+        m = _DOCS_FETCHED_PATH_RE.match(path)
+        if m:
+            return self._send_json(200, _docs_fetched_payload(m.group(1), snapshot))
+        m = _DOCS_GIVEN_PATH_RE.match(path)
+        if m:
+            return self._send_json(200, _docs_given_payload(m.group(1), snapshot))
+        if path == "/sessions":
+            return self._send_json(200, _sessions_payload(snapshot))
+        self._send_json(404, {"error": "not found"})
+
+    def log_message(self, *args) -> None:
+        """Silence per-request logging: this runs unattended under launchd."""
+        return
+
+
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn,
+                              socketserver.UnixStreamServer):
+    """HTTP over a unix socket (same shape as session-view's).
+
+    BaseHTTPRequestHandler expects a (host, port) client_address; a unix peer
+    has none, so hand it a placeholder rather than let formatting blow up
+    mid-request.
+    """
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def get_request(self):
+        conn, _ = self.socket.accept()
+        return conn, ("unix", 0)
+
+
+def _serve_unix(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A stale socket from a killed run would make bind() fail with EADDRINUSE and
+    # read as "already running" when nothing is.
+    if path.exists():
+        try:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            probe.connect(str(path))
+            probe.close()
+            print(f"run-register-api: already serving on {path}", file=sys.stderr)
+            return 1
+        except OSError:
+            path.unlink(missing_ok=True)
+
+    # Create it private BEFORE anything can connect: a window at the default
+    # umask is exactly the exposure the socket exists to close.
+    old = os.umask(0o177)
+    try:
+        srv = ThreadingUnixHTTPServer(str(path), Handler)
+    finally:
+        os.umask(old)
+    os.chmod(path, 0o600)
+
+    # SIGTERM is how this actually dies (pkill, launchd), and the default
+    # disposition skips the cleanup below — leaving a stale socket that reads
+    # as "already running" on the next start.
+    def _bye(_sig, _frm):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _bye)
+
+    print(f"run-register-api: serving on {path} (owner-only)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nrun-register-api: stopped")
+    finally:
+        srv.server_close()
+        path.unlink(missing_ok=True)
+    return 0
+
+
+def main() -> int:
+    return _serve_unix(SOCKET_PATH)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

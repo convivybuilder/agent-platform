@@ -1,0 +1,90 @@
+#!/usr/bin/env python3.11
+"""worktrees-cleanup — remove extra worktrees that are safe to drop.
+
+Safe = not the primary, not in use by an active agent, no real uncommitted
+changes (untracked debris like venvs/caches/pr-body.md and the files
+`knowledge-ctx use` rendered into .claude/ don't count), and
+either not ahead of the base branch or ahead only with a MERGED PR (squash
+merges keep branches "ahead" forever). Reaped branches are deleted locally so
+allocate_worktree can't resurrect them. Defaults to --dry-run; pass --commit
+to act.
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import worktrees as W  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description="Remove extra worktrees with no active agent and no uncommitted work.")
+    p.add_argument("--base-branch", default=W.DEFAULT_BASE_BRANCH,
+                   help="branch used for ahead/behind comparison (default: main)")
+    p.add_argument("--commit", action="store_true",
+                   help="actually remove (default is dry-run)")
+    args = p.parse_args(argv)
+
+    cands = W.cleanup_candidates(base_branch=args.base_branch)
+    strays = W.unregistered_dirs()
+    if not cands and not strays:
+        print("(no extra worktrees found)")
+        return 0
+
+    removable = [c for c in cands if c.reason.startswith("removable")]
+    skipped = [c for c in cands if not c.reason.startswith("removable")]
+
+    for c in cands:
+        marker = "DROP" if c.reason.startswith("removable") else "skip"
+        print(f"{marker:>4}  {c.worktree.label:<50s}  ({c.reason})")
+
+    for path, kind in strays:
+        print(f"left  {path.name:<50s}  (not a worktree: {kind})")
+
+    def summary() -> None:
+        print(f"\n{len(removable)} removable, {len(skipped)} kept, {len(strays)} left alone, by reason:")
+        for reason, n in W.reason_counts(cands):
+            print(f"  {n:>5}  {reason}")
+        for kind in sorted({k for _, k in strays}):
+            print(f"  {sum(1 for _, k in strays if k == kind):>5}  not-a-worktree:{kind}")
+
+    if not args.commit:
+        summary()
+        print("\n[dry-run] Re-run with --commit to drop.")
+        return 0
+
+    print()
+    errors = removed = 0
+    for c in removable:
+        wt = c.worktree
+        try:
+            skip_reason, fresh_dirty = W.recheck_candidate(c)
+            if skip_reason:
+                print(f"SKIP (state changed to {skip_reason}): {wt.label}")
+                continue
+            # recheck_candidate re-verified real_dirty_files == 0 on the current
+            # snapshot, so any remaining files are debris. Plain git worktree remove
+            # refuses untracked files — force past debris using the fresh count.
+            W.remove_worktree(wt.path, force=fresh_dirty > 0)
+            removed += 1
+            print(f"removed: {wt.label}")
+        except subprocess.CalledProcessError as e:
+            errors += 1
+            print(f"ERROR removing {wt.label}: {e.stderr.strip() if e.stderr else e}")
+            continue
+        if wt.branch and wt.branch != args.base_branch:
+            # -D only when a merged PR was verified; otherwise -d, which succeeds
+            # only for branches already an ancestor of HEAD.
+            if W.delete_branch(wt.primary, wt.branch, force=(c.reason == "removable:pr-merged")):
+                print(f"  branch deleted: {wt.branch}")
+    summary()
+    print(f"\nremoved {removed} of {len(removable)} removable ({errors} errors).")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

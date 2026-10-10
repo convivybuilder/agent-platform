@@ -1,0 +1,186 @@
+#!/bin/zsh
+# launch-weekly-kb-audit — read the KB's write history back, once a week, and
+# re-read who could write to it from GitHub's live settings.
+#
+# The compensating control ARCH-408 attached to `in-session` provenance. That
+# provenance grants a direct write to knowledge/main on the writing agent's own
+# attestation that the operator agreed to the change; it was accepted on the condition
+# that those writes get read back in batch. Until this ran, they never were.
+#
+# It also reports the bypass class: a commit reaching main by neither the cage
+# nor a PR merge. Nothing else in the platform notices those — the ARCH-395
+# pre-commit hook blocks committing ON main, not pushing TO it from a branch, so
+# a `git push HEAD:main` sails past it. The first real run found six in a week.
+#
+# A SECOND, LIVE GITHUB READ ANSWERS WHO COULD WRITE, ONE LEVEL UP FROM THE
+# HISTORY READ ABOVE (issue_01KZQA9FK7F6GZS4E4NCQRH0YB): collaborators, teams,
+# the repo's default workflow-token permissions, any workflow file granting
+# itself `contents: write`, and every GitHub App installed on the org. Two of
+# those controls were verified once, by hand, on 2026-08-11 and closed as
+# fixed — and "verified once" is not "in force" with nothing watching it. This
+# is the only call in this job that reaches the network; `kb_audit.main()`
+# authenticates as the convivy-bosun GitHub App and makes read-only GET calls.
+#
+# Output goes to the operating plane as a signal, NOT to Slack: the operator stopped
+# reading Slack on 2026-07-21, so a report posted there is delivered-looking and
+# unread. The log below is the fallback for when the plane is unreachable.
+#
+# Exit code carries the finding, so `launchctl list` shows a non-zero status
+# rather than a healthy job hiding a real result — the same failure the
+# briefing job had for a day, a silent problem behind a successful-looking run:
+#   1 — the write-history read itself could not run (could not read git)
+#   2 — the access read could not read at least one GitHub surface; NEVER
+#       treated as a pass, because a check that cannot fail is worse than none
+#   3 — the write-history read found a bypass (neither the cage nor a PR merge)
+#   4 — the access read found a drift from the recorded expectation
+
+set -u
+
+# Resolve this script's OWN location, following symlinks — so a deployed copy
+# (platform/decisions/0059 rule 1) reaches its own deploy-area sibling, and
+# the ~/.local/bin symlink into the checkout (rule 5) still reaches the
+# checkout's sibling. Bash equivalent of bin/check-cli-contracts's
+# pathlib.Path(__file__).resolve(): a real file is already its own answer, a
+# symlink chain is followed back to what it points at. Bounded at 20 hops so a
+# symlink CYCLE errors out rather than spinning forever in an unattended job —
+# pathlib.Path.resolve() raises on a cycle; this is bash's version of the same
+# guard (security-reviewer, round 6).
+_self="$0"
+_hops=0
+while [ -L "$_self" ]; do
+    _hops=$((_hops + 1))
+    if [ "$_hops" -gt 20 ]; then
+        echo "$(basename "$0"): symlink cycle resolving \$0 (>20 hops) — aborting" >&2
+        exit 1
+    fi
+    _link_dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in
+        /*) ;;
+        *) _self="$_link_dir/$_self" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+
+# Run records live under builder_root.data_root() (company/decisions/0008):
+# BUILDER_ROOT when set, else the machine's root, printed by the sibling
+# bin/builder-root.
+DATA_ROOT="${BUILDER_ROOT:-$("$SCRIPT_DIR/builder-root")}" || exit 1
+LOG=$DATA_ROOT/agent-runs/weekly-kb-audit.log
+AGENTCTL=$SCRIPT_DIR/agentctl               # sibling-resolved above, not ~/.local/bin (rule 5)
+SINCE=${KB_AUDIT_SINCE:-8.days}             # a day of overlap, so a run that slips cannot skip a day
+# Resolved relative to THIS file (symlinks followed), not hardcoded to
+# ~/.local/lib/agent-platform — that farm symlinks into whichever branch the
+# agent-platform checkout is on (platform/decisions/0059 rule 1), which is
+# exactly the hazard a deploy-pinned copy of this script must not reach back
+# into. A deployed copy resolves this to its own deploy area's lib/; the
+# interactive symlink at ~/.local/bin resolves it to the checkout, same as today.
+LIB_DIR=${0:A:h}/../lib/agent-platform
+
+log() { print -r -- "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >>$LOG }
+
+if [[ ! -x $AGENTCTL ]]; then
+    log "ERROR: $AGENTCTL not found; skipping"
+    exit 1
+fi
+
+report=$($AGENTCTL kb audit --since "$SINCE" 2>&1)
+rc=$?
+
+log "$report"
+
+# The access read: who could write, from GitHub's live settings. A separate
+# process from the write-history read above — it is the only network call in
+# this job, and keeping it a separate `kb_audit.main()` invocation means a
+# GitHub outage or a credential problem shows up as its own exit code (2)
+# rather than as a bypass finding (3) from a command that never ran, which is
+# exactly the failure `agentctl kb audit` itself already guards against
+# (THREE, NOT TWO, in cmd_kb_audit's own docstring).
+access_report=$(/usr/bin/env python3.11 "$LIB_DIR/kb_audit.py" 2>&1)
+access_rc=$?
+
+log "$access_report"
+
+# Post to the plane so it lands where decisions and issues already live.
+#
+# An outcome with a bypass or a live-access drift is an ALERT
+# (/engineering/alerts): either way, something wants attention. A clean week on
+# both reads is a REPORT (/memory/reports), the right weight for "nothing to
+# see" — a routine result filed as an alert is how a reader learns to dismiss
+# alerts.
+/usr/bin/env python3.11 - "$report" "$rc" "$access_report" "$access_rc" "$LIB_DIR" <<'PYEOF' >>$LOG 2>&1
+import datetime
+import sys
+sys.path.insert(0, sys.argv[5])
+try:
+    import signal_client
+except Exception as e:                       # never fail the audit on a capture problem
+    print(f"kb-audit: could not import signal_client ({e}); the report is in the log")
+    raise SystemExit(0)
+
+report, rc, access_report, access_rc = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+# External output, so both reports are sanitised (escapes stripped, credentials
+# redacted) before either lands on any tiered page, as an alert or as the
+# weekly report. PER LINE, so the structure survives the treatment —
+# `sanitise` collapses newlines, and both reports are deliberately multi-line
+# and meant to be skimmed (`render`/`render_access`'s own docstrings); a
+# single sanitise call over the whole string would flatten each one to a
+# single unreadable line, the same fix bin/agent-platform-autopull already
+# applies for the same reason (reviewer, PR #803 round 1).
+def _sanitise_report(text: str) -> str:
+    return "\n".join(signal_client.sanitise(line) for line in text.splitlines())
+
+combined = _sanitise_report(report) + "\n\n" + _sanitise_report(access_report)
+
+# AN AUDIT THAT FAILED IS NOT A CLEAN WEEK. The write-history read's only
+# outcomes are 0 and 3; the access read's are 0, 2 and 4. Anything else means
+# that read could not answer, and posting that as a routine report would put
+# "nothing to see" on the plane for a week nobody actually examined — the
+# exact shape of the briefing bug this platform spent a day not noticing, so
+# it gets its own alert rather than a quiet skip. This also covers the access
+# read being UNABLE to read a GitHub surface (exit 2): that is never reported
+# as clean either, because a check that cannot fail is worse than none.
+if rc not in ("0", "3") or access_rc not in ("0", "2", "4"):
+    signal_client.post_alert(
+        "kb-audit", f"The weekly KB audit could not fully run (write-history exit "
+                    f"{rc}, access exit {access_rc}). Treat this as unknown, not "
+                    f"clean.\n\n{combined}",
+        product="substrate")
+    print(f"kb-audit: audit failed (write {rc}, access {access_rc}); alerted "
+          f"rather than reported clean")
+    raise SystemExit(0)
+
+concerning = rc == "3" or access_rc in ("2", "4")
+post = signal_client.post_alert if concerning else signal_client.post_report
+# (year, week), not week alone: week 30 of 2027 would otherwise collide with
+# week 30 of 2026 and silently dedup away a whole post.
+year, week, _ = datetime.date.today().isocalendar()
+res = post("kb-audit", combined, product="substrate",
+           # One row per week per outcome, so a manual re-run does not duplicate
+           # it while a CHANGE of outcome still posts.
+           dedup_key=f"kb-audit-{year}-w{week:02d}-"
+                     f"{'alert' if concerning else 'clean'}")
+print(f"kb-audit: signal {res}" + (" (FINDING)" if concerning else ""))
+PYEOF
+
+# Priority order for the exit code: a read that could not run at all (1) or
+# could not read a live surface (2) outranks a read that ran and found
+# something (3, 4) — an unreadable surface is the one outcome this exit code
+# must never let read the same as 0.
+if (( rc != 0 && rc != 3 )); then
+    log "the write-history read failed (exit $rc)"
+    exit $rc
+elif (( access_rc == 2 )); then
+    log "COULD NOT READ A LIVE GITHUB SURFACE — see the report above; exiting non-zero so this run reads as unhealthy rather than clean"
+    exit 2
+elif (( rc == 3 )); then
+    log "BYPASSES FOUND — see the report above; exiting non-zero so this run reads as unhealthy"
+    exit 3
+elif (( access_rc == 4 )); then
+    log "ACCESS DRIFT FOUND — see the report above; exiting non-zero so this run reads as unhealthy"
+    exit 4
+elif (( access_rc != 0 )); then
+    log "the access read failed (exit $access_rc)"
+    exit $access_rc
+fi
+exit 0

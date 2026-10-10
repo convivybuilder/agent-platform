@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Make each multi-directory project's inboxes ONE inbox, by symlink (ARCH-426).
+
+A project with a home directory and associated directories has one inbox per
+directory and one reader. The co watches the home directory's inbox, so a note an
+agent drops while standing in an associated directory is never read. `svc` is the
+live case: agents working in `convivy-services` write to that repo's inbox and the
+svc co, watching `convivy-app-kit/inbox`, sees nothing.
+
+This points every associated directory's `inbox/` at the home directory's, so the
+project having one inbox is true at the filesystem level rather than true only for
+callers that consult the registry. `projects.inbox_links()` computes the pairs;
+this applies them.
+
+WHAT IT WILL NOT DO: replace a directory that has content in it. A real `inbox/`
+holding notes is data, and turning it into a link would discard them silently.
+Those are reported and skipped, the operator merges them into the home inbox, and
+a re-run finishes the job. An EMPTY directory is replaced, since there is nothing
+to lose.
+
+Neither repo tracks a file under `inbox/` and both gitignore `inbox/handled/`, so
+the link itself commits nothing.
+
+Usage:
+    link-project-inboxes                 # apply to every registered project
+    link-project-inboxes --project svc   # just one
+    link-project-inboxes --check         # report drift, change nothing, exit 1 if any
+
+Exit status: 0 when everything is linked, 1 when something needs attention — a
+blocked directory, or (under --check) a link that is missing or wrong.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import projects  # noqa: E402
+
+
+def link_one(link: Path, target: Path, *, check: bool) -> tuple[bool, str]:
+    """Bring one (link, target) pair into the desired state.
+
+    `target` is relative to the link's PARENT, which is what keeps the farm valid
+    when the base directory moves. Returns (ok, message); ok=False means the pair
+    needs attention — blocked by real content, or, under --check, not yet linked.
+    """
+    resolved_target = (link.parent / target).resolve()
+
+    if link.is_symlink():
+        if os.readlink(link) == str(target):
+            return True, f"ok        {link} -> {target}"
+        # A link pointing somewhere else is ours to correct: replacing a symlink
+        # destroys no content, only the pointer.
+        if check:
+            return False, f"WRONG     {link} -> {os.readlink(link)} (want {target})"
+        link.unlink()
+        link.symlink_to(target)
+        return True, f"repointed {link} -> {target}"
+
+    if link.is_dir():
+        entries = list(link.iterdir())
+        if entries:
+            return False, (
+                f"BLOCKED   {link} is a directory holding {len(entries)} "
+                f"entr{'y' if len(entries) == 1 else 'ies'} — merge them into "
+                f"{resolved_target} and re-run; this will not discard them")
+        if check:
+            return False, f"MISSING   {link} is an empty directory (want -> {target})"
+        try:
+            link.rmdir()
+        except OSError as e:
+            # Something landed in the directory between the emptiness check above
+            # and this call. `rmdir(2)` is the atomic backstop and refuses a
+            # non-empty directory unconditionally, so no note can be lost here —
+            # but letting the OSError propagate would end the run in a traceback
+            # instead of the BLOCKED line the operator can act on.
+            return False, (
+                f"BLOCKED   {link} gained content while being linked ({e.strerror}) "
+                f"— merge it into {resolved_target} and re-run")
+        link.symlink_to(target)
+        return True, f"linked    {link} -> {target}"
+
+    if link.exists():
+        return False, f"BLOCKED   {link} is a file, not a directory — resolve by hand"
+
+    if check:
+        return False, f"MISSING   {link} is absent (want -> {target})"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return True, f"linked    {link} -> {target}"
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--project", help="one project slug; default is every registered project")
+    p.add_argument("--check", action="store_true",
+                   help="report drift and change nothing; exit 1 if any link is missing or wrong")
+    args = p.parse_args(argv)
+
+    slugs = [args.project] if args.project else sorted(projects.load())
+    if args.project and projects.get(args.project) is None:
+        print(f"link-project-inboxes: no such project: {args.project}", file=sys.stderr)
+        return 1
+
+    problems = 0
+    acted = 0
+    for slug in slugs:
+        pairs = projects.inbox_links(slug)
+        if not pairs:
+            continue
+        for link, target in pairs:
+            # The home inbox is the link's destination, so it has to exist or every
+            # link dangles. Creating it is safe and idempotent.
+            home_inbox = (link.parent / target)
+            if not args.check and not home_inbox.exists():
+                home_inbox.mkdir(parents=True, exist_ok=True)
+                print(f"{slug}: created   {home_inbox.resolve()}")
+            ok, msg = link_one(link, target, check=args.check)
+            print(f"{slug}: {msg}")
+            if not ok:
+                problems += 1
+            elif not msg.startswith("ok"):
+                acted += 1
+
+    if problems:
+        # Flush first: the summary is a conclusion about the lines above it, and
+        # unflushed stdout would print it before the detail it summarises.
+        sys.stdout.flush()
+        print(f"\n{problems} inbox link(s) need attention.", file=sys.stderr)
+        return 1
+    if args.check:
+        print("\nEvery project inbox link is in place.")
+    elif acted:
+        print(f"\n{acted} inbox link(s) created or repointed.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

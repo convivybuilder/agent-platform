@@ -1,0 +1,800 @@
+#!/usr/bin/env python3.11
+"""Are the live-deployed primary checkouts still on main? (substrate ARCH-437)
+
+WHAT THIS PROTECTS. Several repos are deployed by being READ where they sit.
+`~/.local/bin` and `~/.local/lib` symlink into agent-platform's working tree
+(ARCH-229), orient's server renders from its checkout at request time (ARCH-182),
+the knowledge watcher indexes the knowledge checkout, and the operator's lab publish runs
+from the lab checkout. For all of them the branch the PRIMARY happens to sit on is
+the code that actually runs — so a checkout left on a feature branch silently
+serves un-merged work to every scheduled job on the box.
+
+WHY A MONITOR, GIVEN ARCH-396 ALREADY INSTALLED A HOOK. Two hooks exist and
+neither can close this. `pre-commit` refuses a commit made in the primary, which
+does not fire on a pure branch switch. `post-checkout` catches the switch and
+CANNOT BLOCK — git ignores its exit code — so it prints a warning into whichever
+terminal ran the checkout. When that terminal belongs to an agent, the warning is
+delivered and read by nobody, which is the same false-confidence shape as a Slack
+post into a channel no one opens.
+
+It has now happened twice. On 2026-07-22 agent-platform's primary sat on a deck
+branch for a day while three merged PRs went unrun by the overnight; that incident
+produced ARCH-396 and the hooks. On 2026-08-02 it sat on
+`feat/session-view-deck-open-anchors` for seven minutes, was harmless only because
+the branch pointer happened to equal main's head, and was noticed by a DIFFERENT co
+session rather than by anything watching. A guard that depends on a human reading a
+warning is not a guard; this is the check that does not.
+
+BEHAVIOUR. A pass is silent. A breach logs an alert signal against the affected repo
+(with dedup_key scoped to the UTC day, so a checkout left off main logs once a day
+while it stays there, and again when it returns on a later day; one that returns
+within the same UTC day logs nothing after that day's first signal, unless its key differs:
+a job breach keys on its label, so a return with a different label logs again),
+EXCEPT for a black-box crew — see below. A missing checkout degrades gracefully —
+the repo is simply not checked. It never creates a work item (platform/decisions/0073).
+
+A SECOND, INDEPENDENT BREACH: the job itself is not loaded or is disabled.
+`com.convivy.appkit.autoupdate` sat disabled for 26 days before anyone noticed
+(engineering-practice/skills/security-review-rubric rule 2) — a branch check can
+never catch this, because a job that never fires also never leaves its checkout
+on the wrong branch. `launchctl bootstrap` reports a disabled service only as an
+opaque I/O error, so nothing short of asking `launchctl` directly surfaces it.
+For each label declared in `_LIVE_CHECKOUTS[repo]["jobs"]`, `check_jobs` asks
+`launchctl list <label>` (not loaded -> breach) against one `launchctl
+print-disabled gui/<uid>` queried once for the whole sweep (listed disabled ->
+breach; the query itself failing or printing something unparseable -> breach,
+never a pass — a "disabled" that could not be checked must never read as
+"enabled"). Logged on its own `dedup_key` (`primary-checkout:job:<repo>:<label>`),
+separate from the branch check's (`primary-checkout:<repo>`), so neither
+condition's signal can mask the other's.
+
+A BLACK-BOX CREW'S BREACH IS NEVER LOGGED. ADR-0043 says "a black box crew files
+no issues and logs no signals", and that rule is about the finding's EXISTENCE in
+the shared, multi-reader signal store rather than about how much it says — so it
+binds this check even though the only thing it ever reports is a branch name.
+That is not incidental here: a private crew's branch name can itself name a
+client or a deal. `main()` calls `_is_private_checkout` before building any
+title, body, or dedup_key, on BOTH logging paths (the per-repo breach loop and the
+unclassified audit), via the SAME registry lookup `check-serving-checkouts` and
+`session_state.py` use — `private_crew.private_home_for`, not a second
+implementation that could drift. A private crew's breach is still COUNTED toward
+the exit code and still PRINTED in full to this process's own stderr; it simply
+never reaches `signal_client`. So an operator reading this machine's own logs sees
+everything, and the shared signal store sees nothing.
+
+DELIBERATELY NOT SELF-HEALING. Switching a checkout back to main under whoever is
+working in it would discard their context and could strand uncommitted work. The
+correct actor is the person or agent that moved it, and the correct output is a
+loud, durable alert naming what to run.
+
+SCOPE. This checks the BRANCH only. Whether a checkout is BEHIND origin/main is a
+different question with a different owner (`com.convivy.agent-platform-autopull`), and
+folding the two would make one alert mean two things.
+
+SAFETY. Read-only. Runs `git symbolic-ref` and nothing else; never checks out,
+fetches, or writes to any repo.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+from typing import Any, NamedTuple
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR  # noqa: E402
+
+CONVIVY_ROOT = BR.root()
+
+# The repos whose PRIMARY checkout is read live by something scheduled, and what
+# reads it. DECLARED, not discovered: a repo that is merely present must not be
+# policed, and only the deployment mechanism tells the two apart. The `reads` text
+# goes into the alert, so whoever gets paged learns what is actually affected
+# rather than only that a rule was broken.
+#
+# `jobs`: the launchd labels, among those already named in `reads` above, whose
+# liveness `check_jobs` also checks. DECLARED here rather than parsed out of the
+# `reads` prose at runtime, for the same reason the repo list itself is declared
+# and not discovered: a rewording of `reads` that happened to drop a label's exact
+# spelling would silently stop checking it, with nothing to say so. Left empty
+# where `reads` names no single job: `agent-platform`'s "every cron job",
+# `convivy-orient`'s `serve.sh`, and `selector`'s deliberately unenumerated
+# `com.selector.*` family (see the comment at that entry for why).
+_LIVE_CHECKOUTS: dict[str, dict[str, Any]] = {
+    "agent-platform": {
+        "reads": "~/.local/bin and ~/.local/lib symlink into this working tree "
+                 "(ARCH-229), so every cron job and the 01:00 overnight run "
+                 "whatever branch it sits on",
+        "adr": "ARCH-396",
+        "jobs": (),
+    },
+    "knowledge": {
+        "reads": "com.convivy.knowledge-watcher indexes this checkout, so an "
+                 "off-main branch changes what every agent can retrieve",
+        "adr": "ARCH-395",
+        "jobs": ("com.convivy.knowledge-watcher",),
+    },
+    "convivy-orient": {
+        "reads": "serve.sh runs the site from this checkout and the full-tier "
+                 "dashboards render live per request (ARCH-182), so team.convivy.com "
+                 "serves whatever branch it sits on",
+        "adr": "ARCH-182",
+        "jobs": (),
+    },
+    # The four below came out of PR #347's review. The reviewer found
+    # convivy-services; sweeping every launchd plist for the same shape found the
+    # other three, which is the fourth time in two days that a list of "the places
+    # X happens" was short. The audit below is the answer to that pattern.
+    "convivy-services": {
+        "reads": "com.convivy.think-gateway is a PERSISTENT service (KeepAlive) "
+                 "running convivy_services from an EDITABLE install in this "
+                 "checkout's .venv, so uvicorn imports the source tree directly — "
+                 "every /think request the mini serves runs whatever branch this "
+                 "checkout sits on, from the next request onward",
+        "adr": "ARCH-249",
+        "jobs": ("com.convivy.think-gateway",),
+    },
+    # No job COUNTS in these descriptions, deliberately. The first version said
+    # "nine launchd jobs" for selector and the real number was ten; a count in a
+    # paging alert drifts every time a job is added or retired, and being wrong
+    # about the number is worse than not stating one, because it invites the
+    # reader to trust the rest of the sentence (reviewer, #347). The same reason
+    # leaves `jobs` empty here rather than guessing at individual labels: naming
+    # some of a `com.selector.*` family and not the rest would read as complete
+    # coverage while being exactly the gap this comment already warns against.
+    "selector": {
+        "reads": "the com.selector.* jobs — the web server, the poller, the "
+                 "backfills, the sweeps, the deploy — all run from this checkout, "
+                 "and the selector package is an EDITABLE install in its .venv, so "
+                 "the source tree is what they execute",
+        "adr": "ARCH-247",
+        "jobs": (),
+    },
+    "selector-backend": {
+        "reads": "com.selector-backend.api serves the MusicBrainz mirror API from "
+                 "this checkout",
+        "adr": "ARCH-247",
+        "jobs": ("com.selector-backend.api",),
+    },
+    "convivy-app-kit": {
+        "reads": "com.convivy.rails.update runs deploy-rails against this checkout "
+                 "(--kit-checkout) and the package is an EDITABLE install in its "
+                 ".venv, so the source tree is what a rails deploy ships. "
+                 "com.convivy.appkit.autoupdate also names this path but only "
+                 "`git pull --ff-only`s INTO it — it is not a reader, and a pull "
+                 "onto a feature branch is its own quiet problem",
+        "adr": "ARCH-249",
+        # BOTH checked, not just the reader: `com.convivy.appkit.autoupdate` is
+        # the exact job that sat disabled for 26 days unnoticed (module docstring
+        # "A SECOND, INDEPENDENT BREACH" above) — "not a reader" explains why the
+        # branch check above never names it, not why its own liveness wouldn't
+        # matter.
+        "jobs": ("com.convivy.rails.update", "com.convivy.appkit.autoupdate"),
+    },
+    # The two below came out of check-serving-checkouts' own launchd audit
+    # (agent-platform#423/#424) finding two checkouts a plist reads that were in
+    # NEITHER this dict nor _NOT_LIVE — the exact gap this file's completeness
+    # audit exists to surface, closed here by the audit's own next reader.
+    "library": {
+        "reads": "com.convivy.library runs the Library API straight out of this "
+                 "checkout (platform/decisions/0022 made it its own deployable "
+                 "service), so the branch it sits on is the code every request is "
+                 "served from — this is the checkout that served code from 19 "
+                 "hours before library#45 merged (2026-08-20) because nothing here "
+                 "had classified it as live",
+        "adr": "platform/decisions/0022",
+        "jobs": ("com.convivy.library",),
+    },
+    "CFO": {
+        "reads": "com.convivy.cfo-review reads this checkout",
+        "adr": "platform/decisions/0043",
+        "jobs": ("com.convivy.cfo-review",),
+    },
+}
+
+# Checkouts a launchd job references that are NOT branch-sensitive, each with the
+# reason. Empty today, and that is the point: the audit below treats an
+# unclassified referenced repo as a finding, so the next one forces a decision
+# rather than defaulting to unwatched.
+_NOT_LIVE: dict[str, str] = {}
+
+LAUNCH_AGENTS = pathlib.Path.home() / "Library" / "LaunchAgents"
+
+
+def launchd_referenced_repos(launch_agents: pathlib.Path,
+                             convivy_root: pathlib.Path) -> set[str]:
+    """<root>/<name> git repos that some launchd plist names.
+
+    THE LIST ABOVE IS DECLARED, which is correct — only the deployment mechanism
+    can say whether a branch is load-bearing, and discovery cannot tell "not
+    deployed" from "nobody added it". But a declared list rots, and this one was
+    short by four on the day it was written. This derives the CANDIDATES so the
+    audit can name what nobody has classified, without ever deciding for anyone.
+
+    Deliberately incomplete in the other direction too: agent-platform and
+    knowledge appear in no plist path, because their consumers reach them through
+    `~/.local/bin` symlinks and `~/.knowledge-index`. Discovery would miss the two
+    most important entries, which is why it audits rather than replaces.
+    """
+    found: set[str] = set()
+    try:
+        plists = sorted(launch_agents.glob("*.plist"))
+    except OSError:
+        return found
+    # Built from the root this run was TOLD to check, not from a hardcoded
+    # account-specific prefix. A hardcoded prefix silently matched nothing under
+    # `--convivy-root`, so the audit reported clean in every test and would have
+    # reported clean on any machine whose home is not `/Users/<name>`.
+    pattern = re.compile(
+        re.escape(str(convivy_root).rstrip("/")) + r"/([A-Za-z0-9][A-Za-z0-9._-]*)")
+    for p in plists:
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for name in pattern.findall(text):
+            # Only a primary checkout counts. A worktree path under
+            # <root>/worktrees/ or <root>/<repo>-wt/ is somebody's branch by
+            # design and is not what this guards.
+            if (convivy_root / name / ".git").exists():
+                found.add(name)
+    return found
+
+# Track how many report attempts failed. Reset each run. Distinguishes "breaches
+# logged OK" (exit 2) from "breaches but reporting failed" (exit 3).
+_report_failures: int = 0
+
+_LIB_DIR = pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"
+
+
+def _ensure_lib_on_path() -> None:
+    """Put the installed platform lib on sys.path exactly once.
+
+    Resolved relative to this file, not ~/.local/lib/agent-platform: that farm
+    symlinks into whichever branch the agent-platform checkout is on
+    (platform/decisions/0059 rule 1), which is exactly the hazard a
+    deploy-pinned copy of this script must not reach back into. A deployed
+    copy resolves this to its own deploy area's lib/; the interactive symlink
+    at ~/.local/bin resolves it to the checkout, same as before.
+    """
+    entry = str(_LIB_DIR)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+
+def _is_private_checkout(repo_dir: pathlib.Path) -> bool:
+    """Is this checkout a black-box crew's (`platform/decisions/0043`)?
+
+    Ported from `check-serving-checkouts`' function of the same name rather than
+    reimplemented — that file's docstring has the full history (security-reviewer,
+    PR #423, run-0d72a1e3): a finding's own EXISTENCE in the shared, multi-reader
+    signal store is the leak ADR-0043 forbids, independent of how little it says,
+    so CFO's breach here must never reach `_post_signal` even though this check has
+    always been branch-name-only and never reads file content.
+
+    Delegates to `private_crew.private_home_for`, the SAME registry lookup
+    `session_state.py`/`tmux_transcript.py`/`check-serving-checkouts` already use
+    — not a second implementation that could drift from theirs, and one that
+    compares real paths via `os.path.samefile` rather than a slug string, which
+    matters here specifically: CFO's checkout directory is capital-`CFO` on disk
+    while the registry slug is lower-case `cfo`.
+
+    Returns `True` — skip logging — both when the checkout genuinely IS private
+    and when that cannot be determined at all (the import failed, or
+    `private_home_for` returned its own `UNKNOWN`): fails CLOSED, since this
+    function is about to decide whether to WRITE something to a shared store.
+    """
+    try:
+        _ensure_lib_on_path()
+        import private_crew
+    except Exception:
+        return True  # cannot import the check -> cannot rule out private
+    home = private_crew.private_home_for(str(repo_dir))
+    return home is not None  # a real path or private_crew.UNKNOWN are both non-None
+
+
+def _utc_today() -> str:
+    """Today's UTC date, ISO format: the day scope of this monitor's dedup_key.
+
+    A named seam so a test can pin the day. main() reads it once per run and
+    passes that one value to every key the run writes."""
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _names_digest(names: list[str]) -> str:
+    """The identity of a set of names in a dedup_key. Joining them with `_` let `["x_y"]` and
+    `["x", "y"]` produce one key, so the second distinct breach answered `duplicate`. A hash of the
+    JSON list cannot collide that way (review of PR #788, rounds 1 and 2)."""
+    return hashlib.sha256(json.dumps(list(names)).encode("utf-8")).hexdigest()[:16]
+
+
+def _post_signal(product: str, title: str, body: str, dedup_key: str,
+                 *, dry_run: bool = False, severity: str = "high") -> dict[str, Any]:
+    """Log an alert signal for a breach. Best-effort. A signal, never a work item.
+
+    The harm is that unreviewed code is live to every scheduled job on the box, and
+    the window lasts until a human notices — which last time meant a full day. The
+    title leads the body, since a signal has no title field.
+    """
+    global _report_failures
+    if dry_run:
+        return {"status": "dry-run"}
+    try:
+        _ensure_lib_on_path()
+        import signal_client  # noqa: E402
+        status = signal_client.post_alert(
+            "primary-checkout", signal_client.sanitise_body(f"{title}\n\n{body}"),
+            product=product, dedup_key=dedup_key, meta={"severity": severity})
+        return {"status": status}
+    except Exception as exc:
+        _report_failures += 1
+        print(f"[REPORT-ERROR] {product}: {exc}", file=sys.stderr)
+        return {"status": f"error:{type(exc).__name__}"}
+
+
+def current_branch(repo_dir: pathlib.Path) -> tuple[str | None, str]:
+    """(branch, error). branch is None on a detached HEAD or an unreadable repo.
+
+    A DETACHED HEAD is a breach too, and naming it separately matters: it points
+    the deployment at an arbitrary commit with the same effect as a named branch
+    while reading, in `git status`, like something transient (#206 review made the
+    same point about the post-checkout hook).
+    """
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", str(repo_dir), "symbolic-ref", "--short", "-q", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as exc:
+        return None, f"could not read HEAD: {exc}"
+    try:
+        out, err = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        # `subprocess.run`'s timeout raises without reaping the child, and this
+        # runs every 15 minutes — a stalled filesystem would leave one hung git
+        # per sweep, forever (security-reviewer, #354). Reading a single-byte
+        # `.git/HEAD` should never take 30s, so a timeout is already anomalous;
+        # leaking the process on top of it is the part worth fixing.
+        proc.kill()
+        proc.communicate()
+        return None, "timed out reading HEAD (30s)"
+    if out.strip():
+        return out.strip(), ""
+    # `symbolic-ref -q` exits 1 with no output on a detached HEAD — but a
+    # corrupted object store or an unreadable `.git/HEAD` produces the same
+    # non-zero-and-empty signal, and reporting THAT as "detached HEAD" sends an
+    # operator debugging a cancelled night to look at branch state
+    # (security-reviewer, #354). Every branch below is still a breach; they
+    # differ only in what they tell the reader.
+    if proc.returncode == 1 and not err.strip():
+        return None, "detached HEAD"
+    detail = err.strip() or f"git exited {proc.returncode} with no output"
+    return None, f"HEAD is unreadable — not a branch and not a detached HEAD: {detail}"
+
+
+def check(repo: str, cfg: dict[str, Any], convivy_root: pathlib.Path,
+          *, verbose: bool = False) -> tuple[bool, str]:
+    """(ok, reason) for one repo."""
+    repo_dir = convivy_root / repo
+    if not (repo_dir / ".git").exists():
+        if verbose:
+            print(f"[SKIP] {repo}: no checkout at {repo_dir}")
+        return True, "checkout not found; not checked"
+
+    branch, err = current_branch(repo_dir)
+    if branch == "main":
+        if verbose:
+            print(f"[OK] {repo}: on main")
+        return True, "on main"
+    where = f"on '{branch}'" if branch else err
+    if verbose:
+        print(f"[BREACH] {repo}: {where}")
+    return False, where
+
+
+def _launchctl_list_one(label: str) -> tuple[bool, str]:
+    """(loaded, detail) via `launchctl list <label>`.
+
+    Exit 0 means launchd has a record of the job (running or merely waiting on
+    its trigger); a nonzero exit means it has none at all — `launchctl list
+    com.nonexistent` prints `Could not find service "..." in domain for port`
+    to stderr and exits 113 on this machine. That single state covers both
+    "never bootstrapped" and "unloaded after being disabled", which is correct
+    here: either way the job is not going to fire.
+    """
+    try:
+        proc = subprocess.run(["launchctl", "list", label],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"could not query launchctl: {exc}"
+    if proc.returncode == 0:
+        return True, ""
+    detail = proc.stderr.strip() or proc.stdout.strip() or f"launchctl list exited {proc.returncode}"
+    return False, detail
+
+
+_DISABLED_LINE_RE = re.compile(r'"([^"]+)"\s*=>\s*(enabled|disabled)')
+
+# Every real reply opens with this, even when nothing is disabled (confirmed
+# against this machine's own `launchctl print-disabled "gui/$(id -u)"`, which
+# prints `disabled services = {` followed by zero or more `"label" => state`
+# lines). Its absence means the output does not have the shape this parser
+# understands, not that the list is empty — "empty" and "unparseable" must
+# read differently, since only one of them is safe to treat as "nothing
+# disabled".
+_DISABLED_HEADER = "disabled services ="
+
+
+class DisabledQuery(NamedTuple):
+    """One `launchctl print-disabled` result, computed once and shared across
+    every job this sweep checks (never re-queried per label or per repo).
+
+    `ok=False` means the query itself could not be trusted — a nonzero exit, a
+    timeout, or output that does not match `_DISABLED_HEADER` — and `labels`
+    is then meaningless; every caller must treat that as "this job's enabled
+    state is unknown", never as "nothing is disabled". `ok=True` with an empty
+    `labels` IS the legitimate "nothing is disabled" case.
+    """
+    ok: bool
+    labels: frozenset[str]
+    reason: str  # populated when ok is False; empty otherwise
+
+
+def _launchctl_disabled_labels(uid: int) -> DisabledQuery:
+    """Query `launchctl print-disabled gui/<uid>` once for the whole sweep.
+
+    THE OTHER HALF OF THE INCIDENT THIS FILE EXISTS FOR: `launchctl bootstrap`
+    reports a disabled service only as an opaque I/O error, so a job that was
+    `launchctl disable`d — rather than simply never loaded — needs this
+    SEPARATE query; `_launchctl_list_one` alone cannot see it (`man launchctl`
+    distinguishes "loaded" from "disabled" for exactly this reason, and a
+    machine was found with one disabled for 26 days — module docstring).
+
+    FAILS CLOSED, not toward silence: a failed or unparsable call used to
+    return an empty set, which `job_status` then read as "nothing disabled" —
+    exactly the loaded-but-disabled-reads-as-healthy blind spot this file
+    exists to close, just moved one level down (PR#730 review). A nonzero
+    exit, a timeout, or output missing `_DISABLED_HEADER` now returns
+    `DisabledQuery(False, ..., reason)`, which every caller must turn into an
+    "enabled state unknown" breach for each job this sweep checks.
+    """
+    try:
+        proc = subprocess.run(["launchctl", "print-disabled", f"gui/{uid}"],
+                              capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired:
+        return DisabledQuery(False, frozenset(), "print-disabled timed out after 10s")
+    except OSError as exc:
+        return DisabledQuery(False, frozenset(), f"could not query launchctl: {exc}")
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exited {proc.returncode}"
+        return DisabledQuery(False, frozenset(),
+                             f"print-disabled exited {proc.returncode}: {detail}")
+    if _DISABLED_HEADER not in proc.stdout:
+        snippet = proc.stdout.strip()[:120] or "(empty output)"
+        return DisabledQuery(False, frozenset(),
+                             f"print-disabled output not recognized: {snippet!r}")
+    labels = frozenset(label for label, state in _DISABLED_LINE_RE.findall(proc.stdout)
+                       if state == "disabled")
+    return DisabledQuery(True, labels, "")
+
+
+_OWNED_LABEL_PREFIX = "com.convivy."
+
+
+def _legacy_label_loaded(label: str) -> str | None:
+    """A label this job is loaded under OTHER than `label` itself, found by
+    suffix match against `launchctl list`'s full report — or None.
+
+    CQ-428 renamed knowledge-watcher's label from a personal namespace to
+    com.convivy.knowledge-watcher. Until `install.sh --migrate-labels` runs
+    on this machine, the job may
+    still be loaded under its old label. That old label named a person, so
+    it is never hardcoded here either (the whole point of CQ-428 is removing
+    it, not writing it again) — it is discovered the same way install.sh's
+    own migration discovers it: by bare-name suffix against what launchd
+    actually reports loaded. Scoped to `com.convivy.*` labels only (the only
+    ones CQ-428 could have renamed) — a bare last-dot-segment match would
+    false-match an unrelated job for a multi-dot label like
+    `com.convivy.appkit.autoupdate`.
+    """
+    if not label.startswith(_OWNED_LABEL_PREFIX):
+        return None
+    suffix = "." + label[len(_OWNED_LABEL_PREFIX):]
+    try:
+        proc = subprocess.run(["launchctl", "list"], capture_output=True,
+                              text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        candidate = line.split("\t")[-1].strip()
+        if candidate and candidate != label and candidate.endswith(suffix):
+            return candidate
+    return None
+
+
+def job_status(label: str, disabled: DisabledQuery) -> tuple[bool, str]:
+    """(ok, reason) — is this launchd job loaded and known to be enabled?
+
+    Three independent outcomes, asked in this order so each is reported
+    precisely rather than masked by a redundant one: "not loaded" first, then
+    — only for a job `launchctl list` does know about — whether this sweep's
+    `disabled` query could even answer the enabled question at all. A failed
+    `disabled` query (`disabled.ok` is False) must read as a breach here, not
+    as a pass: that is the exact shape of the 26-day incident, just moved from
+    "nobody asked" to "asked and the answer was lost".
+    """
+    loaded, detail = _launchctl_list_one(label)
+    if not loaded:
+        legacy = _legacy_label_loaded(label)
+        if legacy is not None:
+            loaded, detail = _launchctl_list_one(legacy)
+            if loaded:
+                label = legacy
+        if not loaded:
+            return False, f"not loaded ({detail})" if detail else "not loaded"
+    if not disabled.ok:
+        return False, f"enabled state unknown ({disabled.reason})"
+    if label in disabled.labels:
+        return False, "disabled (launchctl print-disabled)"
+    return True, "loaded and enabled"
+
+
+def check_jobs(repo: str, cfg: dict[str, Any], convivy_root: pathlib.Path,
+               disabled: DisabledQuery, *, verbose: bool = False) -> list[tuple[str, str]]:
+    """[(label, reason)] for every job of `repo` that is not loaded, is
+    disabled, or whose enabled state this sweep could not determine. Empty
+    when the checkout is absent — same degrade as `check()`, since a job for a
+    repo not even cloned here is not this machine's problem — or when every
+    declared job is healthy.
+
+    `disabled` is the ONE `print-disabled` result for the whole sweep, passed
+    in rather than queried here — `main()` computes it once via
+    `_launchctl_disabled_labels` and shares it across every repo's call to
+    this function, instead of shelling out once per label (reviewer note,
+    PR#730).
+    """
+    repo_dir = convivy_root / repo
+    if not (repo_dir / ".git").exists():
+        return []
+    breaches: list[tuple[str, str]] = []
+    for label in cfg.get("jobs", ()):
+        ok, reason = job_status(label, disabled)
+        if ok:
+            if verbose:
+                print(f"[OK] {repo}: {label} is {reason}")
+            continue
+        if verbose:
+            print(f"[BREACH] {repo}: {label} is {reason}")
+        breaches.append((label, reason))
+    return breaches
+
+
+EXIT_ASSERT_BREACH = 4   # --assert: the named checkout is off main
+
+
+def assert_one(repo: str, convivy_root: pathlib.Path, *, actor: str) -> int:
+    """`--assert <repo>`: 0 if that checkout is on main, EXIT_ASSERT_BREACH if not.
+
+    THE MONITOR BOUNDS HOW LONG a bad state lasts; this stops it being ACTED ON
+    (ARCH-441). Both reviewers of PR #347 made the same structural point from
+    different angles: `com.convivy.appkit.autoupdate` pulls INTO a checkout on a
+    schedule, and if that checkout is on a feature branch the pull either
+    fast-forwards the feature branch to new remote commits or fails outright,
+    neither of which anyone intends — and the 15-minute monitor learns about it
+    afterwards, at the layer where nothing can be done about it.
+
+    Deliberately the SAME predicate the monitor uses, called through the same
+    `check()`. Two implementations of "is this checkout deployable" would
+    eventually disagree, and the one that disagreed silently would be this one,
+    because nothing watches an assertion that passes.
+
+    It does NOT log a signal: the monitor already logs one, on its own dedup_key,
+    within fifteen minutes. A second logger would double-report one incident and
+    make the signal count of it wrong. Refusing loudly on stderr, and letting
+    the caller decide what a refusal means, is this function's whole job.
+    """
+    cfg = _LIVE_CHECKOUTS.get(repo)
+    if cfg is None:
+        print(f"assert: {repo!r} is not in _LIVE_CHECKOUTS — refusing rather than "
+              f"passing a repo nobody has classified", file=sys.stderr)
+        return EXIT_ASSERT_BREACH
+    ok, reason = check(repo, cfg, convivy_root)
+    if ok:
+        return 0
+    print(f"REFUSING: the {repo} primary checkout is {reason}, not main.\n"
+          f"  {actor} was about to act on it, and {cfg['reads']}.\n"
+          f"  Fix:  cd {convivy_root}/{repo} && git switch main && git pull --ff-only\n"
+          f"  Work in progress there belongs in a worktree "
+          f"({cfg['adr']}; check-primary-checkouts logs the alert signal).",
+          file=sys.stderr)
+    return EXIT_ASSERT_BREACH
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="check-primary-checkouts",
+                                     description=__doc__)
+    parser.add_argument("--assert", dest="assert_repo", default=None, metavar="REPO",
+                        help="check ONE repo and exit 4 if it is off main, instead "
+                             "of sweeping every checkout. For an actor asserting "
+                             "before it acts (ARCH-441); logs no signal, since the "
+                             "monitor already does.")
+    parser.add_argument("--actor", default="the caller",
+                        help="what is about to act, named in the refusal message "
+                             "(only with --assert)")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="print per-repo details even when passing")
+    parser.add_argument("--convivy-root", default=str(CONVIVY_ROOT),
+                        help="override the machine's root (for testing)")
+    parser.add_argument("--no-report", action="store_true",
+                        help="detect breaches but do not log signals (dry run)")
+    parser.add_argument("--launch-agents", default=str(LAUNCH_AGENTS),
+                        help="override ~/Library/LaunchAgents (for testing)")
+    parser.add_argument("--uid", type=int, default=os.getuid() if hasattr(os, "getuid") else 0,
+                        help="uid launchctl's gui/<uid> domain uses (for testing)")
+    opts = parser.parse_args(argv)
+
+    global _report_failures
+    _report_failures = 0
+
+    convivy_root = pathlib.Path(opts.convivy_root)
+
+    if opts.assert_repo:
+        # Before the completeness audit and before any signal is logged: an assertion
+        # is a fast pre-flight for one actor, not a sweep.
+        return assert_one(opts.assert_repo, convivy_root, actor=opts.actor)
+
+    breaches = 0
+    day = _utc_today()
+
+    # The COMPLETENESS audit, before the branch checks. A repo missing from
+    # `_LIVE_CHECKOUTS` is not reported as healthy — it is not reported at all,
+    # which is the failure this whole tool is about, one level up. PR #347's
+    # reviewer found `convivy-services` missing; sweeping the plists found three
+    # more, so the gap was not a one-off oversight and a list nobody re-derives
+    # will have another.
+    unclassified = sorted(
+        launchd_referenced_repos(pathlib.Path(opts.launch_agents), convivy_root)
+        - set(_LIVE_CHECKOUTS) - set(_NOT_LIVE))
+    if unclassified:
+        breaches += 1
+        # A black-box crew's own NAME must never reach this shared signal, same as
+        # its branch below — a future private crew showing up in "checkouts
+        # nobody has classified" would name it to the shared signal store before
+        # anyone ever gets to decide whether it belongs in `_LIVE_CHECKOUTS` at all
+        # (ADR-0043: existence in the signal store is the leak, independent of
+        # content). A mixed set, not all-or-nothing: the public names still get the
+        # signal they have always gotten.
+        unclassified_private = [r for r in unclassified
+                                if _is_private_checkout(convivy_root / r)]
+        unclassified_public = [r for r in unclassified if r not in unclassified_private]
+        if unclassified_private:
+            print(f"[UNCLASSIFIED] (private crew, not logged): "
+                  f"{', '.join(unclassified_private)}", file=sys.stderr)
+        if unclassified_public:
+            title = (f"[primary-checkout] {len(unclassified_public)} "
+                     f"checkout(s) nobody has classified")
+            body = (
+                f"**A launchd job reads these `{convivy_root}` checkouts and nothing decides "
+                f"whether their branch matters:** {', '.join(unclassified_public)}.\n\n"
+                f"Each one is either live-deployed — in which case a feature branch there "
+                f"serves un-merged code to a scheduled job, unwatched — or it is not, in "
+                f"which case say so.\n\n"
+                f"Add each to `_LIVE_CHECKOUTS` with what reads it, or to `_NOT_LIVE` "
+                f"with why its branch does not matter, in `bin/check-primary-checkouts`."
+            )
+            res = _post_signal("agent-platform", title, body,
+                               dedup_key=f"primary-checkout:unclassified:"
+                                     f"{_names_digest(unclassified_public)}:{day}",
+                               severity="medium", dry_run=opts.no_report)
+            print(f"[UNCLASSIFIED] {', '.join(unclassified_public)} → "
+                  f"{res.get('status', '?')}", file=sys.stderr)
+    elif opts.verbose:
+        print("[OK] every launchd-referenced checkout is classified")
+
+    for repo in sorted(_LIVE_CHECKOUTS):
+        cfg = _LIVE_CHECKOUTS[repo]
+        ok, reason = check(repo, cfg, convivy_root, verbose=opts.verbose)
+        if ok:
+            continue
+        breaches += 1
+        if _is_private_checkout(convivy_root / repo):
+            # Local log only — never signal_client, never the shared signal store. A
+            # black-box crew "files no issues and logs no signals"
+            # (platform/decisions/0043); this is that rule's equivalent for a
+            # signal this script would otherwise log. The title/body below are
+            # never even built — nothing here constructs text meant for a
+            # shared store, matching check-serving-checkouts' own gate.
+            print(f"[BREACH] {repo} (private crew, not logged): {reason}",
+                  file=sys.stderr)
+            continue
+        title = f"[primary-checkout] {repo} is {reason}, not main"
+        body = (
+            f"**The {repo} PRIMARY checkout is {reason}.**\n\n"
+            f"This matters because {cfg['reads']}.\n\n"
+            f"So un-merged code is live right now, and stays live until someone "
+            f"moves the checkout back. {cfg['adr']} is the decision this enforces.\n\n"
+            f"Fix:\n\n"
+            f"```\ncd {convivy_root}/{repo}\ngit switch main && git pull --ff-only\n```\n\n"
+            f"If there is work in progress there, move it to a worktree first — "
+            f"feature work in a primary is what strands it off main:\n\n"
+            f"```\ngit worktree add -b <branch> {convivy_root}/{repo}-wt/<name>\n```\n\n"
+            f"The `post-checkout` hook warns about this at switch time and cannot "
+            f"block (git ignores its exit code), so when an agent does the switch "
+            f"the warning reaches nobody. That is why this check exists."
+        )
+        # The branch name is deliberately OUT of the dedup_key. One alert per repo
+        # per open incident is the intent; keying on the branch would log a fresh
+        # signal each time someone switched between feature branches, turning a real
+        # signal into the noise this is meant to cut through.
+        res = _post_signal(repo, title, body, dedup_key=f"primary-checkout:{repo}:{day}",
+                           dry_run=opts.no_report)
+        print(f"[BREACH] {repo}: {reason} → {res.get('status', '?')}", file=sys.stderr)
+
+    # A SECOND, INDEPENDENT breach, in its own loop: the job that deploys a repo
+    # may be fine on branch and still not loaded, or loaded and disabled —
+    # neither of which the loop above can see (module docstring). Checked for
+    # every repo regardless of whether its branch check passed, since the two
+    # conditions are unrelated; a separate loop rather than folding this into
+    # the one above means the private-crew `continue` on a branch breach can
+    # never also skip the job check for that same repo.
+    #
+    # `disabled` is queried ONCE here, for the whole sweep, and shared across
+    # every repo's `check_jobs` call below — not re-queried per label, which is
+    # what `job_status` used to do (reviewer note, PR#730).
+    disabled = _launchctl_disabled_labels(opts.uid)
+    for repo in sorted(_LIVE_CHECKOUTS):
+        cfg = _LIVE_CHECKOUTS[repo]
+        for label, reason in check_jobs(repo, cfg, convivy_root, disabled,
+                                        verbose=opts.verbose):
+            breaches += 1
+            if _is_private_checkout(convivy_root / repo):
+                print(f"[BREACH] {repo} job {label} (private crew, not logged): "
+                      f"{reason}", file=sys.stderr)
+                continue
+            title = f"[primary-checkout] {label} ({repo}) is {reason}"
+            body = (
+                f"**The `{label}` launchd job is {reason}.**\n\n"
+                f"It deploys {repo}: {cfg['reads']}.\n\n"
+                f"A job that is not loaded or is disabled runs nothing, silently — "
+                f"`launchctl bootstrap` reports a disabled service only as an opaque "
+                f"I/O error, so nothing else on this machine says so on its own. "
+                f"{cfg['adr']} is the decision this enforces.\n\n"
+                f"Check and fix:\n\n"
+                f"```\nlaunchctl print-disabled \"gui/$(id -u)\" | grep {label}\n"
+                f"launchctl enable \"gui/$(id -u)/{label}\"\n"
+                f"launchctl bootstrap \"gui/$(id -u)\" "
+                f"~/Library/LaunchAgents/{label}.plist\n```"
+            )
+            # The label is IN the dedup_key, separate from both the branch check's
+            # (`primary-checkout:<repo>`) and the completeness audit's
+            # (`primary-checkout:unclassified:...`) — three independent
+            # conditions, three independent keys, so one condition's signal never
+            # silences another's.
+            res = _post_signal(repo, title, body,
+                               dedup_key=f"primary-checkout:job:{repo}:{label}:{day}",
+                            dry_run=opts.no_report)
+            print(f"[BREACH] {repo} job {label}: {reason} → "
+                  f"{res.get('status', '?')}", file=sys.stderr)
+
+    if breaches == 0:
+        if opts.verbose:
+            print("[OK] every live checkout is on main and every declared job "
+                  "is loaded and enabled")
+        return 0
+
+    print(f"[DONE] {breaches} finding(s)", file=sys.stderr)
+    if _report_failures > 0:
+        print(f"[REPORT-FAIL] {_report_failures} report(s) failed — "
+              "breaches not all logged", file=sys.stderr)
+        return 3
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

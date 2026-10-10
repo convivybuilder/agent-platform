@@ -1,0 +1,23 @@
+# Top-level Python dependencies for the agent platform.
+# The full transitive set is determined at install time by pip; pinning the
+# entry points here keeps a fresh-mini restore reproducible without freezing
+# every transitive (which would drift quickly from upstream security patches).
+#
+# Used by:
+#   knowledge-watcher  → watchdog, PyYAML
+#   knowledge.py       → PyYAML
+#   knowledge-ctx      → PyYAML
+#   mcp-kb-server      → mcp
+#   notion-migrate     → requests (Notion API)
+#   lib/agent-platform/deck_signature.py (agentctl `kb apply`, a Deck-signed
+#   save, library-protocol.md §2.2) → cryptography
+#   agentctl, slack.py, registry.py, telemetry.py, worktrees.py, budget.py,
+#   agent-summary, knowledge-autopull, co, worktrees-{status,cleanup}
+#     → stdlib only, except agentctl's own `kb apply` as noted above
+#
+# Versions match what's currently installed on the mini (2026-05-20).
+watchdog==6.0.0
+PyYAML==6.0.3
+mcp==1.28.1
+requests==2.34.2
+cryptography==50.0.1

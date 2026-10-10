@@ -1,0 +1,128 @@
+#!/bin/sh
+# install-agent-platform-primary-guard — keep the agent-platform PRIMARY checkout
+# on main (ARCH-396).
+#
+# WHY. `~/.local/bin` and `~/.local/lib` symlink into the agent-platform working
+# tree (ARCH-229), so whatever branch the PRIMARY checkout sits on is the code
+# cron and the 01:00 overnight actually run. On 2026-07-22 the primary sat on a
+# `feat/session-verbs` deck branch for a day; #197/#198/#202 merged to main but the
+# overnight kept running the older branch. ARCH-368 already says never edit
+# agent-platform's live working tree — the steward works in a worktree, the primary
+# stays on clean main — and this enforces that. (ARCH-386 is a different worktree
+# rule, for kb apply on the knowledge repo; not this.) The pre-commit here
+# supersedes ARCH-103's steward-direct-to-main path for the primary specifically,
+# which is the right call under the ARCH-229 symlink model.
+#
+# TWO hooks, because the harm (stale code to cron) happens with or without a commit:
+#   - pre-commit  — refuses a commit made in the PRIMARY checkout, steering the work
+#     to a worktree. Feature work in the primary is exactly what strands it off main.
+#   - post-checkout — warns the moment the primary lands on a non-main branch (the
+#     pure-switch case a pre-commit hook cannot see). It cannot block (git ignores a
+#     post-checkout exit code), so it is a loud nudge, not a gate.
+#
+# NEITHER fires in a worktree. Git worktrees share the common hooks dir, so both
+# hooks run in every agent-platform worktree too — the is_primary check (the git-dir
+# equals the common git-dir only in the primary) is what makes them no-ops there,
+# which is load-bearing rather than incidental: without it, this guard would block
+# the very worktree commits it exists to encourage.
+#
+# Idempotent + marker-guarded, never clobbering a foreign hook. --no-verify overrides
+# the pre-commit block. Run from install.sh or by hand.
+set -eu
+
+# FOR TESTS ONLY: `--root-config FILE` names the machine's root through a
+# session-agent.env, the one way a test moves it (company/decisions/0008).
+# install.sh passes nothing.
+ROOT_CONFIG=""
+if [ "${1:-}" = "--root-config" ]; then
+  [ $# -ge 2 ] || { echo "  ! --root-config requires a value" >&2; exit 1; }
+  ROOT_CONFIG=$2
+fi
+
+# The primary checkout lives under the machine's root, printed by the
+# bin/builder-root beside this file's real path; one hop through a ~/.local/bin
+# link reaches it. HOME does not move it, and builder-root refuses a config that
+# names no root rather than printing the real one. An unresolvable root exits 1,
+# which install.sh reports as a non-fatal skip.
+_self_path="$0"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+_builder_root="$(dirname "$_self_path")/builder-root"
+if [ -n "$ROOT_CONFIG" ]; then
+  ROOT="$("$_builder_root" --root --config "$ROOT_CONFIG")" || ROOT=""
+else
+  ROOT="$("$_builder_root" --root)" || ROOT=""
+fi
+if [ -z "$ROOT" ]; then
+  echo "  ! cannot resolve the machine's root (bin/builder-root --root)" >&2
+  exit 1
+fi
+AP="$ROOT/agent-platform"
+MARKER="# managed-by: agent-platform primary-guard (ARCH-396)"
+hooks_dir="$AP/.git/hooks"
+
+if [ ! -d "$hooks_dir" ]; then
+  echo "  ! $AP has no .git/hooks (not a git repo?) — skipping" >&2
+  exit 0
+fi
+
+# Shared by both hooks: true only in the primary checkout, false in a linked
+# worktree. In the primary the git-dir IS the common git-dir; a worktree's git-dir
+# is .git/worktrees/<name> while its common-dir points back to the main .git.
+_is_primary_fn='is_primary() {
+  _gd="$(git rev-parse --absolute-git-dir 2>/dev/null || echo x)"
+  _cd="$(cd "$(git rev-parse --git-common-dir 2>/dev/null || echo /nonexistent)" 2>/dev/null && pwd || echo y)"
+  [ "$_gd" = "$_cd" ]
+}'
+
+write_hook() { # $1 hook name  $2 body
+  hook="$hooks_dir/$1"
+  if [ -f "$hook" ] && ! grep -q "primary-guard (ARCH-396)" "$hook" 2>/dev/null; then
+    echo "  ! $hook exists and is not ours — leaving it, NOT installing" >&2
+    return 0
+  fi
+  printf '%s\n' "$2" > "$hook"
+  chmod +x "$hook"
+  echo "  ✓ $hook (agent-platform primary-guard)"
+}
+
+write_hook pre-commit "#!/bin/sh
+$MARKER
+# Refuse a commit made in the agent-platform PRIMARY checkout — do the work in a
+# worktree so the primary stays on main and the ~/.local symlinks serve merged code
+# to cron (ARCH-229/368). Override: git commit --no-verify.
+$_is_primary_fn
+is_primary || exit 0   # a worktree commit is the desired flow — allow it
+branch=\"\$(git symbolic-ref --short -q HEAD || true)\"
+echo \"\" >&2
+echo \"BLOCKED: refusing a commit in the agent-platform PRIMARY checkout (ARCH-396).\" >&2
+echo \"  branch: \${branch:-<detached>} — but the primary should not receive commits at all.\" >&2
+echo \"  ~/.local/bin + ~/.local/lib symlink into this tree, so cron and the 01:00\" >&2
+echo \"  overnight run whatever is checked out here. Feature work belongs in a worktree:\" >&2
+echo \"    git worktree add $ROOT/worktrees/agent-platform.<purpose> -b <branch> origin/main\" >&2
+echo \"  then open a PR from there. (Override this once with: git commit --no-verify.)\" >&2
+echo \"\" >&2
+exit 1"
+
+write_hook post-checkout "#!/bin/sh
+$MARKER
+# Warn when the agent-platform PRIMARY checkout is switched to a non-main branch:
+# the symlinks now serve that branch's code to cron (ARCH-229). Cannot block (git
+# ignores a post-checkout exit code); this is the interactive nudge.
+# Args: \$1 prev-HEAD  \$2 new-HEAD  \$3 branch-checkout-flag (1 = branch switch).
+[ \"\${3:-0}\" = \"1\" ] || exit 0
+$_is_primary_fn
+is_primary || exit 0
+branch=\"\$(git symbolic-ref --short -q HEAD || true)\"
+[ \"\$branch\" = \"main\" ] && exit 0
+echo \"\" >&2
+if [ -z \"\$branch\" ]; then
+  # Detached HEAD — a bare \`git checkout <sha>\` points the cron symlinks at an
+  # arbitrary commit, the same ARCH-229 harm as a named branch (#206 review).
+  echo \"⚠️  agent-platform PRIMARY is now in DETACHED HEAD, not on main (ARCH-396).\" >&2
+else
+  echo \"⚠️  agent-platform PRIMARY is now on '\$branch', not main (ARCH-396).\" >&2
+fi
+echo \"   cron + tonight's 01:00 overnight run THIS checkout via the ~/.local symlinks.\" >&2
+echo \"   Do feature work in a worktree; return the primary to main when done:\" >&2
+echo \"     git switch main && git pull --ff-only\" >&2
+echo \"\" >&2
+exit 0"

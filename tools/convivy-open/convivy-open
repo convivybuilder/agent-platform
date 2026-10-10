@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""convivy-open: terminal companion to the Convivy open-server.
+
+Resolve a Convivy file reference against *this* machine's Convivy base, then act
+on it in the terminal. The reference can be any of:
+
+  - a relative path           agent-runs/2026-05-22/run-50d95758/foo.md
+  - a full Slack link         http://localhost:8765/open?p=agent-runs/.../foo.md
+  - an absolute mini path      <the mini's resolved root>/agent-runs/.../foo.md
+  - an absolute laptop path    <the root's SMB-mounted mirror>/agent-runs/.../foo.md
+
+Actions:
+  convivy-open <ref>        print the resolved absolute path (default)
+  convivy-open -e <ref>     open in $EDITOR (default: vim)
+  convivy-open -d <ref>     print its containing dir  ->  cd "$(convivy-open -d X)"
+  convivy-open -l <ref>     page it with $PAGER (default: less)
+  convivy-open -o <ref>     GUI open, same as clicking the Slack link
+
+Base is CONVIVY_OPEN_BASE (default: this machine's own resolved root, never a
+hardcoded path — see _default_base()), with the same /Volumes/<user>-N SMB
+fallback the server uses.
+"""
+
+import argparse
+import glob
+import os
+import subprocess
+import sys
+from urllib.parse import urlparse, parse_qs, unquote
+
+def _mini_root_here():
+    """The mini's own root, ONLY when THIS machine has the agent-platform lib
+    installed — i.e. this machine IS the mini (company/decisions/0008). None
+    on the laptop, which never has this lib."""
+    try:
+        sys.path.insert(0, os.path.expanduser("~/.local/lib/agent-platform"))
+        import builder_root as _br
+        return str(_br.root())
+    except Exception:
+        return None
+
+
+def _cached(key):
+    """A value cached in the laptop config resolve-open-base.sh writes
+    (install-laptop.sh), which read the mini's root over ssh at install
+    time. None when the file or key is absent."""
+    try:
+        with open(os.path.expanduser("~/.config/convivy/convivy-open.env")) as f:
+            for line in f:
+                if line.startswith(key + "="):
+                    return line.strip().split("=", 1)[1]
+    except OSError:
+        pass
+    return None
+
+
+_MINI_ROOT_HERE = _mini_root_here()
+# This machine's own default: the mini's root when running on the mini,
+# else the laptop's SMB-mounted mirror cached by resolve-open-base.sh. Empty
+# when neither resolves, so the existing "base not present" refusal fires
+# rather than a guess.
+BASE = os.environ.get("CONVIVY_OPEN_BASE") or _MINI_ROOT_HERE or _cached("CONVIVY_OPEN_BASE") or ""
+# Both forms, so a mini-absolute reference pasted on the laptop (or vice
+# versa) still resolves. Off the mini, the mini's root is only known via the
+# laptop's own cache of it (MINI_OPEN_BASE) — never assumed.
+KNOWN_ROOTS = tuple(r for r in (
+    _MINI_ROOT_HERE or _cached("MINI_OPEN_BASE"),
+    _cached("CONVIVY_OPEN_BASE"),
+) if r)
+
+
+def die(msg):
+    sys.stderr.write("convivy-open: " + msg + "\n")
+    sys.exit(1)
+
+
+def _candidate_bases():
+    """Plausible base dirs that exist: the configured BASE first, then the SMB
+    `-N` siblings macOS creates when a share name is already taken."""
+    bases = []
+    if os.path.isdir(BASE):
+        bases.append(BASE)
+    parent, name = os.path.split(BASE.rstrip("/"))
+    grandparent, mountname = os.path.split(parent)
+    for cand in sorted(glob.glob(os.path.join(grandparent, mountname + "-*", name))):
+        if os.path.isdir(cand) and cand not in bases:
+            bases.append(cand)
+    return bases
+
+
+def _nonempty(d):
+    """True if dir d has at least one entry (a live mount); False if empty (a
+    stale mountpoint left after the share dropped) or unreadable."""
+    try:
+        with os.scandir(d) as it:
+            return any(True for _ in it)
+    except OSError:
+        return False
+
+
+def resolve_base(rel=None):
+    """Pick the base to resolve against, skipping stale/empty shadow mounts.
+
+    A configured BASE that exists but is EMPTY (the SMB share dropped, or macOS
+    remounted the live share at a `-N` suffix and left the old name as an empty
+    dir) must not shadow the live mount. Prefer, in order: a candidate base that
+    actually contains `rel` (when given), then the first non-empty candidate.
+    Return None when nothing usable exists (so the caller can error or remount)."""
+    bases = _candidate_bases()
+    if rel:
+        for b in bases:
+            if os.path.exists(os.path.join(b, rel)):
+                return b
+    for b in bases:
+        if _nonempty(b):
+            return b
+    return None
+
+
+def to_relative(ref):
+    ref = ref.strip()
+    if ref.startswith(("http://", "https://")):
+        q = parse_qs(urlparse(ref).query)
+        return unquote((q.get("p") or [""])[0]).lstrip("/")
+    for root in KNOWN_ROOTS:
+        if ref.startswith(root + "/"):
+            return ref[len(root) + 1:]
+    # The SMB `-N` suffix siblings macOS creates when the laptop's share name
+    # is already taken (same shape _candidate_bases() checks for the live
+    # mount; this is for a REFERENCE naming one of them).
+    _laptop_root = _cached("CONVIVY_OPEN_BASE")
+    if _laptop_root:
+        _parent, _name = os.path.split(_laptop_root.rstrip("/"))
+        _grandparent, _mountname = os.path.split(_parent)
+        for cand in glob.glob(os.path.join(_grandparent, _mountname + "-*", _name) + "/"):
+            if ref.startswith(cand):
+                return ref[len(cand):]
+    return ref.lstrip("/")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="convivy-open", add_help=True,
+                                 description="Resolve a Convivy reference on this machine.")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("-e", "--edit", action="store_true", help="open in $EDITOR")
+    g.add_argument("-d", "--dir", action="store_true", help="print containing directory")
+    g.add_argument("-l", "--less", action="store_true", help="page with $PAGER")
+    g.add_argument("-o", "--open", action="store_true", help="GUI open (like clicking)")
+    ap.add_argument("ref", help="relative path, absolute path, or localhost link")
+    args = ap.parse_args()
+
+    rel = to_relative(args.ref)
+    base = resolve_base(rel)
+    if not base:
+        die("Convivy base '%s' not present or empty (mount the mini?)." % BASE)
+
+    target = os.path.realpath(os.path.join(base, rel))
+    base_real = os.path.realpath(base)
+    if not (target == base_real or target.startswith(base_real + os.sep)):
+        die("refused: path escapes the Convivy root")
+    if not os.path.exists(target):
+        die("not found: " + target)
+
+    if args.edit:
+        os.execvp(os.environ.get("EDITOR", "vim"), [os.environ.get("EDITOR", "vim"), target])
+    elif args.dir:
+        print(target if os.path.isdir(target) else os.path.dirname(target))
+    elif args.less:
+        pager = os.environ.get("PAGER", "less")
+        os.execvp(pager, [pager, target])
+    elif args.open:
+        subprocess.run(["open", target], check=False)
+        print(target)
+    else:
+        print(target)
+
+
+if __name__ == "__main__":
+    main()

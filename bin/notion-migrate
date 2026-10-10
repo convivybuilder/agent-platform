@@ -1,0 +1,903 @@
+#!/usr/bin/env python3
+"""notion-migrate: one-shot migration of existing Notion pages to <root>/knowledge/.
+
+For each MIGRATION entry, walk the subtree rooted at the Notion page id,
+classify each page's kind/project per the rule set, convert blocks to
+markdown, and emit <root>/knowledge/projects/<project>/<kind-dir>/<slug>.md.
+
+Default mode is --dry-run (prints what would be written; no writes).
+Use --commit to actually write files.
+
+Spec: 01-knowledge-infra.md deliverable 2.7. Migration plan agreed
+with the operator 2026-05-18 (calls 1-5 resolved).
+"""
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, requires=("requests",))
+import requests  # noqa: E402
+import builder_root as BR  # noqa: E402
+import operator_config  # noqa: E402
+
+ROOT = BR.root() / "knowledge"
+ENV_FILE = Path.home() / ".local" / "etc" / "knowledge" / ".env"
+
+
+def load_token() -> str:
+    for line in ENV_FILE.read_text().splitlines():
+        if line.startswith("NOTION_TOKEN="):
+            return line.split("=", 1)[1].strip()
+    sys.exit("NOTION_TOKEN missing from " + str(ENV_FILE))
+
+
+TOKEN = load_token()
+HEADERS = {
+    "Authorization": f"Bearer {TOKEN}",
+    "Notion-Version": "2022-06-28",
+}
+
+KIND_TO_DIR = {
+    "agent": "agents",
+    "skill": "skills",
+    "architecture": "architecture",
+    "decision": "decisions",
+    "spec": "specs",
+    "runbook": "runbooks",
+    "playbook": "playbooks",
+    "reference": "reference",
+    "prd": "prds",
+    "brand": "brand",
+    "legal": "legal",
+    "meeting-notes": "meeting-notes",
+}
+
+# Migration plan: each entry is one root subtree.
+# kind_rules apply per-page (match on exact title or prefix); first match wins.
+# A rule may override `project` (e.g., Convivy/Engineering pages that are
+# really platform-meta → utility).
+# skip_titles excludes named pages outright.
+# Post-migration merges: append the body of a skipped page onto a canonical
+# target file under a labeled marker. Used to combine duplicate-titled pages
+# into one doc without losing content.
+MERGES: list[dict[str, Any]] = [
+    {
+        "target_rel": "vivy/runbooks/dev-ops-cheat-sheet",
+        "append_page_id": "34a710dc-096e-80dd-9119-efb02e801d2f",
+        "marker": "## Earlier version (2026-04-23)",
+    },
+]
+
+MIGRATIONS: list[dict[str, Any]] = [
+    # Constance
+    {
+        "root_id": "346710dc-096e-80ce-99f7-cf830f6edd25",
+        "label": "Constance / Product",
+        "project": "constance",
+        "default_kind": "prd",
+    },
+    {
+        "root_id": "346710dc-096e-808e-96c9-fa2ceff9a2a6",
+        "label": "Constance / Engineering",
+        "project": "constance",
+        "default_kind": "architecture",
+        "kind_rules": [
+            {"title_startswith": "ADR — ", "kind": "decision"},
+            {"title": "Operational Runbook", "kind": "runbook"},
+            {"title": "Dev & Ops Cheat Sheet", "kind": "runbook"},
+            {"title": "Partner Application Tracker", "kind": "reference"},
+            {"title": "Architectural Design Proposals", "kind": "spec", "apply_to_subtree": True},
+        ],
+    },
+    {
+        "root_id": "34b710dc-096e-805c-b88b-ef949c7976a5",
+        "label": "Constance / Meeting Notes",
+        "project": "constance",
+        "default_kind": "meeting-notes",
+    },
+    {
+        "root_id": "35c710dc-096e-813c-8741-de42a4ff97d3",
+        "label": "Constance / Core Beliefs & Values",
+        "project": "constance",
+        "default_kind": "brand",
+    },
+    {
+        "root_id": "35e710dc-096e-81d8-9d58-ea30032ee548",
+        "label": "Constance / Feature Flows",
+        "project": "constance",
+        "default_kind": "spec",
+    },
+    # Vivy
+    {
+        "root_id": "c70460b0-da91-45c0-8fef-f5d1af6fd527",
+        "label": "Vivy / Product",
+        "project": "vivy",
+        "default_kind": "prd",
+        "skip_titles": ["Archived (2026-05-05 reorg)"],
+    },
+    {
+        "root_id": "2a0189a0-3ace-47bf-a9cd-45f1c98bb8e3",
+        "label": "Vivy / Engineering",
+        "project": "vivy",
+        "default_kind": "architecture",
+        "skip_titles": ["End-to-End Testing Plan (DORMANT)", "Engineering Backlog"],
+        # Skip the older of the two "Dev & Ops Cheat Sheet" pages — merged
+        # into the newer one via MERGE_INTO below.
+        "skip_page_ids": ["34a710dc-096e-80dd-9119-efb02e801d2f"],
+        "kind_rules": [
+            {"title": "Operational Runbook", "kind": "runbook"},
+            {"title": "Dev & Ops Cheat Sheet", "kind": "runbook"},
+            {"title": "Release Procedure", "kind": "runbook"},
+            {"title": "Running platform-track Alembic migrations against prod", "kind": "runbook"},
+            {"title": "Reports Module — Design", "kind": "spec"},
+            {"title": "OwnerRez Sandbox Tooling — Separate Repo", "kind": "reference"},
+            {"title": "VS Code Statboard", "kind": "reference"},
+        ],
+    },
+    {
+        "root_id": "35f710dc-096e-810c-8b67-e6471dbe973c",
+        "label": "Vivy / Feature Flows",
+        "project": "vivy",
+        "default_kind": "spec",
+    },
+    # Convivy / The Company
+    {
+        "root_id": "34b710dc-096e-81a1-ae85-c28143bd891f",
+        "label": "Convivy / People",
+        "project": "shared",
+        "default_kind": "reference",
+    },
+    {
+        "root_id": "34b710dc-096e-8101-a0fe-e81555fd2961",
+        "label": "Convivy / Entity & Operations",
+        "project": "shared",
+        "default_kind": "legal",
+    },
+    {
+        "root_id": "34b710dc-096e-8113-9942-ea8140e8d6ea",
+        "label": "Convivy / Portfolio",
+        "project": "shared",
+        "default_kind": "reference",
+    },
+    {
+        "root_id": "34b710dc-096e-8101-8a41-d8f61baaf6ba",
+        "label": "Convivy / Brand & Domain",
+        "project": "shared",
+        "default_kind": "brand",
+    },
+    {
+        "root_id": "34e710dc-096e-81f7-a8fc-f69632db67f6",
+        "label": "Convivy / Engineering",
+        "project": "shared",
+        "default_kind": "architecture",
+        "kind_rules": [
+            {"title": "Claude Code Permissions Configuration", "kind": "reference", "override_project": "utility"},
+            {"title": "Local Development Server", "kind": "runbook", "override_project": "utility"},
+        ],
+    },
+    {
+        "root_id": "34b710dc-096e-81af-8845-c3f4aceaf9dd",
+        "label": "Convivy / Partner Vetting Narrative",
+        "project": "shared",
+        "default_kind": "reference",
+    },
+    {
+        "root_id": "350710dc-096e-8160-a516-cce253ecb7bf",
+        "label": "Convivy / Legal",
+        "project": "shared",
+        "default_kind": "legal",
+    },
+]
+
+
+def api_get(url: str, params: dict | None = None) -> dict:
+    for attempt in range(3):
+        r = requests.get(url, headers=HEADERS, params=params or {}, timeout=30)
+        if r.status_code == 429:
+            time.sleep(1 + attempt)
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+
+
+def api_patch(url: str, body: dict) -> dict:
+    for attempt in range(3):
+        r = requests.patch(url, headers=HEADERS, json=body, timeout=30)
+        if r.status_code == 429:
+            time.sleep(1 + attempt)
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()
+
+
+def get_page(page_id: str) -> dict:
+    return api_get(f"https://api.notion.com/v1/pages/{page_id}")
+
+
+def get_children(block_id: str) -> list[dict]:
+    out: list[dict] = []
+    cursor: str | None = None
+    while True:
+        params: dict[str, Any] = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        data = api_get(f"https://api.notion.com/v1/blocks/{block_id}/children", params)
+        out.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+    return out
+
+
+def page_title(page: dict) -> str:
+    for val in page.get("properties", {}).values():
+        if val.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in val.get("title", [])) or "(untitled)"
+    return "(untitled)"
+
+
+SLUG_BAD = re.compile(r"[^a-z0-9]+")
+
+
+def slugify(title: str) -> str:
+    s = title.lower()
+    s = SLUG_BAD.sub("-", s).strip("-")
+    return s or "untitled"
+
+
+# --- block → markdown ---
+
+def rich_text_to_md(rt: list[dict]) -> str:
+    out: list[str] = []
+    for piece in rt:
+        text = piece.get("plain_text", "")
+        ann = piece.get("annotations", {}) or {}
+        href = piece.get("href")
+        if ann.get("code"):
+            text = f"`{text}`"
+        if ann.get("bold"):
+            text = f"**{text}**"
+        if ann.get("italic"):
+            text = f"*{text}*"
+        if ann.get("strikethrough"):
+            text = f"~~{text}~~"
+        if href and not text.startswith("`"):
+            text = f"[{text}]({href})"
+        out.append(text)
+    return "".join(out)
+
+
+def render_block(block: dict, indent: int = 0) -> list[str]:
+    bt = block.get("type")
+    body = block.get(bt, {}) if bt else {}
+    pad = "  " * indent
+    lines: list[str] = []
+
+    if bt == "paragraph":
+        text = rich_text_to_md(body.get("rich_text", []))
+        if text:
+            lines.append(pad + text)
+        else:
+            lines.append("")
+    elif bt in ("heading_1", "heading_2", "heading_3"):
+        level = {"heading_1": "#", "heading_2": "##", "heading_3": "###"}[bt]
+        text = rich_text_to_md(body.get("rich_text", []))
+        lines.append(f"{pad}{level} {text}")
+    elif bt == "bulleted_list_item":
+        text = rich_text_to_md(body.get("rich_text", []))
+        lines.append(f"{pad}- {text}")
+    elif bt == "numbered_list_item":
+        text = rich_text_to_md(body.get("rich_text", []))
+        lines.append(f"{pad}1. {text}")
+    elif bt == "to_do":
+        text = rich_text_to_md(body.get("rich_text", []))
+        check = "x" if body.get("checked") else " "
+        lines.append(f"{pad}- [{check}] {text}")
+    elif bt == "toggle":
+        text = rich_text_to_md(body.get("rich_text", []))
+        lines.append(f"{pad}- {text}")
+    elif bt == "quote":
+        text = rich_text_to_md(body.get("rich_text", []))
+        lines.append(f"{pad}> {text}")
+    elif bt == "callout":
+        text = rich_text_to_md(body.get("rich_text", []))
+        icon = body.get("icon", {}) or {}
+        emoji = icon.get("emoji", "💡") if icon.get("type") == "emoji" else "💡"
+        lines.append(f"{pad}> {emoji} {text}")
+    elif bt == "code":
+        lang = body.get("language", "")
+        code = "".join(t.get("plain_text", "") for t in body.get("rich_text", []))
+        lines.append(f"{pad}```{lang}")
+        for cl in code.splitlines():
+            lines.append(f"{pad}{cl}")
+        lines.append(f"{pad}```")
+    elif bt == "divider":
+        lines.append(f"{pad}---")
+    elif bt == "bookmark":
+        url = body.get("url", "")
+        lines.append(f"{pad}<{url}>")
+    elif bt == "image":
+        file = body.get("file") or body.get("external") or {}
+        url = file.get("url", "")
+        caption = rich_text_to_md(body.get("caption", []))
+        alt = caption or "image"
+        lines.append(f"{pad}![{alt}]({url})")
+    elif bt == "table":
+        # Walk table rows in children below.
+        pass
+    elif bt == "table_row":
+        cells = body.get("cells", [])
+        rendered = [rich_text_to_md(cell) for cell in cells]
+        lines.append(pad + "| " + " | ".join(rendered) + " |")
+    elif bt == "column_list" or bt == "column":
+        # No native markdown equivalent; children render inline.
+        pass
+    elif bt == "child_page":
+        # Don't recurse here — each child_page becomes a separate file.
+        title = body.get("title", "(untitled)")
+        lines.append(f"{pad}- ↳ child page: **{title}**")
+    elif bt == "child_database":
+        title = body.get("title", "(untitled database)")
+        lines.append(f"{pad}- ↳ child database: **{title}**")
+    else:
+        lines.append(f"{pad}<!-- unsupported notion block: {bt} -->")
+
+    if block.get("has_children") and bt not in ("child_page", "child_database"):
+        children = get_children(block["id"])
+        # For tables, render rows at the same indent.
+        child_indent = indent if bt == "table" else indent + 1
+        for child in children:
+            lines.extend(render_block(child, child_indent))
+
+    return lines
+
+
+def page_to_markdown(page_id: str) -> str:
+    blocks = get_children(page_id)
+    out: list[str] = []
+    for block in blocks:
+        out.extend(render_block(block, 0))
+    # Collapse runs of blank lines.
+    text = "\n".join(out)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+
+# --- classification ---
+
+
+def match_rule(title: str, rules: list[dict]) -> dict | None:
+    for rule in rules:
+        if "title" in rule and title == rule["title"]:
+            return rule
+        if "title_startswith" in rule and title.startswith(rule["title_startswith"]):
+            return rule
+    return None
+
+
+def classify(page_title: str, migration: dict, in_apply_to_subtree_for: str | None) -> tuple[str | None, str, str]:
+    """Returns (skip_reason | None, kind, project)."""
+    if page_title in (migration.get("skip_titles") or []):
+        return ("skipped: in skip_titles", "", "")
+    if page_title.startswith("[Archived]") or page_title.startswith("Archived "):
+        return (f"skipped: archived ({page_title})", "", "")
+    rules = migration.get("kind_rules", [])
+    matched = match_rule(page_title, rules)
+    if matched:
+        return (None, matched["kind"], matched.get("override_project", migration["project"]))
+    if in_apply_to_subtree_for:
+        # We're inside a subtree-scoped rule; inherit its kind.
+        return (None, in_apply_to_subtree_for, migration["project"])
+    return (None, migration["default_kind"], migration["project"])
+
+
+# --- main migration walk ---
+
+
+def derive_authors_default() -> list[str]:
+    # Per the migration plan: hardcode the operator marker; round-trip via
+    # Notion if needed later.
+    return [operator_config.get("operator_marker")]
+
+
+def build_frontmatter(*, title: str, kind: str, project: str, last_edited_iso: str, notion_id: str) -> dict:
+    slug = slugify(title)
+    return {
+        "id": f"{project}/{KIND_TO_DIR[kind]}/{slug}",
+        "kind": kind,
+        "project": project,
+        "title": title,
+        "status": "current",
+        "last_reviewed": last_edited_iso[:10],
+        "authors": derive_authors_default(),
+        "notion_id": notion_id,
+    }
+
+
+def dump_frontmatter(fm: dict) -> str:
+    # Tiny YAML writer — avoids reordering keys.
+    lines = ["---"]
+    for key in ("id", "kind", "project", "title", "status", "last_reviewed", "authors", "notion_id"):
+        val = fm.get(key)
+        if val is None:
+            continue
+        if isinstance(val, list):
+            inner = ", ".join(val)
+            lines.append(f"{key}: [{inner}]")
+        elif isinstance(val, str) and (":" in val or val.startswith("[")):
+            lines.append(f"{key}: \"{val}\"")
+        else:
+            lines.append(f"{key}: {val}")
+    lines.append("---")
+    return "\n".join(lines)
+
+
+NON_CONTENT_BLOCK_TYPES = {
+    "child_page",
+    "child_database",
+    "divider",
+    "column_list",
+    "column",
+    "table_of_contents",
+    "breadcrumb",
+}
+
+
+def section_header_skip(blocks: list[dict]) -> bool:
+    """A page is a 'section-header empty' if it has child_page blocks AND
+    no substantive direct content (a brief intro paragraph counts as
+    substantive — threshold ~100 chars of plain text)."""
+    has_children = any(b.get("type") == "child_page" for b in blocks)
+    if not has_children:
+        return False
+    char_score = 0
+    for block in blocks:
+        bt = block.get("type")
+        if not bt or bt in NON_CONTENT_BLOCK_TYPES:
+            continue
+        body = block.get(bt, {}) or {}
+        rt = body.get("rich_text", [])
+        text = "".join(t.get("plain_text", "") for t in rt).strip()
+        char_score += len(text) if text else 5
+    return char_score < 100
+
+
+def walk_subtree(
+    *,
+    page_id: str,
+    migration: dict,
+    out: list[dict],
+    in_apply_to_subtree_for: str | None = None,
+    visited: set[str] | None = None,
+    is_root: bool = False,
+) -> None:
+    if visited is None:
+        visited = set()
+    if page_id in visited:
+        return
+    visited.add(page_id)
+
+    # Skip explicitly excluded page IDs.
+    if page_id in (migration.get("skip_page_ids") or []):
+        return
+
+    page = get_page(page_id)
+    if page.get("object") != "page" or page.get("archived"):
+        return
+    title = page_title(page)
+    last_edited = page.get("last_edited_time", "")
+
+    skip_reason, kind, project = classify(title, migration, in_apply_to_subtree_for)
+    if skip_reason:
+        out.append({
+            "skipped": skip_reason,
+            "title": title,
+            "page_id": page_id,
+        })
+        return
+
+    # Fetch children once; reused below for recursion and for section-header detection.
+    blocks = get_children(page_id)
+
+    # Empty section-header detection: pages whose only content is links to
+    # child pages get skipped — their children migrate as their own docs.
+    if section_header_skip(blocks):
+        out.append({
+            "skipped": "empty section-header",
+            "title": title,
+            "page_id": page_id,
+        })
+    else:
+        out.append({
+            "title": title,
+            "page_id": page_id,
+            "last_edited": last_edited,
+            "kind": kind,
+            "project": project,
+            "subtree_label": migration["label"],
+        })
+
+    # Recurse into child_page blocks.
+    rules = migration.get("kind_rules", [])
+    rule_for_subtree = None
+    matched = match_rule(title, rules)
+    if matched and matched.get("apply_to_subtree"):
+        rule_for_subtree = matched["kind"]
+    next_inherit = rule_for_subtree or in_apply_to_subtree_for
+
+    for block in blocks:
+        if block.get("type") == "child_page":
+            walk_subtree(
+                page_id=block["id"],
+                migration=migration,
+                out=out,
+                in_apply_to_subtree_for=next_inherit,
+                visited=visited,
+                is_root=False,
+            )
+
+
+MIGRATED_TITLE_RE = re.compile(r"^\[Migrated [0-9]{4}-[0-9]{2}-[0-9]{2}\] ")
+
+
+def title_property_name(page: dict) -> str | None:
+    """Find the name of the title-typed property on a page."""
+    for name, val in page.get("properties", {}).items():
+        if val.get("type") == "title":
+            return name
+    return None
+
+
+def mark_source_pages(items: list[dict], today: str) -> None:
+    """PATCH each migrated source page's title with a '[Migrated YYYY-MM-DD] ' prefix.
+    Idempotent — skips pages whose title already carries the prefix."""
+    print(f"\n=== marking {len(items)} source pages in Notion ===\n")
+    marked = 0
+    skipped = 0
+    for item in items:
+        page_id = item["page_id"]
+        try:
+            page = get_page(page_id)
+        except requests.HTTPError as exc:
+            sys.stderr.write(f"  skip (fetch failed) {page_id}: {exc}\n")
+            continue
+        prop_name = title_property_name(page)
+        if not prop_name:
+            sys.stderr.write(f"  skip (no title prop) {page_id}\n")
+            continue
+        current = "".join(t.get("plain_text", "") for t in page["properties"][prop_name].get("title", []))
+        if MIGRATED_TITLE_RE.match(current):
+            skipped += 1
+            continue
+        new_title = f"[Migrated {today}] {current}"
+        try:
+            api_patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                {
+                    "properties": {
+                        prop_name: {
+                            "title": [{"type": "text", "text": {"content": new_title}}]
+                        }
+                    }
+                },
+            )
+            marked += 1
+            sys.stderr.write(f"  marked: {current[:80]}\n")
+        except requests.HTTPError as exc:
+            sys.stderr.write(f"  failed {page_id} ({current[:60]}): {exc}\n")
+    print(f"\nmarked {marked} pages. skipped {skipped} already-marked.")
+
+
+def walk_migrated_only(page_id: str, out: list[dict]) -> None:
+    """Recurse a subtree, collect (id, title, url) for every page whose title
+    matches MIGRATED_TITLE_RE. Used by --list-migrated / --purge-migrated."""
+    try:
+        page = get_page(page_id)
+    except requests.HTTPError:
+        return
+    if page.get("archived"):
+        return  # already archived — skip
+    title_prop = title_property_name(page)
+    title = ""
+    if title_prop:
+        title = rich_text_to_md(page["properties"][title_prop]["title"])
+    if MIGRATED_TITLE_RE.match(title):
+        out.append({"id": page_id, "title": title, "url": page.get("url", "")})
+    # Recurse into child pages
+    try:
+        children = get_children(page_id)
+    except requests.HTTPError:
+        return
+    for child in children:
+        if child.get("type") == "child_page":
+            walk_migrated_only(child["id"], out)
+
+
+def archive_pages(items: list[dict]) -> tuple[int, int]:
+    """PATCH archived:true on each. Returns (ok, failed)."""
+    ok = 0
+    failed = 0
+    for it in items:
+        try:
+            api_patch(f"https://api.notion.com/v1/pages/{it['id']}", {"archived": True})
+            sys.stderr.write(f"  archived: {it['title']}\n")
+            ok += 1
+        except requests.HTTPError as e:
+            sys.stderr.write(f"  FAILED  {it['title']}: {e}\n")
+            failed += 1
+    return ok, failed
+
+
+def unmark_pages(items: list[dict]) -> tuple[int, int]:
+    """Inverse of mark_source_pages: strip the '[Migrated YYYY-MM-DD] ' prefix
+    from each page's title. Used to clean up keep-list pages so they look
+    normal in Notion after the purge."""
+    ok = 0
+    failed = 0
+    for it in items:
+        page_id = it["id"]
+        try:
+            page = get_page(page_id)
+        except requests.HTTPError as e:
+            sys.stderr.write(f"  skip (fetch failed) {it['title']}: {e}\n")
+            failed += 1
+            continue
+        prop_name = title_property_name(page)
+        if not prop_name:
+            sys.stderr.write(f"  skip (no title prop) {it['title']}\n")
+            failed += 1
+            continue
+        current = "".join(t.get("plain_text", "") for t in page["properties"][prop_name].get("title", []))
+        m = MIGRATED_TITLE_RE.match(current)
+        if not m:
+            # already clean — no-op
+            ok += 1
+            continue
+        new_title = current[m.end():]
+        try:
+            api_patch(
+                f"https://api.notion.com/v1/pages/{page_id}",
+                {"properties": {prop_name: {"title": [{"type": "text", "text": {"content": new_title}}]}}},
+            )
+            sys.stderr.write(f"  unmarked: {new_title}\n")
+            ok += 1
+        except requests.HTTPError as e:
+            sys.stderr.write(f"  FAILED {it['title']}: {e}\n")
+            failed += 1
+    return ok, failed
+
+
+def load_keep_set(path: str) -> set[str]:
+    """Read a file of Notion page IDs (one per line, comments with #, hyphens
+    optional). Returns the set of IDs normalized (no hyphens, lowercase)."""
+    out: set[str] = set()
+    for line in Path(path).read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        # strip URL prefix if user pasted the full Notion URL
+        if "notion.so/" in line:
+            line = line.rsplit("-", 1)[-1].rsplit("/", 1)[-1]
+        out.add(line.replace("-", "").lower())
+    return out
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--commit", action="store_true", help="actually act (default: dry-run)")
+    parser.add_argument("--filter", help="only run migrations whose label contains this substring")
+    parser.add_argument(
+        "--mark-source",
+        action="store_true",
+        help="instead of writing files, PATCH each migrated source page in Notion with a '[Migrated YYYY-MM-DD] ' title prefix",
+    )
+    parser.add_argument(
+        "--list-migrated",
+        action="store_true",
+        help="walk the MIGRATIONS trees and list every Notion page whose title starts with '[Migrated YYYY-MM-DD] '; no writes",
+    )
+    parser.add_argument(
+        "--purge-migrated",
+        action="store_true",
+        help="archive (soft-delete) every Notion page tagged '[Migrated …]'; requires --commit to act, otherwise prints the list",
+    )
+    parser.add_argument(
+        "--keep-file",
+        help="optional path to a file of Notion page IDs (one per line, hyphens optional) to exclude from --purge-migrated",
+    )
+    args = parser.parse_args()
+
+    # --list-migrated and --purge-migrated short-circuit before the migration plan.
+    if args.list_migrated or args.purge_migrated:
+        items: list[dict] = []
+        seen_ids: set[str] = set()
+        for migration in MIGRATIONS:
+            if args.filter and args.filter not in migration["label"]:
+                continue
+            sys.stderr.write(f"scanning {migration['label']}...\n")
+            subset: list[dict] = []
+            walk_migrated_only(migration["root_id"], subset)
+            for it in subset:
+                if it["id"] in seen_ids:
+                    continue
+                seen_ids.add(it["id"])
+                items.append(it)
+
+        # Partition into keep (unmark the prefix; page stays) vs archive (soft-delete).
+        keep_ids = load_keep_set(args.keep_file) if args.keep_file else set()
+        def normid(s: str) -> str: return s.replace("-", "").lower()
+        keep_items = [it for it in items if normid(it["id"]) in keep_ids]
+        archive_items = [it for it in items if normid(it["id"]) not in keep_ids]
+
+        print(f"\nfound {len(items)} Notion pages tagged [Migrated YYYY-MM-DD]")
+        if keep_ids:
+            print(f"  → keep (unmark prefix): {len(keep_items)}")
+            print(f"  → archive: {len(archive_items)}")
+        print()
+
+        if keep_items:
+            print("=== KEEP (will strip '[Migrated …]' prefix from title) ===\n")
+            for it in keep_items:
+                print(f"  {it['title']}")
+                print(f"    {it['url']}")
+            print()
+        print(f"=== ARCHIVE ({len(archive_items)} pages) ===\n")
+        for it in archive_items:
+            print(f"  {it['title']}")
+            print(f"    {it['url']}")
+
+        if args.purge_migrated:
+            if not args.commit:
+                action = (f"unmark {len(keep_items)} + archive {len(archive_items)}"
+                          if keep_items else f"archive {len(archive_items)}")
+                print(f"\n(dry-run — re-run with --commit to {action}.)")
+                return 0
+            print("\n=== running on Notion ===\n", file=sys.stderr)
+            unmark_ok = unmark_fail = 0
+            if keep_items:
+                sys.stderr.write(f"unmarking {len(keep_items)} keep pages...\n")
+                unmark_ok, unmark_fail = unmark_pages(keep_items)
+            sys.stderr.write(f"\narchiving {len(archive_items)} pages...\n")
+            ok, failed = archive_pages(archive_items)
+            print(f"\nunmarked {unmark_ok}/{len(keep_items)}, archived {ok}/{len(archive_items)}")
+            return 0 if (failed + unmark_fail) == 0 else 1
+        return 0
+
+
+    dry_run = not args.commit
+    all_results: list[dict] = []
+
+    for migration in MIGRATIONS:
+        if args.filter and args.filter not in migration["label"]:
+            continue
+        sys.stderr.write(f"walking {migration['label']}...\n")
+        results: list[dict] = []
+        walk_subtree(
+            page_id=migration["root_id"],
+            migration=migration,
+            out=results,
+            is_root=True,
+        )
+        all_results.extend(results)
+
+    # Detect slug collisions and inventory.
+    slugs: dict[str, list[dict]] = {}
+    skipped: list[dict] = []
+    keep: list[dict] = []
+    for r in all_results:
+        if "skipped" in r:
+            skipped.append(r)
+            continue
+        rel = f"{r['project']}/{KIND_TO_DIR[r['kind']]}/{slugify(r['title'])}"
+        r["target_rel"] = rel
+        slugs.setdefault(rel, []).append(r)
+        keep.append(r)
+
+    collisions = {rel: items for rel, items in slugs.items() if len(items) > 1}
+
+    # Report.
+    print("\n=== migration plan ===\n")
+    for migration in MIGRATIONS:
+        if args.filter and args.filter not in migration["label"]:
+            continue
+        subset = [r for r in keep if r["subtree_label"] == migration["label"]]
+        print(f"## {migration['label']} ({len(subset)} pages → {migration['project']}/{migration['default_kind']} default)")
+        for r in subset:
+            print(f"  - {r['target_rel']}.md  ← \"{r['title']}\"  [{r['last_edited'][:10]}]")
+        print()
+
+    print("\n=== totals ===")
+    print(f"  pages to migrate: {len(keep)}")
+    print(f"  pages skipped: {len(skipped)}")
+    if skipped:
+        print("\n  skip details:")
+        for s in skipped[:20]:
+            print(f"    - {s.get('skipped')}: \"{s.get('title')}\"")
+    if collisions:
+        print(f"\n  ⚠ slug collisions: {len(collisions)}")
+        for rel, items in collisions.items():
+            print(f"    - {rel}.md  ← {len(items)} pages:")
+            for it in items:
+                print(f"        {it['title']}  (subtree: {it['subtree_label']}, id {it['page_id']})")
+
+    if MERGES:
+        print("\n=== post-migration merges ===")
+        for m in MERGES:
+            print(f"  append page {m['append_page_id']} → {m['target_rel']}.md  (marker: '{m['marker']}')")
+
+    if args.mark_source:
+        today = time.strftime("%Y-%m-%d", time.localtime())
+        # Also mark the merged-but-skipped page(s) so they're tagged in Notion.
+        to_mark = list(keep)
+        for m in MERGES:
+            to_mark.append({"page_id": m["append_page_id"], "title": "(merge source)"})
+        mark_source_pages(to_mark, today)
+        return 0
+
+    if dry_run:
+        print("\n(dry-run — no files written. re-run with --commit to write.)")
+        return 0
+
+    if collisions:
+        print("\n✗ aborting commit: resolve slug collisions first.")
+        return 2
+
+    # Write files.
+    print("\n=== writing files ===\n")
+    written = 0
+    skipped_existing = 0
+    for r in keep:
+        out_path = ROOT / "projects" / r["target_rel"]
+        out_path = out_path.with_suffix(".md")
+        if out_path.exists():
+            sys.stderr.write(f"  skip (exists): {out_path}\n")
+            skipped_existing += 1
+            continue
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fm = build_frontmatter(
+            title=r["title"],
+            kind=r["kind"],
+            project=r["project"],
+            last_edited_iso=r["last_edited"],
+            notion_id=r["page_id"],
+        )
+        body = page_to_markdown(r["page_id"])
+        out_path.write_text(dump_frontmatter(fm) + "\n\n" + body + "\n")
+        written += 1
+        sys.stderr.write(f"  wrote {out_path.relative_to(Path.home())}\n")
+    print(f"\nwrote {written} files. skipped {skipped_existing} that already existed.")
+
+    # Post-migration merges.
+    if MERGES:
+        print("\n=== applying merges ===\n")
+        for m in MERGES:
+            target = ROOT / "projects" / (m["target_rel"] + ".md")
+            if not target.exists():
+                sys.stderr.write(f"  skip merge (target missing): {target}\n")
+                continue
+            try:
+                appended_body = page_to_markdown(m["append_page_id"])
+            except requests.HTTPError as exc:
+                sys.stderr.write(f"  skip merge (fetch failed for {m['append_page_id']}): {exc}\n")
+                continue
+            current = target.read_text().rstrip()
+            target.write_text(
+                current + "\n\n---\n\n" + m["marker"] + "\n\n" + appended_body + "\n"
+            )
+            sys.stderr.write(f"  appended {m['append_page_id']} → {target.relative_to(Path.home())}\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

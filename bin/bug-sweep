@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# bug-sweep — daytime cost-shift packaging for overnight Phase 1 (GH-issue
+# ingest + #*-bugs triage) against a single product. ARCH-075.
+#
+# Subscription-billed: launches an interactive co session on the
+# bug-investigator agent inside the product repo. The session's initial
+# prompt scopes the work to overnight Phase 1 verbatim and tells the agent
+# to run `mark-fresh <product> bug-sweep` when complete — the next overnight
+# (within 72h) then skips Phase 1 for this product.
+#
+# Usage:
+#   bug-sweep <product>
+#
+#   product: constance | vivy | sous-chef
+#
+# Pre-2026-06-15 this is just convenience (everything is subscription).
+# Post-2026-06-15 this is the cost-shift — overnight Phase 1 = metered API,
+# this command = subscription. See substrate/decisions.md ARCH-075.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: bug-sweep <constance|vivy|sous-chef>" >&2
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+product=$1
+
+case $product in
+    constance|vivy|sous-chef) ;;
+    *) echo "bug-sweep: invalid product '$product'" >&2; usage ;;
+esac
+
+# The product lives under the machine's root (company/decisions/0008), printed by
+# the bin/builder-root beside this file's real path; HOME does not move it.
+_self_path="${BASH_SOURCE[0]}"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+root="$("$(dirname "$_self_path")/builder-root" --root)" && [[ -n "$root" ]] \
+    || { echo "bug-sweep: cannot resolve the machine's root (bin/builder-root --root)" >&2; exit 1; }
+product_dir="$root/$product"
+[[ -d "$product_dir" ]] || { echo "bug-sweep: no product dir at $product_dir" >&2; exit 1; }
+
+gh_repos_by_product() {
+    case $1 in
+        constance) echo "convivy/constance" ;;
+        vivy)      echo "convivy/vivy + convivy/vivy-ownerrez-sandbox-tools" ;;
+        sous-chef) echo "convivy/sous-chef" ;;
+    esac
+}
+
+gh_repos=$(gh_repos_by_product "$product")
+
+# Initial prompt for the bug-investigator co session. Scoped to overnight
+# Phase 1 verbatim so the agent's behavior is identical to the overnight
+# pipeline — just driven by an interactive session billed to subscription.
+prompt="Task: Run overnight Phase 1 (bug-sweep) for $product end-to-end. Subscription-billed daytime cost-shift per ARCH-075.
+
+Phase 1: GitHub-issue ingestion + triage (same scope as overnight-orchestrator's Phase 1, ARCH-041 + ARCH-014).
+
+(a) GitHub-issue ingestion. Poll \`gh issue list --state open --label '-claude-mirrored'\` against $gh_repos. For each unmirrored open issue, apply the \`claude-mirrored\` label so it's not re-ingested, then file a bug on the ops queue via \`agentctl bug-create\` with the issue title and URL.
+
+(b) Bug triage. For each open bug on the ops queue for $product, diagnose it (read the code, follow the stack trace if there is one, check the database schema if relevant), then add a threaded diagnosis comment via \`gh issue comment\` summarizing your findings.
+
+You do NOT fix bugs in this command — that's bug-drain. You diagnose and comment; bug-drain (or the next overnight Phase 2) picks up from there.
+
+When the sweep is genuinely complete (you've ingested every unmirrored GH issue AND triaged every open ops-queue bug for $product), run \`mark-fresh $product bug-sweep\` from Bash before ending the session. The next overnight will skip Phase 1 for $product if it sees that marker within 72 hours.
+
+If you can't complete the sweep (rate limit, ambiguous bug, unknown state), surface that to me and DO NOT run mark-fresh — overnight will pick up the remainder."
+
+cd "$product_dir"
+exec co bug "$prompt"

@@ -1,0 +1,710 @@
+#!/usr/bin/env python3.11
+"""Capture interactive Claude Code session transcripts into the Library's
+Archives (issue_01M0BRGVMXGQKM4GXBEFG2Z7PS — the agent-platform half of
+library#issue_01M0ASMWF82GD1849F2PK76PD5).
+
+`~/.claude/projects` is a rolling ~30-day window (observed retention; see the
+KB contract `agent-platform/contracts/claude-transcript-jsonl`). Nothing else
+walks it, so a day not captured is a day of history gone for good. This job
+walks it, groups each transcript's communication into turns, and POSTs each
+turn to the Library as one Archives signal.
+
+**Black-box exclusion is directory-name-only, and happens before this script
+opens a single line inside an excluded directory.** `projects.private_slugs()`
+names the excluded crews (today just `cfo`); for each, this forward-computes
+the sanitized directory-name fragment its home directory, its `dirs`-registered
+directories (ARCH-426), and its repos' worktree collections would produce, and
+skips any `~/.claude/projects/<dir>` whose name contains one of them at a
+'-'-delimited boundary. Recomputed fresh from the registry on every run —
+never hardcoded to a slug, since ADR-0043 says more crews will follow.
+
+**Capture is an allowlist: a directory is captured only when it resolves to a
+registered, non-private project, and every other directory is skipped unopened,
+exactly like a black box.** The black-box exclusion alone is a denylist, and a
+denylist fails open for any session whose cwd no crew's fragment names. Two
+did, until 2026-09-12. Ask's directory is not in the registry at all, so its
+sessions were posted under their raw dirname. Headless `claude -p` jobs that
+launchd starts with no WorkingDirectory run at `/`, whose dirname is `-`, and
+that is how the EA crew's mailbox and calendar prompts reached the Library
+despite EA being private. An unregistered directory now loses its archive
+rather than leaking it; a job whose transcripts should be archived runs from a
+registered directory instead of widening this.
+
+**The match is a delimited substring anywhere in the dirname, not just a
+leading prefix.** A worktree living under `<root>/worktrees/` or nested
+inside a repo checkout (`<repo>/.claude/worktrees/<name>`) sanitizes to a
+dirname that STARTS with the project's fragment, but a scratchpad cwd rooted
+outside `<root>` (`/private/tmp/claude-<uid>/<origin-path>-scratchpad-
+<name>`) embeds that same fragment partway through the dirname instead — a
+leading-prefix-only check can never catch that shape no matter how many
+fragments are enumerated. `dir_matches_prefixes` scans for the fragment at
+any position, delimited by '-' (or a string edge) so that a private home_dir
+of `.../CFO` cannot also swallow an unrelated `.../CFOextra` wherever it
+appears.
+
+**The match is case- and Unicode-normalization-insensitive, on purpose.** This
+machine defaults to case-insensitive APFS, so a session whose cwd was reached
+via different case (`<root-lowercased>/cfo` instead of `<root>/CFO`) sanitizes to a
+differently-cased directory name that still names the SAME on-disk directory —
+a naive case-sensitive prefix comparison misses it. `dir_matches_prefixes`
+NFC-normalizes and casefolds both sides before comparing. This is a directory-
+NAME comparison against a forward-computed prefix, not a live filesystem
+resolution, so there is no symlink to chase on the transcript side; the
+registry side already resolves through `projects.home_path()`, which follows
+symlinks and refuses anything outside the home directory.
+
+**Turn model**, reusing `lib/agent-platform/session_view.py`'s own
+communication-first `classify()` rather than re-deriving the transcript
+format: a turn is one `prompt`-kind FULL row plus every `speech`-kind FULL row
+up to the next `prompt` row. Tool calls, results, and reasoning are COLLAPSED/
+HIDDEN by `classify()` and never enter a turn. `classify_lines` additionally
+dedupes repeated `assistant` records on `(message.id, requestId)` (ARCH-383):
+Claude Code can write the same assistant response into the transcript more
+than once, and without this a turn's body would repeat the same paragraph up
+to 4x.
+
+**Incremental, resumable capture.** A cursor file
+(`~/.orient-control/transcript-capture.cursor.json`) maps each session file's
+absolute path to a BYTE offset — the start of the earliest line not yet safely
+captured. A turn not yet closed by a following prompt row (the session's most
+recent turn, still possibly growing) is held back rather than posted with
+partial content: only once the file has gone quiet for
+`LIVE_THRESHOLD_SECONDS` is it treated as final and posted. The cursor never
+advances past a turn that failed to POST, so a crash or a Library outage
+re-covers that turn next run rather than losing it; `dedup_key` (a hash of the
+session id and the turn's starting byte offset — stable across reruns since
+the underlying file is append-only) makes a re-covered turn idempotent rather
+than a duplicate.
+
+Auth: a bearer token from `$TRANSCRIPT_CAPTURE_TOKEN` or the 0600 file
+`~/.orient-control/transcript-capture-token` — this job's OWN `POST /signals`
+credential (issue_01M3VY56TWPFFHQ50QTFM5P07K), separate from the shared
+agent-platform one. `POST /signals` rate-limits each authenticated actor to
+120/minute (library#176); this job alone can peak at 576/minute (see below),
+which would otherwise hold the whole shared agent-platform bucket for minutes
+and starve every other sender's signals. Until the Library mints and installs
+this job's own credential, `capture_token()` falls back to the shared one
+(`signal_client.token()`, the existing agent-kind `agent-platform` credential
+in `api-tokens.json`, `products: ["*"]`, no `signal.create_customer` — this
+job only ever writes `privacy_class: internal`, the server default) and warns
+once to stderr. The actual POST is `signal_client.post_signal`
+(ARCH-353/356), not a second implementation — this job can peak at 576
+signals/minute (2026-09-16), well over the Library's 120/minute/submitter
+ceiling (library#176), so it needs the 429/Retry-After retry `post_signal`
+gives a caller that passes its own run `deadline` (see `_RUN_DEADLINE_SECONDS`
+below), which this job does. Requests route through
+`vault_plane`, which picks the live plane (the Library by default; see
+`VAULTS_ON_LIBRARY` in `lib/agent-platform/vault_plane.py`) and attaches
+`Library-Protocol: 1` when that plane is the Library.
+
+A 429 still unresolved when this run's own deadline passes
+(`_RUN_DEADLINE_SECONDS`, from `main()`) comes back as `error:429`, counted in
+`tally["errors"]` exactly like any other delivery failure — the file's cursor
+does not advance past it (see capture_file's docstring), so the turn is
+re-covered, not lost.
+
+Modes:
+  --backfill    every session file, ignoring the cursor
+  (default)     incremental: only lines appended since each file's cursor
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import sys
+import time
+import unicodedata
+from pathlib import Path
+from typing import NamedTuple
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "projects.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+import projects  # noqa: E402
+import session_view as SV  # noqa: E402
+import signal_client as SC  # noqa: E402
+import builder_root as BR  # noqa: E402
+
+CLAUDE_PROJECTS = SV.CLAUDE_PROJECTS
+CURSOR_FILE = Path.home() / ".orient-control" / "transcript-capture.cursor.json"
+TOKEN_ENV = "TRANSCRIPT_CAPTURE_TOKEN"
+TOKEN_FILE = Path.home() / ".orient-control" / "transcript-capture-token"
+
+# How long a session file must sit unmodified before its trailing (possibly
+# still-growing) turn is treated as final and posted. Matches the 10-minute
+# OVERLAP convention the sibling captures (github_capture.py, gmail_capture.py)
+# use for the analogous "don't act on a window that might still change" idea.
+LIVE_THRESHOLD_SECONDS = 600
+
+# The delivery-wanting budget (signal_client._DELIVERY_TIMEOUT's own reasoning
+# applies verbatim: a one-shot launchd job cares that the write lands, not that
+# it lands within the tee's 2s).
+_POST_TIMEOUT = SC._DELIVERY_TIMEOUT
+# No `attempts` is passed to signal_client.post_signal below — this job only
+# wants the 429/Retry-After retry (via `deadline`), which post_signal gives
+# independent of `attempts`. Passing attempts > 1 would additionally retry a
+# 503/timeout/connection-error, a behaviour this job never had before this
+# fix (its old hand-rolled POST made exactly one attempt) and does not need:
+# a transcript turn that fails to post keeps its file's cursor from
+# advancing (see capture_file's docstring), so it is re-covered next run
+# either way.
+# Bounds how long one capture run keeps resending a signal into the Library's
+# POST /signals 429 (library#176, 120 signals/minute/submitter — see
+# signal_client.post_signal's 429 handling). This job's own StartInterval is
+# 900s (launchd/com.convivy.transcript-capture.plist); 600s leaves 300s of
+# headroom before the next scheduled fire. A signal still unsent when this
+# deadline passes comes back as 'error:429', counted in tally["errors"] like
+# any other delivery failure — the cursor does not advance past it, so the
+# turn is re-covered next run rather than lost.
+_RUN_DEADLINE_SECONDS = 600
+
+# <root>/worktrees — resolved once, the same collection dir
+# lib/agent-platform/worktrees.py's `_extras_dir_for` computes, but defined
+# independently here rather than imported: pulling in worktrees.py (which
+# imports registry.py) for one path constant would widen this script's import
+# surface for no benefit to a security-critical, directory-name-only check.
+# The root comes from builder_root.root(), which is stdlib-only and reads no
+# environment, so it widens nothing (company/decisions/0008).
+_WORKTREES_ROOT = (BR.root() / "worktrees").resolve()
+
+_MAX_IDENT = 64                    # library/store.py MAX_IDENT — POST /signals
+                                    # 400s on source/kind/product over this
+                                    # (actor's own cap is the separate, larger
+                                    # store.MAX_ACTOR, 200 chars)
+_MAX_CONTENT_BYTES = 20_000_000    # library/store.py MAX_BLOB_BYTES
+_MAX_BODY_CHARS = 200_000          # library/store.py MAX_TEXT — POST /signals
+                                    # 400s on body over this (library#201);
+                                    # the check is `len(body) > MAX_TEXT` on
+                                    # the Python str, i.e. characters, so the
+                                    # clip below is a character slice, not a
+                                    # byte slice
+
+
+# --- black-box exclusion + product resolution (pure, unit-tested) --------------
+
+
+def _sanitize(path: Path) -> str:
+    """A directory Path -> the `~/.claude/projects` naming convention: every
+    '/' AND every '.' becomes '-' (verified empirically against this
+    machine's real `~/.claude/projects` entries, e.g. the on-disk worktree
+    `agent-platform.black-box` sanitizes to
+    `...-worktrees-agent-platform-black-box`, not
+    `...-worktrees-agent-platform.black-box`)."""
+    return str(path).replace("/", "-").replace(".", "-")
+
+
+class _Prefix(NamedTuple):
+    """One sanitized directory-name fragment a project's sessions can appear
+    under, matched as a '-'-delimited SUBSTRING anywhere in a transcript
+    dirname (see `dir_matches_prefixes`), not only at its start — a
+    scratchpad cwd rooted outside <root> embeds a project's sanitized
+    identifier partway through the dirname, not at the front of it.
+
+    `boundary=True` means the match must be delimited by '-' (or a string
+    edge) on BOTH sides — required for a home_dir/dirs_for fragment, where
+    nothing else disambiguates "CFO" from "CFOextra" wherever in the string
+    it appears. `boundary=False` means only the LEFT side needs delimiting —
+    true for a worktree fragment, whose trailing '.' (from `<repo>.<purpose>`)
+    is itself sanitized to a trailing '-' by `_sanitize`, so the fragment
+    STRING already ends in the separator and its own last character already
+    satisfies the right side (requiring one there too would look for a
+    *second* '-' immediately after the first, which never occurs)."""
+    value: str
+    boundary: bool
+
+
+def _project_prefixes(slug: str, unit: dict) -> list[_Prefix]:
+    """Every sanitized directory-name prefix this project's sessions can
+    appear under: its home directory, every other directory the registry's
+    `dirs` field (ARCH-426) associates with it, and one per repo's worktree
+    collection.
+
+    `dirs_for(slug)` leads with `home_path(slug)` itself, so it is only
+    consulted for the entries BEYOND home — a repo checkout that is not
+    nested under the project's home directory (the shape `svc` already uses
+    for `convivy-services`). Without this, a private crew registered with a
+    non-empty `dirs` entry gets zero exclusion coverage for that directory
+    tree, even though its own home directory is covered.
+
+    Forward-computed from the registry, never decoded from a transcript
+    directory name — that direction is ambiguous, since a repo name can
+    itself contain '-' (`sous-chef`, `convivy-orient`), the same character the
+    sanitizer uses as its separator.
+    """
+    out: list[_Prefix] = []
+    home = projects.home_path(slug)
+    if home is not None:
+        out.append(_Prefix(_sanitize(home), boundary=True))
+    for extra in projects.dirs_for(slug):
+        if extra == home:
+            continue
+        out.append(_Prefix(_sanitize(extra), boundary=True))
+    for repo in unit.get("repos") or []:
+        if not isinstance(repo, str) or not repo:
+            continue
+        out.append(_Prefix(_sanitize(_WORKTREES_ROOT / f"{repo}."), boundary=False))
+    return out
+
+
+def all_project_prefixes() -> dict[str, list[_Prefix]]:
+    """Every registered project's prefixes, {slug: [_Prefix, ...]}. Computed
+    fresh from the registry each call — cheap (the registry load is cached,
+    `home_path` is the only per-project syscall) and called once per run."""
+    units = projects.load()
+    return {slug: _project_prefixes(slug, unit) for slug, unit in units.items()}
+
+
+def black_box_prefixes(project_index: dict[str, list[_Prefix]],
+                        private: set[str]) -> list[_Prefix]:
+    """The prefixes naming every black-box crew's sessions, drawn from the
+    SAME `project_index` `resolve_product` uses — so exclusion and product
+    resolution can never disagree about what a given prefix means."""
+    out: list[_Prefix] = []
+    for slug in sorted(private):
+        out.extend(project_index.get(slug, []))
+    return out
+
+
+def _normalize(s: str) -> str:
+    """NFC-normalize then casefold, so a comparison built on this is immune to
+    both ASCII case (`CFO` vs `cfo`) and Unicode form differences — the two
+    ways APFS's normalization-insensitive, case-insensitive default lets two
+    different literal strings name the same on-disk path."""
+    return unicodedata.normalize("NFC", s).casefold()
+
+
+def _delimited_occurrence(dirname: str, fragment: str, *, require_right_boundary: bool) -> bool:
+    """Whether `fragment` occurs in `dirname` at a position delimited by '-'
+    (or a string edge) on the left, and — when `require_right_boundary` — on
+    the right too.
+
+    Scans every occurrence of `fragment` rather than stopping at the first:
+    an early occurrence can fail the boundary check (e.g. `fragment`
+    reappearing, unboundaried, as the tail of some longer unrelated token)
+    while a later, genuinely-delimited occurrence exists further along the
+    same string.
+    """
+    start = 0
+    flen = len(fragment)
+    while True:
+        i = dirname.find(fragment, start)
+        if i == -1:
+            return False
+        left_ok = i == 0 or dirname[i - 1] == "-"
+        right_ok = (not require_right_boundary
+                    or i + flen == len(dirname)
+                    or dirname[i + flen] == "-")
+        if left_ok and right_ok:
+            return True
+        start = i + 1
+
+
+def dir_matches_prefixes(dirname: str, prefixes: list[_Prefix]) -> bool:
+    """Whether a `~/.claude/projects/<dirname>` belongs to one of `prefixes`.
+
+    Case- and normalization-insensitive throughout (see `_normalize`). Each
+    prefix is matched as a delimited SUBSTRING anywhere in `dirname`, not
+    only at its start (`_delimited_occurrence`) — required because a
+    scratchpad cwd rooted outside <root>
+    (`/private/tmp/claude-<uid>/<origin-path>-scratchpad-<name>`) embeds a
+    project's sanitized identifier partway through the dirname, e.g.
+    `-private-tmp-claude-501--Users-operator-Convivy-CFO-somehash-
+    scratchpad-probe`: the private home_dir fragment `-Users-operator-
+    Convivy-CFO` sits after `claude-501-`, never at the front, so a plain
+    `startswith` can never catch it no matter how many prefixes are
+    enumerated (security-reviewer, PR #415, run-3a454557). A `boundary=True`
+    prefix requires the delimiter on both sides, so a private home_dir of
+    `.../CFO` does not also swallow an unrelated `.../CFOextra` wherever in
+    the string it appears; a `boundary=False` (worktree) prefix already
+    carries its own trailing '-' (sanitized from `<repo>.`), which is itself
+    the right-side delimiter, so only the left side is checked.
+    """
+    norm_dir = _normalize(dirname)
+    for p in prefixes:
+        norm_p = _normalize(p.value)
+        if _delimited_occurrence(norm_dir, norm_p, require_right_boundary=p.boundary):
+            return True
+    return False
+
+
+def resolve_product(dirname: str, project_index: dict[str, list[_Prefix]],
+                     private: set[str]) -> str | None:
+    """The registered, non-private project slug a transcript directory belongs
+    to, or None when none matches, and None means `main()` skips the directory
+    unopened.
+
+    This used to fall back to the raw directory name, and that fallback is the
+    leak the module docstring describes: every unregistered directory,
+    including `-` and ask's, was captured under its own name.
+
+    `private` is excluded from the candidate pool as a second, independent
+    guard alongside the caller's own exclusion check — belt-and-suspenders,
+    matching `library/identity.py`'s own pattern of a capability check backed
+    by an unconditional kind check on the write route: a bug in the caller's
+    exclusion pass must not be able to smuggle a black-box crew's slug into a
+    signal's `product` field via this path instead.
+    """
+    for slug in sorted(project_index):
+        if slug in private:
+            continue
+        if dir_matches_prefixes(dirname, project_index[slug]):
+            return slug
+    return None
+
+
+# --- turn extraction (pure, unit-tested) ----------------------------------------
+
+
+def classify_lines(lines: list[str], offsets: list[int]) -> list[dict]:
+    """Parse and classify each transcript line, keeping only FULL prompt/
+    speech rows — the human-visible communication `session_view.classify()`
+    already separates from tool calls, reasoning, and control-plane noise.
+
+    Degrades per record rather than raising: an unparseable line, a non-dict
+    JSON value, or a `classify()` failure is skipped and the rest of the file
+    still processes — matching `classify()`'s own documented "never raises"
+    contract and the KB contract's warning that one malformed line must not
+    take a whole transcript's capture down.
+
+    Deduplicates repeated `assistant` records (ARCH-383): Claude Code can
+    write the identical assistant response into the transcript more than
+    once. A record counts as a repeat only when BOTH `message.id` and
+    `requestId` are present and match one already seen in THIS call; a record
+    missing either key is never collapsed with another keyless one, matching
+    the contract's own dedupe rule for cost consumers.
+    """
+    seen_assistant: set[tuple[str, str]] = set()
+    out: list[dict] = []
+    for line_idx, raw in enumerate(lines):
+        text = raw.strip()
+        if not text:
+            continue
+        try:
+            rec = json.loads(text)
+        except Exception:  # noqa: BLE001 — degrade per record, never crash the file
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "assistant":
+            message = rec.get("message")
+            msg_id = message.get("id") if isinstance(message, dict) else None
+            req_id = rec.get("requestId")
+            if isinstance(msg_id, str) and isinstance(req_id, str):
+                dedup = (msg_id, req_id)
+                if dedup in seen_assistant:
+                    continue
+                seen_assistant.add(dedup)
+        try:
+            rows = SV.classify(rec)
+        except Exception:  # noqa: BLE001 — classify() documents "never raises";
+            continue        # degrade defensively anyway rather than trust that blindly
+        ts = rec.get("timestamp") if isinstance(rec.get("timestamp"), str) else None
+        byte_offset = offsets[line_idx] if line_idx < len(offsets) else None
+        for row in rows:
+            if row.get("display") != SV.FULL:
+                continue
+            if row.get("kind") not in ("prompt", "speech"):
+                continue
+            out.append({**row, "_byte": byte_offset, "_timestamp": ts})
+    return out
+
+
+def group_turns(rows: list[dict]) -> list[dict]:
+    """FULL prompt/speech rows -> turns: `{"start_byte": int, "rows": [...]}`.
+
+    A turn is one `prompt` row plus every `speech` row up to the next
+    `prompt` row. Rows opening with `speech` and no `prompt` seen yet in this
+    read window (the first lines read from a file whose earlier history
+    predates this window) start a turn anchored on that first row rather than
+    being dropped — losing them silently would be worse than an occasional
+    turn with no human line at its head.
+    """
+    turns: list[dict] = []
+    current: dict | None = None
+    for row in rows:
+        if row.get("kind") == "prompt":
+            if current is not None:
+                turns.append(current)
+            current = {"start_byte": row.get("_byte"), "rows": [row]}
+        else:
+            if current is None:
+                current = {"start_byte": row.get("_byte"), "rows": [row]}
+            else:
+                current["rows"].append(row)
+    if current is not None:
+        turns.append(current)
+    return turns
+
+
+def _turn_text(rows: list[dict]) -> str:
+    parts = []
+    for row in rows:
+        body = (row.get("body") or "").strip()
+        if not body:
+            continue
+        label = row.get("label") or row.get("kind") or "?"
+        parts.append(f"{label}: {body}")
+    return "\n\n".join(parts)
+
+
+def turn_payload(session_id: str, product: str, actor: str, turn: dict) -> dict | None:
+    """One turn -> a `POST /signals` payload, or None for a turn with no
+    visible text (e.g. every row's body was blank).
+
+    **`body` and `content` derive from one sanitized string, but `body` is
+    then clipped to `_MAX_BODY_CHARS` while `content` keeps the full text.**
+    A transcript line can carry a lone Unicode surrogate (`\\ud800`) — valid
+    JSON, not valid UTF-8. The library's `POST /signals` refuses an
+    unencodable `content` with a 400 (library/app.py, PR #40), but has no
+    equivalent guard on `body`, which reaches SQLite's INSERT and raises
+    uncaught. Since `capture_file` only advances a session's cursor on a
+    zero-error run, one such turn would wedge that session's cursor
+    permanently, silently dropping everything appended after it. The
+    encode/decode roundtrip below sanitizes before truncating to
+    `_MAX_CONTENT_BYTES`, and the final decode with "replace" absorbs any
+    multi-byte sequence the truncation itself splits — so the one resulting
+    string is always safe to store as `content`. `POST /signals` separately
+    refuses a `body` over `_MAX_BODY_CHARS` characters (library#201) rather
+    than truncating it the way it used to, so `body` takes a further
+    character-count clip of that same sanitized string; `content` is the
+    blob column (`_MAX_CONTENT_BYTES`, 20 MB) and is unaffected."""
+    text = _turn_text(turn["rows"])
+    if not text:
+        return None
+    content_bytes = text.encode("utf-8", "replace")
+    if len(content_bytes) > _MAX_CONTENT_BYTES:
+        content_bytes = content_bytes[:_MAX_CONTENT_BYTES]
+    sanitized = content_bytes.decode("utf-8", "replace")
+    body = sanitized[:_MAX_BODY_CHARS]
+    produced_at = next((r["_timestamp"] for r in turn["rows"] if r.get("_timestamp")), "")
+    return {
+        "source": "claude-transcript",
+        "kind": "transcript-turn",
+        "actor": actor,
+        "product": product[:_MAX_IDENT],
+        "stream": session_id,
+        "body": body,
+        "content": sanitized,
+        "dedup_key": f"claude-transcript:{session_id}:{turn['start_byte']}",
+        "produced_at": produced_at,
+    }
+
+
+# --- I/O: transcript reads, signal POSTs, the cursor, the token ------------------
+
+
+def _read_new_lines(path: Path, start_byte: int) -> tuple[list[str], list[int], int]:
+    """Complete (newline-terminated) lines appended after `start_byte`, each
+    one's starting byte offset, and the byte offset just past the last
+    complete line. A trailing partial line (the file mid-write) is excluded
+    and never counted into that offset, so a later run rereads it once it is
+    whole rather than missing the completed record forever."""
+    with open(path, "rb") as fh:
+        fh.seek(start_byte)
+        raw = fh.read()
+    lines: list[str] = []
+    offsets: list[int] = []
+    pos = 0
+    end_of_complete = start_byte
+    while True:
+        nl = raw.find(b"\n", pos)
+        if nl == -1:
+            break
+        offsets.append(start_byte + pos)
+        lines.append(raw[pos:nl].decode("utf-8", "replace"))
+        pos = nl + 1
+        end_of_complete = start_byte + pos
+    return lines, offsets, end_of_complete
+
+
+def capture_token() -> str:
+    """This job's own `POST /signals` credential (`TOKEN_ENV` or `TOKEN_FILE`),
+    else the shared agent-platform one (`signal_client.token()`) with a
+    one-line stderr warning — see the module docstring's Auth section. Exits
+    only when NEITHER credential is available; a missing own-credential file
+    alone must not stop the run, since the fallback keeps it posting through
+    the switch to a dedicated actor."""
+    tok = os.environ.get(TOKEN_ENV, "").strip()
+    if tok:
+        return tok
+    try:
+        file_tok = TOKEN_FILE.read_text().strip()
+        if file_tok:
+            return file_tok
+    except OSError:
+        pass
+    print(f"transcript-capture: no {TOKEN_FILE} and no ${TOKEN_ENV}; sharing the "
+          "agent-platform signal bucket until the Library mints "
+          "transcript-capture's own credential", file=sys.stderr)
+    shared = SC.token()
+    if shared:
+        return shared
+    sys.exit(f"no capture token: set {TOKEN_ENV}, create {TOKEN_FILE}, or set "
+             f"{SC.TOKEN_ENV}/create {SC.TOKEN_FILE}")
+
+
+def post_signal(payload: dict, token: str, *, deadline: float | None = None,
+                sleep=time.sleep) -> str:
+    """POST one signal. Returns 'created' | 'duplicate' | 'error:<code>'.
+
+    Through `signal_client.post_signal` (ARCH-353/356) rather than a second,
+    independent POST implementation — see this module's own docstring for why
+    that matters here (a 429 from the Library's rate limit, library#176).
+    `deadline` (a `time.monotonic()` value) bounds how long a 429 is retried;
+    `main()` passes this run's own budget through a `poster` closure built
+    from this function rather than changing `capture_file`'s `poster(payload,
+    token)` contract, which every existing caller (including every test
+    `poster=` lambda) still relies on. `sleep` is the test seam for that
+    retry's wait — tests override it so a 429/Retry-After loop does not
+    consume real wall-clock time; production never passes it, so it is always
+    the real `time.sleep`.
+
+    No `attempts` is passed through — see `_POST_TIMEOUT`'s neighbouring
+    comment for why this job wants only the 429 retry `deadline` already
+    gives it, not the 503/timeout retry `attempts > 1` would add."""
+    return SC.post_signal(payload, tok=token, timeout=_POST_TIMEOUT,
+                          deadline=deadline, sleep=sleep)
+
+
+def load_cursor() -> dict:
+    try:
+        return json.loads(CURSOR_FILE.read_text())
+    except Exception:  # noqa: BLE001 — a missing/corrupt cursor just means "start fresh"
+        return {}
+
+
+def save_cursor(cur: dict) -> None:
+    CURSOR_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CURSOR_FILE.write_text(json.dumps(cur, indent=1))
+
+
+def _actor() -> str:
+    try:
+        return getpass.getuser() or "unknown"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+# --- the capture run -------------------------------------------------------------
+
+
+def capture_file(path: Path, start_byte: int, now: float, product: str, actor: str,
+                  token: str, poster=post_signal) -> tuple[int, dict]:
+    """Capture new turns from one transcript file. Returns (new_cursor_value,
+    tally). The returned cursor value is meaningful only when
+    `tally["errors"] == 0` — `main()` persists it only in that case, so a
+    file with any POST failure keeps its old cursor and re-covers the same
+    window next run (dedup_key absorbs the safe re-posts)."""
+    tally = {"created": 0, "duplicate": 0, "skipped": 0, "errors": 0}
+    session_id = path.stem
+    try:
+        stat = path.stat()
+    except OSError:
+        tally["errors"] += 1
+        return start_byte, tally
+    # A cursor past the current file size means the file was rotated/replaced
+    # out from under us; restart from the beginning rather than seeking past EOF.
+    read_from = start_byte if start_byte <= stat.st_size else 0
+    try:
+        lines, offsets, end_of_complete = _read_new_lines(path, read_from)
+    except OSError:
+        tally["errors"] += 1
+        return start_byte, tally
+    if not lines:
+        return read_from, tally
+    rows = classify_lines(lines, offsets)
+    turns = group_turns(rows)
+    if not turns:
+        return end_of_complete, tally
+    closed, trailing = turns[:-1], turns[-1]
+    to_post = list(closed)
+    if now - stat.st_mtime >= LIVE_THRESHOLD_SECONDS:
+        # The file has gone quiet: the trailing turn is not going to grow any
+        # further, so it is safe to treat as final.
+        to_post.append(trailing)
+        new_cursor = end_of_complete
+    else:
+        # Still live: hold the trailing turn back and reread it (plus
+        # whatever gets appended to it) next run rather than posting it now
+        # and losing anything appended to it after this post — the Library
+        # never updates a row's content on a dedup_key collision.
+        new_cursor = trailing["start_byte"]
+    for turn in to_post:
+        payload = turn_payload(session_id, product, actor, turn)
+        if payload is None:
+            tally["skipped"] += 1
+            continue
+        result = poster(payload, token)
+        if result == "created":
+            tally["created"] += 1
+        elif result == "duplicate":
+            tally["duplicate"] += 1
+        else:
+            tally["errors"] += 1
+    return new_cursor, tally
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Capture interactive Claude Code session transcripts into "
+                     "the Library's Archives")
+    ap.add_argument("--backfill", action="store_true",
+                    help="ignore the cursor and reprocess every session from the start")
+    args = ap.parse_args()
+
+    if not CLAUDE_PROJECTS.is_dir():
+        print(f"{CLAUDE_PROJECTS} does not exist; nothing to capture")
+        return
+
+    token = capture_token()
+    actor = _actor()
+    project_index = all_project_prefixes()
+    black_box = black_box_prefixes(project_index, projects.private_slugs())
+    cursor = {} if args.backfill else load_cursor()
+    now = time.time()
+    # One deadline for the whole run, not per signal — see _RUN_DEADLINE_SECONDS.
+    deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
+    poster = lambda payload, tok: post_signal(payload, tok, deadline=deadline)
+
+    grand = {"created": 0, "duplicate": 0, "skipped": 0, "errors": 0}
+    excluded = 0
+    unregistered = 0
+    for dirpath in sorted(p for p in CLAUDE_PROJECTS.iterdir() if p.is_dir()):
+        if dir_matches_prefixes(dirpath.name, black_box):
+            # Excluded at the directory level: nothing inside it is opened,
+            # not even to list its files.
+            excluded += 1
+            continue
+        product = resolve_product(dirpath.name, project_index, projects.private_slugs())
+        if product is None:
+            # No registered public project owns it: skipped just as unopened.
+            # `-` (cwd `/`) and ask's dir both land here.
+            unregistered += 1
+            continue
+        for f in sorted(dirpath.glob("*.jsonl")):
+            key = str(f)
+            start = 0 if args.backfill else cursor.get(key, 0)
+            new_cursor, tally = capture_file(f, start, now, product, actor, token,
+                                             poster=poster)
+            for k in grand:
+                grand[k] += tally[k]
+            if tally["errors"] == 0:
+                cursor[key] = new_cursor
+    save_cursor(cursor)
+    print(f"excluded {excluded} black-box directories")
+    print(f"skipped {unregistered} unregistered directories")
+    print(f"total: {grand}")
+    if grand["errors"]:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

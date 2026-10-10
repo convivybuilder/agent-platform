@@ -1,0 +1,36 @@
+{
+  "appearance": "system",
+  "railNames": {
+    "ask": "Ask",
+    "constance": "Constance",
+    "constance-commercial": "Constance Commercial",
+    "convivy-commercial": "Convivy Commercial",
+    "deck": "Deck",
+    "hollis": "Hollis",
+    "nyh-arch-tools": "NYH Arch Tools",
+    "nyh-etc": "East Texas Circle",
+    "nyh-park-villa": "Park Villa",
+    "selector": "Selector",
+    "sous-chef": "Sous Chef",
+    "steward": "Steward",
+    "svc": "Convivy Kit",
+    "vivy": "Vivy",
+    "vivy-commercial": "Vivy Commercial",
+    "write-better": "Write Better"
+  },
+  "sessions": {
+    "ask": "indigo",
+    "constance": "violet",
+    "convivy": "ember",
+    "convivy-commercial": "gold",
+    "deck": "gold",
+    "hollis": "rose",
+    "nyh-etc": "teal",
+    "nyh-park-villa": "amber",
+    "selector": "indigo",
+    "sous-chef": "amber",
+    "svc": "azure",
+    "vivy": "azure",
+    "write-better": "teal"
+  }
+}

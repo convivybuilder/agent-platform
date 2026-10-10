@@ -1,0 +1,505 @@
+#!/usr/bin/env python3.11
+"""agent-summary — daily digest of agent runs, split into two period posts.
+
+Fires once via launchd at 07:00 local (MST) and emits TWO digests, so overnight
+drain cost is never confused with daytime/interactive cost (the failure mode that
+prompted ARCH-091):
+
+  • OVERNIGHT  — window [01:00, 07:00) MST of the fire date. Holds the 01:00
+                 overnight-orchestrator drain. Labeled with the fire date.
+  • DAYTIME    — window [07:00, 01:00) MST, i.e. the *preceding* working day +
+                 evening: [fire_date-1 @ 07:00, fire_date @ 01:00). Labeled with
+                 fire_date-1 (the day the work happened).
+
+The two windows partition [fire_date-1 @ 07:00, fire_date @ 07:00) — the same 24h
+the single pre-ARCH-091 digest covered — split at the 01:00 day-boundary. Each
+post states its own window (start → end, with timezone); every run time is shown
+in local MST and labeled. Each digest is written to its own markdown file
+(<date>-overnight.md / <date>-daytime.md) and posted separately to #agent-cost.
+
+Both posts fire together at 07:00: by then the overnight drain is normally done,
+and the daytime window (closed at 01:00) is complete. CLI flags for ad-hoc use:
+`--date YYYY-MM-DD` (the fire date), `--window {overnight,daytime,both}`,
+`--no-post`, `--no-write`, `--no-stdout`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+from collections import Counter
+from datetime import date as date_t, datetime, time as time_t, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import telemetry as T  # noqa: E402
+import budget as B     # noqa: E402
+
+import builder_root as BR
+RUNS_ROOT = BR.runs_root()
+SUMMARIES_DIR = RUNS_ROOT / "summaries"
+STALE_LOG = RUNS_ROOT / "stale-runs.jsonl"
+KB_INDEX = Path.home() / ".knowledge-index" / "index.db"
+
+# Local hour the digest fires (launchd StartCalendarInterval) and the boundary
+# between the two windows. The fire hour (07:00) ends the overnight window and
+# starts/ends the daytime window; the 01:00 day-boundary splits them. Keep
+# DIGEST_HOUR in sync with the launchd plist.
+DIGEST_HOUR = 7
+DAY_BOUNDARY_HOUR = 1
+
+# Per-window display metadata. Keyed by window id.
+WINDOWS = ("overnight", "daytime")
+WINDOW_TITLE = {"overnight": "Overnight", "daytime": "Daytime"}
+
+# billing_source → display labels (telemetry.VALID_BILLING_SOURCES). The
+# provider_api:* sources are real metered cash through the Phase C gateway
+# (ARCH-102); subscription_credit is the Anthropic Max pool whose `usd` is the
+# API-list-price proxy, which overstates real economic cost (~13× today, accurate
+# after the 2026-06-15 Agent-SDK billing split). Keeping the two apart in the
+# report is the whole point of the breakdown.
+PROVIDER_LABEL = {
+    "subscription_credit":      "Anthropic · subscription credit",
+    "api_fallback":             "Anthropic · API fallback",
+    "provider_api:openai":      "OpenAI · metered API",
+    "provider_api:deepseek":    "DeepSeek · metered API",
+    "provider_api:moonshot":    "Moonshot · metered API",
+    "provider_api:openrouter":  "OpenRouter · metered API",
+    "interactive":              "Interactive",
+    "unknown":                  "Unknown billing source",
+}
+SHORT_PROVIDER = {
+    "subscription_credit": "Anthropic", "api_fallback": "Anthropic",
+    "provider_api:openai": "OpenAI", "provider_api:deepseek": "DeepSeek",
+    "provider_api:moonshot": "Moonshot", "provider_api:openrouter": "OpenRouter",
+    "interactive": "Interactive", "unknown": "?",
+}
+
+
+def is_metered(billing_source: str) -> bool:
+    """True when the run booked real metered cash (a Phase C gateway provider),
+    vs subscription-credit proxy dollars."""
+    return (billing_source or "").startswith("provider_api:")
+
+
+def fmt_usd(usd: float) -> str:
+    """4 decimals under $1 (metered runs are routinely sub-cent), else 2."""
+    return f"${usd:.4f}" if abs(usd) < 1 else f"${usd:.2f}"
+
+
+# --- IO helpers --------------------------------------------------------------
+
+
+def parse_date(s: str) -> date_t:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def parse_iso(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def list_run_dirs(date: date_t) -> list[Path]:
+    day_dir = RUNS_ROOT / date.isoformat()
+    if not day_dir.is_dir():
+        return []
+    return sorted(p for p in day_dir.iterdir() if p.is_dir() and p.name.startswith("run-"))
+
+
+def subwindow_bounds(fire_date: date_t, window: str) -> tuple[datetime, datetime, date_t]:
+    """Bounds + label-date for one period digest fired at DIGEST_HOUR on `fire_date`.
+
+    Returns (start, end, date_label) as tz-aware local datetimes:
+      overnight → [fire_date @ 01:00, fire_date @ 07:00), labeled fire_date.
+      daytime   → [fire_date-1 @ 07:00, fire_date @ 01:00), labeled fire_date-1.
+    """
+    seven = datetime.combine(fire_date, time_t(DIGEST_HOUR)).astimezone()
+    one = datetime.combine(fire_date, time_t(DAY_BOUNDARY_HOUR)).astimezone()
+    if window == "overnight":
+        return one, seven, fire_date
+    if window == "daytime":
+        return seven - timedelta(days=1), one, fire_date - timedelta(days=1)
+    raise ValueError(f"unknown window: {window}")
+
+
+def fmt_local(dt: datetime) -> str:
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def tz_abbrev() -> str:
+    return datetime.now().astimezone().strftime("%Z")
+
+
+def period_label(start: datetime, end: datetime) -> str:
+    """Full window label with explicit dates + timezone, for the markdown header."""
+    return f"{fmt_local(start)} → {fmt_local(end)} {end.astimezone().strftime('%Z')}"
+
+
+
+def collect_runs(start: datetime, end: datetime) -> list[dict]:
+    """Load every run whose start time falls in [start, end).
+
+    Run dirs are UTC-dated, but the window is local, so it can straddle two UTC
+    date dirs — scan both and filter each run by its actual `started_at`. Runs
+    missing a parseable start time are dropped (they surface elsewhere as
+    stale/in-progress)."""
+    utc_dates = sorted({
+        start.astimezone(timezone.utc).date(),
+        (end - timedelta(microseconds=1)).astimezone(timezone.utc).date(),
+    })
+    runs: list[dict] = []
+    seen: set[str] = set()
+    for d in utc_dates:
+        for p in list_run_dirs(d):
+            if p.name in seen:
+                continue
+            run = load_run(p)
+            started = parse_iso(run["meta"].get("started_at"))
+            if started is None or not (start <= started < end):
+                continue
+            seen.add(p.name)
+            runs.append(run)
+    return sorted(runs, key=lambda r: r["meta"].get("started_at", ""))
+
+
+def load_run(run_dir: Path) -> dict:
+    """Read every available artifact for a single run. Missing pieces are silently
+    tolerated — partial runs (still in progress, or interrupted) should still
+    render in the summary instead of crashing it."""
+    data = {"run_id": run_dir.name, "dir": run_dir, "meta": {}, "outcome": {}, "cost": {}}
+    try: data["meta"] = T.read_meta(run_dir)
+    except (FileNotFoundError, json.JSONDecodeError): pass
+    try: data["outcome"] = T.read_outcome(run_dir)
+    except (FileNotFoundError, json.JSONDecodeError): pass
+    try: data["cost"] = T.read_cost(run_dir)
+    except (FileNotFoundError, json.JSONDecodeError): pass
+    return data
+
+
+def hhmmss(seconds: int) -> str:
+    h, rem = divmod(seconds, 3600); m, s = divmod(rem, 60)
+    if h:  return f"{h:d}h{m:02d}m{s:02d}s"
+    if m:  return f"{m:d}m{s:02d}s"
+    return f"{s:d}s"
+
+
+def run_duration_s(run: dict) -> int:
+    started = parse_iso(run["meta"].get("started_at"))
+    ended = parse_iso(run["meta"].get("ended_at"))
+    if not started or not ended:
+        return 0
+    return max(0, int((ended - started).total_seconds()))
+
+
+# --- section builders --------------------------------------------------------
+
+
+def section(name: str) -> str:
+    return f"\n## {name}\n\n"
+
+
+def total_cost_section(runs: list[dict], avg: float) -> str:
+    total_usd = round(sum(float(r["cost"].get("usd", 0.0) or 0.0) for r in runs), 4)
+    tokens_in = sum(int(r["cost"].get("tokens_in", 0) or 0) for r in runs)
+    tokens_out = sum(int(r["cost"].get("tokens_out", 0) or 0) for r in runs)
+    if avg > 0:
+        delta_pct = (total_usd - avg) / avg * 100
+        delta = f" ({delta_pct:+.0f}% vs preceding 7-day avg ${avg:.2f} for this window)"
+    else:
+        delta = " (no preceding-week baseline)"
+    out = f"**Total spend: ${total_usd:.2f}**{delta}\n\n"
+    out += f"- Runs: **{len(runs)}**\n"
+    out += f"- Tokens: {tokens_in:,} in / {tokens_out:,} out\n"
+    return out
+
+
+def aggregate_by_model(runs: list[dict]) -> dict:
+    """Group spend per (billing_source, model).
+
+    Each run is attributed by its `meta.billing_source` (the authoritative pool /
+    provider — a run is one model, so one source); per-model figures come from
+    `cost.by_model`, falling back to `meta.model` when a run booked cost but wrote
+    no by_model (e.g. estimate_fallback edge). Returns:
+      { billing_source: {"usd": float,
+                         "models": {model: {usd, tokens_in, tokens_out, runs}}} }
+    """
+    agg: dict[str, dict] = {}
+    for r in runs:
+        bs = r["meta"].get("billing_source") or "unknown"
+        agent = r["meta"].get("agent") or "?"
+        by_model = r["cost"].get("by_model") or {}
+        if not by_model:
+            usd = float(r["cost"].get("usd", 0.0) or 0.0)
+            if usd <= 0:
+                continue  # no cost and no per-model split — nothing to attribute
+            by_model = {r["meta"].get("model") or "unknown": {
+                "usd": usd,
+                "tokens_in": r["cost"].get("tokens_in", 0),
+                "tokens_out": r["cost"].get("tokens_out", 0),
+            }}
+        prov = agg.setdefault(bs, {"usd": 0.0, "models": {}})
+        for model, stats in by_model.items():
+            usd = float(stats.get("usd", 0.0) or 0.0)
+            m = prov["models"].setdefault(
+                model, {"usd": 0.0, "tokens_in": 0, "tokens_out": 0, "runs": 0, "agents": {}})
+            m["usd"] += usd
+            m["tokens_in"] += int(stats.get("tokens_in", 0) or 0)
+            m["tokens_out"] += int(stats.get("tokens_out", 0) or 0)
+            m["runs"] += 1
+            a = m["agents"].setdefault(agent, {"usd": 0.0, "runs": 0})
+            a["usd"] += usd
+            a["runs"] += 1
+            prov["usd"] += usd
+    return agg
+
+
+def metered_subscription_split(agg: dict) -> tuple[float, float]:
+    """(real metered $, subscription-credit proxy $) from an aggregate_by_model dict."""
+    metered = round(sum(p["usd"] for bs, p in agg.items() if is_metered(bs)), 4)
+    subscription = round(sum(p["usd"] for bs, p in agg.items() if not is_metered(bs)), 4)
+    return metered, subscription
+
+
+def cost_by_model_section(runs: list[dict]) -> str:
+    """Spend broken out by provider (billing source) → model → agent, with the
+    real-metered vs subscription-proxy split called out — the part of 'Total cost'
+    that a single number hides. Each model shows a bold subtotal row, then one row
+    per contributing agent (sorted by spend)."""
+    agg = aggregate_by_model(runs)
+    if not agg:
+        return "_No attributable spend in this window._\n"
+    metered, subscription = metered_subscription_split(agg)
+    head = (f"**Real metered API spend: {fmt_usd(metered)}**"
+            f" · subscription-credit (list-price proxy): {fmt_usd(subscription)}\n\n")
+    lines = ["| Provider | Model | Agent | Spend | Runs | Tokens (in/out) |",
+             "|---|---|---|---|---|---|"]
+    for bs, prov in sorted(agg.items(), key=lambda kv: -kv[1]["usd"]):
+        label = PROVIDER_LABEL.get(bs, bs)
+        for model, m in sorted(prov["models"].items(), key=lambda kv: -kv[1]["usd"]):
+            lines.append(
+                f"| {label} | `{model}` | **all agents** | **{fmt_usd(m['usd'])}** "
+                f"| **{m['runs']}** | {m['tokens_in']:,}/{m['tokens_out']:,} |")
+            for agent, a in sorted(m["agents"].items(), key=lambda kv: -kv[1]["usd"]):
+                lines.append(
+                    f"| | | {agent} | {fmt_usd(a['usd'])} | {a['runs']} | |")
+    return head + "\n".join(lines) + "\n"
+
+
+def recent_seven_day_avg(fire_date: date_t, window: str) -> float:
+    """Mean USD across the 7 preceding windows OF THE SAME TYPE (overnight vs
+    daytime), so the comparison is apples-to-apples. Skips empty windows."""
+    totals = []
+    for i in range(1, 8):
+        s, e, _ = subwindow_bounds(fire_date - timedelta(days=i), window)
+        win_runs = collect_runs(s, e)
+        if not win_runs:
+            continue
+        totals.append(sum(float(r["cost"].get("usd", 0.0) or 0.0) for r in win_runs))
+    return round(sum(totals) / len(totals), 4) if totals else 0.0
+
+
+def runs_table_section(runs: list[dict]) -> str:
+    if not runs:
+        return "_No runs._\n"
+    tz = tz_abbrev()
+    lines = [f"| Time ({tz}) | Agent | Task | Dur | Cost | Outcome |",
+             "|---|---|---|---|---|---|"]
+    for r in sorted(runs, key=lambda r: r["meta"].get("started_at", "")):
+        started = parse_iso(r["meta"].get("started_at"))
+        time_str = started.astimezone().strftime("%H:%M") if started else "—"
+        agent = r["meta"].get("agent", "?")
+        task_full = r["meta"].get("task", "")
+        task = task_full[:48].replace("|", "\\|") + ("…" if len(task_full) > 48 else "")
+        dur = hhmmss(run_duration_s(r))
+        cost = f"${float(r['cost'].get('usd', 0.0) or 0.0):.2f}"
+        status = r["outcome"].get("exit_status", "running")
+        files_n = (len(r["outcome"].get("files_modified") or [])
+                   + len(r["outcome"].get("files_added") or [])
+                   + len(r["outcome"].get("files_deleted") or []))
+        bits = [status]
+        if files_n: bits.append(f"{files_n}f")
+        for url in r["outcome"].get("prs_opened") or []:
+            num = url.rsplit("/", 1)[-1]
+            bits.append(f"[#{num}]({url})")
+        lines.append(f"| {time_str} | {agent} | {task} | {dur} | {cost} | {' · '.join(bits)} |")
+    return "\n".join(lines) + "\n"
+
+
+def docs_pulled_section(runs: list[dict], top_n: int = 5) -> str:
+    """Count `mcp__kb__kb_get` hits across this window's runs — the 'actually
+    consulted' signal (kb_search is discovery; kb_get is the pull)."""
+    pulls: Counter[str] = Counter()
+    for r in runs:
+        try:
+            for entry in T.iter_tool_calls(r["dir"]):
+                if entry["tool_name"] == "mcp__kb__kb_get":
+                    did = entry["input"].get("id")
+                    if did:
+                        pulls[did] += 1
+        except (FileNotFoundError, json.JSONDecodeError):
+            continue
+    if not pulls:
+        return "_No documents pulled in this window._\n"
+    lines = ["| Doc | Pulls |", "|---|---|"]
+    for doc_id, count in pulls.most_common(top_n):
+        lines.append(f"| `{doc_id}` | {count} |")
+    return "\n".join(lines) + "\n"
+
+
+def stale_docs_section(fire_date: date_t, lookback_days: int = 30, list_n: int = 10) -> str:
+    """Docs in the KB index not pulled in the lookback window — review/deprecation
+    candidates. A 30-day rollup (not window-scoped); emitted in the daytime digest
+    only, so it lands once per day."""
+    if not KB_INDEX.exists():
+        return "_Knowledge index missing._\n"
+    pulled: set[str] = set()
+    for i in range(lookback_days):
+        d = fire_date - timedelta(days=i)
+        for run_dir in list_run_dirs(d):
+            try:
+                for entry in T.iter_tool_calls(run_dir):
+                    if entry["tool_name"] == "mcp__kb__kb_get":
+                        did = entry["input"].get("id")
+                        if did:
+                            pulled.add(did)
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+    conn = sqlite3.connect(f"file:{KB_INDEX}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT id, kind FROM docs WHERE status = 'current' ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    not_pulled = [(id_, kind) for id_, kind in rows if id_ not in pulled]
+    if not not_pulled:
+        return "_All current docs pulled at least once in the last 30 days._\n"
+    out = f"{len(not_pulled)} of {len(rows)} current docs not pulled in {lookback_days} days. First {min(list_n, len(not_pulled))}:\n\n"
+    out += "\n".join(f"- `{id_}` ({kind})" for id_, kind in not_pulled[:list_n]) + "\n"
+    return out
+
+
+def open_prs_section(runs: list[dict]) -> str:
+    """Lists PRs opened by this window's runs."""
+    prs = []
+    for r in runs:
+        for url in r["outcome"].get("prs_opened") or []:
+            prs.append((r["meta"].get("agent", "?"), url))
+    if not prs:
+        return "_No PRs opened in this window._\n"
+    lines = []
+    for agent, url in prs:
+        parts = url.rstrip("/").split("/")
+        # Expecting .../<org>/<repo>/pull/<num>
+        repo_path = f"{parts[-4]}/{parts[-3]}" if len(parts) >= 4 else url
+        num = parts[-1]
+        lines.append(f"- [{repo_path}#{num}]({url}) ({agent})")
+    return "\n".join(lines) + "\n"
+
+
+def issues_section(start: datetime, end: datetime, runs: list[dict]) -> str:
+    issues: list[str] = []
+    bad = [r for r in runs if r["outcome"].get("exit_status") in ("errored", "killed", "budget_refused", "capacity_refused")]
+    for r in bad:
+        issues.append(f"- `{r['run_id']}` {r['meta'].get('agent', '?')}: **{r['outcome'].get('exit_status')}**")
+    # Daily budget markers are filed per UTC date dir; the window can straddle two.
+    utc_dates = sorted({
+        start.astimezone(timezone.utc).date(),
+        (end - timedelta(microseconds=1)).astimezone(timezone.utc).date(),
+    })
+    # Per-pool budget markers (ARCH-320). Report each autonomous pool's crossing
+    # distinctly and name it: a curation-only hard cross refuses curation spawns,
+    # not overnight ones, so a single global "spawns refused" line would mislead.
+    # Pool set + marker filenames come from budget so a new pool can't drift.
+    def _marker_hit(kind: str, pool: str) -> bool:
+        return any((RUNS_ROOT / d.isoformat() / B.marker_name(kind, pool)).exists()
+                   for d in utc_dates)
+    for pool in B.POOL_ORIGINS:
+        if _marker_hit("hard", pool):
+            issues.append(f"- 🛑 {pool} pool: daily hard cap reached ({pool} spawns refused)")
+        elif _marker_hit("soft", pool):
+            issues.append(f"- ⚠️ {pool} pool: daily soft budget crossed")
+    stale_in_window: list[dict] = []
+    if STALE_LOG.exists():
+        for line in STALE_LOG.open():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            reaped_at = parse_iso(e.get("reaped_at"))
+            if reaped_at and start <= reaped_at < end:
+                stale_in_window.append(e)
+    if stale_in_window:
+        issues.append(f"- {len(stale_in_window)} stale run(s) reaped from registry (dead PIDs)")
+    if not issues:
+        return "_No issues._\n"
+    return "\n".join(issues) + "\n"
+
+
+# --- assembly ----------------------------------------------------------------
+
+
+def build_digest(fire_date: date_t, window: str) -> tuple[str, Path]:
+    start, end, date_label = subwindow_bounds(fire_date, window)
+    title = WINDOW_TITLE[window]
+    runs = collect_runs(start, end)
+    n = len(runs)
+    avg = recent_seven_day_avg(fire_date, window)
+
+    md = [f"# Agent runs — {title.lower()} — {date_label.isoformat()}\n\n"
+          f"_Window ({window}): {period_label(start, end)}_\n"]
+    if window == "overnight" and n == 0:
+        md += ["\n> ℹ️ No runs in this window. The autonomous overnight cron drain "
+               "was retired 2026-09-14 — work is event-triggered now, so an empty "
+               "window here is expected rather than a failure signal.\n"]
+    md += [section("Total cost"),        total_cost_section(runs, avg)]
+    md += [section("Spend by provider / model"), cost_by_model_section(runs)]
+    md += [section("Runs"),              runs_table_section(runs)]
+    md += [section("Docs most pulled"),  docs_pulled_section(runs)]
+    if window == "daytime":  # 30-day KB-health rollup — once per day
+        md += [section("Docs not pulled in 30 days"), stale_docs_section(fire_date)]
+    md += [section("Open PRs"),          open_prs_section(runs)]
+    md += [section("Issues"),            issues_section(start, end, runs)]
+    md_text = "".join(md)
+
+    out_path = SUMMARIES_DIR / f"{date_label.isoformat()}-{window}.md"
+    return md_text, out_path
+
+
+# --- entry -------------------------------------------------------------------
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Daily two-window digest of agent runs.")
+    p.add_argument("--date", default=None,
+                   help=f"YYYY-MM-DD — the fire date (default: today local). The "
+                        f"overnight window is [date @ {DAY_BOUNDARY_HOUR:02d}:00, "
+                        f"date @ {DIGEST_HOUR:02d}:00); the daytime window is "
+                        f"[date-1 @ {DIGEST_HOUR:02d}:00, date @ {DAY_BOUNDARY_HOUR:02d}:00).")
+    p.add_argument("--window", choices=["overnight", "daytime", "both"], default="both",
+                   help="which window(s) to emit (default: both)")
+    p.add_argument("--no-write", action="store_true",
+                   help="don't write the markdown to <root>/agent-runs/summaries/")
+    p.add_argument("--no-stdout", action="store_true",
+                   help="don't echo the markdown to stdout")
+    args = p.parse_args(argv)
+
+    fire_date = parse_date(args.date) if args.date else datetime.now().astimezone().date()
+    windows = WINDOWS if args.window == "both" else (args.window,)
+
+    if not args.no_write:
+        SUMMARIES_DIR.mkdir(parents=True, exist_ok=True)
+
+    for window in windows:
+        md, out_path = build_digest(fire_date, window)
+        if not args.no_stdout:
+            sys.stdout.write(md + "\n")
+        if not args.no_write:
+            out_path.write_text(md)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

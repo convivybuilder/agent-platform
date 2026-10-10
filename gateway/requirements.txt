@@ -1,0 +1,12 @@
+# Gateway venv dependencies — governs ~/.local/venv-llm-gateway ONLY.
+# NOT read by the repo's pytest, CI, or install.sh (isolation is the architecture).
+# Platform requirements*.txt and pyproject.toml are deliberately untouched.
+#
+# Pin: verify/update the exact litellm version at venv-create time.
+# As of 2026-05-31, latest stable is in the 1.x line; <2.0 guards against
+# breaking changes in the 2.x API.
+litellm[proxy]>=1.40.0,<2.0.0
+# LiteLLM's database code imports prisma (E17·1). Pinned to the version litellm 1.86.2
+# declares in its extras metadata. It is pinned here directly, and not through litellm's
+# extra-proxy extra, which would also install Azure and Google Cloud packages.
+prisma==0.11.0

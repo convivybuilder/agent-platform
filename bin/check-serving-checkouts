@@ -1,0 +1,663 @@
+#!/usr/bin/env python3.11
+"""Is every launchd service serving code from `main`, with nothing uncommitted
+that it could actually execute?
+
+WHAT THIS PROTECTS. Several launchd services read their code straight from a
+`WorkingDirectory` that is a git checkout — the process reads the tree AS IT
+SITS, on every request or every run, not what was last deployed. If that
+checkout is on a feature branch, or carries an uncommitted change to a file the
+service loads, the service is running code that is in no reviewed, merged
+commit — indefinitely, until a human happens to look at the checkout rather
+than the running process.
+
+THE INCIDENT THIS IS FOR. `com.convivy.library` served code from 19 hours
+before `library#45` merged (2026-08-20). Not because nothing restarted the
+process — it restarts fine — but because its `WorkingDirectory` pointed at the
+Library crew's own checkout, and that checkout was still on the feature branch
+the PR was reviewed from. The PR merged through `gh`; the local checkout was
+never switched back. **A restart-on-merge fix would have restarted the
+identical stale branch — that is the distinction this check is built around,
+and why it is not `convivy-orient`'s "restart on merge" work in a different
+hat.**
+
+WHY THIS IS A SEPARATE CHECK, NOT A FOLD-IN. The identical defect is already
+written down for THIS repo — `agent-platform`'s `bin/`/`lib/` are symlinks
+into the working tree (ARCH-396), so a feature-branch checkout makes un-merged
+code live to cron — and it still caught nobody when the Library hit the same
+shape. A note in one repo does not travel; a scheduled check does. It is
+ALSO deliberately not folded into `check-primary-checkouts`: that script
+checks branch only, against a hand-DECLARED list of repos somebody has
+classified as live-deployed, and its own docstring says why dirty-tree
+checking is a different question ("would make one alert mean two things").
+This script instead DISCOVERS every checkout a launchd plist actually serves
+from, and checks both branch and dirty state — a genuinely different sweep,
+not a wider version of that one. Folding this into an existing check that
+already promises something narrower is how a "verified" claim quietly stops
+being true; `agentctl kb sync` reporting "verified" every cycle while a
+corrupt FTS index sat under it is the same failure shape, found the same day
+this check was commissioned.
+
+THE NOISE PROBLEM, AND WHY THIS DOES NOT JUST REPORT "dirty". A survey run by
+hand on 2026-08-20 found `convivy-orient` serving 8 of its jobs from a
+checkout carrying 7 uncommitted files — all `.claude/` individuation (a
+`.materialized` marker, agent `.md` files, a skill doc) plus one stray
+untracked image, none of it served. Flagging that every run trains the reader
+to stop looking at the output within a week, which is worse than not checking
+at all — a check nobody reads is a false "verified" with extra steps. So a
+dirty file only counts as a finding when BOTH:
+
+  - it is not under `.claude/` (Claude Code's own session/individuation
+    state, never part of what any service here executes, in any repo), and
+  - it is TRACKED and changed (`git status --porcelain` reports anything other
+    than `??`) — an untracked file is something nobody committed yet, which is
+    a different situation from a committed file whose content on disk has
+    silently drifted from the commit a review approved. `com.convivy.cfo-review`
+    serving from a checkout with untracked `agent-runs/`/`hook-log/`/`webapp/`
+    directories alongside four MODIFIED tracked files (`schema.sql` and three
+    scripts) is exactly this split: the modified files are the finding, the
+    untracked directories are operational data this rule correctly ignores.
+
+BLACK-BOX CREWS. CFO is a black-box crew (`platform/decisions/0043`) — this
+check must never read a served file's CONTENT, only THAT it changed. Every
+signal here comes from `git branch --show-current`/`git status --porcelain`:
+a branch name, a path, a one-letter status code. Nothing here runs `git
+diff`, `git show`, `git log -p`, or opens a file. That is not a carve-out
+for CFO specifically — it is the design, so the same check is safe to run
+against any black-box crew added later without anyone having to remember to
+exempt it.
+
+CONTENT SAFETY IS NOT THE WHOLE CONSTRAINT, and this file's first draft
+missed the other half (security-reviewer, PR #423, run-0d72a1e3): a
+finding's own EXISTENCE in the shared, multi-reader signal store is itself a
+leak, independent of how little it says. Logging "CFO is on branch `x` with
+these changed files" is exactly what ADR-0043 forbids — "a black box crew
+files no issues and logs no signals" — even though the finding never quotes
+a line of CFO's own code. `main()` checks `_is_private_checkout` once per
+checkout, via the SAME registry lookup `session_state.py`/`tmux_transcript.py`
+already use (`private_crew.private_home_for`, not a second implementation
+that could drift), and a private crew's findings print to this process's own
+local log and go no further — still counted, still visible to whoever reads
+this machine directly, never written to `signal_client`.
+
+WHAT COUNTS AS "SERVING". Every `~/Library/LaunchAgents/*.plist` whose
+`WorkingDirectory` is a git checkout (`.git` present) under `--convivy-root`.
+Deliberately not narrowed to KeepAlive/daemon jobs — a periodic job (a backfill,
+a poller) reading a stale branch on every firing is the same defect, just
+firing on a schedule instead of continuously. Deliberately scoped to
+`--convivy-root` (default: the machine's resolved root) rather than "any WorkingDirectory that
+happens to be a git repo" — Homebrew's own installation at `/opt/homebrew` is
+git-managed and would otherwise show up as a false positive on a branch this
+check has no opinion about.
+
+MULTIPLE SERVICES, ONE CHECKOUT. `convivy-orient` alone backs 8 plists from one
+checkout. Findings are grouped by checkout (branch/dirty state can only be
+asked once per directory), and the alert names every service label that reads
+it, so whoever responds knows the full blast radius rather than one instance
+of it.
+
+DELIBERATELY NOT SELF-HEALING, for the same reason `check-primary-checkouts`
+is not: switching a checkout back under whoever is working in it could strand
+uncommitted work, and the correct output is a loud, durable alert naming what
+to run, not an unattended `git switch`.
+
+SAFETY. Read-only. Runs `git branch --show-current` and `git status
+--porcelain`, and reads plist files. Never checks out, fetches, resets, or
+writes to any repo; never reads the contents of any file the check reports on.
+
+BEHAVIOUR. A pass is silent. A finding logs an alert signal with dedup_key scoped to
+the UTC day, so a finding logs once a day while it persists, and again after it clears
+and returns on a later day. A finding that clears and returns within the same UTC day
+logs nothing after that day's first signal, unless it returns as a different kind: the key
+carries the finding kind, so a same-day return of another kind logs again. The unparseable-plist
+finding is the exception: its key takes the LOCAL day from `_today()`, and it carries the count
+of unparseable plists,
+so a same-day return with a different count logs again. It never creates a work item
+(platform/decisions/0073).
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import pathlib
+import plistlib
+import shutil
+import subprocess
+import sys
+from typing import Any
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR  # noqa: E402
+
+CONVIVY_ROOT = BR.root()
+LAUNCH_AGENTS = pathlib.Path.home() / "Library" / "LaunchAgents"
+
+# `plutil` only exists on macOS, which is the ONLY platform this ever runs on
+# in production — it reads `~/Library/LaunchAgents`, which does not exist
+# anywhere else. Resolved once at import so a missing binary is one check, not
+# a `subprocess.run` OSError caught on every plist. `None` here (this repo's
+# CI runs its `python` job on `convivy-linux`) routes `_plist_fields` to the
+# `plistlib` fallback below, which exists ONLY to keep that job's test suite
+# honest on Linux — see `_plist_fields`'s docstring for why `plutil` is
+# preferred whenever it is available.
+_PLUTIL = shutil.which("plutil")
+
+# Track how many report attempts failed. Reset each run. Distinguishes
+# "findings logged OK" (exit 2) from "findings but reporting failed" (exit 3) —
+# same split `check-primary-checkouts` makes, for the same reason: a logging
+# failure must not read on stderr identically to a clean sweep.
+_report_failures: int = 0
+
+# Two candidates, same order bin/knowledge-watcher uses: this checkout's own
+# lib first (so this script and the library it was written against move
+# together), the installed farm second (a copied deployment). Neither existing
+# is not an error: the import then falls through to PYTHONPATH, which is how a
+# test reaches this checkout's own lib rather than whatever is installed on the
+# machine.
+_LIB_CANDIDATES = (
+    pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform",
+    pathlib.Path.home() / ".local" / "lib" / "agent-platform",
+)
+
+
+def _ensure_lib_on_path() -> None:
+    """Put the platform lib on sys.path exactly once, gated on a known module.
+
+    A wrong guess finds nothing (and falls through to PYTHONPATH) instead of
+    importing a stale copy.
+    """
+    for libdir in _LIB_CANDIDATES:
+        if (libdir / "private_crew.py").is_file():
+            entry = str(libdir)
+            if entry not in sys.path:
+                sys.path.insert(0, entry)
+            return
+
+
+def _is_private_checkout(repo_dir: pathlib.Path) -> bool:
+    """Is this checkout a black-box crew's (`platform/decisions/0043`)?
+
+    THE BUG THIS CLOSES (security-reviewer, PR #423, run-0d72a1e3). This
+    check's findings used to be written to the shared, multi-reader store for
+    every checkout, CFO included — a signal there names CFO's branch and
+    changed file paths, which is exactly what
+    the ADR says must never happen: "A black box crew files no issues and
+    logs no signals... so the queue and the issue-derived views will not see
+    it, and should not." Never reading file CONTENT (this script's other,
+    already-correct constraint) does not cover this — a finding's own
+    EXISTENCE in a shared store is itself the leak, independent of what it
+    says. `main()` calls this once per checkout before ever calling
+    `_post_signal` for it. Returns `True` — skip logging — both when the
+    checkout genuinely IS private and when that cannot be determined at all
+    (the import itself failed, or `private_crew.private_home_for` returned
+    its own `UNKNOWN`): fails CLOSED, matching the WRITER's own direction in
+    `private_crew`'s module docstring (this function is about to decide
+    whether to WRITE something to a shared store, so "cannot tell" must not
+    be read as "go ahead").
+
+    Delegates to `private_crew.private_home_for`, the SAME registry lookup
+    and inode-based comparison `session_state.py`/`tmux_transcript.py`
+    already use — not a second implementation of "which crew owns this
+    directory" that could drift from theirs. Reusing it here also closes the
+    case-sensitivity trap a naive fix would walk straight into: CFO's
+    checkout directory is capital-`CFO` on disk while the registry's slug is
+    lower-case `cfo`, so a bare string comparison against a slug set would
+    silently never match; `private_home_for` compares real paths via
+    `os.path.samefile`, not names.
+    """
+    try:
+        _ensure_lib_on_path()
+        import private_crew
+    except Exception:
+        return True  # cannot import the check -> cannot rule out private
+    home = private_crew.private_home_for(str(repo_dir))
+    return home is not None  # a real path or private_crew.UNKNOWN are both non-None
+
+
+def _post_signal(product: str, title: str, body: str, dedup_key: str,
+                 *, dry_run: bool = False, severity: str = "high") -> dict[str, Any]:
+    """Log an alert signal for a finding. Best-effort, never raises. A signal,
+    never a work item. The title leads the body, since a signal has no title field."""
+    global _report_failures
+    if dry_run:
+        return {"status": "dry-run"}
+    try:
+        _ensure_lib_on_path()
+        import signal_client  # noqa: E402
+        status = signal_client.post_alert(
+            "serving-checkout", signal_client.sanitise_body(f"{title}\n\n{body}"),
+            product=product, dedup_key=dedup_key, meta={"severity": severity})
+        return {"status": status}
+    except Exception as exc:
+        _report_failures += 1
+        print(f"[REPORT-ERROR] {product}: {exc}", file=sys.stderr)
+        return {"status": f"error:{type(exc).__name__}"}
+
+
+def _plist_fields(path: pathlib.Path) -> tuple[dict[str, str], str]:
+    """(fields, error) for one plist's `Label`/`WorkingDirectory`.
+
+    `error` is set ONLY when the FILE ITSELF could not be parsed — genuinely
+    different from a plist that parses fine and simply does not declare one
+    of these keys, which is `fields` missing that key, not an error. A launchd
+    job with no `WorkingDirectory` is not a defect this check has an opinion
+    about; a plist this check could not even read is a gap in its own
+    coverage and must be reported as one rather than silently skipped —
+    reported live on 2026-08-21 as a survey-invalidating gap: a hand count run
+    with `plistlib` alone silently dropped 16 of 29 real launchd-referenced
+    checkouts on this exact `--`-in-comment shape, read as "13, so the scope
+    is small" rather than as "16 unreadable."
+
+    PREFERS `plutil -lint` + `-extract ... raw`, one call per key, over
+    `plistlib` — found by running against this machine's real
+    `~/Library/LaunchAgents/`, not synthetic fixtures: `plistlib`'s strict XML
+    parser rejects a `--` sequence inside a `<!-- comment -->`, which several
+    real plists here carry in their own header comments (documentation, not
+    the directive). macOS's own `plutil` accepts them without complaint, and
+    launchd itself clearly does too, since it runs these jobs.
+    `com.selector-backend.api` is the ONLY plist naming that checkout, so
+    `plistlib` alone would make an entire real, currently-running service
+    invisible to this check, not merely undercounted.
+
+    FALLS BACK TO `plistlib` only when `plutil` itself is not on this machine
+    at all (non-macOS — this repo's CI runs its `python` job on
+    `convivy-linux`, where `~/Library/LaunchAgents` does not exist either).
+    That path exists to keep the test suite exercising real parsing logic on
+    Linux, not because this script is meant to tolerate malformed plists
+    there — it never runs there in production.
+    """
+    if _PLUTIL:
+        try:
+            lint = subprocess.run([_PLUTIL, "-lint", str(path)],
+                                  capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return {}, f"could not run plutil -lint: {exc}"
+        if lint.returncode != 0:
+            return {}, (lint.stderr.strip() or lint.stdout.strip()
+                        or f"plutil -lint exited {lint.returncode}")
+        fields: dict[str, str] = {}
+        for key in ("Label", "WorkingDirectory"):
+            try:
+                proc = subprocess.run([_PLUTIL, "-extract", key, "raw", str(path)],
+                                      capture_output=True, text=True, timeout=10)
+            except (OSError, subprocess.TimeoutExpired):
+                continue
+            if proc.returncode == 0:
+                val = proc.stdout.strip()
+                if val:
+                    fields[key] = val
+        return fields, ""
+    try:
+        with path.open("rb") as fh:
+            data = plistlib.load(fh)
+    except Exception as exc:  # noqa: BLE001 — plistlib's XML backend can raise
+        # xml.parsers.expat.ExpatError, which is not a plistlib exception; any
+        # parse failure here is the same "could not read this file" answer.
+        return {}, f"{type(exc).__name__}: {exc}"
+    fields = {k: data[k] for k in ("Label", "WorkingDirectory")
+             if isinstance(data.get(k), str) and data.get(k)}
+    return fields, ""
+
+
+def serving_checkouts(
+    launch_agents: pathlib.Path, convivy_root: pathlib.Path,
+) -> tuple[dict[pathlib.Path, list[str]], dict[pathlib.Path, list[str]], list[str]]:
+    """(checkouts, excluded, unparseable_plist_names).
+
+    `checkouts` maps every git checkout UNDER `convivy_root` some launchd
+    plist's `WorkingDirectory` names to the sorted labels of the services
+    that read it — this is what `main()` actually checks branch/dirty state
+    for. `excluded` is the same shape, for a real git checkout a plist names
+    that sits OUTSIDE `convivy_root` — reported rather than silently dropped
+    (steward, 2026-08-21): scoping to `convivy_root` is what correctly keeps
+    Homebrew's own git-managed `/opt/homebrew` out, but the identical rule
+    also drops any future checkout placed outside the machine's root for a reason
+    nobody records — exactly the shape of the unparseable-plist bug this
+    file already fixed once, just by design instead of by accident. Silently
+    excluding is not wrong; being unable to tell "excluded" from "never
+    existed" is. `unparseable_plist_names` names every plist `_plist_fields`
+    could not read AT ALL — reported, not silently skipped, for the same
+    reason (see `_plist_fields`).
+
+    A plist that parses fine but declares no `WorkingDirectory`, or whose
+    `WorkingDirectory` is not itself a git checkout, is correctly absent
+    from all three — that is not a gap, it is "not a serving checkout at
+    all," a different fact from "a checkout this scope excludes."
+    """
+    found: dict[pathlib.Path, list[str]] = {}
+    excluded: dict[pathlib.Path, list[str]] = {}
+    unparseable: list[str] = []
+    try:
+        plists = sorted(launch_agents.glob("*.plist"))
+    except OSError:
+        return found, excluded, unparseable
+    convivy_root = convivy_root.resolve()
+    for p in plists:
+        fields, error = _plist_fields(p)
+        if error:
+            unparseable.append(p.name)
+            continue
+        label, wd = fields.get("Label"), fields.get("WorkingDirectory")
+        if not label or not wd:
+            continue
+        wd_path = pathlib.Path(wd)
+        try:
+            wd_resolved = wd_path.resolve()
+        except OSError:
+            continue
+        if not (wd_resolved / ".git").exists():
+            continue
+        # A real checkout. In scope only if it sits under convivy_root —
+        # otherwise it is named in `excluded` rather than dropped.
+        try:
+            wd_resolved.relative_to(convivy_root)
+        except ValueError:
+            excluded.setdefault(wd_resolved, []).append(label)
+            continue
+        found.setdefault(wd_resolved, []).append(label)
+    for labels in found.values():
+        labels.sort()
+    for labels in excluded.values():
+        labels.sort()
+    return found, excluded, sorted(unparseable)
+
+
+def current_branch(repo_dir: pathlib.Path) -> tuple[str | None, str]:
+    """(branch, error). branch is None on a detached HEAD or an unreadable repo.
+
+    A detached HEAD is a finding too, and named separately rather than folded
+    into "off main": it points the service at an arbitrary commit with the
+    same effect as a named feature branch, while `git status` shows nothing
+    that reads as a problem at a glance.
+    """
+    try:
+        proc = subprocess.Popen(
+            ["git", "-C", str(repo_dir), "symbolic-ref", "--short", "-q", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    except OSError as exc:
+        return None, f"could not read HEAD: {exc}"
+    try:
+        out, err = proc.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        # A stalled filesystem must not leave a hung `git` behind every time
+        # this runs — `subprocess.run`'s timeout raises without reaping the
+        # child (the same fix `check-primary-checkouts` applies, security
+        # review #354).
+        proc.kill()
+        proc.communicate()
+        return None, "timed out reading HEAD (30s)"
+    if out.strip():
+        return out.strip(), ""
+    if proc.returncode == 1 and not err.strip():
+        return None, "detached HEAD"
+    detail = err.strip() or f"git exited {proc.returncode} with no output"
+    return None, f"HEAD is unreadable — not a branch and not a detached HEAD: {detail}"
+
+
+def servable_dirty_paths(repo_dir: pathlib.Path) -> tuple[list[str], str]:
+    """(paths, error). `paths` are the tracked, changed files outside `.claude/`
+    — never file contents, only the porcelain status lines' path column.
+
+    `git status --porcelain=v1 --no-renames` rather than the default: renames
+    print as `old -> new` on one line, which this would otherwise misparse as
+    a single "path" containing a literal arrow. `--no-renames` reports a rename
+    as a plain delete-plus-add instead, two ordinary lines this already knows
+    how to read.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_dir), "status", "--porcelain=v1", "--no-renames"],
+            capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"could not read status: {exc}"
+    if proc.returncode != 0:
+        return [], f"git status exited {proc.returncode}: {proc.stderr.strip()}"
+    servable: list[str] = []
+    for line in proc.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        status, path = line[:2], line[3:]
+        if status == "??":
+            continue  # untracked — not yet in any commit either way
+        if path.startswith(".claude/") or path == ".claude":
+            continue  # Claude Code's own individuation state, never served
+        servable.append(path)
+    return sorted(servable), ""
+
+
+def _utc_today() -> str:
+    """Today's UTC date, ISO format: the day scope of a finding's dedup_key.
+
+    A named seam so a test can pin the day. main() reads it once per run and
+    passes that one value to every finding key the run writes."""
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _today() -> str:
+    """Today's date, ISO format — a named seam rather than an inline
+    `datetime.date.today()` call, so a test can pin that the unparseable-plist
+    `dedup_key` actually varies by date (the same reason `session_state.py`'s
+    `_utc_today` exists as a seam of its own).
+
+    LOCAL TIME, DELIBERATELY, unlike session_state.py's `_utc_today`, which this is modelled on
+    (security-reviewer, PR #424 round 2). One launchd job on one host writes
+    this key, so there is no second writer whose UTC day could disagree with
+    this one's local day, and a local day matches the run-dir convention this
+    repo already uses (ARCH-156). Do NOT copy this seam anywhere with more
+    than one writing host without switching it to UTC: `session_state.py`
+    carries a real prior incident where a local-vs-UTC day-key mix-up
+    produced up-to-a-day-stale reads, silently."""
+    return datetime.date.today().isoformat()
+
+
+def check(repo_dir: pathlib.Path) -> list[dict[str, Any]]:
+    """Every independent finding for one checkout, as `{kind, reason, paths}`.
+
+    A LIST, NOT ONE (ok, reason) TUPLE, deliberately — branch state and
+    dirty-tree state are two conditions that start and resolve on their own
+    schedules. A checkout can be off `main` AND carry a dirty served file at
+    the same time, and collapsing that into one reason string would let
+    fixing either one silently swallow the other from the alert. Each
+    dict's `kind` becomes part of the signal's `dedup_key` in `main()`, so the
+    two stay independently tracked even when they co-occur.
+    """
+    findings: list[dict[str, Any]] = []
+    branch, err = current_branch(repo_dir)
+    dirty, dirty_err = servable_dirty_paths(repo_dir)
+    if dirty_err:
+        # A status read that failed is itself a finding — silence here is
+        # exactly the false "clean" this check exists to prevent.
+        findings.append({"kind": "unreadable",
+                         "reason": f"could not be checked: {dirty_err}", "paths": []})
+        return findings
+    if branch != "main":
+        where = f"on '{branch}'" if branch else err
+        findings.append({"kind": "branch", "reason": where, "paths": []})
+    if dirty:
+        findings.append({"kind": "dirty",
+                         "reason": "has uncommitted changes to served files",
+                         "paths": dirty})
+    return findings
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="check-serving-checkouts", description=__doc__)
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="print per-checkout details even when passing")
+    parser.add_argument("--convivy-root", default=str(CONVIVY_ROOT),
+                        help="override the machine's root (for testing)")
+    parser.add_argument("--launch-agents", default=str(LAUNCH_AGENTS),
+                        help="override ~/Library/LaunchAgents (for testing)")
+    parser.add_argument("--no-report", action="store_true",
+                        help="detect findings but do not log signals (dry run)")
+    opts = parser.parse_args(argv)
+
+    global _report_failures
+    _report_failures = 0
+
+    convivy_root = pathlib.Path(opts.convivy_root)
+    launch_agents = pathlib.Path(opts.launch_agents)
+    day = _utc_today()
+
+    checkouts, excluded, unparseable = serving_checkouts(launch_agents, convivy_root)
+    findings = 0
+
+    if excluded:
+        # A line in the output, not a finding and not a signal (steward,
+        # 2026-08-21) — scoping to convivy_root is a deliberate design
+        # choice, not a defect, but a silent exclusion is indistinguishable
+        # from a checkout this check never learned about at all. Printed
+        # unconditionally (not gated on --verbose) so the scope of a run is
+        # legible from its log without reading this file's source.
+        excluded_desc = "; ".join(
+            f"{repo.name} ({', '.join(labels)})" for repo, labels in sorted(excluded.items()))
+        print(f"[EXCLUDED] outside {convivy_root}, not checked: {excluded_desc}",
+              file=sys.stderr)
+
+    if unparseable:
+        # Reported, not skipped — see `serving_checkouts`'s docstring. This
+        # is a gap in this check's OWN coverage, not a claim about the
+        # services those plists define, so it is logged once as its own
+        # finding rather than attributed to any checkout.
+        #
+        # THE SHARED SIGNAL NEVER NAMES A FILENAME (security-reviewer, PR #423
+        # round 2, non-blocking — fixed as the immediate follow-up rather
+        # than left as a note). A plist this check cannot parse at all has
+        # no readable `WorkingDirectory`, so there is no directory to hand
+        # `_is_private_checkout` — confirmed directly: `plutil -extract`
+        # fails identically to `plutil -lint` on a genuinely corrupt file,
+        # so there is no partial read to resolve a crew from. Building a
+        # SECOND privacy resolution for "which crew does this filename
+        # belong to" would be worse than the exposure it closes (steward,
+        # 2026-08-21) — a plist filename can itself name a crew
+        # (`com.convivy.cfo-review.plist` genuinely contains "cfo"), so the
+        # shared signal reports only a COUNT; the actual filenames go to this
+        # process's own local stderr log only, same as a private checkout's
+        # finding already does.
+        findings += 1
+        names = ", ".join(unparseable)
+        title = f"[serving-checkout] {len(unparseable)} plist(s) could not be read"
+        body = (
+            f"**This check could not parse {len(unparseable)} plist(s) under "
+            f"`{launch_agents}` at all**, so it has no idea whether the "
+            f"service(s) they define are serving from a stale checkout.\n\n"
+            f"An unreadable plist here is reported rather than silently "
+            f"skipped on purpose — a hand survey of exactly this question "
+            f"(run with a stricter plist parser) missed 16 of 29 real "
+            f"launchd-referenced checkouts this same way and reported the "
+            f"scope as \"13, so it's small\" instead of \"16 unreadable\".\n\n"
+            f"Which plists: check this run's own log — the names are not "
+            f"repeated here, because a plist's own filename can itself name "
+            f"a crew this check must not disclose, and it cannot resolve "
+            f"privacy for a file it cannot parse in the first place."
+        )
+        # THE COUNT, NOT A HASH OF THE NAMES (security-reviewer, PR #424
+        # round 1, blocking — a plain digest was the wrong fix, not just an
+        # incomplete one). Launchd plist filenames in this fleet are drawn
+        # from a small, largely-public namespace
+        # (`com.convivy.<crew>[-suffix].plist`) — a reader of the shared
+        # store can enumerate a few dozen plausible names, hash each one,
+        # and match against a published digest in microseconds. SHA-256 is
+        # one-way against a large or unknown input space; it is not private
+        # against a small, guessable one, which is exactly what a plist
+        # filename is here. Fixing that properly would need an HMAC keyed
+        # with a secret that never leaves this machine — real
+        # infrastructure this script has no other reason to hold, for a
+        # narrow benefit (exact-set dedup precision). Coarser dedup buys
+        # the same practical property (this run's finding does not spam a
+        # fresh signal every 15 minutes while the SAME NUMBER of plists stay
+        # broken) from a value with no connection to which plists they are.
+        #
+        # AND THE DATE, NOT JUST THE COUNT. The store's dedup_key is unique for
+        # all time (store.py insert_signal looks it up with no time filter), so a
+        # bare count-based key would log a same-count condition once, ever, and a
+        # later, different incident with that count would vanish into it. Scoping
+        # the key to today's date bounds that to one signal per day while a count
+        # persists (not 96/day at this job's 15-minute interval), and a later day
+        # logs again. Matches `convivy-orient/market_digest.py`'s
+        # `market-digest:<ISO-week>`, an established shape for bounded periodic
+        # dedup in this codebase.
+        #
+        # WHAT IT STILL DOES NOT COVER, WITHIN ONE DAY. A same-count condition that
+        # recurs later the same day has a byte-identical dedup_key, so the store
+        # answers it `duplicate` and nothing new is logged until the count changes
+        # or the date rolls over. The `[UNPARSEABLE]` stderr line below still logs
+        # every run, so this is not a total blind spot.
+        res = _post_signal("agent-platform", title, body,
+                           dedup_key=f"serving-checkout:unparseable:{_today()}:count-{len(unparseable)}",
+                           severity="medium", dry_run=opts.no_report)
+        print(f"[UNPARSEABLE] {names} → {res.get('status', '?')}", file=sys.stderr)
+    elif opts.verbose:
+        print("[OK] every plist under launch_agents was readable")
+
+    for repo_dir in sorted(checkouts):
+        labels = checkouts[repo_dir]
+        repo_findings = check(repo_dir)
+        if not repo_findings:
+            if opts.verbose:
+                print(f"[OK] {repo_dir}: on main, clean ({len(labels)} service(s))")
+            continue
+        services = ", ".join(labels)
+        # CFO (and any future black-box crew) never reaches _post_signal — a
+        # finding's own EXISTENCE in the shared signal store is the leak
+        # ADR-0043 forbids, independent of the fact that this check never
+        # reads file content (security-reviewer, PR #423, run-0d72a1e3). The
+        # finding still counts (a real problem on a private checkout is
+        # still a real problem) and still prints locally — this machine's
+        # own log, not a shared multi-reader store — just never logs.
+        private = _is_private_checkout(repo_dir)
+        for f in repo_findings:
+            findings += 1
+            if private:
+                # Local log only — never signal_client, never the shared
+                # signal store. A black-box crew "files no issues and logs no
+                # signals" (platform/decisions/0043); this is the equivalent
+                # for a signal this script would otherwise log. The title/body
+                # this finding would have used are never even built —
+                # nothing here constructs text meant for a shared store.
+                print(f"[FINDING] {repo_dir.name} (private crew, not logged): "
+                      f"{f['reason']}", file=sys.stderr)
+                continue
+            title = f"[serving-checkout] {repo_dir.name} {f['reason']}"
+            paths_block = (
+                "\n\nFiles changed from the committed state, outside `.claude/`:\n"
+                + "\n".join(f"  - {p}" for p in f["paths"])
+            ) if f["paths"] else ""
+            body = (
+                f"**`{repo_dir}` {f['reason']}**, and this checkout is what "
+                f"the following launchd service(s) serve from directly:\n\n"
+                f"{services}\n\n"
+                f"Whatever this checkout sits on right now is what those services "
+                f"are running — not what merged, not what `main` says, what is "
+                f"literally on disk here.{paths_block}\n\n"
+                f"Fix:\n\n"
+                f"```\ncd {repo_dir}\ngit status\ngit switch main && git pull --ff-only\n```\n\n"
+                f"If there is work in progress here, move it to a worktree first — "
+                f"a live-serving checkout is not a place for feature work.\n\n"
+                f"This check reads git metadata only (branch name, changed paths) "
+                f"and never file contents."
+            )
+            # Each finding kind gets its own dedup_key — branch state and
+            # dirty-tree state start and resolve independently, and a checkout
+            # can be both off `main` AND dirty at once, so one key covering
+            # "something about this checkout is wrong" would let one signal
+            # silently swallow the other.
+            res = _post_signal(repo_dir.name, title, body,
+                               dedup_key=f"serving-checkout:{repo_dir.name}:{f['kind']}:{day}",
+                               dry_run=opts.no_report)
+            print(f"[FINDING] {repo_dir.name} ({services}): {f['reason']} → "
+                  f"{res.get('status', '?')}", file=sys.stderr)
+
+    if findings == 0:
+        if opts.verbose:
+            print(f"[OK] every serving checkout ({len(checkouts)}) is on main and clean")
+        return 0
+    print(f"[DONE] {findings} finding(s) across {len(checkouts)} serving checkout(s)",
+          file=sys.stderr)
+    if _report_failures > 0:
+        print(f"[REPORT-FAIL] {_report_failures} report(s) failed — "
+              "findings not all logged", file=sys.stderr)
+        return 3
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.convivy.weekly-consulting</string>
+
+  <!-- The weekly outside-view strategy brief (ARCH-158). Fires Sunday 03:00
+       local. The consultant studies the evolving industry practice of building
+       agent systems, assesses our substrate against it, writes a one-page brief
+       to knowledge agent-platform/briefs/, and opens a PR (the operator merges). Sunday
+       03:00 is the weekend long-form slot (weekday news Mon-Fri 03:00, engineering
+       deep-dive Sat 03:00); 03:00 clears the overnight orchestrator's 01:00 spawn
+       wave and the local-day budget (ARCH-156) is still fresh. Same budget pool/cap
+       as the overnight job (DAILY_BUDGET_USD); agentctl gates the spawn.
+       AGENT_RUN_ORIGIN is also exported by the launcher. Cadence per the operator,
+       2026-06-27.
+
+       Deploy-pinned per platform/decisions/0059 rule 1
+       (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+       production USE of launch-weekly-consulting, not someone working on it,
+       so this reads a COPY installed from `main` into
+       ~/.local/deploy/agent-platform-shared/ (rules 2, 6, 7) instead of the
+       ~/.local/bin symlink into the checkout — that symlink still exists and
+       still reaches the tree, for the person who re-invokes
+       launch-weekly-consulting interactively while working on it (rule 5).
+       bin/agent-platform-autopull refreshes the deploy area on every
+       origin/main advance; bin/install-agent-platform-shared is what actually
+       builds it.
+       argv stays a single entry (rule 4 pins the INTERPRETER; the entry
+       point here is a shell script, not a python one, and the deploy area
+       builds no shell of its own) — the script itself moves to the deploy
+       area's copy and is run by its own path. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/deploy/agent-platform-shared/bin/launch-weekly-consulting</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>DAILY_BUDGET_USD</key>
+    <string>50</string>
+    <key>AGENT_RUN_ORIGIN</key>
+    <string>scheduled</string>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>0</integer>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Convivy/agent-runs/weekly-consulting-launcher.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Convivy/agent-runs/weekly-consulting-launcher.err.log</string>
+</dict>
+</plist>

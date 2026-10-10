@@ -1,0 +1,59 @@
+{
+  "Profiles": [
+    {
+      "Name": "co-convivy",
+      "Guid": "co-convivy-substrate-2026-05-28",
+      "Dynamic Profile Parent Name": "Default",
+      "Semantic History": {
+        "action": "raw command",
+        "text": "$HOME/bin/open-md-link \\1 \\2"
+      },
+      "Background Color": {
+        "Color Space": "sRGB",
+        "Red Component": 1.0,
+        "Green Component": 0.988,
+        "Blue Component": 0.973,
+        "Alpha Component": 1.0
+      },
+      "Foreground Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.173,
+        "Green Component": 0.141,
+        "Blue Component": 0.129,
+        "Alpha Component": 1.0
+      },
+      "Cursor Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.957,
+        "Green Component": 0.376,
+        "Blue Component": 0.298,
+        "Alpha Component": 1.0
+      },
+      "Selection Color": {
+        "Color Space": "sRGB",
+        "Red Component": 1.0,
+        "Green Component": 0.902,
+        "Blue Component": 0.855,
+        "Alpha Component": 1.0
+      },
+      "Tab Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.957,
+        "Green Component": 0.376,
+        "Blue Component": 0.298,
+        "Alpha Component": 1.0
+      },
+      "Use Tab Color": true,
+      "Badge Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.957,
+        "Green Component": 0.376,
+        "Blue Component": 0.298,
+        "Alpha Component": 0.25
+      },
+      "Badge Text": "convivy",
+      "Badge Max Width": 0.2,
+      "Badge Max Height": 0.04
+    }
+  ]
+}

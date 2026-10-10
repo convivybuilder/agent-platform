@@ -1,0 +1,175 @@
+#!/usr/bin/env python3.11
+"""orchestrator-tokens — per-night orchestrator token/turn report (ARCH-129).
+
+Decomposes an overnight-orchestrator transcript into the cost drivers the
+token-reduction work targets: API request count (each request re-reads the
+whole accumulated context), cache-read volume, uncached input, output, and
+the tool-call mix. Run it after a night to measure the ARCH-129 prompt
+changes (baseline 2026-06-10: 573 requests, 84.1M cache reads, ~$12).
+
+Usage: orchestrator-tokens [--date YYYY-MM-DD]
+       (default: the most recent date with an orchestrator run)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR
+import telemetry as T
+RUNS_ROOT = BR.runs_root()
+HISTORY = RUNS_ROOT / "orchestrator-tokens-history.jsonl"
+
+# The single-session cost baseline the phase-split is held to (~$12-14/night,
+# measured 2026-06-10/06-27). The nightly cost is always recorded to HISTORY; we
+# only POST when a night runs above this — an edge-triggered alert, not a nightly
+# metric dump (ARCH-313 alert standard). Env-overridable for tuning; a malformed
+# value falls back to the default rather than crashing the nightly record.
+try:
+    BASELINE_USD = float(os.environ.get("ORCHESTRATOR_TOKENS_BASELINE_USD", "14"))
+except ValueError:
+    BASELINE_USD = 14.0
+
+
+def usage_totals(lines) -> dict:
+    """Aggregate a transcript's API usage records + tool-call mix. Pure.
+
+    Claude Code writes the same assistant response into a transcript more than
+    once with byte-identical usage (ARCH-383); summing every occurrence
+    over-reports `api_requests` and every token count by that multiple, so
+    this dedupes on (message.id, requestId) via the shared T.UsageDedup, same
+    as every other summing site."""
+    requests = reads = miss = out = 0
+    tools: Counter = Counter()
+    dedup = T.UsageDedup()
+    for line in lines:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = rec.get("message") or {}
+        u = msg.get("usage") or rec.get("usage")
+        if isinstance(u, dict) and "input_tokens" in u:
+            if not dedup.is_duplicate(msg.get("id"), rec.get("requestId")):
+                requests += 1
+                reads += u.get("cache_read_input_tokens") or 0
+                miss += (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
+                out += u.get("output_tokens") or 0
+        content = msg.get("content")
+        if isinstance(content, list):
+            for blk in content:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    tools[blk.get("name") or "?"] += 1
+    return {
+        "api_requests": requests,
+        "cache_read_tokens": reads,
+        "uncached_input_tokens": miss,
+        "output_tokens": out,
+        "avg_context_tokens": (reads + miss) // requests if requests else 0,
+        "tool_calls": sum(tools.values()),
+        "tools": dict(tools.most_common()),
+    }
+
+
+# The phase-split (ARCH-268 lever C) replaces the single overnight-orchestrator
+# session with these stage agents. They ARE the orchestration cost on a
+# phase-split night (the launcher itself is bash, ~0 tokens), so the revert
+# tripwire must sum them — not just the "orchestrator"-named single session.
+ORCHESTRATION_STAGE_AGENTS = {"overnight-triage", "overnight-fix-drain", "overnight-verify"}
+
+
+def is_orchestration_agent(agent: str) -> bool:
+    """True for the single-session orchestrator OR a phase-split stage agent."""
+    return "orchestrator" in agent or agent in ORCHESTRATION_STAGE_AGENTS
+
+
+def orchestrator_runs(date_dir: Path):
+    """(run_dir, meta) for every orchestration run under one date dir — the
+    single-session overnight-orchestrator, or the phase-split stage agents."""
+    out = []
+    for run in sorted(date_dir.iterdir()):
+        meta_path = run / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if is_orchestration_agent(meta.get("agent") or ""):
+            out.append((run, meta))
+    return out
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Per-night orchestrator token/turn report (ARCH-129).")
+    p.add_argument("--date", default=None, help="YYYY-MM-DD (default: latest date with an orchestrator run)")
+    p.add_argument("--record", action="store_true",
+                   help="append each run's metrics to orchestrator-tokens-history.jsonl "
+                        "(idempotent per date+run) and post a one-line summary to "
+                        "#agent-cost. The ARCH-129 lever-C gate measurement: accumulate "
+                        "post-A+B nights, then compare cost/night against the ~$3 gate.")
+    args = p.parse_args(argv)
+
+    dates = [RUNS_ROOT / args.date] if args.date else sorted(RUNS_ROOT.glob("20*-*-*"), reverse=True)
+    for date_dir in dates:
+        if not date_dir.is_dir():
+            continue
+        runs = orchestrator_runs(date_dir)
+        if not runs:
+            continue
+        records = []
+        for run, meta in runs:
+            transcript = run / "transcript.jsonl"
+            if not transcript.exists():
+                print(f"{date_dir.name} {run.name}: no transcript.jsonl")
+                continue
+            t = usage_totals(transcript.read_text(errors="ignore").splitlines())
+            usd = None
+            try:
+                usd = json.loads((run / "cost.json").read_text()).get("usd")
+            except (OSError, json.JSONDecodeError):
+                pass
+            top = ", ".join(f"{k}×{v}" for k, v in list(t["tools"].items())[:6])
+            print(f"{date_dir.name}  {run.name}  {meta.get('model') or '?'}  "
+                  f"{'$%.2f' % usd if usd is not None else '$—'}")
+            print(f"  requests={t['api_requests']}  cache_read={t['cache_read_tokens']/1e6:.1f}M  "
+                  f"uncached_in={t['uncached_input_tokens']/1e6:.2f}M  out={t['output_tokens']/1e3:.0f}K  "
+                  f"avg_context={t['avg_context_tokens']/1e3:.0f}K")
+            print(f"  tool_calls={t['tool_calls']}  top: {top}")
+            records.append({"date": date_dir.name, "run": run.name,
+                            "model": meta.get("model"), "product": meta.get("repo"),
+                            "agent": meta.get("agent"), "usd": usd, **t})
+        if args.record:
+            _record(date_dir.name, records)
+        return 0
+    print("no orchestrator runs found", file=sys.stderr)
+    return 1
+
+
+def _record(date: str, records: list) -> None:
+    """Append the night's per-run metrics to the history log (idempotent per
+    date+run). The `tools` dict is dropped from the persisted record to keep
+    each line compact."""
+    seen = set()
+    if HISTORY.exists():
+        for line in HISTORY.read_text(errors="ignore").splitlines():
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            seen.add((r.get("date"), r.get("run")))
+    fresh = [r for r in records if (r["date"], r["run"]) not in seen]
+    if fresh:
+        with HISTORY.open("a") as fh:
+            for r in fresh:
+                fh.write(json.dumps({k: v for k, v in r.items() if k != "tools"}) + "\n")
+
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,95 @@
+# tests/bash/installer-test-inputs.txt — one grep -E pattern per repo-relative
+# path, read by BOTH ci.yml's `changes` job (to decide whether a PR needs the
+# four macOS-only installer test files below) and
+# tests/bash/test_installer_test_inputs_coverage.sh (which checks this list
+# against what those four files reference literally, so the two readers
+# cannot drift apart unnoticed — see that test's header for exactly what it
+# can and cannot verify). Comment lines and blank lines are ignored by both
+# readers. Every pattern below is grep -E, anchored where the underlying path
+# is exact (`$`) and left open where any file under a directory qualifies.
+#
+# DELIBERATELY NOT HERE: lib/agent-platform/*.py in general (e.g.
+# session_state.py), EXCEPT builder_root.py, listed below by name.
+# test_install_run_register_api.sh's test 10 globs the whole directory to
+# compute an import closure for bin/run-register-api, but that assertion only
+# moves when an IMPORT STATEMENT changes somewhere in the closure — a
+# content-only edit to one of those files (the overwhelming majority of
+# changes) leaves the closure and the result identical. Listing the whole
+# directory here would make almost every substrate change re-run the macOS
+# job, which is the cost this gate exists to cut. A real import-closure
+# regression is still caught: every push to main runs the full suite
+# regardless of this gate.
+#
+# builder_root.py is excepted because three of the four gated tests depend on
+# its CONTENT, not just its import statements: test_install_agent_platform_shared.sh
+# test 8, test_install_run_register_api.sh test 7, and every root-resolution
+# scenario in test_agent_platform_autopull.sh exec bin/builder-root (below)
+# with no --repo/--repo-default override, which imports this file from the
+# real tree and asserts on what root() returns. See the pattern's own comment
+# below for the exec chain.
+
+# test_install_agent_platform_shared.sh — the installer under test
+^bin/install-agent-platform-shared$
+# test_install_agent_platform_shared.sh test 17 — greps this file's real call spelling
+^bin/agent-platform-autopull$
+
+# test_install_run_register_api.sh — the installer under test
+^bin/install-run-register-api$
+# test_install_run_register_api.sh test 10 — its embedded python ast-walks this
+# file's transitive local imports (read inside the test's own python heredoc,
+# not a literal $REPO_ROOT/<path> in the shell source, so the coverage test
+# cannot extract this one mechanically — hand-listed here instead)
+^bin/run-register-api$
+
+# test_install_new_plists.sh clones the whole repo and runs this end-to-end
+^install\.sh$
+# install.sh phase 2 runs this unguarded under set -e; a failure aborts before
+# the plist phase test_install_new_plists.sh asserts on
+^lib/link-farm\.sh$
+# install.sh's final ROOT= line runs this unguarded under set -e (also read by
+# install-agent-platform-shared's and install-run-register-api's own
+# --repo-default scenarios: test_install_agent_platform_shared.sh test 8 and
+# test_install_run_register_api.sh test 7)
+^bin/builder-root$
+# bin/builder-root imports this at startup from its own real path
+# (bin/builder-root:27-28), so it is a content-sensitive input everywhere
+# bin/builder-root is exec'd from the real tree with no --repo override:
+# test_install_agent_platform_shared.sh test 8 (rc/message asserted at
+# tests/bash/test_install_agent_platform_shared.sh:252,263),
+# test_install_run_register_api.sh test 7 (tests/bash/test_install_run_register_api.sh:218,232),
+# and every root-resolution scenario in test_agent_platform_autopull.sh, which
+# asserts on the rc bin/agent-platform-autopull:194-195 gets back from it.
+^lib/agent-platform/builder_root\.py$
+# test_agent_platform_autopull.sh test 18 asserts the script's own signal-
+# heredoc library resolution (issue_01M33KK04A9B1A2MC710CNF583) lands on
+# THIS checkout's own copy of this file, not any farm under a fake $HOME
+^lib/agent-platform/signal_client\.py$
+# install.sh phase 1 pip-installs this unguarded under set -e; a broken file
+# aborts before the plist phase test_install_new_plists.sh asserts on
+^requirements\.txt$
+# test_install_new_plists.sh decides which plists read as "new" vs
+# already-installed from this whole directory; test_agent_platform_autopull.sh
+# test 10 also reads one specific plist here directly
+^launchd/
+
+# test_agent_platform_autopull.sh — the script under test
+^bin/agent-platform-autopull$
+
+# every one of the four sources this for its assertion helpers and REPO_ROOT
+^tests/bash/lib\.sh$
+# the harness that runs every test file, including the skip this file enables
+^tests/bash/run\.sh$
+# this file's own path — the same reasoning as tests/bash/run.sh above: a PR
+# that touches only this file (narrowing a pattern, dropping a line by
+# mistake) must still run the four tests whose skip it controls, rather than
+# grading itself against its own pre-edit version
+^tests/bash/installer-test-inputs\.txt$
+
+# the four test files themselves
+^tests/bash/test_install_agent_platform_shared\.sh$
+^tests/bash/test_install_run_register_api\.sh$
+^tests/bash/test_install_new_plists\.sh$
+^tests/bash/test_agent_platform_autopull\.sh$
+
+# a CI change must always run CI
+^\.github/

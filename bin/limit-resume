@@ -1,0 +1,62 @@
+#!/usr/bin/env python3.11
+"""limit-resume — wake each co session that stopped on a usage limit, once,
+after the limit resets (issue_01M3PXMTR0PFF6QH46F8SN76CZ).
+
+Runs every few minutes from launchd (`launchd/com.convivy.limit-resume.plist`).
+All the decision logic lives in `lib/agent-platform/limit_resume.py`; this is
+the thin entry point that wires it to the real tmux/session-input calls and
+guards against two runs overlapping.
+
+See that module's docstring for why this is its own scheduled job rather than
+a `co-session-health` mode: the failure this fixes is a session taking no
+turns at all, and a per-turn status-line hook cannot fire for a session that
+never takes one.
+"""
+from __future__ import annotations
+
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/co-working-on's
+# shape) — a deploy area (ADR-0059) has bin/ and lib/agent-platform/ together
+# but no ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "limit_resume.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+import limit_resume as LR  # noqa: E402
+
+# One run at a time. launchd's `StartInterval` does not wait for a prior
+# firing to finish, and two overlapping runs would both read `prompted.json`,
+# each miss the other's in-flight write, and could both send the same
+# session two resume prompts. A non-blocking lock means a run that finds one
+# already in flight simply does nothing this time, rather than queuing up
+# behind it — the next firing a few minutes later is the retry.
+LOCK_PATH = Path.home() / ".cache" / "limit-resume" / "run.lock"
+
+
+def main() -> int:
+    LOCK_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("limit-resume: another run is already in progress; skipping this one")
+        os.close(lock_fd)
+        return 0
+    try:
+        LR.run_once()
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

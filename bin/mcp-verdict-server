@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""mcp-verdict-server: stdio MCP server that posts a dispatched reviewer's verdict.
+
+One tool, `review_post`, served as `mcp__verdict__review_post`. Claude Code starts this
+server for each dispatched run (spawn passes it in `--mcp-config`), outside the run's
+sandbox. The run id is in this process's launch environment, set by spawn. The run's
+Bash cannot reach the review-record credential, and this server holds no capability
+beyond posting its own run's verdict. See `lib/agent-platform/run_verdict.py` for the
+refusals and the posting path.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, requires=("mcp",))
+from mcp.server.fastmcp import FastMCP  # noqa: E402
+
+import run_verdict as RV  # noqa: E402
+
+AGENTCTL = Path(__file__).resolve().parent / "agentctl"
+
+mcp = FastMCP(RV.SERVER_NAME)
+
+
+@mcp.tool()
+def review_post(verdict: str, body: str, pr: str | None = None, repo: str | None = None,
+                reviewed_commit: str | None = None) -> str:
+    """Post this review's verdict to the pull request it was dispatched to review.
+
+    `verdict` is APPROVE or REQUEST_CHANGES. `body` is the review, as markdown.
+
+    The PR, repository and commit come from this run's own dispatch record, so leave
+    `pr`, `repo` and `reviewed_commit` unset. Passing one that names another PR,
+    repository or commit is refused. Only reviewer and security-reviewer runs dispatched
+    with --pr can post.
+    """
+    run_id = os.environ.get("AGENTCTL_RUN_ID", "")
+    try:
+        target, done = RV.post_verdict(run_id, verdict, body, agentctl=AGENTCTL,
+                                       pr=pr, repo=repo, reviewed_commit=reviewed_commit)
+    except RV.Refused as e:
+        return f"refused: {e}"
+    if done.returncode != 0:
+        return f"not posted (review-post exit {done.returncode}): {done.stderr.strip()}"
+    return done.stdout.strip() or f"posted {verdict} on PR #{target.pr} at {target.commit[:9]}"
+
+
+if __name__ == "__main__":
+    mcp.run()

@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# launch-weekly-consulting — the weekly outside-view strategy brief (ARCH-158).
+#
+# Fires Sunday 03:00 (its own launchd job, com.convivy.weekly-consulting). Spawns
+# the `consultant` agent FOREGROUND: it studies how the industry's agent-building
+# practice is evolving (WebSearch/WebFetch), assesses our substrate against it,
+# writes a one-page brief to knowledge `agent-platform/briefs/`, and opens a PR
+# to convivy/knowledge (no autonomous merge — ARCH-020).
+#
+# Why its own launcher (not folded into launch-overnight): the brief is an
+# outside-view assessment, not part of the per-product drain. It wants Opus,
+# a single weekly cadence, and a clean separation from the nightly bug/queue
+# work. Same lesson as ARCH-122's launch-weekly-curation — deterministic
+# launchd dispatch beats a prompt-handoff that silently gets dropped.
+#
+# Sunday 03:00: the daily AI briefings used to run Mon–Sat at 03:00
+# (discontinued 2026-09-13); the consultant strategy brief keeps that slot on
+# Sunday, the one day they never ran. The overnight orchestrator fires at
+# 01:00, so 03:00 clears that spawn wave and the local-day budget (ARCH-156)
+# is still fresh — the consultant draws from an empty pool and never gets
+# gated behind the drain.
+#
+# agentctl gates the spawn on the daily budget ($50 soft / $80 hard); a hot
+# budget winds it down rather than blowing the cap. AGENT_RUN_ORIGIN=scheduled
+# tags the run as autonomous so it's budget-visible (ARCH-156).
+#
+# Logs to <root>/agent-runs/weekly-consulting-launcher.log.
+#
+# Usage: launch-weekly-consulting [--dry-run]   (--dry-run prints the spawn, runs nothing)
+
+set -euo pipefail
+
+# Autonomous-origin tag for the budget caps (ARCH-156); inherited by the spawn.
+export AGENT_RUN_ORIGIN=scheduled
+
+# Run records live under builder_root.data_root() (company/decisions/0008):
+# BUILDER_ROOT when set, else the machine's root, printed by the sibling
+# bin/builder-root. One hop through a ~/.local/bin link reaches the real bin/.
+_self_path="${BASH_SOURCE[0]}"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+DATA_ROOT="${BUILDER_ROOT:-$("$(dirname "$_self_path")/builder-root")}" || exit 1
+LOG_DIR="$DATA_ROOT/agent-runs"
+# The crews/knowledge/checkouts anchor (company/decisions/0008), for the task
+# prompt below — distinct from DATA_ROOT, which BUILDER_ROOT can redirect.
+ROOT="$("$(dirname "$_self_path")/builder-root" --root)" || exit 1
+LOG_FILE="$LOG_DIR/weekly-consulting-launcher.log"
+# Resolved beside this script, not $HOME/.local/bin (ADR-0059 rule 1): that
+# symlink reaches whatever branch the working checkout is on, and a
+# deploy-pinned copy of this launcher must not reach back into it. A deploy
+# area's bin/ carries agentctl alongside every script it ships (rule 2).
+AGENTCTL="$(dirname "$_self_path")/agentctl"
+DATE="$(date +%F)"
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG_FILE"; }
+
+# Self-alert on launcher failure (mirrors launch-weekly-curation's ARCH-083
+# trap): a non-zero exit is otherwise silent — the brief just doesn't appear.
+_on_exit() {
+    local rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    log "EXIT trap: non-zero exit ($rc)"
+}
+trap _on_exit EXIT
+
+TASK="Weekly outside-view strategy brief for ${DATE} (ARCH-158). Execute your full role per your prompt: study how the industry's practice of building and running agent systems is evolving this week (WebSearch/WebFetch, credible primary sources, dated), read our substrate (the agent roster under projects/shared/agents + projects/agent-platform, $ROOT/substrate/decisions.md, agent-run telemetry under $LOG_DIR, the KB via mcp__kb, and your prior briefs under projects/agent-platform/briefs), and write the one-page brief (where we're at / what's changing in the industry / what we should consider). Write it to $ROOT/knowledge/projects/agent-platform/briefs/agentic-state-${DATE}.md with the frontmatter your prompt specifies, open a PR to convivy/knowledge on branch consultant/${DATE}-weekly-brief (no merge — the operator merges). Earn the page: cite or cut, be specific to our setup, honesty over flattery — a quiet week is a valid one-line brief."
+
+log "===== weekly consulting brief start (${DATE}) ====="
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRY-RUN spawn: consultant --on agent-platform --profile agent-platform/daytime\n  task: %s\n' "$TASK"
+    log "dry-run — nothing spawned"
+    trap - EXIT
+    exit 0
+fi
+
+if "$AGENTCTL" spawn consultant --on agent-platform --profile agent-platform/daytime \
+        --foreground --task "$TASK" >> "$LOG_FILE" 2>&1; then
+    log "===== weekly consulting brief done (${DATE}): ok ====="
+else
+    rc=$?
+    log "===== weekly consulting brief FAILED (${DATE}): exit $rc ====="
+    exit "$rc"
+fi

@@ -1,0 +1,57 @@
+#!/bin/zsh
+# oc — OpenCode trial launcher (substrate ARCH-133).
+#
+# Launches OpenCode in <root>/convivy-orient (the one-repo trial of the
+# OpenCode exit hedge) with the gateway key in env. Throwaway quality by
+# design — if the trial verdict is adopt-as-hedge, the durable artifact is
+# the break-glass runbook, not this script.
+#
+# Trial rules live in convivy-orient/AGENTS.md + .opencode/ (merge-block
+# plugin, handoff skills). Models: deepseek (default) | kimi | gpt5 via the
+# local LiteLLM gateway — switch mid-session with /models.
+#
+# Usage:
+#   oc            -> OpenCode TUI in the trial repo
+#   oc run "..."  -> headless one-shot (any opencode args pass through)
+
+set -eu
+
+# The machine's root (company/decisions/0008), printed by the bin/builder-root
+# beside this file's real path, as co resolves it; HOME does not move it.
+_oc_root=$("${0:A:h}/builder-root" --root) && [[ -n $_oc_root ]] \
+    || { print -u2 "oc: cannot resolve the machine's root (bin/builder-root --root)"; exit 1; }
+
+# File first, Keychain second — an SSH session cannot read the login keychain at
+# all, so from a co session the file is the only path. `gateway-vkey` prints its
+# own reason on failure.
+OPENCODE_GATEWAY_KEY=$("$_oc_root/agent-platform/lib/agent-platform/gateway-vkey" litellm-opencode-virtual-key) || exit 1
+export OPENCODE_GATEWAY_KEY
+
+cd "$_oc_root/convivy-orient"
+
+# Mark the tmux window so the trial session is visually distinct from co's.
+#
+# TARGETED, AND SKIPPED ENTIRELY WITHOUT A PANE. Untargeted, tmux resolves a
+# rename to the current session's ACTIVE window — whatever the operator was
+# last looking at — rather than to the pane running the command, so this line
+# could rename a window it does not own. `bin/co` shipped this exact construct
+# and it fired twice: on 2026-09-06 it renamed the operator's main Ask window
+# (issue_01M1VTRHKRERY7MJEYCF4WR2G2), and on 2026-09-16 it labelled the live
+# `bosun` window `<personal-crew>`, and earlier `Shipwright`
+# (issue_01M2PXARYZ2HA08G9MJ4QPQYW9). The second reading was a lost session.
+#
+# `$TMUX_PANE` alone is not the fix, which is what the first round got wrong.
+# It closes the case where the variable is PRESENT; the recurrence came through
+# the case where it is ABSENT, and there the right answer is to do nothing. A
+# window keeping its own name is a cosmetic miss; a window wearing another
+# crew's name is a wrong answer that looks right, reaches Deck, and reads as a
+# session that moved.
+#
+# This file was never a reported site. It was found by sweeping for the
+# construct, which is the lesson of the second occurrence: fixing the sites a
+# finding names leaves the class alive in the ones it does not.
+if [[ -n ${TMUX:-} && -n ${TMUX_PANE:-} ]]; then
+    tmux rename-window -t "$TMUX_PANE" "oc-trial" 2>/dev/null || true
+fi
+
+exec opencode "$@"

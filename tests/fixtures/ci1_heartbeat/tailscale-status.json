@@ -1,0 +1,169 @@
+{
+  "_synthetic_example": "Shaped like `tailscale status --json` on macstudio, 2026-10-05. Field names and value shapes are real; keys, addresses and DNS names are synthetic.",
+  "Version": "1.102.4-t3caf7d9e7-g084ee3b64",
+  "BackendState": "Running",
+  "HaveNodeKey": true,
+  "TailscaleIPs": [
+    "192.0.2.10",
+    "2001:db8::10"
+  ],
+  "Self": {
+    "ID": "nTVZXhqr4t11CNTRL",
+    "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000004",
+    "HostName": "macstudio",
+    "DNSName": "macstudio.example.com.",
+    "OS": "macOS",
+    "UserID": 6539738449803490,
+    "Online": true,
+    "Tags": [
+      "tag:apps"
+    ],
+    "TailscaleIPs": [
+      "192.0.2.10",
+      "2001:db8::10"
+    ]
+  },
+  "Health": [],
+  "MagicDNSSuffix": "example.com",
+  "CurrentTailnet": {
+    "Name": "example.com",
+    "MagicDNSSuffix": "example.com",
+    "MagicDNSEnabled": true
+  },
+  "Peer": {
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000001": {
+      "ID": "n1CNTRL",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000001",
+      "HostName": "ci1",
+      "DNSName": "ci1.example.com.",
+      "OS": "linux",
+      "UserID": 1001,
+      "TailscaleIPs": [
+        "192.0.2.1",
+        "2001:db8::1"
+      ],
+      "Addrs": [
+        "192.0.2.1:41641"
+      ],
+      "CurAddr": "192.0.2.1:41641",
+      "Relay": "nyc",
+      "Online": true,
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "Tags": [
+        "tag:ci"
+      ],
+      "Active": false,
+      "Created": "2026-09-01T00:00:00Z",
+      "LastWrite": "2026-10-05T01:40:00Z",
+      "LastHandshake": "2026-10-05T01:40:00Z",
+      "KeyExpiry": "0001-01-01T00:00:00Z",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "PeerAPIURL": [],
+      "PrimaryRoutes": null,
+      "AllowedIPs": [
+        "192.0.2.1/32"
+      ],
+      "Capabilities": null,
+      "CapMap": null,
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "NoFileSharingReason": "",
+      "TaildropTarget": 0,
+      "PeerRelay": "",
+      "NodeID": "nID1"
+    },
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000002": {
+      "ID": "n2CNTRL",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000002",
+      "HostName": "macmini",
+      "DNSName": "macmini.example.com.",
+      "OS": "macOS",
+      "UserID": 1002,
+      "TailscaleIPs": [
+        "192.0.2.2",
+        "2001:db8::2"
+      ],
+      "Addrs": [
+        "192.0.2.2:41641"
+      ],
+      "CurAddr": "192.0.2.2:41641",
+      "Relay": "nyc",
+      "Online": true,
+      "LastSeen": "0001-01-01T00:00:00Z",
+      "Tags": [
+        "tag:apps"
+      ],
+      "Active": false,
+      "Created": "2026-09-01T00:00:00Z",
+      "LastWrite": "2026-10-05T01:40:00Z",
+      "LastHandshake": "2026-10-05T01:40:00Z",
+      "KeyExpiry": "0001-01-01T00:00:00Z",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "PeerAPIURL": [],
+      "PrimaryRoutes": null,
+      "AllowedIPs": [
+        "192.0.2.2/32"
+      ],
+      "Capabilities": null,
+      "CapMap": null,
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "NoFileSharingReason": "",
+      "TaildropTarget": 0,
+      "PeerRelay": "",
+      "NodeID": "nID2"
+    },
+    "nodekey:0000000000000000000000000000000000000000000000000000000000000003": {
+      "ID": "n3CNTRL",
+      "PublicKey": "nodekey:0000000000000000000000000000000000000000000000000000000000000003",
+      "HostName": "Macbook",
+      "DNSName": "Macbook.example.com.",
+      "OS": "macOS",
+      "UserID": 1003,
+      "TailscaleIPs": [
+        "192.0.2.3",
+        "2001:db8::3"
+      ],
+      "Addrs": [
+        "192.0.2.3:41641"
+      ],
+      "CurAddr": "192.0.2.3:41641",
+      "Relay": "nyc",
+      "Online": false,
+      "LastSeen": "2026-10-05T01:40:00.1Z",
+      "Tags": null,
+      "Active": false,
+      "Created": "2026-09-01T00:00:00Z",
+      "LastWrite": "2026-10-05T01:40:00Z",
+      "LastHandshake": "2026-10-05T01:40:00Z",
+      "KeyExpiry": "0001-01-01T00:00:00Z",
+      "InNetworkMap": true,
+      "InMagicSock": true,
+      "InEngine": true,
+      "ExitNode": false,
+      "ExitNodeOption": false,
+      "PeerAPIURL": [],
+      "PrimaryRoutes": null,
+      "AllowedIPs": [
+        "192.0.2.3/32"
+      ],
+      "Capabilities": null,
+      "CapMap": null,
+      "RxBytes": 0,
+      "TxBytes": 0,
+      "NoFileSharingReason": "",
+      "TaildropTarget": 0,
+      "PeerRelay": "",
+      "NodeID": "nID3"
+    }
+  },
+  "User": {}
+}

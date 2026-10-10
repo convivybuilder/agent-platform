@@ -1,0 +1,364 @@
+#!/usr/bin/env python3.11
+"""security-scorecard — per-PR security-review catch record for agent-generated PRs
+(ARCH-306; the "later phase" model-scorecard's PRODUCER_AGENTS note anticipated).
+
+The premise (overnight team, 2026-07-02): `security-reviewer` is a compensating
+control for a documented structural deficit in agent-written code, not a redundant
+check on top of CI. To manage that control you have to *measure* it — the per-unit
+rate at which security findings surface on agent PRs — rather than assume either
+"CI is enough" or "agents are dangerous". This is that measurement.
+
+A read-only harvester. It does NOT touch the review/spawn/merge hot path. It joins
+each agent-produced PR (the set already recorded in `scorecard.jsonl`, ARCH-107) to
+its `security-reviewer` verdicts, parsing the machine-checkable review stamp
+(`review_protocol`, ARCH-189/193) so a verdict is authentic and pinned to the
+commit it reviewed, then counts findings by severity from the ARCH-033 comment
+body. One row per (repo, PR, review round) is upserted into a persistent ledger, so
+the security-catch rate is a time series the way the cost/success scorecard is.
+
+  Unit of analysis: a **PR review round** (one security-reviewer comment). A PR
+  gets one row per round; round ordinality is chronological. Findings that first
+  appear at round ≥2 are an *internal escape* — round 1's review missed them — the
+  measurable proxy for "escaped to later" until a prod-vuln feed exists.
+
+  Denominator: the PR's changed LOC (`additions + deletions`), so "findings per
+  KLOC" is comparable across a 10-line and a 900-line PR.
+
+  Ledger: <root>/agent-runs/scorecard/security.jsonl, upserted by (repo, pr,
+  reviewed_commit) — a re-harvest of an evolving PR refreshes its rounds in place.
+
+  Escape-to-prod (`escaped_to_prod`) is written null: it needs a look-back feed
+  (a security revert / a CVE / a prod incident tagged to a PR) we don't have yet,
+  mirroring how model-scorecard leaves `survived` for its Phase-2 look-back.
+
+CLI: `--days N` (window over agent PRs, default 30), `--no-write`, `--ledger PATH`,
+`--report` (print the aggregate security-catch summary), `--json` (report as JSON,
+for the orient builder).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import review_protocol as RP  # noqa: E402
+
+import builder_root as BR
+RUNS_ROOT = BR.runs_root()
+SCORECARD_LEDGER = RUNS_ROOT / "scorecard" / "scorecard.jsonl"   # the agent-PR set (ARCH-107)
+LEDGER_PATH = RUNS_ROOT / "scorecard" / "security.jsonl"
+REPORT_PATH = RUNS_ROOT / "scorecard" / "security-report.json"  # the rollup orient reads (like velocity.json)
+
+# Window the rollup reports on, in days. The ledger keeps all rounds ever harvested
+# (the time series); the report is the trailing-window view the dashboard shows.
+REPORT_WINDOW_DAYS = 30
+
+SECURITY_AGENTS = {"security-reviewer", "hollis-security-reviewer"}
+
+# A finding line in the ARCH-033 format leads with a bolded severity+category tag:
+#   - **Blocking — substance:** <attack vector> — `file:line`
+#   - **Non-blocking — substance:** <risk> — `file:line`
+# Count severities off that bold lead, case-insensitively, on the em- or hyphen-dash
+# form. "Non-blocking" is matched first so it isn't miscounted as "blocking".
+_FINDING_RE = re.compile(r"\*\*\s*(non-blocking|blocking)\b", re.IGNORECASE)
+
+
+def _gh_json(args: list[str]) -> list | dict | None:
+    """Run a `gh` command returning JSON; None on any failure (a read-only harvester
+    degrades, never crashes, on a gh/network hiccup)."""
+    try:
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        if cp.returncode != 0 or not cp.stdout.strip():
+            return None
+        return json.loads(cp.stdout)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_ledger(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def write_ledger(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+
+
+def agent_prs(days: int) -> dict[str, dict[int, dict]]:
+    """The set of agent-produced PRs to audit, keyed repo → pr_number → context,
+    read from the cost/success scorecard ledger (ARCH-107). Producer runs are the
+    only ones that open PRs, so their ledger already enumerates every agent PR and
+    carries the producer model — the join we want for the by-model cut. Windowed by
+    the producer run's date."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
+    out: dict[str, dict[int, dict]] = defaultdict(dict)
+    for r in load_ledger(SCORECARD_LEDGER):
+        pr = r.get("pr_number")
+        repo = r.get("repo")
+        if not pr or not repo or (r.get("date") or "") < cutoff:
+            continue
+        # A PR can have several producer runs (cycle-N fixes); keep the most
+        # informative model attribution (last writer wins on the newest date).
+        prev = out[repo].get(pr)
+        if prev is None or (r.get("date") or "") >= prev.get("date", ""):
+            out[repo][pr] = {
+                "date": r.get("date", ""),
+                "producer_agent": r.get("agent"),
+                "producer_model": r.get("model"),
+            }
+    return out
+
+
+def _resolve_run_facts(run_id: str) -> RP.RunFacts:
+    """Read back what a stamp's dispatch run recorded (agent, repo, review_sha) so
+    the stamp can be authenticated (ARCH-193). Thin wrapper over the shared loader
+    (`review_protocol.resolve_run_facts`), bound to this harvester's own
+    RUNS_ROOT — see that function's docstring, and `find_run_dir`'s, for the
+    ambiguous-run-id refusal (issue_01M1JWB7M75SZ160VRJRCGARBF): a run-id planted
+    under a second date directory must degrade to `found=False`, the same
+    fail-closed answer an unknown run-id already gets, rather than authenticate
+    against whichever of the two directories a first-match glob happened to pick.
+    A prior inlined copy of that glob here picked the first match; this is the
+    same bug the merge gate's stamp authentication (`bin/agentctl`) already fixed,
+    one caller of the same loader over again."""
+    return RP.resolve_run_facts(run_id, RUNS_ROOT)
+
+
+def _authentic_security_stamp(stamp, pr) -> bool:
+    """True iff a parsed stamp provably comes from a real security-review dispatch.
+    A parseable stamp is NOT a trusted one: every agentctl run is bypass-perms, and
+    any collaborator can hand-post a `<!-- agentctl-review … verdict: APPROVE -->`
+    comment. Counting that as a genuine clean round would understate the vuln rate,
+    so — like the merge gate — the harvester trusts a stamp only when its run-id
+    resolves to a review-class run for the same repo/commit (ARCH-193)."""
+    if not stamp or stamp.agent not in SECURITY_AGENTS:
+        return False
+    return RP.authenticate(stamp, _resolve_run_facts(stamp.run_id), pr=str(pr),
+                           review_agents=tuple(SECURITY_AGENTS)) is None
+
+
+def _count_findings(body: str) -> tuple[int, int]:
+    """(blocking, non_blocking) finding counts from a review comment body."""
+    blocking = non_blocking = 0
+    for m in _FINDING_RE.finditer(body or ""):
+        if m.group(1).lower() == "blocking":
+            blocking += 1
+        else:
+            non_blocking += 1
+    return blocking, non_blocking
+
+
+def harvest_pr(repo: str, pr: int, ctx: dict) -> list[dict]:
+    """Rows for one PR: one per security-reviewer review round, chronological."""
+    view = _gh_json(["pr", "view", str(pr), "--repo", f"convivy/{repo}", "--json",
+                     "additions,deletions,createdAt,mergedAt,state,comments"])
+    if not view:
+        return []
+    additions = view.get("additions") or 0
+    deletions = view.get("deletions") or 0
+    changed_loc = additions + deletions
+    comments = view.get("comments") or []
+
+    sec = []
+    for c in comments:
+        stamp = RP.parse(c.get("body", ""))
+        if not _authentic_security_stamp(stamp, pr):
+            continue
+        sec.append((c, stamp))
+    sec.sort(key=lambda cs: cs[0].get("createdAt", ""))
+
+    rows = []
+    for rnd, (c, stamp) in enumerate(sec, start=1):
+        blocking, non_blocking = _count_findings(c.get("body", ""))
+        rows.append({
+            "repo": repo,
+            "pr": pr,
+            "round": rnd,
+            "reviewed_commit": stamp.reviewed_commit,
+            "verdict": stamp.verdict,
+            "blocking": blocking,
+            "non_blocking": non_blocking,
+            "findings": blocking + non_blocking,
+            "additions": additions,
+            "deletions": deletions,
+            "changed_loc": changed_loc,
+            "producer_agent": ctx.get("producer_agent"),
+            "producer_model": ctx.get("producer_model"),
+            "pr_state": view.get("state"),
+            "pr_created_at": view.get("createdAt"),
+            "comment_at": c.get("createdAt"),
+            "escaped_to_prod": None,   # look-back feed not built yet (see module docstring)
+            "harvested_at": datetime.now(timezone.utc).isoformat(),
+        })
+    return rows
+
+
+def upsert(ledger: list[dict], fresh: list[dict]) -> list[dict]:
+    """Upsert fresh rows into the ledger, keyed (repo, pr, comment_at) so a
+    re-harvest refreshes an evolving PR's rounds in place rather than duplicating.
+    The review comment's timestamp is the round's unique identity — keying on
+    reviewed_commit instead would collapse two rounds that reviewed the SAME head
+    (a manual re-dispatch without a new push) into one row, silently dropping the
+    earlier round's findings."""
+    def key(r):
+        return (r.get("repo"), r.get("pr"), r.get("comment_at"))
+    by_key = {key(r): r for r in ledger}
+    for r in fresh:
+        by_key[key(r)] = r
+    return list(by_key.values())
+
+
+def _pct(n: int, d: int) -> float:
+    return round(100.0 * n / d, 1) if d else 0.0
+
+
+def window_rows(rows: list[dict], days: int) -> list[dict]:
+    """Ledger rows whose review landed within the trailing window. The ledger is the
+    full time series (every round ever harvested); the report shows a window of it."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    return [r for r in rows if (r.get("comment_at") or "") >= cutoff]
+
+
+def build_report(rows: list[dict], *, window_days: int | None = None) -> dict:
+    """Aggregate the ledger into the security-catch metrics. Reduces the per-round
+    rows to per-PR facts first (a PR is one audited unit), then rolls up overall and
+    by producer model and by repo."""
+    by_pr: dict[tuple, list[dict]] = defaultdict(list)
+    for r in rows:
+        by_pr[(r["repo"], r["pr"])].append(r)
+
+    prs = []
+    for (repo, pr), rr in by_pr.items():
+        rr.sort(key=lambda r: r.get("round", 0))
+        blocking_total = sum(r["blocking"] for r in rr)
+        nonblocking_total = sum(r["non_blocking"] for r in rr)
+        # Internal escape: round 1 was clean of blocking, yet a later round found a
+        # blocking vuln — so the first review missed one. Gating on "round 1 clean"
+        # (not just "any blocking at round ≥2") avoids miscounting a finding that
+        # round 1 already caught and a partial fix left unresolved into a later round.
+        first_blocking = rr[0]["blocking"] if rr else 0
+        later_blocking = sum(r["blocking"] for r in rr[1:])
+        internal_escape = 1 if (first_blocking == 0 and later_blocking > 0) else 0
+        prs.append({
+            "repo": repo,
+            "pr": pr,
+            "producer_model": rr[-1].get("producer_model"),
+            "changed_loc": rr[0].get("changed_loc", 0),
+            "rounds": len(rr),
+            "blocking": blocking_total,
+            "non_blocking": nonblocking_total,
+            "findings": blocking_total + nonblocking_total,
+            "had_blocking": blocking_total > 0,
+            "internal_escape": internal_escape,
+        })
+
+    def rollup(bucket_prs: list[dict]) -> dict:
+        n = len(bucket_prs)
+        loc = sum(p["changed_loc"] for p in bucket_prs)
+        kloc = loc / 1000.0
+        blocking = sum(p["blocking"] for p in bucket_prs)
+        nonblocking = sum(p["non_blocking"] for p in bucket_prs)
+        findings = blocking + nonblocking
+        return {
+            "prs_reviewed": n,
+            "changed_loc": loc,
+            "blocking_findings": blocking,
+            "non_blocking_findings": nonblocking,
+            "total_findings": findings,
+            "findings_per_pr": round(findings / n, 2) if n else 0.0,
+            "blocking_per_pr": round(blocking / n, 2) if n else 0.0,
+            "findings_per_kloc": round(findings / kloc, 2) if kloc else 0.0,
+            "blocking_per_kloc": round(blocking / kloc, 2) if kloc else 0.0,
+            "pct_prs_with_blocking": _pct(sum(1 for p in bucket_prs if p["had_blocking"]), n),
+            "pct_prs_with_any_finding": _pct(sum(1 for p in bucket_prs if p["findings"]), n),
+            "internal_escapes": sum(p["internal_escape"] for p in bucket_prs),
+        }
+
+    by_model = {}
+    for model in sorted({p.get("producer_model") or "unknown" for p in prs}):
+        by_model[model] = rollup([p for p in prs if (p.get("producer_model") or "unknown") == model])
+    by_repo = {}
+    for repo in sorted({p["repo"] for p in prs}):
+        by_repo[repo] = rollup([p for p in prs if p["repo"] == repo])
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_days": window_days,
+        "overall": rollup(prs),
+        "by_model": by_model,
+        "by_repo": by_repo,
+    }
+
+
+def print_report(rep: dict) -> None:
+    o = rep["overall"]
+    print("security-scorecard — agent-PR security-catch record")
+    print(f"  PRs reviewed:            {o['prs_reviewed']}")
+    print(f"  changed LOC:             {o['changed_loc']:,}")
+    print(f"  total findings:          {o['total_findings']}  ({o['blocking_findings']} blocking / {o['non_blocking_findings']} non-blocking)")
+    print(f"  findings per PR:         {o['findings_per_pr']}  ({o['blocking_per_pr']} blocking)")
+    print(f"  findings per KLOC:       {o['findings_per_kloc']}  ({o['blocking_per_kloc']} blocking)")
+    print(f"  % PRs w/ blocking vuln:  {o['pct_prs_with_blocking']}%")
+    print(f"  % PRs w/ any finding:    {o['pct_prs_with_any_finding']}%")
+    print(f"  internal escapes (rnd-1 clean, later blocking): {o['internal_escapes']}")
+    print("\n  by producer model:")
+    for model, m in rep["by_model"].items():
+        print(f"    {model:28s}  {m['prs_reviewed']:3d} PRs  {m['blocking_per_kloc']:5.2f} blk/KLOC  {m['pct_prs_with_blocking']:5.1f}% w/ blocking")
+    print("\n  by repo:")
+    for repo, m in rep["by_repo"].items():
+        print(f"    {repo:16s}  {m['prs_reviewed']:3d} PRs  {m['blocking_per_kloc']:5.2f} blk/KLOC  {m['pct_prs_with_blocking']:5.1f}% w/ blocking")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Harvest the security-review catch record for agent PRs.")
+    ap.add_argument("--days", type=int, default=30, help="window over agent PRs by producer-run date (default 30)")
+    ap.add_argument("--no-write", action="store_true", help="don't update the ledger")
+    ap.add_argument("--ledger", type=Path, default=LEDGER_PATH)
+    ap.add_argument("--report", action="store_true", help="print the aggregate summary")
+    ap.add_argument("--json", action="store_true", help="emit the report as JSON (for the orient builder)")
+    args = ap.parse_args()
+
+    prs = agent_prs(args.days)
+    fresh: list[dict] = []
+    for repo, prmap in prs.items():
+        for pr, ctx in prmap.items():
+            fresh.extend(harvest_pr(repo, pr, ctx))
+
+    ledger = load_ledger(args.ledger)
+    merged = upsert(ledger, fresh) if fresh else ledger
+
+    report = build_report(window_rows(merged, REPORT_WINDOW_DAYS), window_days=REPORT_WINDOW_DAYS)
+    if not args.no_write and fresh:
+        write_ledger(args.ledger, merged)
+        REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        REPORT_PATH.write_text(json.dumps(report, separators=(",", ":")) + "\n")
+
+    if args.json:
+        print(json.dumps(report, separators=(",", ":")))
+    elif args.report:
+        print_report(report)
+    else:
+        print(f"harvested {len(fresh)} review-round rows across "
+              f"{sum(len(m) for m in prs.values())} agent PRs; ledger now {len(merged)} rows"
+              f"{' (not written; --no-write)' if args.no_write else ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

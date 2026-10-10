@@ -1,0 +1,41 @@
+#!/bin/sh
+# install-rollover-policy — seed ~/.config/convivy/rollover.json, once (ADR-0069).
+#
+# `lib/agent-platform/rollover_policy.py` re-reads this file on every hook
+# firing, so once it exists it is the operator's (or, from Slice 3 on,
+# `session-agent rollover-policy`'s) to edit. This script writes it ONLY when
+# it is absent — a present file, even one containing only `{}`, is left alone,
+# the same rule `deck_config.py` follows for `theme.json` at the coarser grain
+# of "the whole file" rather than "one key", because this file has no per-key
+# merge story yet.
+#
+# The seed's `mode` is `observe`: the hook records state and emits nothing
+# until an operator flips it to `enforce`. `seek_pct` and `floor_pct` seed to
+# 40 and 50, matching the policy `session-agent rollover-policy --set` put
+# live on this machine on 2026-10-01 at the operator's direction, raised from 25/35
+# because sessions were rolling over too often and losing conversations and
+# messages. `seek_call_cap` stays `null` (inert) pending its own
+# measurement; a null limit never fires.
+#
+# Idempotent. Run from install.sh or by hand.
+set -eu
+
+# FOR TESTS ONLY: ROLLOVER_POLICY_FILE overrides the seeded path, so a test
+# does not touch the real $HOME. install.sh passes nothing.
+FILE="${ROLLOVER_POLICY_FILE:-$HOME/.config/convivy/rollover.json}"
+
+if [ -e "$FILE" ]; then
+  echo "  = $FILE already exists, leaving it alone"
+  exit 0
+fi
+
+mkdir -p "$(dirname "$FILE")"
+cat >"$FILE" <<'JSON'
+{
+  "mode": "observe",
+  "seek_pct": 40,
+  "floor_pct": 50,
+  "seek_call_cap": null
+}
+JSON
+echo "  ✓ $FILE seeded (mode=observe, seek_pct=40, floor_pct=50, seek_call_cap null)"

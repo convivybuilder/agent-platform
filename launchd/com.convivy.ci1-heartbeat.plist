@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.ci1-heartbeat</string>
+
+    <!-- The ci1 heartbeat (bin/ci1-heartbeat, issue_01M44VMKSMHQPKJGVSZ6ZK7ZWK): logs one
+         alert signal when ci1, the self-hosted Linux CI box, stops taking
+         convivy-linux jobs, and a cleared signal on recovery. The operator does not read Slack, so this
+         job is the only thing that tells him.
+
+         300s (5 min). The 15-minute thresholds live in the script, so a tick every five
+         minutes detects an outage within 20 minutes of its start. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1: a timer firing unattended is
+         production use, so this reads the copy install-agent-platform-shared builds from
+         main into ~/.local/deploy/agent-platform-shared, not the ~/.local/bin symlink into
+         the checkout (tests/test_plists_are_deploy_pinned.py enforces this).
+         ProgramArguments names the deploy area's pinned interpreter explicitly.
+
+         NOT INSTALLED BY THIS CHANGE: the orchestrator loads it after merge. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/ci1-heartbeat</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/ci1-heartbeat.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/ci1-heartbeat.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- The script sets tailscale's absolute path (TAILSCALE in bin/ci1-heartbeat), and
+             lib/agent-platform/github_app.py sets openssl's (OPENSSL). PATH is kept for parity
+             with the other deploy-pinned jobs. -->
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,89 @@
+#!/bin/bash
+#
+# sshd-watchdog — auto-rebind the mini's sshd when it stops listening (ARCH-310).
+#
+# Runs as a ROOT LaunchDaemon (com.convivy.sshd-watchdog, StartInterval 60). The
+# mini's Remote Login can enter an "enabled but unbound" state: launchd shows
+# com.openssh.sshd enabled yet nothing listens on :22, locking the laptop out
+# (twice — 2026-07-03, 2026-07-04). The proven manual fix is `systemsetup
+# -setremotelogin off` then `on`, which forces a socket rebind. This job automates
+# it and drops an event file the user-context notify agent turns into a Slack
+# alert — a root daemon can't read the operator's login keychain, so it can't post itself.
+#
+# SECURITY: a root daemon executes this, so the installed copy MUST be root-owned
+# and not group/world-writable. It is copied (root:wheel 755) to
+# /usr/local/sbin/sshd-watchdog — NOT symlinked into the user-writable repo tree
+# like our user bins (a root daemon following a user-writable path is a privilege-
+# escalation surface). Re-copy on change; the source of truth is this repo file.
+# Install with: sudo bash sbin/install-sshd-watchdog.sh
+#
+# bash 3.2-safe (ARCH-082); absolute tool paths (thin launchd PATH, ARCH-086).
+
+set -u
+
+NETSTAT=/usr/sbin/netstat
+GREP=/usr/bin/grep
+SYSTEMSETUP=/usr/sbin/systemsetup
+HOSTNAME_BIN=/bin/hostname
+DATE=/bin/date
+SLEEP=/bin/sleep
+MKDIR=/bin/mkdir
+CHMOD=/bin/chmod
+
+BASE=/var/log/sshd-watchdog
+EVENT_DIR="$BASE/events"
+LOG="$BASE/watchdog.log"
+
+"$MKDIR" -p "$EVENT_DIR"
+
+# Privilege-independent listen check: read the kernel TCP table for a LISTEN on
+# port 22 (matches both tcp4 and tcp6). lsof would need root to see sshd's socket
+# and is fragile; netstat -an does not.
+listening() {
+  "$NETSTAT" -an -p tcp 2>/dev/null | "$GREP" -qE '\.22 .*LISTEN'
+}
+
+iso()   { "$DATE" -u +%Y-%m-%dT%H:%M:%SZ; }
+stamp() { "$DATE" -u +%Y%m%dT%H%M%SZ; }
+
+if listening; then
+  exit 0
+fi
+
+detected="$(iso)"
+echo "$detected sshd NOT listening on :22 — attempting rebind" >> "$LOG"
+
+# The proven manual fix: cycle Remote Login off->on to force a socket rebind.
+# -f forces past systemsetup's interactive yes/no confirmation (a daemon can't
+# answer it). Deliberately NOT `set -e`: `off` must not abort before `on` runs.
+# Log each exit code so watchdog.log tells the full story.
+"$SYSTEMSETUP" -f -setremotelogin off >> "$LOG" 2>&1
+off_rc=$?
+"$SYSTEMSETUP" -f -setremotelogin on  >> "$LOG" 2>&1
+on_rc=$?
+echo "$(iso) systemsetup off exit=$off_rc on exit=$on_rc" >> "$LOG"
+
+"$SLEEP" 3
+
+if listening; then
+  result=recovered
+else
+  result=STILL-DOWN
+fi
+
+finished="$(iso)"
+echo "$finished rebind result=$result" >> "$LOG"
+
+# Drop an event file for the user notify agent (idempotent-marker pattern). The
+# event file is the durable "when did it happen" record even if the Slack post
+# is missed.
+event_file="$EVENT_DIR/event-$(stamp).txt"
+{
+  echo "detected=$detected"
+  echo "finished=$finished"
+  echo "result=$result"
+  echo "host=$("$HOSTNAME_BIN" -s 2>/dev/null)"
+} > "$event_file"
+"$CHMOD" 644 "$event_file"
+
+exit 0

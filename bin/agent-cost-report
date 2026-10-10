@@ -1,0 +1,657 @@
+#!/usr/bin/env python3.11
+"""agent-cost-report — per-model spend breakdown for the cost dashboards (ARCH-136).
+
+Built after Fable 5 silently burned ~$318 in API-rate spend in one day
+(2026-06-11, ARCH-134) with zero telemetry on the interactive path — the
+autonomous path had budget watchdogs + the scorecard, but interactive co
+sessions bill directly and surface nowhere until the monthly bill. This is the
+matching coverage: record what models we've run today and what they cost, so a
+price/model spike is caught in hours.
+
+Slack is gone from this tool entirely. ARCH-362 R3 retired the 4-hourly summary
+post because /spending and /cost-performance already carry the same numbers, and
+agent-platform#293 removed the remaining tripwire post. Every alert this tool
+raises is now a structured kind=alert signal that lands on /engineering/alerts
+and reaches the operator by push; a tripwire is an event, not a digest, so it still fires.
+
+This tool's REAL deliverable is the dashboard snapshot, not any notification.
+`latest.json` is what /spending and /cost-performance read, so if this stops
+running those pages freeze at their last write and say nothing about why. That
+is not hypothetical: #293 deleted this file as a "Slack-only alerter", the two
+launchd jobs went with it, and the dashboards sat frozen at 2026-07-28 20:35 for
+22 hours until the operator noticed the number had not moved. Whatever else changes here,
+the snapshot write is the thing that must not be treated as incidental.
+
+Three cost sources, kept distinct because they are different dollars:
+  • Anthropic models (claude-*) — ccusage's API-rate ESTIMATE from the local
+    Claude Code transcripts. Under the Max subscription these are mostly flat-
+    rate "what this would cost at API rates"; the slice that exceeds the plan is
+    real credit burn (the Fable overage was). This is the number we are trying
+    to push down by moving work to deepseek.
+  • Gateway models (deepseek/kimi/gpt5) — the ACTUAL provider cost from the
+    gateway spend logs (real out-of-pocket), not an estimate.
+  • Direct-API apps (PA, cookbook — ARCH-147) — standalone apps that call
+    providers directly with their own keys (Anthropic console credits, and for
+    cookbook deepseek/openai too), invisible to ccusage and the gateway log alike.
+    Read from each app's append-only spend ledger; real out-of-pocket dollars, a
+    separate lane from the gateway. This is the blind spot ARCH-146 burned through.
+
+The 00:00 run is special: instead of a structurally-$0 "today as of 00:00", it
+records the day-close — the FINAL total for the day that just ended, including
+the 20:00→24:00 evening window a 20:00 run misses. The 15-min refresh cannot do
+this for itself, because it always computes "today".
+
+CLI: prints the report and refreshes the dashboard snapshot; `--date YYYY-MM-DD`
+overrides today (testing); `--close` forces day-close mode (auto-on at the 00:00
+launchd slot). The old `--dry-run` is gone with Slack — it only ever set slack's
+dry-run env var, and no plist, test, or caller passed it.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date as date_t, datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import signal_client  # noqa: E402
+
+import builder_root as BR
+RUNS_ROOT = BR.runs_root()
+GATEWAY_SPEND = RUNS_ROOT / "gateway-spend"
+COST_DIR = RUNS_ROOT / "cost-report"
+# Mirrors telemetry.RATE_LIMIT_SEVERITY; this script does not import the
+# platform libs, and the pair is pinned by a test.
+RATE_LIMIT_SEVERITY = ("allowed", "allowed_warning", "rejected")
+
+# Subscription-spend tripwire (operator 2026-06-23). Daytime/interactive subscription
+# spend is uncapped by design (the caps gate only autonomous origins, ARCH-156),
+# so this posts a heads-up to #agent-cost each time the day's Anthropic
+# subscription estimate crosses a new $STEP multiple — so a runaway subagent is
+# noticed within a refresh cycle (~15 min) instead of at the monthly bill. Pure
+# visibility, no enforcement. Edge-triggered via its own per-day state file.
+# $1000, not $50 (operator 2026-07-19). The old step fired on the ANTHROPIC ESTIMATE,
+# which is mostly flat-rate spend already covered by the Max plan — so it went off
+# 17 times in 14 days and became noise. That is ARCH-174's rule applied to the
+# alert itself: gate on real overage, not on a headline number that is an
+# API-rate estimate of subscription usage.
+#
+# $1000 is deliberately a level the operator hits on a busy day. His reasoning: if it
+# arrives while he is at the computer it is expected and costs him nothing; if it
+# arrives while he is AWAY, that is exactly what he wants to know.
+SUBSCRIPTION_WARN_STEP_USD = float(os.environ.get("SUBSCRIPTION_WARN_STEP_USD", "1000"))
+INCREMENT_STATE_PATH = RUNS_ROOT / "cost-report" / "subscription-alert-state.json"
+
+# The OUT-OF-POCKET lane: gateway (real provider cost) + direct-API apps. This is
+# money actually leaving the account, so the bar is far lower — $5, then every $5.
+# Over the 14 days before this shipped it would have fired ONCE, on the day real
+# spend reached $7.18. A cheap alert that almost never fires is worth more than a
+# frequent one nobody reads.
+OUT_OF_POCKET_WARN_STEP_USD = float(os.environ.get("OUT_OF_POCKET_WARN_STEP_USD", "5"))
+OUT_OF_POCKET_STATE_PATH = RUNS_ROOT / "cost-report" / "out-of-pocket-alert-state.json"
+# Once-per-day state for the Fable tripwire, mirroring the increment alert's own
+# file. Its own file, not a shared one, so neither tripwire can reset the other.
+FABLE_STATE_PATH = RUNS_ROOT / "cost-report" / "fable-alert-state.json"
+
+# The Anthropic per-token estimate counts ONLY Anthropic-direct models, whose
+# ccusage modelBreakdowns names all start with this prefix (claude-opus/sonnet/
+# haiku/fable/mythos). Gateway-served models (deepseek/kimi/gpt/...) also surface
+# in ccusage's transcripts but carry their real out-of-pocket cost in the gateway
+# spend log, so they're excluded here to avoid double-counting. This is an
+# ALLOWLIST (keep iff name starts with the prefix), not a gateway denylist, so a
+# NEW gateway model can never silently leak into the Anthropic estimate (ARCH-192).
+ANTHROPIC_MODEL_PREFIX = "claude"
+
+# Direct-API app spend ledgers (ARCH-147 / ARCH-152). Standalone apps call LLM
+# providers directly with their own API keys (Anthropic console credits, and for
+# some apps deepseek/openai too), so their spend is invisible to ccusage (no Claude
+# Code transcript) AND to the gateway log (they don't route through litellm). We sum
+# the day's per-call dollar amount per app so this real out-of-pocket spend surfaces
+# on #agent-cost instead of only on the monthly bill.
+#
+# Two ledger sources, by where the app runs:
+#   • MINI-LOCAL apps write their own file on the mini directly — listed in
+#     APP_LEDGERS below. Only PA today (a mini launchd service). Dollar field `usd`.
+#   • CLOUD apps (vivy, constance, sous-chef/cookbook — all on Render) can't write
+#     the mini's disk, so they POST contract-conformant events to the convivy-orient
+#     ingest endpoint, which appends them to APP_LEDGER_DIR/<app>.jsonl. We scan that
+#     dir too; the filename stem is the authoritative app name (the endpoint sets it
+#     from the authenticated caller, not the payload). (cookbook was briefly on the
+#     local path in ARCH-147 — that was its stale DEV ledger; its real spend is on
+#     Render, so it belongs on the endpoint, ARCH-152.)
+# The reader accepts `usd` or `cost` as the dollar field for either source.
+APP_LEDGERS = {
+    "hollis": BR.root() / "hollis" / "data" / "llm-spend.jsonl",
+}
+APP_LEDGER_DIR = RUNS_ROOT / "llm-spend"  # collected ledgers from the ingest endpoint
+
+# Per-row source tags, carried into by_model in the snapshot and the printed
+# table. est = ccusage API-rate estimate
+# (subscription/credit); actual = gateway out-of-pocket; api = an app's direct-API
+# spend from its ledger (ARCH-147), real dollars like `actual` but a separate
+# billing lane (the provider's own console, not the litellm gateway).
+ROW_TAGS = {"est": "", "actual": "  _(actual)_", "api": "  _(direct API)_"}
+
+
+def _resolve_npx() -> str:
+    """Absolute npx for the launchd thin PATH (ARCH-086).
+
+    `safe_which` never reads PATH: it checks a fixed list of system
+    directories, `/usr/local/bin` (the Intel Homebrew location) among them,
+    so there is no separate PATH-based fallback to try after it — and no
+    planted `npx` under the running account's home or a worktree for it to
+    ever choose, because neither is on that fixed list
+    (platform/decisions/0090's Handoff).
+    """
+    import safe_path as SP
+    found = SP.safe_which("npx")
+    if found:
+        return found
+    raise SystemExit("agent-cost-report: npx not found (needed for ccusage)")
+
+
+
+def overage_rollup(day: date_t) -> dict:
+    """Was the SUBSCRIPTION in overage on `day`, and how full did the window get?
+
+    Reads the quota fields `_finalize_run` records per run (ARCH-442), which come
+    from the CLI's own `rate_limit_event` stream — the same signal the TUI's
+    extra-usage indicator shows.
+
+    THIS IS THE NUMBER THE DOLLARS CANNOT GIVE. Everything else in this report is
+    an API-RATE ESTIMATE against subscription usage that is mostly inside the
+    plan, so a large `anthropic_total` says nothing about whether a cent was
+    actually spent. ARCH-174 is explicit that a model squeeze gets gated on real
+    overage rather than the headline; this is what makes that checkable.
+
+    Returns `{}` when no run that day reported quota at all. A day with no runs
+    and a day whose runs never emitted the event are the same to us, and neither
+    is evidence of being under the cap — so the panel must render "not reported"
+    rather than a reassuring zero.
+    """
+    runs = 0
+    over = 0
+    peak = None
+    worst_rank = -1
+    for outcome_p in sorted(RUNS_ROOT.glob(f"{day.isoformat()}/*/outcome.json")):
+        try:
+            o = json.loads(outcome_p.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if "overage_seen" not in o:
+            continue
+        runs += 1
+        if o.get("overage_seen"):
+            over += 1
+        u = o.get("peak_utilization")
+        if isinstance(u, (int, float)):
+            peak = u if peak is None else max(peak, u)
+        st = o.get("rate_limit_status")
+        if st in RATE_LIMIT_SEVERITY:
+            worst_rank = max(worst_rank, RATE_LIMIT_SEVERITY.index(st))
+    if not runs:
+        return {}
+    out = {"runs_reporting": runs, "runs_in_overage": over}
+    if peak is not None:
+        out["peak_utilization"] = round(float(peak), 4)
+    if worst_rank >= 0:
+        out["worst_status"] = RATE_LIMIT_SEVERITY[worst_rank]
+    return out
+
+
+def ccusage_by_model(day: date_t) -> dict[str, float]:
+    """Return {model_name: usd} from ccusage for `day`, claude-* models only."""
+    ymd = day.strftime("%Y%m%d")
+    out = subprocess.run(
+        [_resolve_npx(), "ccusage@latest", "daily", "--json", "--since", ymd, "--until", ymd],
+        capture_output=True, text=True, check=False,
+    )
+    if out.returncode != 0 or not out.stdout.strip():
+        return {}
+    data = json.loads(out.stdout)
+    by_model: dict[str, float] = {}
+    for row in data.get("daily", []):
+        for mb in row.get("modelBreakdowns", []):
+            name = mb.get("modelName", "")
+            if not name.startswith(ANTHROPIC_MODEL_PREFIX):
+                continue  # gateway / non-Anthropic model — priced from the spend log instead
+            by_model[name] = by_model.get(name, 0.0) + float(mb.get("cost", 0.0))
+    return by_model
+
+
+def _iter_spend_rows(paths: list[Path]):
+    """Yield parsed JSON records from each existing jsonl path, skipping bad lines."""
+    for f in paths:
+        if not f.exists():
+            continue
+        for line in f.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def gateway_by_model(day: date_t) -> dict[str, float]:
+    """Return {provider_model: usd} gateway actuals for `day`.
+
+    Gateway spend lands in two places, and the callback writes each request to
+    exactly one of them, so summing both never double-counts: uncorrelated
+    requests (the interactive co day-lane, stray calls) go to the central
+    `gateway-spend/<date>.jsonl`, while every agentctl-correlated worker run
+    writes to its own `<run_dir>/gateway_spend.jsonl`. Reading only the central
+    log hid all worker spend — the entire deepseek squeeze — from #agent-cost
+    (the gap the operator caught 2026-06-12: $0 shown against ~$0.76 real that day).
+
+    Aggregate both, filtering by each row's `ts` so a run that spans midnight is
+    counted under the right day no matter which date-folder holds its run dir.
+    """
+    day_str = day.isoformat()
+    prev_str = (day - timedelta(days=1)).isoformat()
+    # Central per-day logs (current + prior day, in case a row crossed midnight).
+    paths = [GATEWAY_SPEND / f"{day_str}.jsonl", GATEWAY_SPEND / f"{prev_str}.jsonl"]
+    # Per-run worker logs: a run dated `day` (normal) or `day-1` (started before
+    # midnight, still emitting after) can both carry rows whose ts is `day`.
+    paths += sorted(RUNS_ROOT.glob(f"{day_str}/*/gateway_spend.jsonl"))
+    paths += sorted(RUNS_ROOT.glob(f"{prev_str}/*/gateway_spend.jsonl"))
+    tot: dict[str, float] = defaultdict(float)
+    for r in _iter_spend_rows(paths):
+        if not str(r.get("ts", "")).startswith(day_str):
+            continue
+        name = r.get("model") or ""
+        if not name:
+            continue
+        tot[name] += float(r.get("usd", 0.0) or 0.0)
+    return dict(tot)
+
+
+def apps_by_app(day: date_t) -> dict[str, float]:
+    """Return {app: usd} direct-API app spend for `day` (ARCH-147).
+
+    Standalone apps (PA, cookbook/Sous-chef) call providers directly with their own
+    keys — real out-of-pocket spend invisible to both ccusage (no Claude Code
+    transcript) and the gateway log (they don't route through litellm). Each app
+    writes an append-only JSONL ledger of per-call records; sum the day's dollar
+    amount per app. The dollar field is `usd` (PA) or `cost` (cookbook). A missing
+    ledger means that app isn't instrumented or hasn't run yet — it contributes $0,
+    never an error. The day match uses the same `ts`-startswith convention as
+    gateway_by_model (a single growing ledger, not per-day folders, so no prior-day
+    path is needed)."""
+    day_str = day.isoformat()
+    # Two sources (ARCH-152): mini-local files in APP_LEDGERS, and the collected
+    # ledgers in APP_LEDGER_DIR/<app>.jsonl the convivy-orient ingest endpoint writes
+    # for cloud apps. For the collected dir the filename stem is the authoritative
+    # app name (set by the endpoint from the authenticated caller, not the payload).
+    sources = list(APP_LEDGERS.items())
+    if APP_LEDGER_DIR.is_dir():
+        sources += [(p.stem, p) for p in sorted(APP_LEDGER_DIR.glob("*.jsonl"))]
+    tot: dict[str, float] = defaultdict(float)
+    for app, ledger in sources:
+        for r in _iter_spend_rows([ledger]):
+            if not str(r.get("ts", "")).startswith(day_str):
+                continue
+            amount = r.get("usd")
+            if amount is None:
+                amount = r.get("cost", 0.0)
+            tot[app] += float(amount or 0.0)
+    return {app: usd for app, usd in tot.items() if usd}
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically: a sibling temp file, then os.replace
+    (atomic on POSIX within one filesystem). The /dashboard cost panel reads these
+    files LIVE per request (ARCH-182) and the data-only refresh writes them every
+    15 min (ARCH-183), so a plain write could be caught mid-flush — a reader would
+    see a truncated, unparseable file. The pid in the temp name keeps two writers
+    (the midnight day-close job and the 15-min refresh) from clobbering each other's temp."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def build_report(day: date_t, now_iso: str, is_close: bool = False) -> tuple[float, str, dict]:
+    """Return (today_total, plain_text, snapshot) for `day`.
+
+    `is_close` marks the midnight day-close run: it reports the FINAL total for
+    the day that just ended (including the 20:00→24:00 evening window a 20:00
+    "so far" run misses), instead of a structurally-$0 "today as of 00:00".
+
+    Notifies nothing. The 4-hourly summary post was retired by ARCH-362 R3 — it
+    duplicated /spending and /cost-performance — and every alert-shaped thing
+    this tool carries is now a structured kind=alert signal (maybe_alert_fable,
+    maybe_alert_subscription_increment, maybe_alert_out_of_pocket) that reaches
+    the operator by push. This function's output feeds the snapshot and the printed table.
+    """
+    anthropic = ccusage_by_model(day)
+    gateway = gateway_by_model(day)
+    apps = apps_by_app(day)
+    fable = sum(v for k, v in anthropic.items() if "fable" in k.lower())
+    anthropic_total = sum(anthropic.values())
+    gateway_total = sum(gateway.values())
+    apps_total = sum(apps.values())
+    today_total = anthropic_total + gateway_total + apps_total
+
+    # --- assemble rows, costliest first ---
+    rows = [(k, v, "est") for k, v in anthropic.items()]
+    rows += [(k, v, "actual") for k, v in gateway.items()]
+    rows += [(k, v, "api") for k, v in apps.items()]
+    rows.sort(key=lambda r: -r[1])
+
+    lines = []
+    for name, cost, kind in rows:
+        if cost < 0.005:
+            continue
+        flag = "  ⚠️ FABLE — should be $0 (ARCH-134)" if "fable" in name.lower() else ""
+        tag = ROW_TAGS.get(kind, "")
+        lines.append(f"`{name:<22}` ${cost:,.2f}{tag}{flag}")
+    table = "\n".join(lines) if lines else "_no spend recorded yet today_"
+
+    hhmm = datetime.fromisoformat(now_iso).strftime("%H:%M")
+    if is_close:
+        headline = f"*💰 Agent cost — {day.isoformat()} FINAL* (day close)"
+    else:
+        headline = f"*💰 Agent cost — {day.isoformat()} so far* (as of {hhmm})"
+    total_label = "Total" if is_close else "Today"
+    summary = (
+        f"{total_label}: *${today_total:,.2f}*\n"
+        f"Anthropic (subscription/credit, API-rate est.): ${anthropic_total:,.2f}  ·  "
+        f"Gateway (actual out-of-pocket): ${gateway_total:,.2f}  ·  "
+        f"Direct-API apps (out-of-pocket): ${apps_total:,.2f}"
+    )
+
+    plain = f"{headline}\n{summary}\n{table}"
+
+    snapshot = {
+        "date": day.isoformat(),
+        "generated_at": now_iso,
+        "total": round(today_total, 2),
+        "anthropic_total": round(anthropic_total, 2),
+        "gateway_total": round(gateway_total, 2),
+        "apps_total": round(apps_total, 2),
+        "fable": round(fable, 2),
+        "by_model": [
+            {"model": name, "cost": round(cost, 2), "kind": kind}
+            for name, cost, kind in rows if cost >= 0.005
+        ],
+    }
+    # Omitted entirely on a day nothing reported, so /spending can tell "not
+    # reported" from "reported, and we were inside the plan" (ARCH-442).
+    rollup = overage_rollup(day)
+    if rollup:
+        snapshot["overage"] = rollup
+    return today_total, plain, snapshot
+
+
+def upsert_history(snapshot: dict) -> None:
+    """Upsert one day's row into the history series (idempotent by date).
+
+    Each row carries the day's totals AND its per-model breakdown — the latter
+    is what lets the /dashboard cost panel show a windowed (7/30/60/90-day)
+    by-model view, the only place interactive co-session spend (Opus) surfaces.
+    Extra keys are inert to the totals-only sparkline that also reads this file.
+    """
+    out = COST_DIR
+    out.mkdir(parents=True, exist_ok=True)
+    hist = out / "history.jsonl"
+    rows = []
+    if hist.exists():
+        for line in hist.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    rows = [r for r in rows if r.get("date") != snapshot["date"]]
+    rows.append({
+        "date": snapshot["date"],
+        "total": snapshot["total"],
+        "anthropic_total": snapshot["anthropic_total"],
+        "gateway_total": snapshot["gateway_total"],
+        "apps_total": snapshot.get("apps_total", 0.0),
+        "fable": snapshot["fable"],
+        "by_model": snapshot.get("by_model", []),
+    })
+    rows.sort(key=lambda r: r.get("date", ""))
+    _atomic_write(hist, "\n".join(json.dumps(r) for r in rows) + "\n")
+
+
+def write_snapshot(snapshot: dict) -> None:
+    """Persist the latest breakdown for the /dashboard cost panel (ARCH-136),
+    and upsert today's row into the history series. upsert_history creates the
+    dir, so write it first, then latest.json."""
+    upsert_history(snapshot)
+    _atomic_write(COST_DIR / "latest.json", json.dumps(snapshot, indent=1))
+
+
+def backfill_history(days: int, now_iso: str) -> int:
+    """Recompute and upsert the last `days` days of history rows (inclusive of
+    today), so the windowed by-model panel has data immediately rather than only
+    accruing forward. Reconstructable because ccusage (transcripts), the gateway
+    spend logs, and the app ledgers all retain history. Does NOT touch latest.json
+    (today's live snapshot) — history rows only."""
+    today = date_t.today()
+    for n in range(days - 1, -1, -1):
+        day = today - timedelta(days=n)
+        # is_close only shapes the printed headline, not the snapshot totals we
+        # persist — so it's irrelevant to a history rebuild.
+        _, _, snapshot = build_report(day, now_iso, is_close=False)
+        upsert_history(snapshot)
+        print(f"backfilled {day.isoformat()}: ${snapshot['total']:,.2f} "
+              f"({len(snapshot.get('by_model', []))} models)", file=sys.stderr)
+    return 0
+
+
+def _maybe_alert_increment(*, day: date_t, total: float, step: float,
+                           state_path: Path, alert_key: str,
+                           message_for) -> int | None:
+    """Edge-triggered $`step`-increment alert on a daily spend total.
+
+    Shared by both spend lanes so the crossing logic — which level counts as
+    crossed, when it resets, and the write-before-send ordering — exists once
+    and is tested once. The lanes differ only in threshold, state file, and
+    wording; they should not differ in mechanics.
+
+    Each lane keeps its OWN state file, so neither can reset the other.
+
+    Marks the new level whether or not the send succeeds: this is a best-effort
+    visibility ping, and re-firing the same increment every 15-min refresh on a
+    transient webhook failure would be worse than missing one — the next
+    increment and the cost dashboards still surface the spend.
+    """
+    if step <= 0:
+        return None
+    level = int(total // step) * int(step)
+    if level < step:
+        return None  # under the first increment — nothing to warn about
+    state: dict = {}
+    if state_path.exists():
+        try:
+            state = json.loads(state_path.read_text())
+        except json.JSONDecodeError:
+            state = {}
+    today_key = day.isoformat()
+    last = state.get("alerted_increment", 0) if state.get("date") == today_key else 0
+    if level <= last:
+        return None
+    _atomic_write(state_path,
+                  json.dumps({"date": today_key, "alerted_increment": level}))
+    # Structured alert (ARCH-353 Build 2c), now the ONLY delivery path — it routes
+    # to /engineering/alerts by kind and reaches the operator by push.
+    # message_for is a CALLABLE, not a string: the crossed level is only known
+    # here, and an alert that says "crossed $1000" when it actually crossed
+    # $2000 is worse than no number at all.
+    signal_client.post_alert(
+        alert_key, message_for(level),
+        meta={"alert": alert_key, "level": level, "step": step,
+              "spent_usd": round(total, 2)})
+    return level
+
+
+def maybe_alert_subscription_increment(day: date_t, anthropic_total: float,
+                                       *, step: float = SUBSCRIPTION_WARN_STEP_USD) -> int | None:
+    """Runaway tripwire on the day's Anthropic SUBSCRIPTION estimate.
+
+    Not a spend alert in the out-of-pocket sense: this number is ccusage's
+    API-rate estimate of usage that the Max plan mostly already covers. It fires
+    at $1000 because that is where a day stops looking like ordinary work — see
+    the constant for why a level the operator sometimes hits on purpose is the right bar.
+    """
+    level = _maybe_alert_increment(
+        day=day, total=anthropic_total, step=step,
+        state_path=INCREMENT_STATE_PATH, alert_key="subscription-increment",
+        message_for=lambda lvl: (
+            f"Anthropic subscription spend crossed ${lvl:,.0f} today "
+            f"(${anthropic_total:,.2f} so far). This is the API-rate estimate of "
+            f"subscription usage, not out-of-pocket cost."))
+    return level
+
+
+def maybe_alert_out_of_pocket(day: date_t, gateway_total: float, apps_total: float,
+                              *, step: float = OUT_OF_POCKET_WARN_STEP_USD) -> int | None:
+    """Tripwire on money that ACTUALLY left the account today (operator 2026-07-19).
+
+    Gateway (real provider cost) plus direct-API apps. Distinct from the
+    subscription estimate on purpose: these are different dollars, and conflating
+    them is what made the old $50-on-the-estimate alert meaningless. A $5 bar
+    here is worth more than a $50 bar there.
+
+    COVERAGE BOUNDARY, stated so nobody re-derives it wrongly. This lane sees
+    INSTRUMENTED spend only: the gateway log we write, and the per-app ledgers
+    the apps themselves write (Hollis locally; the cloud apps POST to orient's
+    ingest). A key used directly against a provider from somewhere else — the
+    ARCH-146 shape — writes none of those files and shows up in NEITHER lane.
+    That gap predates this change and is not closed by it. It was briefly claimed
+    during review that the $5 bar covered the leaked-key case better than the old
+    $50 alert did; it does not, and the security review caught that.
+    """
+    total = gateway_total + apps_total
+    return _maybe_alert_increment(
+        day=day, total=total, step=step,
+        state_path=OUT_OF_POCKET_STATE_PATH, alert_key="out-of-pocket-spend",
+        message_for=lambda lvl: (
+            f"Out-of-pocket spend crossed ${lvl:,.0f} today "
+            f"(${total:,.2f} so far: ${gateway_total:,.2f} gateway + "
+            f"${apps_total:,.2f} direct-API apps). This is real money, not a "
+            f"subscription estimate."))
+
+
+def maybe_alert_fable(day: date_t, fable: float) -> bool:
+    """Emit the Fable tripwire as a STRUCTURED alert, once per day (ARCH-362 R3).
+
+    The warning already existed, but only as a block inside the 4-hourly cost
+    summary post — which made it alert-class content with no alert path. R3
+    retires that summary post (it duplicates /spending and /cost-performance),
+    and retiring it wholesale would have silently dropped the one genuinely
+    alert-shaped thing it carried. So the warning becomes a first-class
+    `kind=alert` signal FIRST: it lands on /engineering/alerts, inherits the
+    Phase 4a acknowledgment state, and is delivered by Phase 4b push.
+
+    Once per day, keyed on its own state file: Fable spend is a standing
+    condition rather than an event, so re-alerting every 4 hours would train the
+    alert to be ignored — which is the failure mode that makes an alert channel
+    worthless.
+
+    Returns True when an alert was emitted (for tests and the caller's log).
+    """
+    if fable <= 0.005:
+        return False
+    today_key = day.isoformat()
+    state: dict = {}
+    if FABLE_STATE_PATH.exists():
+        try:
+            state = json.loads(FABLE_STATE_PATH.read_text())
+        except json.JSONDecodeError:
+            state = {}
+    if state.get("date") == today_key:
+        return False
+    _atomic_write(FABLE_STATE_PATH,
+                  json.dumps({"date": today_key, "fable": round(fable, 2)}))
+    signal_client.post_alert(
+        "fable-tripwire",
+        f"Fable ran today: ${fable:,.2f}. Pins are in place (ARCH-134), so this is "
+        f"residual from sessions launched before the fix, or a session that "
+        f"overrode the pin. Relaunch any co still on Fable.",
+        meta={"alert": "fable-tripwire", "spend_usd": round(fable, 2),
+              "date": today_key})
+    return True
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--date", help="YYYY-MM-DD override (testing)")
+    ap.add_argument("--close", action="store_true",
+                    help="force day-close mode: report this/yesterday's FINAL total")
+    ap.add_argument("--backfill", type=int, metavar="DAYS",
+                    help="recompute the last DAYS days of by-model history rows and exit")
+    args = ap.parse_args()
+
+    if args.backfill is not None:
+        return backfill_history(args.backfill, datetime.now().isoformat())
+
+    # The 00:00 launchd slot records the FINAL total for the day that just ended
+    # (the day-close), not a structurally-$0 "today as of 00:00". This is the one
+    # thing the 15-min refresh cannot do for itself: it always computes "today",
+    # so once the date rolls, yesterday's last ~15 minutes would never land in its
+    # history row. That is why retiring the summary post did NOT retire this job.
+    now = datetime.now()
+    now_iso = now.isoformat()
+    auto_close = (not args.date) and now.hour == 0
+    is_close = args.close or auto_close
+    if args.date:
+        day = date_t.fromisoformat(args.date)
+    elif auto_close:
+        day = date_t.today() - timedelta(days=1)
+    else:
+        day = date_t.today()
+    today_total, plain, snapshot = build_report(day, now_iso, is_close)
+
+    # Refresh the snapshot the cost dashboards read (ARCH-136), even on a plain
+    # print run, so the panel is current whoever ran the report.
+    #
+    # EXCEPT under --date. That flag is a testing override for a PAST day, and
+    # latest.json is by definition "today" — writing a historical day into it
+    # makes the dashboard report the wrong day's spend until the next refresh.
+    # backfill_history already guards this ("does NOT touch latest.json"); the
+    # --date path did not, and a single `--date 2026-07-18` smoke run during this
+    # change put yesterday's $1,279 into today's panel. History is still upserted,
+    # because recomputing a past day's row is the legitimate use of --date.
+    if args.date:
+        upsert_history(snapshot)
+    else:
+        write_snapshot(snapshot)
+
+    # The spend tripwires. All run on every live "today" run — the 15-min refresh
+    # is the heartbeat — so a runaway is caught within a cycle. Skipped on the
+    # midnight day-close (it reports yesterday, whose increments already fired)
+    # and on --date/backfill historical runs.
+    #
+    # TWO LANES, because they are different dollars (operator 2026-07-19):
+    #   * out-of-pocket ($5) — gateway + direct-API apps, money that actually left
+    #     the account. Rare and worth interrupting for.
+    #   * subscription ($1000) — ccusage's API-rate ESTIMATE of usage the Max plan
+    #     mostly covers. A runaway signal, not a bill.
+    # The old single $50-on-the-estimate alert conflated them and fired 17 times
+    # in 14 days, which is how an alert channel stops being read.
+    if not is_close and not args.date:
+        maybe_alert_out_of_pocket(day, snapshot["gateway_total"], snapshot["apps_total"])
+        maybe_alert_subscription_increment(day, snapshot["anthropic_total"])
+        # Fable tripwire as a structured alert (ARCH-362 R3). Same run conditions
+        # as the increment tripwire above: live "today" runs only, so a backfill
+        # or the midnight day-close cannot re-fire a past day's alert.
+        maybe_alert_fable(day, snapshot["fable"])
+
+    print(plain)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

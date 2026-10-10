@@ -1,0 +1,67 @@
+#!/bin/bash
+# arch129-remeasure — one-shot: post the ARCH-129 post-A+B token re-measure to Slack.
+#
+# Scheduled via com.convivy.arch129-remeasure.plist for 2026-06-11 08:00 (the first
+# morning after the token-discipline prompt landed). Runs orchestrator-tokens on
+# the latest night, compares against the 2026-06-10 baseline, states whether the
+# <$3/night decision gate is met, posts to #overnight-digest, then removes its
+# own launchd job (one-shot; the plist would otherwise re-fire next year).
+#
+# Usage: arch129-remeasure [--dry-run]   (--dry-run prints instead of posting)
+
+set -euo pipefail
+
+# Resolved from this script's own (symlink-followed) location, not
+# ~/.local/bin, for consistency with the rest of the farm (round 7); kept
+# minimal since this job is a spent one-shot.
+_self="$0"
+_hops=0
+while [ -L "$_self" ]; do
+    _hops=$((_hops + 1))
+    [ "$_hops" -gt 20 ] && { echo "arch129-remeasure: symlink cycle resolving \$0" >&2; exit 1; }
+    _link_dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in
+        /*) ;;
+        *) _self="$_link_dir/$_self" ;;
+    esac
+done
+BIN="$(cd -P "$(dirname "$_self")" && pwd)"
+BASELINE="baseline 2026-06-10: 573 requests, 84.1M cache reads, avg context 150K, \$11.98"
+GATE_USD="3.00"
+LABEL="com.convivy.arch129-remeasure"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+report="$("$BIN/orchestrator-tokens" 2>&1)" || report="orchestrator-tokens failed: $report"
+
+# First line ends "... $<usd>"; gate on it when parseable.
+usd="$(printf '%s\n' "$report" | head -1 | grep -oE '\$[0-9]+\.[0-9]+' | head -1 | tr -d '$')"
+if [ -n "$usd" ]; then
+    if [ "$(printf '%s < %s\n' "$usd" "$GATE_USD" | bc)" = "1" ]; then
+        verdict="✅ gate met (\$$usd < \$$GATE_USD/night) — A+B suffice, option C stays shelved."
+    else
+        verdict="❌ gate NOT met (\$$usd ≥ \$$GATE_USD/night) — steward to bring option C (phase-split) to the operator with these numbers."
+    fi
+else
+    verdict="⚠️ could not parse the night's cost — steward to read the report by hand."
+fi
+
+msg="📏 *ARCH-129 re-measure* (first night after the token-discipline prompt; $BASELINE)
+\`\`\`
+$report
+\`\`\`
+$verdict"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf '%s\n' "$msg"
+    exit 0
+fi
+
+printf '%s\n' "$msg" >> "${BUILDER_ROOT:-$("$(dirname "$_self")/builder-root")}/agent-runs/arch129-remeasure.fallback.log"
+
+# Self-cleanup last: bootout kills this process, so nothing may follow it.
+rm -f "$PLIST"
+/bin/launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true

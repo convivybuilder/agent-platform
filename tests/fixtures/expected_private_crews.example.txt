@@ -1,0 +1,7 @@
+# The shape AGENT_PLATFORM_EXPECTED_PRIVATE_CREWS_FILE names (see
+# tests/test_knowledge_projects.py::test_the_operators_private_crews_match_the_expected_list):
+# one registered-private crew slug per line, blank lines and "#" comments ignored.
+# These are synthetic — the real file, naming the operator's own private crews,
+# lives outside this repo and is never checked in.
+private-a
+private-b

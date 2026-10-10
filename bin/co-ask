@@ -1,0 +1,151 @@
+#!/usr/bin/env python3.11
+"""co-ask — the co's side of the Slate: post, resolve and list asks.
+
+Deck's cockpit sheet, `platform/decisions/0091`, replaces the operator's habit of
+copying a co's questions into Apple Notes. An **ask** is a question this
+session needs the operator to answer; the operator answers it on the card in
+Deck and `session-agent` (CQ-358, built on `slate.py`) delivers the answer
+back into this session. This script is the co's own half: it posts asks,
+resolves them once settled, and lists what is still open. It never edits,
+deletes or sends a **note** — those are the operator's own cards, written and
+sent through Deck's `session-agent slate*` verbs.
+
+  co-ask ask "<question>"           # post an ask, print its bare id
+  co-ask ask -                      # read the question from stdin instead
+  co-ask resolve <id> "<outcome>"   # close an open or answered ask
+  co-ask resolve <id> -             # read the outcome from stdin instead
+  co-ask list                       # every ask that is not resolved, one per line:
+                                     #   id<TAB>state<TAB>question
+
+STDIN IS THE FORM THE CO INSTRUCTION WILL SHOW, because a plain-English
+question often holds quotes, apostrophes and `$` that a shell argument
+mangles — `co-ask ask -` sidesteps the shell entirely.
+
+`list`'S QUESTION FIELD IS ESCAPED so one card is always exactly one line: a
+literal backslash, tab or newline in the question is backslash-escaped
+(`\\`, `\t`, `\n`; a carriage return as `\r`) before printing.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "slate.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+import slate as S  # noqa: E402
+
+
+def _escape_field(text: str) -> str:
+    """Backslash-escape one free-text field for one-line-per-card TSV output —
+    see the module docstring for the exact escapes."""
+    return (text.replace("\\", "\\\\")
+                .replace("\t", "\\t")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r"))
+
+
+def _resolve_key() -> str | None:
+    """This session's Slate key, or None with a message already on stderr."""
+    name = S.tmux_session_name()
+    if not name:
+        print("co-ask: not running inside a tmux session; nothing to key "
+              "this crew's Slate to", file=sys.stderr)
+        return None
+    key = S.session_key(name)
+    if not key:
+        print(f"co-ask: tmux session name {name!r} has no usable characters",
+              file=sys.stderr)
+        return None
+    return key
+
+
+def _report_slate_error(e: Exception) -> int:
+    if isinstance(e, S.SlateCorruptError):
+        print(f"co-ask: the Slate file is unreadable and was left alone: {e}",
+              file=sys.stderr)
+    else:
+        print(f"co-ask: {e}", file=sys.stderr)
+    return 1
+
+
+def _cmd_ask(args) -> int:
+    key = _resolve_key()
+    if key is None:
+        return 1
+    question = sys.stdin.read() if args.question == "-" else args.question
+    question = question.strip()
+    if not question:
+        print("co-ask: refusing to post an empty question", file=sys.stderr)
+        return 2
+    try:
+        card_id = S.post_ask(key, question)
+    except S.SlateError as e:
+        return _report_slate_error(e)
+    print(card_id)
+    return 0
+
+
+def _cmd_resolve(args) -> int:
+    key = _resolve_key()
+    if key is None:
+        return 1
+    outcome = sys.stdin.read() if args.outcome == "-" else args.outcome
+    outcome = outcome.strip()
+    if not outcome:
+        print("co-ask: refusing to resolve with an empty outcome", file=sys.stderr)
+        return 2
+    try:
+        S.resolve_ask(key, args.id, outcome)
+    except S.SlateError as e:
+        return _report_slate_error(e)
+    return 0
+
+
+def _cmd_list(args) -> int:
+    key = _resolve_key()
+    if key is None:
+        return 1
+    try:
+        asks = S.open_asks(key)
+    except S.SlateCorruptError as e:
+        return _report_slate_error(e)
+    for card in asks:
+        print("\t".join([card["id"], card["state"], _escape_field(card["question"])]))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="co-ask",
+        description="Post, resolve and list this crew's Slate asks.")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("ask", help="post a new ask, printing its bare id")
+    p.add_argument("question", help="the question, or '-' to read it from stdin")
+
+    p = sub.add_parser("resolve", help="close an open or answered ask")
+    p.add_argument("id", help="the ask's id")
+    p.add_argument("outcome", help="a one-line outcome, or '-' to read it from stdin")
+
+    sub.add_parser("list", help="every ask that is not resolved, one line each "
+                                 "(id<TAB>state<TAB>question, question escaped)")
+
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.cmd == "ask":
+        return _cmd_ask(args)
+    if args.cmd == "resolve":
+        return _cmd_resolve(args)
+    return _cmd_list(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

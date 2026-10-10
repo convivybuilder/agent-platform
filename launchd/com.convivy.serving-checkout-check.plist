@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.serving-checkout-check</string>
+
+    <!-- Is every launchd service that reads its code straight from a git
+         checkout's WorkingDirectory on main, with nothing uncommitted it could
+         actually execute? com.convivy.library served code from 19 hours before
+         library#45 merged (2026-08-20) because its WorkingDirectory sat on a
+         feature branch the PR was reviewed from — restarting the process would
+         have restarted the same stale branch, which is why this checks the
+         CHECKOUT rather than whether the process is running. Deliberately
+         separate from check-primary-checkouts (branch only, a hand-declared
+         list) — this discovers every serving checkout from the plists
+         themselves and also checks dirty-tree state, filtered so `.claude/`
+         materialization noise (measured on convivy-orient: 7 uncommitted files,
+         none of it served) does not train the reader to ignore the output.
+         Logs an alert signal per checkout per finding kind (branch vs dirty, tracked
+         independently); silent on pass. Never reads a file's content, only its
+         path and git status — safe against black-box crews (CFO) by design. -->
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of check-serving-checkouts, not someone working on it, so this
+         reads a COPY installed from `main` into
+         ~/.local/deploy/agent-platform-shared/ (rules 2, 6, 7) instead of the
+         ~/.local/bin symlink into the checkout — that symlink still exists and
+         still reaches the tree, for the person who re-invokes
+         check-serving-checkouts interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/check-serving-checkouts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- Every 15 minutes, matching check-primary-checkouts' cadence: cheap
+         enough (git status + git branch per unique checkout, roughly a dozen
+         on this machine) that the interval is set by how long a stale-branch
+         window should be tolerated rather than by the cost of asking. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Fire at load too — most likely to catch something right after a reboot
+         or re-bootstrap, when nothing has run yet. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/serving-checkout-check.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/serving-checkout-check.err.log</string>
+
+    <!-- launchd jobs get a thin PATH without ~/.local/bin (ARCH-086). `git` and
+         `plutil` (reading each plist's Label/WorkingDirectory) both live under
+         the system paths below. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Print this machine's builder roots, for shell callers (company/decisions/0008).
+
+`builder-root` prints builder_root.data_root(), where run records live. The shell
+launchers resolve their run-record directory as
+`${BUILDER_ROOT:-$(<this directory>/builder-root)}/agent-runs`, so they and the
+Python readers cannot disagree about where run records are.
+
+`builder-root --root` prints builder_root.root(): the machine's root, where the
+crews, the knowledge base and the platform's checkouts live. root() is a TRUST
+ANCHOR (co's black-box matching and the session agent's create-dir floor answer
+from it), so it never reads BUILDER_ROOT or any other environment variable.
+`--config FILE` points it at another session-agent.env instead of the machine's.
+That is how a test isolates root() (the steward's call, 2026-09-11), and because
+it is an argument on the command line, nothing a process inherits can supply it.
+`--config` without `--root` is refused: data_root() takes its override from
+BUILDER_ROOT alone.
+
+`lib/` is found from this file's REAL path, so the copy in the repo, the
+`~/.local/bin` link, and the deploy area each read the `builder_root.py` beside
+them.
+"""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root  # noqa: E402
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="builder-root",
+        description="Print data_root() (run records), or root() (crews, knowledge, checkouts) "
+                    "with --root.")
+    ap.add_argument("--root", action="store_true",
+                    help="print root(), the machine's root, instead of data_root()")
+    ap.add_argument("--config", type=Path, default=None,
+                    help="with --root: read CREWS_ROOT from this file instead of the machine's "
+                         "session-agent.env (how tests isolate root())")
+    args = ap.parse_args(argv)
+    if args.config is not None and not args.root:
+        ap.error("--config applies only to --root; data_root() is overridden by BUILDER_ROOT alone")
+    if not args.root:
+        # The shell launchers' run-record directory comes from here, so this is
+        # their data root's report-only marker check, on stderr where stdout stays
+        # the path.
+        data = builder_root.data_root()
+        builder_root.report_unconfirmed(builder_root.data_root_label(), data)
+        print(data)
+        return 0
+    if args.config is None:
+        print(builder_root.root())
+        return 0
+    # A --config that names no root is refused rather than answered with the
+    # machine's real root. root() never raises: a missing file, a missing or
+    # empty CREWS_ROOT, a relative value, one that is not a directory and one too
+    # wide all come back as its fallback. --config exists only so a test can move
+    # the root, so a test whose config is wrong must stop, not read and write the
+    # real tree (agent-platform#545 rounds 1-3 found this in session-event-log).
+    unhonoured = object()
+    found = builder_root.root(config=args.config, fallback=unhonoured)
+    if found is unhonoured:
+        print(f"builder-root: {args.config} names no root this machine will take",
+              file=sys.stderr)
+        return 2
+    print(found)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

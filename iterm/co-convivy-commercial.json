@@ -1,0 +1,59 @@
+{
+  "Profiles": [
+    {
+      "Name": "co-convivy-commercial",
+      "Guid": "co-convivy-commercial-2026-06-09",
+      "Dynamic Profile Parent Name": "Default",
+      "Semantic History": {
+        "action": "raw command",
+        "text": "$HOME/bin/open-md-link \\1 \\2"
+      },
+      "Background Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.984,
+        "Green Component": 0.976,
+        "Blue Component": 0.878,
+        "Alpha Component": 1.0
+      },
+      "Foreground Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.149,
+        "Green Component": 0.141,
+        "Blue Component": 0.039,
+        "Alpha Component": 1.0
+      },
+      "Cursor Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.902,
+        "Green Component": 0.808,
+        "Blue Component": 0.0,
+        "Alpha Component": 1.0
+      },
+      "Selection Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.957,
+        "Green Component": 0.937,
+        "Blue Component": 0.753,
+        "Alpha Component": 1.0
+      },
+      "Tab Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.902,
+        "Green Component": 0.808,
+        "Blue Component": 0.0,
+        "Alpha Component": 1.0
+      },
+      "Use Tab Color": true,
+      "Badge Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.902,
+        "Green Component": 0.808,
+        "Blue Component": 0.0,
+        "Alpha Component": 0.25
+      },
+      "Badge Text": "commercial",
+      "Badge Max Width": 0.2,
+      "Badge Max Height": 0.04
+    }
+  ]
+}

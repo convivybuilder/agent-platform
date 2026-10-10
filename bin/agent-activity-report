@@ -1,0 +1,194 @@
+#!/usr/bin/env python3.11
+"""agent-activity-report — snapshot agentic session activity for the orient dashboards.
+
+Walks the run-dir corpus via cost_join (which rebuilds parent->child dispatch trees and
+sums cost down each chain), then writes a single JSON snapshot that the convivy-orient
+/activity page and the /cost-performance cost-per-outcome section read. This follows the
+established producer pattern (agent-cost-report -> cost-report/latest.json,
+model-scorecard -> scorecard/*.jsonl): a producer writes a JSON artifact under
+<root>/agent-runs/, and orient's live_html() reads it at request time.
+
+Default cadence (launchd com.convivy.agent-activity-report): every 15 minutes, last 90
+days. The page filters the embedded snapshot client-side by window (today/7d/30d/90d/
+custom), matching the date-picker UX of the other dashboards (ARCH-191). Snapshot
+staleness is bounded by the refresh interval; live in-flight cost is a later pass
+(item-2 fold-in, ARCH-239).
+
+Embedded-payload note: a node's `task` is free text that can run to thousands of chars
+(an overnight-orchestrator prompt). The snapshot trims node tasks hard and session
+tasks moderately so the page payload stays a few MB, not tens.
+
+CLI: --days N (default 90) · --out PATH · --stdout (print, don't write) · --pretty.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import cost_join as cj  # noqa: E402
+
+OUT_DEFAULT = cj.RUNS_ROOT / "activity" / "sessions.json"
+OUTCOMES_DEFAULT = cj.RUNS_ROOT / "activity" / "outcomes.json"
+
+# Both _NODE_KEEP and _SESSION_KEEP are allowlists, on purpose: the snapshot feeds the
+# team.convivy.com surface, so it's fail-closed — a field is carried only if named here.
+# A future cost_join field that happens to embed content is therefore dropped until it's
+# explicitly reviewed and added, rather than silently passing through (PR #56 security
+# review). `task`, `label`, `nodes` are NOT in these tuples; they're handled explicitly
+# below (trimmed for normal products, redacted for data-local ones).
+_NODE_KEEP = (
+    "run_id", "kind", "depth", "agent", "model", "product",
+    "started_at", "ended_at", "duration_s", "usd", "unpriced_models", "cost_source",
+    "turns", "exit_status", "prs_opened", "pr_url", "pr_number",
+)
+_SESSION_KEEP = (
+    "session_id", "kind", "root_run_id", "origin", "product", "agent", "model",
+    "started_at", "ended_at", "duration_s", "worker_count", "status",
+    "main_loop_captured", "total_usd", "unpriced_models", "models", "prs_opened",
+)
+
+# Task/label redaction is FAIL-CLOSED. The /activity scan is opt-out — every Convivy
+# product-root session now surfaces (was a PA-only allowlist) — so only products on this
+# engineering allowlist show their free-text task/label on the shared team.convivy.com
+# surface. Every other product — a data-local lab product (hollis, ask,
+# selector, the NYH studios) whose prompts embed personal content (ARCH-243 / ADR-0027),
+# or any new/unrecognized product — has task+label redacted by default (Hollis,
+# formerly personal-assistant, stays data-local this way too) — so broadening the
+# scan can never leak personal content before a product is explicitly cleared. Cost /
+# agent / model / PR / timing metadata is always kept; only the free text is redacted.
+# The engine (cost_join) holds the true text; this producer applies the surfacing policy.
+# Add a product here only once its task prompts are confirmed free of personal content
+# (security review, PR #92, which flipped this from a deny-list to this allow-list).
+# `knowledge` and the `keel` slug JOIN on 2026-08-06, when agent-platform, substrate
+# and knowledge folded into one `keel` project marked `task_text_public: true`
+# (operator). This set is the ACTUAL gate — `_is_data_local` keys on it directly — while
+# the registry field is what `projects.public_task_slugs()` reads, so the two must
+# agree or the registry states an intent the code does not enforce.
+#
+# The fold's first draft took `false`, the more restrictive of the three merged
+# values, and that was wrong on inspection: agent-platform and substrate were
+# deliberately cleared by PR #92's security review, while knowledge was registered
+# in ARCH-426 step 2 under what that commit calls "the fail-closed default" and was
+# never separately judged. `false` would have propagated an unexamined default onto
+# two repos that had been examined and passed, and hidden the Keel's own work on
+# /activity while every product stayed legible.
+#
+# `knowledge` clears no personal content: the KB holds company knowledge, and user
+# data stays on-device by design (the KB unification). The `keel` slug is listed
+# beside the three repo names for the reason `svc` is — telemetry tags by repo
+# basename, so the slug form needs naming separately.
+_PUBLIC_TASK_PRODUCTS = {
+    "vivy", "vivy-commercial", "constance", "constance-commercial",
+    "agent-platform", "substrate", "knowledge", "library", "keel",
+    # The crew slugs from the 2026-08-17 split. These clear no new content: the
+    # repos behind them (`agent-platform`, `substrate`) were already cleared by
+    # the PR #92 security review and are listed above. Telemetry tags by repo
+    # basename, so this covers the slug form the registry now uses.
+    "bosun", "steward",
+    "sous-chef", "convivy-app-kit",
+    "convivy-commercial", "write-better",
+    # `svc` is the registry slug for the project whose repos are convivy-app-kit
+    # and convivy-services (ARCH-426). convivy-app-kit was already cleared above,
+    # so this clears no new content — it lets the registry NAME the posture that
+    # already applies. Telemetry tags by repo basename, so the raw string reaching
+    # _is_data_local is normally the repo; this covers the slug form.
+    "svc",
+}
+_REDACTED = "[redacted — data-local product]"
+
+
+def _is_data_local(product) -> bool:
+    """A product whose free-text task/label must NOT reach the shared surface — anything
+    not on the engineering allowlist (fail-closed: unknown ⇒ redact)."""
+    return product not in _PUBLIC_TASK_PRODUCTS
+
+
+def _trim_node(n: dict, redact: bool) -> dict:
+    out = {k: n.get(k) for k in _NODE_KEEP}
+    if redact:
+        out["task"] = _REDACTED
+        out["label"] = None
+    else:
+        out["task"] = cj._short_task(n.get("task", ""), 200)
+        out["label"] = n.get("label")
+    return out
+
+
+def _trim_session(s: dict) -> dict:
+    redact = _is_data_local(s.get("product"))
+    out = {k: s.get(k) for k in _SESSION_KEEP}
+    if redact:
+        # The generated "interactive · <product>" label is safe, but an agentctl
+        # session's label derives from the task, so redact both uniformly.
+        out["task"] = _REDACTED
+        out["label"] = _REDACTED
+    else:
+        out["task"] = cj._short_task(s.get("task", ""), 400)
+        out["label"] = s.get("label")
+    # A data-local session forces redaction on ALL its nodes regardless of each node's
+    # own `product` — a cross-product or mistagged child must not leak (PR #56 security
+    # review). A node also redacts on its own product, so a stray data-local node under
+    # another product's session is still covered.
+    out["nodes"] = [_trim_node(n, redact or _is_data_local(n.get("product")))
+                    for n in s.get("nodes", [])]
+    return out
+
+
+def build_snapshot(days: int) -> dict:
+    sessions = [_trim_session(s) for s in cj.sessions_for_days(days)]
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "window_days": days,
+        "session_count": len(sessions),
+        "sessions": sessions,
+    }
+
+
+def build_outcomes_snapshot(days: int) -> dict:
+    outcomes = cj.outcomes_for_days(days)
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "window_days": days,
+        "outcome_count": len(outcomes),
+        "outcomes": outcomes,
+    }
+
+
+def _write(path: Path, snap: dict, pretty: bool) -> str:
+    text = json.dumps(snap, indent=2 if pretty else None, ensure_ascii=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(text)
+    tmp.replace(path)  # atomic swap so a reader never sees a half-written file
+    return text
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--days", type=int, default=90)
+    ap.add_argument("--out", type=Path, default=OUT_DEFAULT)
+    ap.add_argument("--stdout", action="store_true", help="print to stdout, don't write the file")
+    ap.add_argument("--pretty", action="store_true")
+    args = ap.parse_args()
+
+    snap = build_snapshot(args.days)
+    outcomes = build_outcomes_snapshot(args.days)
+
+    if args.stdout:
+        print(json.dumps({"sessions": snap, "outcomes": outcomes},
+                         indent=2 if args.pretty else None, ensure_ascii=False))
+    else:
+        stext = _write(args.out, snap, args.pretty)
+        otext = _write(OUTCOMES_DEFAULT, outcomes, args.pretty)
+        print(f"wrote {args.out} — {snap['session_count']} sessions, {len(stext)//1024} KB; "
+              f"{OUTCOMES_DEFAULT.name} — {outcomes['outcome_count']} outcomes, {len(otext)//1024} KB",
+              file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

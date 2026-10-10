@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.arch129-remeasure</string>
+
+    <!-- ONE-SHOT (2026-06-11 08:00 local): post the ARCH-129 post-A+B token
+         re-measure to #overnight-digest. The script removes this plist and
+         boots the job out after posting, so the date-anchored interval can't
+         re-fire next year. Repo copy kept for the record. -->
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of arch129-remeasure, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes arch129-remeasure interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/arch129-remeasure</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Month</key>
+        <integer>6</integer>
+        <key>Day</key>
+        <integer>11</integer>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/arch129-remeasure.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/arch129-remeasure.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

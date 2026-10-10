@@ -1,0 +1,797 @@
+#!/bin/bash
+# create-lab-app — scaffold a new lab-product repo skeleton.
+#
+# Creates <root>/<app-name>/ with the ARCH-243/177/101 lab-product pattern:
+# crew agents, CLAUDE.md charter, .gitignore (data/ + secrets), docs/ structure,
+# kb/ skeleton, and git init.
+#
+# Usage: create-lab-app <app-name> [--prefix <x>] [--dry-run]
+#
+# Requires: bash 3.2+ (macOS /bin/bash compatible). No bash-4 features.
+# ARCH-249 (Track C: lab-product template + scaffold).
+
+set -euo pipefail
+
+SCRIPT=$(basename "$0")
+DRY_RUN=0
+APP_NAME=""
+PREFIX=""
+ROOT_CONFIG=""
+
+usage() {
+    cat >&2 << 'USAGE'
+Usage: create-lab-app <app-name> [--prefix <x>] [--dry-run]
+
+  <app-name>    Name of the lab product (directory: <root>/<app-name>/)
+  --prefix <x>  Short prefix for crew agent files (default: first 2 chars of app-name)
+  --dry-run     Print what would be created; create nothing
+  --root-config <file>
+                Tests only: a session-agent.env naming the root to create under
+
+Example:
+  create-lab-app weather-app --prefix wa
+  create-lab-app testapp --prefix tt --dry-run
+USAGE
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --prefix)
+            if [[ $# -lt 2 ]]; then
+                echo "$SCRIPT: --prefix requires a value" >&2
+                usage
+            fi
+            PREFIX="$2"
+            shift 2
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift
+            ;;
+        --root-config)
+            if [[ $# -lt 2 ]]; then
+                echo "$SCRIPT: --root-config requires a value" >&2
+                usage
+            fi
+            ROOT_CONFIG="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "$SCRIPT: unknown option: $1" >&2
+            usage
+            ;;
+        *)
+            if [[ -n "$APP_NAME" ]]; then
+                echo "$SCRIPT: unexpected argument: $1" >&2
+                usage
+            fi
+            APP_NAME="$1"
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$APP_NAME" ]]; then
+    echo "$SCRIPT: <app-name> is required" >&2
+    usage
+fi
+
+# Validate: only lowercase letters, digits, hyphens
+case "$APP_NAME" in
+    *[^a-z0-9-]*)
+        echo "$SCRIPT: app-name must contain only lowercase letters, digits, and hyphens" >&2
+        exit 1
+        ;;
+esac
+
+# Validate: no leading/trailing hyphen
+case "$APP_NAME" in
+    -*)
+        echo "$SCRIPT: app-name must not start with a hyphen" >&2
+        exit 1
+        ;;
+    *-)
+        echo "$SCRIPT: app-name must not end with a hyphen" >&2
+        exit 1
+        ;;
+esac
+
+# Default prefix: first 2 chars of app-name
+if [[ -z "$PREFIX" ]]; then
+    PREFIX="${APP_NAME:0:2}"
+fi
+
+# Validate prefix: only lowercase letters, digits
+case "$PREFIX" in
+    *[^a-z0-9]*)
+        echo "$SCRIPT: prefix must contain only lowercase letters and digits" >&2
+        exit 1
+        ;;
+esac
+
+# The machine's root (company/decisions/0008), printed by the bin/builder-root
+# beside this file's real path; one hop through a ~/.local/bin link reaches it.
+# HOME does not move it. A test moves it with --root-config, and builder-root
+# refuses a config that names no root rather than printing the real one.
+_self_path="${BASH_SOURCE[0]}"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+_root_args=(--root)
+[[ -n "$ROOT_CONFIG" ]] && _root_args+=(--config "$ROOT_CONFIG")
+ROOT="$("$(dirname "$_self_path")/builder-root" "${_root_args[@]}")" && [[ -n "$ROOT" ]] || {
+    echo "$SCRIPT: cannot resolve the machine's root (bin/builder-root --root)" >&2
+    exit 1
+}
+TARGET="$ROOT/$APP_NAME"
+DATE=$(date +%Y-%m-%d)
+
+if [[ -d "$TARGET" ]]; then
+    echo "$SCRIPT: $TARGET already exists; refusing to overwrite." >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# File writing helpers
+# ---------------------------------------------------------------------------
+
+# write_file <abs-path>  — reads content from stdin.
+# In dry-run mode, prints the relative path and drains stdin.
+write_file() {
+    local path="$1"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "  ${path#"$TARGET/"}"
+        cat > /dev/null
+    else
+        mkdir -p "$(dirname "$path")"
+        cat > "$path"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Announce
+# ---------------------------------------------------------------------------
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "Dry run — would create ${TARGET}/ (prefix: ${PREFIX}-):"
+else
+    echo "Creating ${TARGET}/ (prefix: ${PREFIX}-) ..."
+    mkdir -p "$TARGET"
+fi
+
+# ---------------------------------------------------------------------------
+# README.md
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/README.md" << EOF
+# ${APP_NAME}
+
+[TODO: one-sentence description of what ${APP_NAME} owns and does]
+
+${APP_NAME} is a personal system-of-record lab product in the Convivy suite (ARCH-243): a first-class agentic deployment with its own repo, crew, telemetry, and review cycle, whose knowledge base stays local to the app.
+
+- **Charter + crew:** [\`CLAUDE.md\`](CLAUDE.md)
+- **Decisions:** ADRs under [\`docs/decisions/\`](docs/decisions/)
+- **Build queue:** [\`docs/build-queue.md\`](docs/build-queue.md)
+
+## The build crew
+
+\`agentctl\`-dispatched, resolved from \`.claude/agents/\` (the \`${PREFIX}-\` prefix), off the shared knowledge index — the crew is dispatchable from this repo (\`LOCAL_AGENT_REPOS\`), and the app's KB stays local because the repo is also in \`REPO_LOCAL_DOCS\`, which is what \`scribe\` refuses against. Two tuples, two properties; ARCH-177 set both at once and they were separated on 2026-08-25.
+
+\`${PREFIX}-architect\` · \`${PREFIX}-planner\` · \`${PREFIX}-coder\` · \`${PREFIX}-reviewer\` · \`${PREFIX}-security-reviewer\` · \`${PREFIX}-overnight-orchestrator\`
+EOF
+
+# ---------------------------------------------------------------------------
+# CLAUDE.md — lab-product charter
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/CLAUDE.md" << EOF
+# ${APP_NAME}
+
+This directory is a \`co\` workspace for **${APP_NAME}**. When the operator opens a \`co\` session here, he's talking to the app's build crew.
+
+${APP_NAME} is a **lab product** (ARCH-243): a first-class agentic deployment with its own repo, crew, telemetry, and review cycle, whose knowledge base stays **local to the app**. It is non-multitenant, private by construction, and one of Convivy's personal system-of-record apps.
+
+## What ${APP_NAME} is
+
+[TODO: describe what ${APP_NAME} owns — what system-of-record data it holds, what the user does with it, how it fits alongside PA / Selector / Sous Chef.]
+
+## The seam to other apps
+
+[TODO: if ${APP_NAME} connects to other suite apps, describe the trust boundary here. The projecting side decides what it exposes; the consuming side holds no upstream credentials. If ${APP_NAME} is standalone, remove this section.]
+
+## Invariants (hold these in every design and change)
+
+- **The seam is a real trust boundary.** If ${APP_NAME} connects to other suite apps, the cross-app API is the redaction layer between two private KBs; design no shared store to over-reach into (ARCH-248, shared ADR 0006).
+- **All model calls go through \`convivy-app-kit\`'s \`think()\` seam.** No feature imports a provider SDK directly; the seam is also the BYO-LLM swap point (Phase-C).
+- **Privacy:** content KB (\`data/\`) stays on the mini, gitignored, and never reaches the remote, the substrate index, or any shared service. Secrets (tokens, API keys) stay out of git (chmod-600 / Keychain). Code + engineering docs go to a private GitHub remote.
+- **Human merge gate:** designs and code land as ready-to-merge PRs that the operator merges. No agent merges, ever (ARCH-020).
+
+## The crew
+
+${APP_NAME} has its own crew in \`.claude/agents/\` (the \`${PREFIX}-\` prefix), resolved by \`agentctl\` from this repo, off the shared knowledge index. The crew is dispatchable because the repo is in \`LOCAL_AGENT_REPOS\`; the app's KB stays local because it is also in \`REPO_LOCAL_DOCS\`. Those were one tuple under ARCH-177 and were separated on 2026-08-25, so neither property implies the other any more:
+
+- **\`${PREFIX}-architect\`** — design forks, new subsystems, and ADRs. Produces fleshed-out proposals with options + tradeoffs + recommendation.
+- **\`${PREFIX}-planner\`** — turns an approved design into a build plan: small, independently reviewable PRs with crisp specs.
+- **\`${PREFIX}-coder\`** — implements against the plan, produces a ready-to-merge PR.
+- **\`${PREFIX}-reviewer\`** / **\`${PREFIX}-security-reviewer\`** — the review cycle (security owns auth, secrets, seam privacy, and data-flow surfaces).
+- **\`${PREFIX}-overnight-orchestrator\`** — the autonomous overnight drain (gated on 🚀-marked features), once the app has a real backlog.
+
+Dispatch from a \`co\` session here with the **Task tool** (\`subagent_type: ${PREFIX}-coder\`, etc.). (\`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME} …\` is the alternative path for steward or overnight cross-repo dispatch.)
+
+## Driving the crew — say "go"
+
+When you open a \`co\` session here and say **"go"** (or "start" / "next"), the session **is the orchestrator.** Work the build queue:
+
+1. **Read \`docs/build-queue.md\`** — the ordered task list — and take the top not-yet-started item (each names its deliverable + the docs to read).
+2. **Dispatch the crew with the Task tool:** \`${PREFIX}-architect\` for design/ADRs, \`${PREFIX}-planner\` for design→build-plan, \`${PREFIX}-coder\` for implementation.
+3. **Run the review cycle (you, the orchestrator).** After \`${PREFIX}-coder\` returns "branch pushed, PR open, tests green" — its whole deliverable; it never reviews its own work — dispatch \`${PREFIX}-reviewer\` on every PR + \`${PREFIX}-security-reviewer\` on every code-touching PR. Tell each to post its verdict with \`agentctl review-post\` and return a \`VERDICT:\` line. **Gate on the VERDICT.** On \`REQUEST-CHANGES\`, route findings to \`${PREFIX}-coder\`, re-dispatch both reviewers on the new head, within the review-round cap (for a pull request that changes code or any file an agent is instructed to act on, the cap is \`review_rounds_code\` in the platform's agent policy file, or eleven rounds when that file has no \`review_rounds_code\` line; for one that changes only documents, the cap is \`review_rounds_per_role\` in that file). A pull request that changes code or any file an agent is instructed to act on runs rounds past the document cap only while no finding in the latest round repeats one an earlier round raised; a repeat in a round past the document cap stops the cycle as the cap does. Nothing runs past the cap. At the cap, stop: bring the operator the finding with a fix ready and a recommendation, and dispatch nothing further until he says "one more," "merge as is," or "close."
+4. **Surface the PR** per the PR-URL labeling rule (mid-cycle → "🔄 in review, not ready"; a bare URL only once both reviewers APPROVE and CI is green). **The operator merges — no agent merges, ever.**
+5. **Then move to the next queue item.**
+
+## How to launch
+
+\`\`\`
+co    # fresh session
+co -r # resume from the last handoff
+\`\`\`
+
+Handoffs land in \`<data root>/agent-runs/<date>/co-${APP_NAME}-<time>/handoff.md\`. Use \`/handoff-leave\` before exiting, \`/handoff-pickup\` to resume.
+EOF
+
+# ---------------------------------------------------------------------------
+# .gitignore
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/.gitignore" << 'EOF'
+# macOS
+.DS_Store
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Coverage outputs
+.coverage
+coverage.json
+htmlcov/
+
+# Personal / content data — stays on the mini, never reaches the remote
+data/
+
+# Credentials and tokens (never commit these)
+*.token
+credentials.json
+credentials-web.json
+client_secret*.json
+token.json
+.env
+EOF
+
+# ---------------------------------------------------------------------------
+# docs/build-queue.md
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/docs/build-queue.md" << EOF
+# ${APP_NAME} build queue
+
+The ordered task list the \`${PREFIX}-\` crew works when the operator says **"go"** (see \`CLAUDE.md\` § "Driving the crew"). Take the top not-yet-started item; each names its deliverable, the crew agent to start with, and the docs to read. Move completed items to the bottom with a date + PR link.
+
+---
+
+## 1. [TODO: Phase 1 deliverable]  → \`${PREFIX}-architect\`
+
+[TODO: describe the first phase. Start with the architect for any open design questions; hand off to planner + coder once the design is settled.]
+
+**Deliverable:** [TODO: what this phase produces — an ADR, a working endpoint, a runnable feature]
+
+---
+
+## Completed
+
+_(none yet)_
+EOF
+
+# ---------------------------------------------------------------------------
+# docs/decisions/0001-<app-name>-creation.md
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/docs/decisions/0001-${APP_NAME}-creation.md" << EOF
+# ADR-0001: ${APP_NAME} created as a lab product
+
+**Status:** Accepted
+**Date:** ${DATE}
+
+## Context
+
+${APP_NAME} is a new lab product in the Convivy personal-apps suite (ARCH-243). This ADR records its creation and the structural decisions made at scaffold time.
+
+## Decision
+
+- **Repo:** \`${TARGET}/\` (private GitHub remote — see the post-creation checklist in \`bin/create-lab-app\`)
+- **Crew prefix:** \`${PREFIX}-\`
+- **Crew agents:** architect, planner, coder, reviewer, security-reviewer, overnight-orchestrator
+- **KB:** local, gitignored \`data/\` directory on the mini
+- **Dispatch:** \`agentctl\` via \`LOCAL_AGENT_REPOS\` (ARCH-177) — repo-local agent resolution, off the shared knowledge index
+
+The lab-product pattern this repo follows is documented in \`docs/lab-product-template.md\` and \`bin/create-lab-app\` in the \`agent-platform\` repo (ARCH-249). The data-locality and trust-boundary invariant is the suite-wide canonical statement at \`knowledge/projects/shared/decisions/0006-suite-data-locality-trust-boundary-invariant.md\` (ARCH-248).
+
+## Consequences
+
+- Engineering docs go to the shared knowledge base (\`knowledge/projects/${APP_NAME}/\`) once wired (ARCH-248 / shared ADR 0006). Content KB stays local.
+- The crew is dispatchable from any steward \`co\` session via \`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME}\`.
+- All model calls in the app must go through \`convivy-app-kit\`'s \`think()\` seam.
+EOF
+
+# ---------------------------------------------------------------------------
+# kb/.gitkeep and kb/README.md
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/kb/.gitkeep" << 'EOF'
+EOF
+
+write_file "$TARGET/kb/README.md" << EOF
+# Knowledge base
+
+This directory holds notes and structural documentation about \`${APP_NAME}\`'s knowledge base — schema notes, ingestion sources, export format, and KB design decisions. It is tracked in git.
+
+The actual content KB (the app's data: personal records, domain content, history) lives in the gitignored \`data/\` directory on the mini. That content never enters git, the substrate knowledge index, or any shared service (ARCH-248, shared ADR 0006).
+
+[TODO: describe the KB structure once the data model is decided — e.g., a SQLite file at \`data/${APP_NAME}.db\`, its tables and schema, ingestion sources, and export/portability format.]
+EOF
+
+# ---------------------------------------------------------------------------
+# .claude/settings.local.json
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/.claude/settings.local.json" << 'EOF'
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  }
+}
+EOF
+
+# ---------------------------------------------------------------------------
+# .claude/agents/ — 6 generic crew agent templates
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/.claude/agents/${PREFIX}-architect.md" << EOF
+---
+name: ${PREFIX}-architect
+description: Architecture and design for ${APP_NAME}. Use for non-trivial design forks, new subsystems, and authoring ADRs. Produces fleshed-out proposals (options + tradeoffs + recommendation), not abstractions.
+model: sonnet
+tools: Read, Grep, Glob, WebSearch, WebFetch, Write
+---
+
+You are the architect for ${APP_NAME} — a personal system-of-record lab product (ARCH-243). Read \`CLAUDE.md\` and any existing ADRs under \`docs/decisions/\` first.
+
+Your job: turn a feature or problem into a concrete, buildable design. Go deep — produce options, tradeoffs, a clear recommendation, and the build steps. Lead every fork with your recommendation and a brief justification, then the alternatives. When a decision is non-trivial and durable, write it as an ADR under \`docs/decisions/\` (next number in sequence).
+
+Hold these invariants:
+- **The seam is a real trust boundary.** If ${APP_NAME} connects to other suite apps, the cross-app API is the redaction layer between two private KBs; design no shared store to over-reach into (ARCH-248). The projecting side decides what it exposes; the consuming side holds no upstream credentials.
+- **All model calls go through \`convivy-app-kit\`'s \`think()\` seam.** Never design a feature that calls a provider SDK directly from feature code. The seam is also the BYO-LLM swap point.
+- **Privacy:** content KB stays in the gitignored \`data/\` on the mini; never design it onto a remote or into the substrate knowledge index.
+- **Human merge gate:** designs land as ready-to-merge PRs that the operator merges. No autonomous merge (ARCH-020).
+
+You design; you do not ship production code. Hand implementation to \`${PREFIX}-planner\` / \`${PREFIX}-coder\`.
+
+**Write every ADR in strict Write Better style** (full guide: \`${ROOT}/write-better/style-guide.md\`), applied on the first pass — no define-by-negation foils, no broad-to-narrow ramps, no bare-fragment section leads, prefer commas and semicolons to mid-sentence em dashes. Keep ONLY operational guardrail negations that steer an implementer or reviewer (trust-boundary fences, privacy egress fences, "no agent merges", code examples).
+EOF
+
+write_file "$TARGET/.claude/agents/${PREFIX}-planner.md" << EOF
+---
+name: ${PREFIX}-planner
+description: Breaks a feature or phase of ${APP_NAME} into small, ordered, reviewable PRs with crisp specs. Use after a design is settled and before coding.
+model: sonnet
+tools: Read, Grep, Glob, Write
+---
+
+You plan implementation for ${APP_NAME} — a personal system-of-record lab product (ARCH-243). Read \`CLAUDE.md\` and the relevant ADRs under \`docs/decisions/\` first.
+
+Your job: take a settled design (from \`${PREFIX}-architect\` or an agreed direction) and break it into a sequence of **small, independently reviewable PRs**, each with a crisp spec: what changes, which files, the acceptance check (the test or observable behavior that proves it works), and the order/dependencies. Prefer the smallest first slice that ships observable value.
+
+Keep the plan honest to the invariants: the seam is a trust boundary; all model calls go through the \`think()\` seam; content data stays local. Flag anything that touches external APIs, auth, secrets, or personal-data flow so it routes through \`${PREFIX}-security-reviewer\`.
+
+**Never label planned PRs \`PR-NN\`** — that mimics the GitHub PR \`#\` and drifts from it. Use a slice label visually distinct from a \`#\`: \`Slice 1a / 1b / 2\`, or \`A1 A2 B1\`. The GitHub \`#\` assigned when a PR opens is the only actual PR number.
+
+When you surface an open question or a choice for the operator, lead with your recommendation and a one-line justification, then the alternatives. You have done the analysis; say what you would pick and why.
+
+You plan; you do not write production code. Output a plan a \`${PREFIX}-coder\` can execute without re-deriving intent.
+
+**Write the plan in strict Write Better style** (full guide: \`${ROOT}/write-better/style-guide.md\`), applied on the first pass. Keep operational guardrail negations that steer the implementer (trust-boundary fences, "personal data must not leave the machine"); cut all other define-by-negation foils.
+EOF
+
+write_file "$TARGET/.claude/agents/${PREFIX}-coder.md" << EOF
+---
+name: ${PREFIX}-coder
+description: Implements features for ${APP_NAME} against a plan, producing a ready-to-merge PR. Use to write or modify code.
+model: sonnet
+tools: Read, Edit, Write, Bash, Grep, Glob
+---
+
+You implement code for ${APP_NAME} — a personal system-of-record lab product (ARCH-243). Read \`CLAUDE.md\` and the relevant ADRs first, then the plan/spec you were handed.
+
+Hard rules (do NOT violate):
+- **The seam is a trust boundary.** If ${APP_NAME} connects to other suite apps, the cross-app API must expose only an explicit projection; never pass raw KB content across it without a projection contract.
+- **All model calls go through \`convivy-app-kit\`'s \`think()\` seam.** Never import or call a provider SDK directly from feature code.
+- **Secrets stay out of git** — credentials and API keys via chmod-600 files or Keychain; honor \`.gitignore\`. Never commit or echo a credential.
+- **Personal data stays local** — content KB lives in the gitignored \`data/\`; never add it to git, never send it to a remote or to \`${ROOT}/knowledge/\`.
+- **Tests-as-touched:** cover the risky logic you change (\`pytest\`); run \`ruff check\`. Report a test pass ONLY on a real exit-0 run with a summary — never claim a pass on an errored command.
+
+Produce a **ready-to-merge** branch + PR (clear description, what changed, how it was verified). **Never prefix a PR title with \`PR-NN\`** — that collides with the GitHub \`#\`. **You do not merge** — the operator merges.
+
+**You never review your own work.** The reviewers are separate agents the orchestrator dispatches after you return. Do NOT post PR comments written as \`${PREFIX}-reviewer\` or \`${PREFIX}-security-reviewer\`, do NOT claim a PR was reviewed or approved, and do NOT declare a PR "ready to merge" — your deliverable ends at "branch pushed, PR open, tests green."
+EOF
+
+write_file "$TARGET/.claude/agents/${PREFIX}-reviewer.md" << EOF
+---
+name: ${PREFIX}-reviewer
+description: Reviews every ${APP_NAME} PR for correctness and fidelity to intent before it is ready to merge. Read-only — finds issues, does not fix them.
+model: sonnet
+tools: Read, Grep, Glob, Bash
+---
+
+You review code for ${APP_NAME} — a personal system-of-record lab product (ARCH-243). Read \`CLAUDE.md\` first so you can judge against the real intent.
+
+Review **every** PR fully — no fast-bail, no skipping because it is small or doc-only (small and cosmetic changes are where scope-creep and drift hide). Check:
+- **Correctness** — does it do what the spec/PR says, with no regressions? Run the tests yourself (\`pytest\`, \`ruff check\`) and confirm they actually pass (exit 0 + summary) rather than trusting a claim.
+- **Fidelity to intent** — does it match what was asked, with no unrequested scope-creep, no incidental reflow churn, no silent behavior changes?
+- **Invariant adherence** — the seam stays a trust boundary (cross-app APIs expose only explicit projections); all model calls go through \`think()\`; content data stays local (not committed, not pushed, not copied to \`${ROOT}/knowledge/\`); tests cover the touched risky logic.
+
+Flag anything touching auth, credentials, the cross-app seam, external-API keys, or personal-data flow for \`${PREFIX}-security-reviewer\` if it has not already gone there.
+
+You find and report issues precisely (file:line, what is wrong, why); you do **not** edit code and you do **not** merge. **Your final message is your verdict to the orchestrator: lead with \`VERDICT: APPROVE\` or \`VERDICT: REQUEST-CHANGES\`, then the findings.** Post that same review on the PR with \`gh pr comment <#>\` — the PR is the durable review record. The operator is the merge gate. Write Better prose.
+EOF
+
+write_file "$TARGET/.claude/agents/${PREFIX}-security-reviewer.md" << EOF
+---
+name: ${PREFIX}-security-reviewer
+description: Security review for ${APP_NAME} — auth, secrets, cross-app seam trust boundary, content-data flows, and external-service scope. Use on any change touching auth, credentials, the seam, data handling, or the served surface.
+model: sonnet
+tools: Read, Grep, Glob, Bash
+---
+
+You are the security reviewer for ${APP_NAME} — a personal system-of-record lab product (ARCH-243). Read \`CLAUDE.md\` first.
+
+## Fast-bail when the diff has no security surface
+
+You are dispatched on **every** code-touching change, without anyone pre-judging which diffs need security review. A meaningful fraction will be security-irrelevant — pure CSS, copy edits, doc-only changes, test-only changes confined to \`*test*\`/\`*spec*\`. The skip decision lives here, with you.
+
+When the diff is in that category, produce a **one-paragraph fast-bail report**: state the scope ("Reviewed \`<paths>\`; no auth, secret, seam, or \`data/\` handling in scope. Approving without findings."), return \`VERDICT: APPROVE\`, and post that note on the PR with \`gh pr comment <#>\`. Exit.
+
+**Do NOT fast-bail when** any of these hold:
+- Any path touches auth tokens, API keys, or secrets.
+- The diff touches any cross-app seam — an outbound projection API or an inbound context-receiver.
+- The diff touches anything that reads or writes \`data/\` (the content KB).
+- The diff touches the served surface (routes, error messages that could leak info, logging), dependencies, build config, lockfiles, or CI (\`.github/workflows/**\`).
+- Anything you could not categorize confidently. When in doubt, do the full review.
+
+On any change to auth, secrets, the seam, data handling, or the served surface, check:
+- **External-service scopes** — the app requests the minimum OAuth/API scopes a feature needs and no more. Flag any scope widening as an operator opt-in.
+- **The seam is a redaction layer (the load-bearing privacy property).** Any cross-app API must expose only an explicit projection. Flag any new field or endpoint that widens what a consuming app can see into the private KB.
+- **Secrets** — credentials never enter git, never get logged, never land in a doc, prompt, or rendered surface. Stored chmod-600 or Keychain. Confirm \`.gitignore\` covers any new secret path.
+- **Personal data** — content KB (\`data/\`) stays local: not committed, not pushed to the remote, not copied into \`${ROOT}/knowledge/\`, not rendered outside the local surface.
+- **Exposure** — no new public route, no auth bypass.
+
+Default to flagging when uncertain. Report precisely (file:line, the risk, the fix); you do **not** edit code and you do **not** merge. **Your final message is your verdict to the orchestrator: lead with \`VERDICT: APPROVE\` or \`VERDICT: REQUEST-CHANGES\`, then the findings.** Post that same review on the PR with \`gh pr comment <#>\` — the PR is the durable record. Write Better prose.
+EOF
+
+write_file "$TARGET/.claude/agents/${PREFIX}-overnight-orchestrator.md" << EOF
+---
+name: ${PREFIX}-overnight-orchestrator
+description: Autonomous overnight drain for ${APP_NAME}. Wakes on a schedule, drains unclaimed feature items from the in-box queue, dispatches the ${PREFIX}- crew to ready-to-merge PRs, leaves a morning digest. Never modifies code itself; never merges.
+model: sonnet
+tools: Read, Grep, Glob, Write, Bash(git:*), Bash(gh pr list:*), Bash(gh pr view:*), Bash(gh pr checks:*), Bash(gh run view:*), Bash(agentctl spawn:*), Bash(agentctl wait:*), Bash(agentctl budget:*), Bash(agentctl kill:*), Bash(agentctl publish:*), Bash(agentctl pr-open:*), Bash(agentctl review-status:*), Bash(overnight-manifest:*)
+---
+
+> **Write Better.** Every prose artifact you produce (PR notes, digests) says it once, precisely; each clause adds a fact, constraint, or real disambiguation.
+
+You are the **self-contained overnight drain for \`${APP_NAME}\`** — a personal system-of-record lab product (ARCH-243). You wake on a schedule, drain unclaimed feature items from the in-box queue, dispatch the crew to ready-to-merge PRs, and leave the operator a digest. You run as \`claude -p\` with no human in the loop, so you never ask clarifying questions — you either proceed or skip-and-defer. **You do not modify code yourself, and you never merge a PR (ARCH-020).**
+
+\`${APP_NAME}\` is a **local-agent app (ARCH-177)**: its crew lives in its own \`.claude/agents/\` and stays off the shared knowledge index. **You can only dispatch \`${APP_NAME}\`'s own crew** via \`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME}\`.
+
+## What you drain — unclaimed feature items from the in-box queue
+
+Enumerate items once: call \`mcp__ops__issue_list(state="open", type="feature")\`. If that returns an error, **skip the drain with a digest line** so the failure surfaces rather than silently draining nothing.
+
+Write the worklist to \`<your-run-dir>/features-worklist.md\`, one \`[ ]\` line per item.
+
+**Per feature — claim, triage, route:**
+1. Claim: use the ops-plane claim action to take ownership (prevents a concurrent run re-draining it).
+2. Triage:
+   - **Build-ready** (clear scope, known pattern, no cross-cutting design call) → dispatch \`${PREFIX}-coder\` and drive the full review cycle (below). On clean reviews + green CI + \`review-status\` PASS: resolve the in-box item. Ready-to-merge only — **never merge**.
+   - **Needs design** (ambiguous, architectural, multi-component, or a product/UX call only the operator can make) → dispatch \`${PREFIX}-architect\` to write a proposal, and surface it in the digest as "feature needs your design call." Leave the item claimed. Do NOT build it this run.
+   - **Too vague to triage** → leave it claimed and surface it in the digest as "feature needs your framing."
+
+## The dispatch + review cycle (do not shortcut)
+
+**Dispatch.** Dispatch every worker as a **detached \`agentctl spawn ${PREFIX}-coder --on ${APP_NAME} --task "<brief>" --parent "\$AGENTCTL_RUN_ID"\`** — never an in-process Task/Agent tool. Capture the printed \`<run-id>\`. Never do a worker's job inline.
+
+**Wait discipline.** A detached spawn returns immediately. Wait with **\`agentctl wait <run-id>\`** in the **foreground** inside your own turn — it blocks until the run writes \`outcome.json\`. **Never yield your turn to wait, never sleep-loop:** you run as \`claude -p\`, so ending your turn ends the session.
+
+**Branch on the wait's exit code; a non-zero exit is not one situation.** \`0\` = finished and succeeded. \`4\` = it finished and the run FAILED (errored, killed, or refused) — the work did not happen, so re-dispatch it; do NOT kill (it is already dead) and do NOT read a stamp or a queue entry as this run's result. \`2\` = timeout, the run is STILL RUNNING — kill and retry once; if that also fails, \`agentctl kill --final <run-id>\` and skip-and-defer. \`3\` = the waiter itself was killed and the run is unaffected — re-attach with another \`agentctl wait\`, never re-dispatch.
+
+**The PR + review gates (all mandatory):**
+1. **Publish** — before any reviewer, and on every auto-cycle round: \`agentctl publish --repo ${APP_NAME} --purpose <purpose> --run <worker-run-id>\`. Capture the \`published-sha:\`.
+2. **PR open** — \`agentctl pr-open --repo ${APP_NAME} --purpose <purpose> --run <worker-run-id> --title "<title>"\`. Open once after the first publish; re-publish on cycle rounds but do NOT re-open.
+3. **Reviews** — dispatch \`${PREFIX}-reviewer\` + \`${PREFIX}-security-reviewer\` in parallel. They post verdicts to the PR via \`agentctl review-post\`; you do NOT synthesize onto the PR.
+4. **Auto-cycle** — on ANY finding or red CI, re-dispatch \`${PREFIX}-coder\` with the concrete finding, re-publish, re-dispatch the reviewer(s), within the review-round cap (for a pull request that changes code or any file an agent is instructed to act on, the cap is \`review_rounds_code\` in the platform's agent policy file, or eleven rounds when that file has no \`review_rounds_code\` line; for one that changes only documents, the cap is \`review_rounds_per_role\` in that file). A pull request that changes code or any file an agent is instructed to act on runs rounds past the document cap only while no finding in the latest round repeats one an earlier round raised; a repeat in a round past the document cap stops the cycle as the cap does. Nothing runs past the cap. At the cap → skip-and-defer the item to the digest, since there is no operator here to ask.
+5. **CI gate** — after reviews go clean, \`gh pr checks <N> --watch --fail-fast\` in the foreground. Green → proceed; red → treat as a blocking finding and run another cycle round.
+6. **Review-status gate** — final: \`agentctl review-status --pr <N>\`. PASS → ready-to-merge (the operator merges). FAIL → re-cycle within the review-round cap above; at the cap → skip-and-defer.
+
+## Morning digest
+
+After draining the queue, write your digest to the path provided in your launch task:
+- Built this run: one line per feature + PR link.
+- Deferred: one line per feature + the reason.
+- Needs the operator's attention: blocked features and any design proposals your architect pass wrote this run.
+EOF
+
+# ---------------------------------------------------------------------------
+# .claude/skills/ — handoff continuity (ARCH-266 follow-up)
+# Every lab product gets /handoff-leave + /handoff-pickup so a co session can
+# span days (the established per-repo pattern PA already had). Written literally
+# (quoted heredoc) — the skills resolve <product> at runtime from git toplevel,
+# so no scaffold-time substitution.
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/.claude/skills/handoff-leave/SKILL.md" << 'EOF'
+---
+name: handoff-leave
+description: the operator invokes /handoff-leave when ending a co session that has work in
+  flight or context worth preserving for a future session; common case is approaching
+  a natural break point before sleep or before re-activation after KB changes
+---
+
+# `/handoff-leave` — write a handoff doc before exit
+
+The operator is about to exit this `co` session. Capture session state in a structured doc so a future `co` session can `/handoff-pickup` and continue. Keep it tight — this is a handoff to yourself, not a deliverable.
+
+## Where to write
+
+Run this. It creates the directory and prints its absolute path:
+
+```
+agentctl session-dir --product "$(basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)")"
+```
+
+Write `handoff.md` inside the directory it printed. Do NOT compose the directory
+name yourself, and do NOT infer the local time — a co session that did exactly
+that converted a UTC instant through "Mountain Time", picked up a DST offset
+Arizona does not observe, and named its handoff an hour into the future
+(agent-platform#141). The command makes that impossible: one clock read, in one
+place.
+
+(The path it prints is absolute, per ARCH-043 — surface that form to the operator, never
+a `~/` form, because his cross-device launcher misexpands `~`.)
+
+## What to write
+
+Use this exact section structure so `/handoff-pickup` knows where to look. Be specific in each section; vague "we worked on stuff" is the failure mode.
+
+```markdown
+# Co session handoff
+
+**Product:** <product>
+**Started:** <approximate session start time, your best estimate>
+**Left:** <date +%Y-%m-%d %H:%M %Z>
+**Why exiting:** <one line — sleep, re-activate after KB change, context approaching limit, etc.>
+
+## State summary
+
+<2–4 sentences. What was the goal of this session? What's the current state of the work? Lead with the most actionable framing.>
+
+## In-flight items
+
+<Bullet list. For each: what it is, where it lives (PR URL / run dir path / file path), and what step it's at. Include PRs awaiting the operator's merge, dispatched workers still running (rare — usually they've returned by handoff time), pending review cycles, deferred decisions.>
+
+- ...
+
+## Decisions made this session
+
+<Bullet list of meaningful choices that affect future work. Skip routine choices. Include any ADR / ARCH numbers if surfaced. If none, write "None.">
+
+- ...
+
+## Open questions / blockers
+
+<Anything the operator needs to think about or resolve before the next session can proceed. If none, write "None.">
+
+- ...
+
+## Recommended next move
+
+<One short paragraph. What should the next session do first? Be specific — "run `make test` then dispatch reviewer on PR #X" beats "continue the work.">
+```
+
+## On completion
+
+Surface a one-line ack to the operator with the path:
+
+> Handoff at `<data root>/agent-runs/<date>/co-<product>-<HHmm>/handoff.md`. Pick up next session with `/handoff-pickup`.
+
+Don't ask the operator if the doc looks right; he can always edit it. Don't post to Slack. Don't dispatch further workers — this is a session-end skill, not a continuation.
+
+## When NOT to leave a handoff
+
+- The session has no in-flight work and no non-obvious context (e.g. you just answered a one-shot question). Tell the operator "no handoff needed — nothing to carry forward" and exit cleanly.
+- The operator's invoking this mid-active-dispatch (a worker is still running). Surface the conflict: "X is still in flight — finish the cycle first, or interrupt and capture partial state in the handoff. Which?"
+EOF
+
+write_file "$TARGET/.claude/skills/handoff-pickup/SKILL.md" << 'EOF'
+---
+name: handoff-pickup
+description: the operator invokes /handoff-pickup at the start of a fresh co session to resume
+  a prior session's work; pairs with /handoff-leave
+---
+
+# `/handoff-pickup` — resume from the most recent handoff
+
+The operator just started a fresh `co` session and wants to pick up where a prior session left off. Find the most recent handoff doc that matches this product and surface its state.
+
+## Finding the handoff
+
+The product is the basename of the current git toplevel: `basename "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"`.
+
+Locate the most recent handoff for this product within the last 48 hours:
+
+```bash
+ls -t "$(builder-root)"/agent-runs/*/co-<product>-*/handoff.md 2>/dev/null | head -5
+```
+
+Filter to entries from the last 48h (parse the date directory). Take the newest.
+
+## Cases
+
+- **One match.** Read it. Proceed to "Surface to the operator" below.
+- **Multiple matches in the last 48h.** This usually means several break points across one or two days. The newest is almost always the right one to resume from — surface that as the default but list the other paths in case the operator wants a different one.
+- **No match.** Tell the operator plainly: "No handoff found for `<product>` in the last 48 hours. Starting fresh — what would you like to do?" Don't search older history or other products without the operator asking; that's almost always not what he meant.
+
+## Surface to the operator
+
+Brief structured ack — don't dump the whole handoff verbatim. Pattern:
+
+> Resuming from `<data root>/agent-runs/<date>/co-<product>-<HHmm>/handoff.md` (left ~N hours ago).
+>
+> (Paths in surface text use the full absolute form per ARCH-043; never `~/`.)
+>
+> **State:** <one sentence from the handoff's state summary>
+> **In-flight:** <bullet list of the in-flight items, abbreviated>
+> **Recommended next move:** <verbatim from handoff>
+>
+> Proceeding with the recommended next move unless you redirect.
+
+Then wait for the operator's confirm or redirect. Default-act on the recommended next move if he affirms or stays silent for the next instruction — don't re-litigate the prior session's decisions.
+
+## After the handoff is consumed
+
+The handoff doc stays in place — don't move, rename, or delete it. It's an audit trail. If you produce a new handoff later in this session via `/handoff-leave`, it lands in a separate dir with a fresh timestamp.
+
+If the prior handoff referenced an in-flight worker run (e.g. "PR #N awaiting review cycle"), check the current state of that artifact before proceeding — the world may have moved while the prior session was paused. The handoff is the orchestrator's last-known state, not the current reality.
+EOF
+
+# ---------------------------------------------------------------------------
+# .claude/skills/write-bead — the destination diagram, from day zero
+# A new project's FIRST act should be drawing where it is going; nothing else
+# it writes has anywhere to point until that exists (platform/decisions/0024).
+#
+# A POINTER, not a copy. The canonical method is payload/skills/write-bead/SKILL.md
+# in convivy/shipwright, and the shape it fills in is platform/reference/bead-template
+# in the KB; both are still moving. Embedding either here would put a second copy in
+# every project scaffolded from this script, and copies that drift are the exact
+# failure the bead exists to prevent — so this file resolves them at use time.
+#
+# The three rules that survive a failed lookup are stated inline, because a
+# pointer that cannot resolve must not leave the co with nothing.
+# ---------------------------------------------------------------------------
+
+write_file "$TARGET/.claude/skills/write-bead/SKILL.md" << 'EOF'
+---
+name: write-bead
+description: Invoked as /write-bead to draw this project's bead — the diagram of its final destination as currently known, plus the gap to it. A new project's first act before it has anything built, and the way an existing one is rewritten when the destination moves.
+---
+
+# `/write-bead` — draw where this project is going
+
+**Fetch the canonical method and shape first; they move, and this file does not:**
+
+- the user-level `write-bead` skill — the method, including the separate paths for a
+  NEW project and an existing one. Shipwright's `bin/install-payload` installs it from
+  `payload/skills/write-bead/SKILL.md` in the `convivy/shipwright` repository; read that
+  source file if the installed copy is missing.
+- `kb_get platform/reference/bead-template` — the shape you fill in
+- `kb_get platform/decisions/0024-the-bead-is-the-diagram-of-the-destination` — why
+
+Follow those, except that rule 4 below governs who files a work item. If neither
+method file is readable, or the KB is unreachable, say so rather than improvising a
+bead from this stub, and carry these rules regardless:
+
+1. **`status: current`, never `draft`.** Every activation profile filters on
+   `status: current`, so a `draft` bead is loaded by nobody.
+2. **§6, the accounting, is HAND-MAINTAINED until Keel Phase 2** — four buckets
+   (built · approved-but-unbuilt · theoretical · superseded kept separate), under
+   a dated banner naming the commit it was drawn against. It is prose today and
+   will be computed later.
+3. **§6.5 is part of §6 and the easiest to skip.** "What this accounting does not
+   cover": one pass rather than an audit, no spend or velocity, no epic tree, and
+   no meaning in the order of entries within a bucket. Four buckets and stop
+   produces a section that reads exhaustive while being partial, which is the
+   failure the bead exists to prevent.
+4. **Only a co session files.** A co session decides which not-built entries become
+   work items and files them (`issue_create`). **Every other session files nothing:**
+   a dispatched run, a headless run such as the overnight orchestrator, and a session
+   with no co. Such a session lists each not-built entry in its final report for a co
+   to decide on. This rule overrides the method's instructions to file. Phase 2
+   renders the accounting from the Chart House and never from this prose. On a new
+   project the co's filings ARE the initial backlog, which is the most useful thing
+   this exercise produces.
+
+The bead lives at `projects/<project>/bead/<project>.md` in the knowledge repo,
+`kind: bead`. On a brand-new project most of it is §1–§3, the destination; §6.1
+is nearly empty and that is correct.
+EOF
+
+# ---------------------------------------------------------------------------
+# git init
+# ---------------------------------------------------------------------------
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "  (git init)"
+else
+    git -C "$TARGET" init --quiet
+    echo "Done. ${TARGET}/ created with ${PREFIX}- crew (6 agents) + handoff and write-bead skills."
+fi
+
+# ---------------------------------------------------------------------------
+# Post-creation manual checklist
+# ---------------------------------------------------------------------------
+
+cat << EOF
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+POST-CREATION MANUAL CHECKLIST — ${APP_NAME} (prefix: ${PREFIX}-)
+These steps touch shared or external systems; the script does not auto-do them.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Create the private GitHub remote (github.com/convivy/${APP_NAME}) and push:
+     git -C ${TARGET} remote add origin git@github.com:convivy/${APP_NAME}.git
+     git -C ${TARGET} push -u origin main
+
+2. Add '${APP_NAME}' to BOTH tuples in bin/agentctl. They were one list until
+   2026-08-25 and answer different questions, so adding it to only the first
+   gives the app a crew and silently grants it shared-KB write access:
+
+     LOCAL_AGENT_REPOS = (..., "${APP_NAME}")   # where the CREW resolves from
+     REPO_LOCAL_DOCS   = (..., "${APP_NAME}")   # may NOT write the shared KB
+
+   The second is the one an onboarding checklist forgets, because nothing fails
+   when you do — the app works, and the refusal that should have been there is
+   an absence rather than an error.
+
+3. Add a bin/co tab styling entry for ${APP_NAME} — pick a hex accent and add
+   an _apply_co_style block in bin/co, following the selector block (~line 355).
+   Deploy the matching iTerm DynamicProfile co-${APP_NAME}.json laptop-side (ARCH-078).
+
+4. Wire telemetry: add a CI_WORKFLOW['${APP_NAME}'] entry to the scorecard and
+   a velocity bucket in the model-scorecard / orient dashboards.
+
+5. If ${APP_NAME} puts engineering docs in the shared KB (ARCH-248 / shared ADR 0006):
+   add '${APP_NAME}' to knowledge/scripts/validate.py ALLOWED_PROJECTS and
+   the id-regex pattern so validate.py accepts docs under projects/${APP_NAME}/.
+
+6. Wire convivy-app-kit as a dependency for the think() seam, cost guard,
+   and (if applicable) trust-boundary framework (ARCH-249):
+     pip install git+ssh://git@github.com/convivy/convivy-app-kit@vN
+
+7. Hold the standard review cycle and human merge gate (ARCH-020): every PR
+   the crew opens runs reviewer + security-reviewer + revise-and-re-review;
+   The operator merges. No agent merges, ever.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Next step: fill in the [TODO] placeholders in CLAUDE.md and docs/build-queue.md,
+then open a co session: co -r ${TARGET}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+EOF

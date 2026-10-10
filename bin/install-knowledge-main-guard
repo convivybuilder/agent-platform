@@ -1,0 +1,96 @@
+#!/bin/sh
+# install-knowledge-main-guard — refuse direct commits to the shared knowledge
+# checkout's `main` branch (ARCH-395).
+#
+# WHY. `<root>/knowledge` is a single checkout every product writes through
+# since the ARCH-355 KB unification. A commit left on its local `main` is
+# invisible to everyone until someone pushes, so it silently accumulates and
+# forces whichever co pushes next to adjudicate other products' unpushed work.
+# On 2026-07-22 the shared `main` reached 10 commits ahead of origin — deck
+# session-pane specs, a hollis reset, a vivy ADR — piled up by sessions that
+# committed straight to `main` and never pushed. Two co's hit the divergence and
+# could not push their own work.
+#
+# WHAT. A pre-commit hook that blocks a commit while HEAD is the `main` branch,
+# and points the committer at the branch-and-PR flow instead. It does NOT block:
+#   - commits on any other branch (that is the desired flow);
+#   - `kb apply`, whose scribe worktree is DETACHED at origin/main, so it is on
+#     no branch and the guard passes it through (ARCH-386);
+#   - merges (git runs no pre-commit on a merge commit), so knowledge-autopull's
+#     ff/merge on `main` is unaffected.
+# Override with `git commit --no-verify` for the rare deliberate case.
+#
+# Git worktrees share the common hooks dir, so installing into the primary
+# checkout's .git/hooks covers every scribe/review worktree too — which is why
+# the detached-HEAD carve-out above is load-bearing rather than incidental.
+#
+# Idempotent + marker-guarded: rewrites only the hook it manages, never clobbers
+# a foreign pre-commit. Run from install.sh or by hand.
+set -eu
+
+# FOR TESTS ONLY: `--root-config FILE` names the machine's root through a
+# session-agent.env, the one way a test moves it (company/decisions/0008).
+# install.sh passes nothing.
+ROOT_CONFIG=""
+if [ "${1:-}" = "--root-config" ]; then
+  [ $# -ge 2 ] || { echo "  ! --root-config requires a value" >&2; exit 1; }
+  ROOT_CONFIG=$2
+fi
+
+# The knowledge checkout lives under the machine's root, printed by the
+# bin/builder-root beside this file's real path; one hop through a ~/.local/bin
+# link reaches it. HOME does not move it, and builder-root refuses a config that
+# names no root rather than printing the real one. An unresolvable root exits 1,
+# which install.sh reports as a non-fatal skip.
+_self_path="$0"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+_builder_root="$(dirname "$_self_path")/builder-root"
+if [ -n "$ROOT_CONFIG" ]; then
+  ROOT="$("$_builder_root" --root --config "$ROOT_CONFIG")" || ROOT=""
+else
+  ROOT="$("$_builder_root" --root)" || ROOT=""
+fi
+if [ -z "$ROOT" ]; then
+  echo "  ! cannot resolve the machine's root (bin/builder-root --root)" >&2
+  exit 1
+fi
+KNOWLEDGE="$ROOT/knowledge"
+MARKER="# managed-by: agent-platform knowledge-main-guard (ARCH-395)"
+hooks_dir="$KNOWLEDGE/.git/hooks"
+hook="$hooks_dir/pre-commit"
+
+if [ ! -d "$hooks_dir" ]; then
+  echo "  ! $KNOWLEDGE has no .git/hooks (not a git repo?) — skipping" >&2
+  exit 0
+fi
+
+if [ -f "$hook" ] && ! grep -q "knowledge-main-guard" "$hook" 2>/dev/null; then
+  echo "  ! $hook exists and is not ours — leaving it, NOT installing" >&2
+  exit 0
+fi
+
+cat >"$hook" <<EOF
+#!/bin/sh
+$MARKER
+# Refuse a direct commit to the shared knowledge checkout's 'main'. See
+# install-knowledge-main-guard for the why. Override: git commit --no-verify.
+branch="\$(git symbolic-ref --short -q HEAD || true)"
+if [ "\$branch" = "main" ]; then
+  echo "" >&2
+  echo "BLOCKED: refusing a direct commit to the shared knowledge checkout's 'main' (ARCH-395)." >&2
+  echo "  This checkout is shared across every product; a commit left on local main is" >&2
+  echo "  invisible until pushed and forces the next co to adjudicate it." >&2
+  echo "" >&2
+  echo "  Work on a branch instead:" >&2
+  echo "    git switch -c <product>/<topic> origin/main" >&2
+  echo "    # make your commit, then:" >&2
+  echo "    git push -u origin <product>/<topic> && gh pr create --base main" >&2
+  echo "" >&2
+  echo "  (kb apply is unaffected — it commits from a detached worktree." >&2
+  echo "   Truly need a direct commit? git commit --no-verify.)" >&2
+  echo "" >&2
+  exit 1
+fi
+exit 0
+EOF
+chmod +x "$hook"
+echo "  ✓ $hook (knowledge-main-guard)"

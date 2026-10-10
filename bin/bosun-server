@@ -1,0 +1,53 @@
+#!/usr/bin/env python3.11
+"""bosun-server — run the Bosun's session-registration listeners by hand.
+
+Starts two listeners in one process: the mTLS registration listener
+Individuators register against (platform/decisions/0092), and the plain
+loopback operator listener `agentctl bosun revoke-machine` calls. There is
+no launchd job for this yet — deployment waits on the Library issuing
+the macstudio's server certificate (0092 decision #6) — so this is for running the
+service by hand during development only.
+
+Refuses to start, naming why, when the TLS preflight fails: see
+`bosun_registration.build_server_ssl_context` and `PreflightError`.
+"""
+from __future__ import annotations
+
+import sys
+import threading
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import bosun_registration as BRG  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        ssl_context = BRG.build_server_ssl_context()
+    except BRG.PreflightError as exc:
+        print(f"bosun-server: refusing to start — {exc}", file=sys.stderr)
+        return 1
+
+    registration = BRG.RegistrationServer(
+        (BRG.REGISTRATION_HOST, BRG.REGISTRATION_PORT), ssl_context)
+    operator = BRG.OperatorServer((BRG.OPERATOR_HOST, BRG.OPERATOR_PORT))
+
+    print(f"bosun-server: registration (mTLS) on "
+          f"{BRG.REGISTRATION_HOST}:{BRG.REGISTRATION_PORT}", file=sys.stderr)
+    print(f"bosun-server: operator (loopback) on "
+          f"{BRG.OPERATOR_HOST}:{BRG.OPERATOR_PORT}", file=sys.stderr)
+
+    op_thread = threading.Thread(target=operator.serve_forever, daemon=True)
+    op_thread.start()
+    try:
+        registration.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        registration.shutdown()
+        operator.shutdown()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

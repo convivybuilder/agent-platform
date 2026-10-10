@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.model-scorecard-weekly</string>
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of model-scorecard, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes model-scorecard interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH.
+
+         Recovered from ~/Library/LaunchAgents/com.convivy.model-scorecard-weekly.plist
+         (48b8a7a found only com.convivy.model-scorecard.plist in this repo; this job's
+         definition existed nowhere else, not committed here and not in any other
+         repo). Distinct job from com.convivy.model-scorecard: this one runs the
+         Monday rollup, posting the judged writeup, not the daily scan. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/model-scorecard</string>
+        <string>--days</string>
+        <string>14</string>
+        <string>--rollup</string>
+        <string>--post</string>
+        <string>--judge</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>8</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/model-scorecard-weekly.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/model-scorecard-weekly.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

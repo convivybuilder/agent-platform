@@ -1,0 +1,188 @@
+#!/usr/bin/env python3.11
+"""Post a release note to the team site.
+
+WHY THIS EXISTS.
+
+`/products/release-notes` has rendered `release_note` signals since ARCH-360
+item 5b, and it works. Nothing has ever fed it. Measured 2026-07-26, the store
+held exactly ONE such signal: a smoke test from 2026-07-18 whose body is
+`## Test note\\n- delete me (item-5b smoke)`.
+
+Meanwhile vivy cuts releases regularly — five tags between 2026-07-23 and
+2026-07-26 — and `scripts/cut_release.sh` drafts a note from the PRs in
+`prev_tag..new_tag` via `claude -p`. So every real release note ever written went
+to a channel the operator stopped reading on 2026-07-21, while the surface built to hold
+them stayed empty.
+
+This is the same shape as the changelog (ARCH-411), and it takes the same fix: a
+tool that writes the note as a signal, feeding the site. `post-changelog` is the
+sibling; this deliberately mirrors it rather than inventing a second set of
+conventions, and it matches the page's own capture form field for field so a note
+written here and one typed into the form are the same object.
+
+ONE IMPLEMENTATION, NOT ONE PER PRODUCT. Only vivy has a release script today.
+Putting the behaviour here means the next product to grow one calls this instead
+of copying a second copy that then drifts — the ARCH-340 lesson applied before
+the copies exist.
+
+FAIL-SAFE. A signal failure is a non-zero exit the caller sees, because a release
+ceremony must not report success on a note that never landed.
+
+Usage:
+    post-release-note --product vivy --version release-2026-07-26 "…"
+    post-release-note --product vivy --version release-2026-07-26 --file notes.md
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import pathlib
+import re
+import sys
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                pathlib.Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "signal_client.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+import signal_client as SC  # noqa: E402
+
+# `kind` IS the page's query — release_notes_build.live_html filters on it alone,
+# so a wrong value here renders nowhere. `source` is not filtered; it matches what
+# the page's own capture form sends, which is what keeps a note written by this
+# tool indistinguishable from one typed into the form.
+_KIND = "release_note"
+_SOURCE = "release-notes"
+
+# The version heads the card, so it has to be a version and not a sentence. A
+# release tag (`release-2026-07-26`, `release-2026-07-26-2`) or a plain semver
+# both pass; a paragraph does not. It also forms half the dedup key and a path
+# segment of refs.url, so the charset excludes `/`, `:`, `%` and every HTML
+# special character.
+#
+# The same gate applies to `product`, which reaches the SAME url and the same key
+# and was previously ungated — an asymmetry with no reason behind it (security
+# review, #251). Both renderers escape the url today, so this closes a
+# malformed-data path rather than a live injection.
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+_MAX_BODY = 100_000            # mirrors the store's MAX_TEXT
+
+
+def _read_message(args) -> str:
+    if args.file:
+        return pathlib.Path(args.file).read_text(encoding="utf-8")
+    if args.message:
+        return args.message
+    raise SystemExit("post-release-note: pass the note as an argument or via --file")
+
+
+def _post_signal(product: str, version: str, message: str) -> str:
+    """Write the note as a `release_note` signal. This is the deliverable."""
+    payload = {
+        "product": product,
+        "kind": _KIND,
+        "source": _SOURCE,
+        # Who cut the release. The store requires an actor; a release cut by a
+        # human at a terminal has no agent name, so fall back to the product.
+        "actor": os.environ.get("AGENTCTL_AGENT_NAME") or f"{product}-release",
+        # The page heads each card with the stream, so this IS the version.
+        "stream": version,
+        "body": message[:_MAX_BODY],
+        # The page orders on produced_at first and the store leaves it NULL when
+        # the payload omits it, so a note without this sorts behind every note
+        # that has one. post-changelog learned this the same way.
+        "produced_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        # A release is cut once per version per product, so that pair is the
+        # identity. The prefix is the one the page's own "Write a release note"
+        # form already sends, so the two paths dedup against EACH OTHER: a note
+        # written here and then re-typed into the form is one row, not two. A
+        # near-miss prefix would have looked idempotent in every test here while
+        # silently doubling any note that took both routes, and the store IGNORES
+        # a collision rather than updating, so the second row could not be
+        # repaired by re-posting — only by deleting it (code review, #251).
+        "dedup_key": f"{_KIND}:{product}:{version}",
+        # Attributable to the tag it describes, in the shape the rest of the
+        # store uses. post-changelog shipped WITHOUT refs and the omission made
+        # its entries unmatchable to their merges (ARCH-411) — the same mistake
+        # here would make a note unattributable to its release.
+        "refs": {"version": version,
+                 "url": f"https://github.com/convivy/{product}/releases/tag/{version}"},
+    }
+    # The delivery budget, not the tee's 2s: this runs once per release and cares
+    # that the write lands, which is exactly what _DELIVERY_TIMEOUT is for.
+    return SC.post_signal(payload, timeout=SC._DELIVERY_TIMEOUT)
+
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Adding or removing a CLI flag here requires sweeping the callers in
+    # every product that invokes this tool (bin/check-cli-contracts enforces
+    # the contract cross-repo). Update _TOOL_CALLERS there and drop/add the
+    # flag in each caller.
+    ap = argparse.ArgumentParser(prog="post-release-note", description=__doc__)
+    ap.add_argument("message", nargs="?", help="the note text (Markdown)")
+    ap.add_argument("--product", required=True, help="product/repo name, e.g. vivy")
+    ap.add_argument("--version", required=True,
+                    help="the release tag or version, e.g. release-2026-07-26")
+    ap.add_argument("--file", help="read the note from this UTF-8 file instead")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    version = args.version.strip()
+    if not _TOKEN_RE.match(version):
+        raise SystemExit(
+            f"post-release-note: {version!r} does not look like a version. It heads "
+            f"the card on the site and is half the idempotency key, so it must be a "
+            f"tag or version string, not prose.")
+    product = args.product.strip()
+    if not _TOKEN_RE.match(product):
+        raise SystemExit(
+            f"post-release-note: {product!r} does not look like a product name. It is "
+            f"the other half of the idempotency key and a path segment of the release "
+            f"URL, so it must be a repo name.")
+
+    message = _read_message(args).strip()
+    if not message:
+        raise SystemExit("post-release-note: refusing to post an empty note")
+
+    sig = _post_signal(product, version, message)
+    print(f"post-release-note: signal {sig}")
+    if sig == "duplicate":
+        # The store is first-write-wins IGNORE, and this key is deliberately
+        # shared with the page's capture form so the two paths cannot double a
+        # note. The cost of sharing it is that a note already submitted through
+        # the form for this version OWNS the key: this call then writes nothing,
+        # and the site shows that note rather than the one the ceremony drafted.
+        # Exiting 0 silently made the ceremony report success over the wrong
+        # content (security review, #251).
+        #
+        # Still 0, not 1: re-running a release ceremony is legitimate — the
+        # script's steps are individually y/N and get retried — so failing here
+        # would break a valid retry. The operator gets a loud, specific warning
+        # instead, and it goes to stderr so a pipeline log shows it even when
+        # stdout is discarded.
+        print(f"post-release-note: WARNING — a note for {product} {version} "
+              f"already exists and was NOT replaced. If this ceremony drafted new "
+              f"content, the site still shows the earlier note; check "
+              f"/products/release-notes before calling the release done.",
+              file=sys.stderr)
+        return 0
+    if sig.startswith("error"):
+        # Say so loudly rather than let a release ceremony report success on a
+        # note that never reached the site.
+        print("post-release-note: the note did NOT reach the team site.", file=sys.stderr)
+        return 1
+    if sig == "skip":
+        print("post-release-note: no ops token — the note did NOT reach the team site.",
+              file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

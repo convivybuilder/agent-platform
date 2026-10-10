@@ -1,0 +1,5 @@
+[
+  {"consumer": "agentctl", "entry": "litellm-agentctl-virtual-key"},
+  {"consumer": "co", "entry": "litellm-co-virtual-key"},
+  {"consumer": "opencode", "entry": "litellm-opencode-virtual-key"}
+]

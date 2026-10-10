@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Print the issues the overnight drain may take for a product (ARCH-361 Part B).
+
+The triage stage used to decide this in its prompt: "list open issues, claim
+each". That misses an issue whose claim expired while its branch lived on, which
+is how the overnight opened convivy/vivy #971 for work a daytime co already had
+in hand on #944. ARCH-311 is the standing lesson that a prompt-driven step
+feeding a deterministic consumer fails silently, so the decision moved into code
+(lib/agent-platform/issue_gate.py) and this prints its result.
+
+Usage:
+    issue-eligible --product vivy              # one issue id per line
+    issue-eligible --product vivy --json       # ids + titles + types
+    issue-eligible --product vivy --explain    # + why each skipped issue was skipped
+
+Exit status is 0 whenever the gate ran, including when nothing is eligible — an
+empty queue is a normal night, not a failure. A non-zero status means the gate
+itself could not run, which a caller must not read as "nothing to do".
+
+That distinction is the point, so the queue read RAISES on failure rather than
+returning an empty list: an unreachable API would otherwise be indistinguishable
+from an empty queue, and the night would report a clean run while blind.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import issue_gate  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    p.add_argument("--product", required=True, help="product slug, e.g. vivy")
+    p.add_argument("--json", action="store_true", dest="as_json",
+                   help="emit a JSON object instead of bare ids")
+    p.add_argument("--explain", action="store_true",
+                   help="also report each skipped issue and why (to stderr, or in --json)")
+    args = p.parse_args(argv)
+
+    try:
+        eligible, skipped = issue_gate.eligible_issues(args.product)
+    except issue_gate.issue_client.IssueQueueUnavailable as e:
+        # UNKNOWN, not empty. Exiting 0 here would tell the caller the queue is
+        # clear while we cannot see it at all.
+        print(f"issue-eligible: cannot read the issue queue for {args.product}: {e}",
+              file=sys.stderr)
+        return 1
+    except Exception as e:  # the gate could not run at all
+        print(f"issue-eligible: gate failed for {args.product}: {e}", file=sys.stderr)
+        return 1
+
+    if args.as_json:
+        payload = {
+            "product": args.product,
+            "eligible": [{"id": i["id"], "title": i.get("title", ""),
+                          "type": i.get("type", "")} for i in eligible],
+        }
+        if args.explain:
+            payload["skipped"] = [{"id": i["id"], "title": i.get("title", ""), "reason": r}
+                                  for i, r in skipped]
+        print(json.dumps(payload, indent=2))
+    else:
+        for item in eligible:
+            print(item["id"])
+        if args.explain:
+            for item, reason in skipped:
+                print(f"skipped {item['id']}: {reason}", file=sys.stderr)
+
+    # A silent cap reads as "covered everything" when it didn't, so always say
+    # how many were held back even when nobody asked for the detail.
+    if skipped and not args.explain:
+        print(f"issue-eligible: {len(skipped)} issue(s) held back as already in flight; "
+              f"re-run with --explain for the reasons", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

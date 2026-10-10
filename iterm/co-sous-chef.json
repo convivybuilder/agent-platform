@@ -1,0 +1,59 @@
+{
+  "Profiles": [
+    {
+      "Name": "co-sous-chef",
+      "Guid": "co-sous-chef-2026-05-28",
+      "Dynamic Profile Parent Name": "Default",
+      "Semantic History": {
+        "action": "raw command",
+        "text": "$HOME/bin/open-md-link \\1 \\2"
+      },
+      "Background Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.949,
+        "Green Component": 0.922,
+        "Blue Component": 0.851,
+        "Alpha Component": 1.0
+      },
+      "Foreground Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.122,
+        "Green Component": 0.102,
+        "Blue Component": 0.078,
+        "Alpha Component": 1.0
+      },
+      "Cursor Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.851,
+        "Green Component": 0.549,
+        "Blue Component": 0.122,
+        "Alpha Component": 1.0
+      },
+      "Selection Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.984,
+        "Green Component": 0.882,
+        "Blue Component": 0.749,
+        "Alpha Component": 1.0
+      },
+      "Tab Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.851,
+        "Green Component": 0.549,
+        "Blue Component": 0.122,
+        "Alpha Component": 1.0
+      },
+      "Use Tab Color": true,
+      "Badge Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.851,
+        "Green Component": 0.549,
+        "Blue Component": 0.122,
+        "Alpha Component": 0.25
+      },
+      "Badge Text": "sous-chef",
+      "Badge Max Width": 0.2,
+      "Badge Max Height": 0.04
+    }
+  ]
+}

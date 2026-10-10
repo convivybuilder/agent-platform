@@ -1,0 +1,864 @@
+#!/usr/bin/env python3.11
+"""Drain the in-box issue queue across the whole fleet, unattended.
+
+WHY THIS EXISTS.
+
+The queue at /issues is product-agnostic, but nothing drained it automatically.
+`issue-drain` is the only drain mechanism and it is a DAYTIME COST-SHIFT WRAPPER
+(ARCH-075): its terminal move is `exec co planning-orchestrator`, an interactive
+session, and it validates `case $product in constance|vivy|sous-chef`. So five of
+the products with open issues could not be drained even by hand, and none could
+be drained on a schedule — looping an interactive co from launchd would open one
+session per product. Measured 2026-07-26: 32 open issues across 11 products, of
+which the overnight reaches four. Half the issues filed had no reader at all.
+
+This is the unattended half. `issue-drain` keeps its job (a human running a
+daytime drain against one product); this command runs nightly across everything.
+
+WHAT IT DISPATCHES. One `planning-orchestrator` per product, non-interactively,
+carrying the same end-to-end brief `issue-drain` gives it: claim -> bug-fixer ->
+publish -> pr-open -> link_pr -> reviewer + security-reviewer -> auto-cycle ->
+record the outcome back on the issue. The orchestration lives in the agent, as it
+already does for the overnight; this command decides only WHICH products get one
+and refuses the ones it cannot dispatch safely.
+
+WHY state="claimable", NOT state="open". A claim is how a session says "I hold
+this" so a drain skips it, and ARCH-361 Part B gave claims a 24h TTL precisely so
+a session that dies cannot strand an issue out of the queue forever. The store
+exposes that as the pseudo-state `claimable` — open, plus claimed-whose-claim-has-
+expired — computed server-side so the TTL lives in one place. `issue-drain`'s
+prompt predates all of it and still asks for `state="open"`, which means a run
+that dies mid-flight loses every issue it had claimed: the next run cannot see
+them. issue_api.py names this exact failure in a comment. Querying `claimable` is
+what makes an interrupted pass safe to re-run, which matters most here, because
+this is the caller that runs unattended with nobody watching it die.
+
+NO CHECKOUT GUARD. This drain dispatches exactly one agent: `planning-orchestrator`
+(see `_ORCHESTRATOR`). `planning-orchestrator` is in `_DEDICATED_WORKTREE_WORKERS`,
+so it runs in its own per-task worktree (ARCH-391, 2026-07-29) and never touches the
+primary checkout. Workers have always been safe: allocate_worktree cuts their trees
+from the local main ref regardless of the primary's state. Issue claims are atomic
+server-side (409 on one already taken), so two drains cannot work the same issue.
+Write-class workers get dedicated worktrees whose name collisions produce a
+WorktreeBusy refusal rather than a race. Because the one agent this drain dispatches
+is worktree-class, no checkout guard is needed for this path and none is run.
+
+WHAT IT COSTS, AND WHY IT IS UNBOUNDED ANYWAY. A product's drain spawns a
+bug-fixer plus two reviewers PER ISSUE, so a pass over the whole queue is a large
+and open-ended spend. That cost is real and unchanged; what changed is the answer
+to it.
+
+This shipped bounded at 3 products x 3 issues, which caps an unattended night at
+nine issues. Against 11 products and a queue that grows every time a reviewer
+files a finding, that does not converge — it is a nightly nibble, and the backlog
+outruns it. The operator's call (2026-07-27) is that the nightly clears the queue, so
+`--max-products` and `--max-issues` default to 0, meaning every product and every
+claimable issue.
+
+The bounds still work; they are now OPT-IN rather than the operating norm. Pass a
+number to cap a pass — useful when headroom is short, which is a judgement about
+the moment rather than a standing policy. Nothing is lost by stopping early,
+because `claimable` re-derives the work from the store on every run.
+
+Usage:
+    issue-queue-drain                     # the scheduled pass: everything
+    issue-queue-drain --dry-run           # list the plan, dispatch nothing
+    issue-queue-drain --product selector  # one product, still guarded
+    issue-queue-drain --type bug          # one class of issue
+    issue-queue-drain --max-products 3    # bound a pass when headroom is short
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+
+# Every other scheduled dispatcher (e.g. launch-weekly-curation) is a shell
+# launcher that exports AGENT_RUN_ORIGIN
+# before invoking the Python program, so the budget gate's CAPPED_ORIGINS check
+# (ARCH-156) applies to what it spawns. This command has no launcher — the plist
+# invokes it directly — so it must set its own default here, or every run
+# (including a hand-run for testing, which is autonomous work same as a
+# scheduled one) falls to telemetry.DEFAULT_ORIGIN ("interactive") and the
+# budget cap never applies to it.
+#
+# UNCONDITIONAL, not setdefault, and the difference is the whole control.
+# AGENT_RUN_ORIGIN is self-asserted and unauthenticated (ADR 0058), and
+# `launchctl setenv AGENT_RUN_ORIGIN interactive` — runnable by any process
+# under this account, including an autonomous agent holding Bash, which is
+# exactly the actor this cap exists to constrain — persists into every
+# launchd-started process until it is unset or the machine reboots. A
+# setdefault yields to that value, so the next 03:30 run would stamp
+# `interactive`, write an otherwise ordinary meta.json, and be silently
+# uncapped again with nothing to signal it. The three sibling launchers all
+# `export` unconditionally for this reason; this line matches them.
+os.environ["AGENT_RUN_ORIGIN"] = "scheduled"
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                pathlib.Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "decision_client.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+import agent_policy as AP  # noqa: E402
+import decision_client as DC  # noqa: E402
+import issue_gate  # noqa: E402
+import registry as R  # noqa: E402
+import signal_client as SC  # noqa: E402
+import vault_plane  # noqa: E402
+from worktrees import is_dispatch_target  # noqa: E402
+import builder_root as BR  # noqa: E402
+
+AGENTCTL = pathlib.Path.home() / ".local" / "bin" / "agentctl"
+
+# The knowledge repository whose origin/main holds the policy file, read for the
+# review-round cap the brief states (the operator raised it 5 -> 7, 2026-10-01,
+# sig_01M3W9600TWE8SVKQNXX6G282A). Same source and the same constant name as
+# `registry.KNOWLEDGE_REPO`, so a test points both at one fixture the same way.
+KNOWLEDGE_REPO = BR.data_root() / "knowledge"
+
+
+# The store's list endpoint caps a response at this many rows.
+_API_PAGE_CAP = 200
+
+# The queue's issue types (the Library's ITEM_TYPES). Used only to reject a
+# mistyped --type at the CLI, loudly: a typo silently matching nothing would
+# drain zero issues and report a clean pass, which is the failure mode this
+# command was written to stop producing.
+_ISSUE_TYPES = {"bug", "nit", "improvement", "task", "epic"}
+
+# Where `planning-orchestrator` is read from, for EVERY product.
+#
+# The six repo-local crews (hollis, selector, convivy-deck, convivy-services,
+# convivy-app-kit, selector-backend) are agentctl's LOCAL_AGENT_REPOS: they
+# resolve agents from their own `.claude/agents/`, and not one defines a
+# `planning-orchestrator` — their crews are prefixed (sel-*, hollis-*, deck-*,
+# svc-*) and selector-backend's directory is empty. Verified 2026-07-26. This is
+# the identical trap changelog-drain hit, where it failed 40 of 88 merges; the
+# fix is identical too, because `--agents-dir` makes agentctl treat the agent as
+# directory-resolved, reading the definition off disk AND skipping knowledge-ctx
+# profile activation (selector-backend has no profile mapping, so activation
+# would fail before the agent ever ran).
+#
+# Passed for every product rather than only the broken ones, so this command does
+# not carry its own copy of LOCAL_AGENT_REPOS to drift against agentctl's.
+# The donors are individuated copies of the same indexed agent agentctl would
+# otherwise resolve, so this is a cache rather than a second source of truth.
+_ORCHESTRATOR_DONORS = ("vivy", "constance", "sous-chef")
+_ORCHESTRATOR = "planning-orchestrator"
+
+
+def _agents_dir() -> pathlib.Path | None:
+    """The directory to resolve the orchestrator from, or None if no donor exists."""
+    for repo in _ORCHESTRATOR_DONORS:
+        d = BR.root() / repo / ".claude" / "agents"
+        if (d / f"{_ORCHESTRATOR}.md").is_file():
+            return d
+    return None
+
+
+# A product name that could not be a repo directory. Enforced at INGEST rather
+# than at dispatch, because the drain touches the name before agentctl's own
+# gate ever sees it (security review, #254):
+#
+#   * `is_dispatch_target` builds a path from it, and pathlib resolves `..`
+#     through the OS — `../sibling-repo` would test a repo outside <root>.
+#
+# So the drain owns this name and must sanitize it. Same discipline agentctl
+# already applies to `--pr` for the same reason (it strips to ASCII digits
+# because the value lands in a path and a git ref). The pattern matches
+# worktrees._SAFE_SEGMENT, with a leading-dot exclusion so `.` and `..` cannot
+# match at all rather than being special-cased afterwards.
+_SAFE_PRODUCT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _dispatchable(product: str) -> bool:
+    """`agentctl spawn --on <product>` needs a primary checkout (ARCH-391).
+
+    Delegates to the platform's own `is_dispatch_target` rather than re-testing
+    for a `.git` path: that function IS agentctl's dispatch test asked as a
+    question, so answering it here any other way would let this command disagree
+    with what dispatch actually does.
+    """
+    return is_dispatch_target(product)
+
+
+
+def _get(path: str, params: dict) -> list[dict]:
+    """One read against the control store. Raises on failure — a drain that cannot
+    READ must not report a clean pass over work it never saw."""
+    tok = SC.token()
+    if not tok:
+        raise SystemExit("issue-queue-drain: no ops token; cannot read the queue")
+    url = vault_plane.url(f"{path}?{urllib.parse.urlencode(params)}")
+    req = urllib.request.Request(url, headers=vault_plane.headers(token=tok))
+    with urllib.request.urlopen(req, timeout=SC._DELIVERY_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8")).get("items", [])
+
+
+_SUPERVISOR_SLOT_POLL_SECONDS = 60
+_SUPERVISOR_SLOT_TIMEOUT_SECONDS = 4 * 3600
+
+
+def _wait_for_supervisor_slot(
+    *, poll: int = _SUPERVISOR_SLOT_POLL_SECONDS,
+    timeout: int = _SUPERVISOR_SLOT_TIMEOUT_SECONDS,
+) -> bool:
+    """Block until the registry will admit another supervisor. True when a slot
+    opened, False on timeout.
+
+    Asks the registry rather than counting runs here, so the cap lives in exactly
+    one place and this cannot drift from it (ARCH-422).
+
+    The timeout is a backstop, not a schedule. A product's drain can legitimately
+    run for hours — the agent-platform orchestrator ran 2h14m on 2026-07-29 — so a
+    short timeout would drop products that were only ever waiting their turn. Four
+    hours from the 01:00 start still lands before the 05:00 healthcheck, and a
+    timeout is REPORTED by the caller rather than swallowed, because a product
+    silently missing from a night reads as an empty queue.
+
+    Uses time.monotonic so a clock change mid-wait cannot make this return early or
+    hang: this runs unattended overnight, across the DST boundary twice a year.
+    """
+    deadline = time.monotonic() + timeout
+    announced = False
+    while True:
+        ok, _current, reason = R.can_spawn(None, _ORCHESTRATOR)
+        if ok:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if not announced:
+            print(f"issue-queue-drain: waiting for a supervisor slot — {reason}",
+                  flush=True)
+            announced = True
+        time.sleep(poll)
+
+
+def _claimable(types: set[str] | None = None) -> tuple[dict[str, list[dict]], list[str]]:
+    """Claimable issues grouped by product, plus warnings worth surfacing.
+
+    `types` narrows to those issue types. Filtered HERE rather than server-side so
+    the count of what was excluded is available to report: a type filter that
+    silently shrinks the queue is the same failure as a queue with no consumer,
+    which is the thing this command exists to have caught.
+    """
+    warnings = []
+    items = _get("/api/issues", {"state": "claimable"})
+    if len(items) >= _API_PAGE_CAP:
+        # Unlike changelog-drain's entries read, a truncated page here cannot
+        # cause duplicate work — the orchestrator claims each issue atomically, so
+        # anything this pass does not see is simply picked up next pass. Warn.
+        warnings.append(
+            f"the queue query returned the {_API_PAGE_CAP}-row cap — this pass sees "
+            f"a prefix; the rest are picked up next pass")
+    by_product: dict[str, list[dict]] = defaultdict(list)
+    rejected = []
+    excluded_by_type = 0
+    for it in items:
+        if types is not None and (it.get("type") or "") not in types:
+            excluded_by_type += 1
+            continue
+        product = it.get("product") or ""
+        if not product:
+            continue
+        if not _SAFE_PRODUCT.match(product):
+            # Named, not silently dropped. A rejected row is either an attack or
+            # a data defect, and both need a human to see WHICH issue carried it.
+            rejected.append(f"{it.get('id') or '?'} ({product!r})")
+            continue
+        by_product[product].append(it)
+    if rejected:
+        warnings.append(
+            f"dropped {len(rejected)} issue(s) whose product name is not a valid "
+            f"repo directory: {', '.join(rejected)}")
+    if excluded_by_type:
+        warnings.append(
+            f"excluded {excluded_by_type} claimable issue(s) by --type "
+            f"({','.join(sorted(types or ()))}); they remain in the queue")
+
+    # THE IN-FLIGHT GATE (ARCH-418). `claimable` answers only the CLAIM question —
+    # open, plus claims whose TTL expired. It knows nothing about branches or PRs,
+    # so an issue whose claim lapsed while its PR stayed open reads as claimable
+    # and a drain would dispatch a worker to redo work already in review. That is
+    # not hypothetical: it is how the overnight opened convivy/vivy #971 for work a
+    # daytime session already had in hand on #944, and it is why issue_gate exists
+    # (ARCH-311 moved the decision out of a prompt and into code).
+    #
+    # This gate previously lived only on launch-overnight's per-product path. That
+    # path is being disconnected in favour of this queue-wide drain, so the gate
+    # has to come across with it — otherwise consolidating would trade four
+    # products' coverage for a duplicate-work regression across eleven.
+    #
+    # Per product, because the branch scan is a per-repo GitHub API call. eligible_issues
+    # already fails CLOSED on a scan failure (it returns everything as skipped), so
+    # an unreachable API costs a product one quiet night instead of a duplicate
+    # PR — but it must be LOUD here, or a product silently drops out of the drain
+    # and looks like an empty queue.
+    gated: dict[str, list[dict]] = {}
+    for product, group in by_product.items():
+        group = _authorized(group, product, warnings)
+        if not group:
+            continue
+        eligible, skipped = issue_gate.eligible_issues(product, items=group)
+        if eligible:
+            gated[product] = eligible
+        for item, reason in skipped:
+            warnings.append(
+                f"{product}: holding back {item.get('id') or '?'} — {reason}")
+    return gated, warnings
+
+
+def _resolve_decision(decision_id: str) -> tuple[str, str]:
+    """Fetch a feature-gate decision; return (state, directive).
+
+    Returns ("error", "") on any failure — fails closed. An authorization gate
+    that cannot resolve a decision must hold the issue back, not pass it through.
+    """
+    if not decision_id:
+        return ("error", "")
+    result = DC.get_decision(decision_id)
+    if result["status"] != "ok" or result["item"] is None:
+        return ("error", "")
+    item = result["item"]
+    state = (item.get("state") or "").strip()
+    directive = (item.get("directive") or "").strip()
+    return (state, directive)
+
+
+def _authorized(items: list[dict], product: str, warnings: list[str]) -> list[dict]:
+    """Drop `feature` issues nobody authorized (ARCH-403 Tier 1.2, carried here by
+    ARCH-418).
+
+    A feature the operator files himself IS the authorization — the plane's successor to his
+    🚀 on a Slack message — and the store records that as `created_by_kind ==
+    "human"`. An agent-filed feature is a PROPOSAL: it must reach him as a
+    feature-gate decision, and must never be built by a drain.
+
+    An agent-filed feature WITH an approved or redirected feature-gate decision IS
+    authorized. Both states allow the issue through: `approved` means build as
+    proposed; `redirected` means build per the operator's directive (which supersedes the
+    original proposal and must reach the orchestrator brief verbatim). Any other
+    state — pending, denied, error, or unresolvable — holds the issue back. This
+    gate fails CLOSED: a decision lookup failure is NOT an authorization.
+
+    This gate previously existed only in overnight-triage's prompt, which acted on
+    human-filed features alone. That prompt is no longer in the loop, and this
+    command's orchestrator brief says "work every claimable issue" — so without
+    this filter the nightly drain would auto-build every feature an agent proposed.
+    That is the authorization gate failing open, unattended, which is worse than
+    any duplicate-work case.
+
+    In CODE rather than in the brief, for the reason ARCH-311 records: a
+    prompt-driven gate feeding a deterministic consumer fails silently overnight.
+
+    Absent `created_by_kind` reads as "agent", matching the store's own default —
+    an unknown author is NOT an authorization, and this and the API must agree on
+    that or a deploy skew would flip the gate open.
+    """
+    out = []
+    for it in items:
+        if (it.get("type") or "") != "feature":
+            out.append(it)
+            continue
+        if (it.get("created_by_kind") or "agent") == "human":
+            out.append(it)
+            continue
+        # Agent-filed feature: pass only when a feature-gate decision authorizes it.
+        #
+        # The API nests decision_id under refs — the top-level read is a fallback
+        # for a future API shape that promotes the field (issue
+        # 01KYRB2J6SHDC7CSGQV6QJQQG6 — the MCP tools already hoist it, which made this bug
+        # invisible when testing through the tool).
+        refs = it.get("refs") or {}
+        decision_id = (it.get("decision_id")
+                       or (refs.get("decision_id") if isinstance(refs, dict) else "")
+                       or "").strip()
+        if decision_id:
+            state, directive = _resolve_decision(decision_id)
+            if state in ("approved", "redirected"):
+                cleared = dict(it)
+                cleared["_feature_gate_cleared"] = state
+                if directive:
+                    cleared["_feature_gate_directive"] = directive
+                out.append(cleared)
+                continue
+            if state == "error":
+                warnings.append(
+                    f"{product}: holding back {it.get('id') or '?'} — "
+                    f"feature-gate decision {decision_id!r} could not be resolved "
+                    f"(lookup failure); re-checked on the next pass")
+            else:
+                warnings.append(
+                    f"{product}: holding back {it.get('id') or '?'} — "
+                    f"feature-gate decision {decision_id!r} is {state!r}, "
+                    f"not yet approved or redirected")
+            continue
+        warnings.append(
+            f"{product}: holding back {it.get('id') or '?'} — an agent-filed feature "
+            f"is a proposal, not authorized work; it needs a feature-gate decision")
+    return out
+
+
+def _operator_watch() -> list[str]:
+    """Surface every `needs=operator` issue, oldest first, on every pass.
+
+    WHY THIS RUNS HERE rather than as its own scheduled job. `operator` issues are
+    excluded from `claimable` by design, so no drain ever sees one and nothing
+    revisits them — that exclusion is the whole point of the field and also its
+    failure mode. This command already runs nightly with the queue in hand, so the
+    re-read costs one extra API call and inherits the cadence for free.
+
+    WHY THE ASYMMETRY MAKES THIS WORTH DOING. Mis-filing agent-possible work as
+    `agent` is loud: a drain claims it, fails, and someone re-files it (that is how
+    issue_01KYN163D85VMWHF66JXAFAEP0 got corrected). Mis-filing it as `operator` is
+    silent: no drain sees it, no failure fires, and the item waits on a human who is
+    waiting on the queue. issue_01KYGK70A6Y9GFHE8P0DJZ3KJA sat that way for two days
+    — declined because the work "needs an operator action in the Render dashboard",
+    which was true of the dashboard and false of the Render API an agent already had
+    a key for.
+
+    WHY IT DOES NOT TRY TO CLASSIFY. The first version of this scanned each body for
+    venue words ("dashboard", "console") absent capability words ("credential",
+    "no agent"), and flagged the mismatch as probably-misclassified. It was tested
+    against the live queue and did not flag the one item known to be wrong:
+    issue_01KYQ44ZYB4DA5B7YYNJWGEPTT says "requires the Render dashboard, which no
+    agent can reach", and "no agent" reads as a capability claim even though the
+    claim is false — the platform holds a Render API key that can do it.
+
+    Telling a true "no agent can reach this" from a false one is semantic, not
+    lexical, so the heuristic silently passed exactly the case it was written for.
+    A check that misses its motivating example while looking like a check is worse
+    than no check: it converts an unknown into a false all-clear. It was removed rather than tuned, because any lexical version has the
+    same shape.
+
+    What is left is the thing that actually carries signal — these items exist, here
+    they are, and here is how long each has waited. Age is the honest proxy: an
+    operator issue open for weeks is worth re-reading whatever its wording, and a
+    human or a later pass can judge what a regex cannot.
+    """
+    out: list[str] = []
+    try:
+        items = _get("/api/issues", {"state": "open", "needs": "operator"})
+    except Exception as exc:  # noqa: BLE001 — a watch must never fail the drain
+        return [f"could not read the operator queue ({exc}); "
+                f"nothing on it was surfaced this pass"]
+    if not items:
+        return out
+
+    def _age_days(it: dict) -> float:
+        # TypeError as well as ValueError. A timestamp with no timezone designator
+        # ("2026-07-01T00:00:00") parses FINE and yields a naive datetime; the
+        # subtraction from an aware `now()` is what raises, one line later. Catching
+        # only the parse error would let that escape through `items.sort()` and take
+        # down the drain this watch rides on — the one thing it must never do.
+        raw = (it.get("created_at") or "").replace("Z", "+00:00")
+        try:
+            return (dt.datetime.now(dt.timezone.utc)
+                    - dt.datetime.fromisoformat(raw)).total_seconds() / 86400
+        except (ValueError, TypeError):
+            return -1.0
+
+    items.sort(key=_age_days, reverse=True)
+    out.append(f"{len(items)} issue(s) waiting on a human (needs=operator), excluded "
+               f"from this drain by design — re-read each against what an agent can "
+               f"actually reach, and re-file as `agent` or `either` if nothing "
+               f"specific is missing:")
+    for it in items:
+        age = _age_days(it)
+        age_s = f"{age:.0f}d" if age >= 0 else "  ?"
+        out.append(f"  {age_s:>4}  {it.get('id')} [{it.get('product')}] "
+                   f"{(it.get('title') or '')[:84]}")
+    return out
+
+
+def _review_round_cap() -> str:
+    """The review-round cap sentence to state in the brief: `review_rounds_code` and
+    `review_rounds_per_role` from the policy file at the knowledge repo's freshly
+    fetched origin/main, with the fallbacks when the file is missing, unreadable or
+    breaks a rule. Mirrors `registry.limits`'s read of the same file."""
+    try:
+        policy = AP.load(AP.policy_text_at_origin_main(str(KNOWLEDGE_REPO)))
+    except Exception:  # noqa: BLE001 - any failure here must fall back, not raise
+        policy = AP.Fallback("review-round cap read raised an exception")
+    return AP.review_round_cap_sentence(policy)
+
+
+def _task_for(product: str, count: int, max_issues: int,
+              types: set[str] | None = None,
+              issues: list[dict] | None = None,
+              *, work_dir: pathlib.Path) -> str:
+    """The orchestrator's brief — `issue-drain`'s, with the queue query corrected
+    to `claimable` and an explicit per-run bound.
+
+    `max_issues=0` means drain the whole product queue. The bound sentence has to
+    change with it rather than interpolating a 0: an agent told to "WORK AT MOST 0
+    ISSUES" reasonably does nothing, and the pass would report success having
+    drained nothing at all.
+
+    `issues` carries the authorized-feature list so that any pre-approved or
+    redirected feature issues get named in the brief with their directives. The
+    orchestrator's step 3 defaults to escalating feature/task issues; the
+    AUTHORIZED FEATURES section below is the override for the ones the drain
+    already cleared through the feature gate.
+
+    `work_dir` is the directory the drain created for this dispatch. The orchestrator
+    writes every filer-text file into it, so no file name is predictable in /tmp.
+    """
+    cap_sentence = _review_round_cap()
+    if max_issues:
+        bound = (
+            f"2. WORK AT MOST {max_issues} ISSUES THIS RUN, oldest first. Each issue "
+            f"costs a bug-fixer plus two reviewers, so this bound is what keeps a "
+            f"nightly pass from becoming an open-ended spend. Stop when you reach it; "
+            f"the rest are picked up on the next pass. Do not raise the bound "
+            f"yourself.\n\n")
+    else:
+        bound = (
+            f"2. WORK EVERY CLAIMABLE ISSUE ON THIS PRODUCT, oldest first — there were "
+            f"{count} when this run started. The operator's call (2026-07-27) is that the drain "
+            f"clears the queue rather than nibbling at it, so there is no per-run cap. "
+            f"Do not stop early because the queue looks long, and do not invent a cap "
+            f"of your own. If you genuinely cannot finish one, record its outcome and "
+            f"move to the next; an issue left claimed with no outcome is the one "
+            f"failure this run cannot recover from.\n\n")
+    scope = ""
+    if types:
+        scope = (
+            f"3a. THIS RUN IS SCOPED TO TYPE {'/'.join(sorted(types))}. Issues of any "
+            f"other type are deliberately out of scope for this pass: skip them, leave "
+            f"them in the queue untouched, and do NOT claim them. They are being "
+            f"handled separately.\n\n")
+    # Build the authorized-features override for issues that cleared the gate.
+    # These are agent-filed features with an approved or redirected decision; step
+    # 3 would escalate them, but they must be drained to a fix PR instead.
+    cleared = [
+        (it.get("id", "?"), it.get("title", ""),
+         it.get("_feature_gate_cleared", "approved"),
+         it.get("_feature_gate_directive", ""))
+        for it in (issues or [])
+        if it.get("_feature_gate_cleared")
+    ]
+    if cleared:
+        lines = "\n".join(
+            (f"   - {iid} \"{title}\": redirected — the operator's directive supersedes the "
+             f"original proposal: {directive!r}")
+            if directive
+            else f"   - {iid} \"{title}\": approved — build the original proposal."
+            for iid, title, gate_state, directive in cleared
+        )
+        authorized_section = (
+            "AUTHORIZED FEATURES — EXCEPTION TO STEP 3: The following feature issues "
+            "carry an approved feature-gate decision. Drain them to a fix PR "
+            "(steps 4-9) instead of escalating. The directive, when present, IS the "
+            "spec — build exactly what it says, not the original proposal:\n"
+            + lines + "\n\n")
+    else:
+        authorized_section = ""
+    # The identity this brief checks out, releases and links under. The ops token is shared
+    # by every session, so the Library tells holders apart by this string alone. It names
+    # this dispatch: the product, and the work_dir mkdtemp made unique for it.
+    owner = f"issue-queue-drain:{product}:{work_dir.name}"
+    return (
+        f"Task: Drain the in-box issue queue for {product} end-to-end. The queue is "
+        f"/issues on team.convivy.com (ARCH-359/360), read and updated through the ops "
+        f"MCP tools (mcp__ops__issue_*). This is the unattended nightly drain, so "
+        f"nobody is watching: every issue you touch must end in a recorded state.\n\n"
+        f"1. List the issues to work: mcp__ops__issue_list(product=\"{product}\", "
+        f"state=\"claimable\"). Use state=\"claimable\", NOT \"open\" — claimable is "
+        f"open plus issues whose 24h claim TTL has expired (ARCH-361 Part B), so a "
+        f"previous run that died does not strand its issues out of the queue forever. "
+        f"The queue never returns the operator's \"Won't do\" issues, so you skip those "
+        f"naturally. There were {count} claimable when this run started.\n\n"
+        + bound + scope +
+        # ARCH-361's drain routing existed as documentation ONLY: control_db defines
+        # ISSUE_AUTO_FIX_TYPES, issue_api's module docstring says non-auto-fix types
+        # route to /engineering/decisions, and no code anywhere reads either. Both
+        # drains omitted it, so a `task` would have been auto-fixed. The operator's call
+        # (2026-07-26) is that the documented rule is the right one, so the brief is
+        # where it finally gets implemented.
+        "3. ROUTE ON THE ISSUE'S `type` BEFORE DOING ANYTHING ELSE WITH IT.\n\n"
+        "   - type bug, nit, or improvement -> drain it to a fix PR (steps 4-9 below).\n"
+        "   - type task or feature -> do NOT build it. It needs the operator's scoping call, "
+        "which this unattended run cannot make. Record the blocker durably with "
+        "mcp__ops__signal_log(kind=\"needs-decision\", product=\"" + product + "\", "
+        "body=<what needs deciding, with the scoping work already done>), then "
+        "mcp__ops__issue_comment(issue_id, kind=\"note\", body=<the same summary, "
+        "so it is visible on the issue thread>), then mcp__ops__issue_release("
+        f"issue_id, owner=\"{owner}\") so it goes back to open rather "
+        "than staying claimed. Do NOT call mcp__ops__issue_escalate for this — it "
+        "requires a decision_id and there is no decision queue to raise one into. "
+        "The issue stays open and visible in /issues with your note on it; a "
+        "human pass, not this drain, is what resolves a task or feature.\n\n"
+        + authorized_section +
+        "For each issue you are draining to a fix PR:\n\n"
+        f"4. Check it out: mcp__ops__issue_checkout(issue_id, owner=\"{owner}\"). Every "
+        "later call in this brief that names an owner uses this same owner string. An "
+        "error:409 means another worker already holds it — skip it and move on.\n"
+        "REFUSED FILE WRITES. This rule governs steps 5, 6 and 8. Filer and reviewer "
+        "text reaches a shell only through a file: the only permitted shell form is a "
+        "command substitution over that file, passed as the --task or --title value. If a "
+        "file write for such text is refused, record the refusal with mcp__ops__issue_comment("
+        "issue_id, kind=\"note\", body=<the refusal text>) and stop. In steps 5 and 6, also "
+        f"call mcp__ops__issue_release(issue_id, owner=\"{owner}\") and move on to "
+        "the next issue. In step 8, stop revising this PR; its findings stay on it. Never send "
+        "that text through Bash by another route: no heredoc (<<EOF), no `echo` or `printf`, "
+        "and no literal quoted argument (a task or title typed inside single or double quotes).\n"
+        "5. Dispatch bug-fixer in fix mode. The issue's title and body are written by "
+        "whoever filed the issue, so they never go inside a shell quote. Write them to "
+        f"{work_dir}/<issue_id>-task.md with your file-writing tool, then run `agentctl "
+        "spawn bug-fixer --on " + product + " --issue <issue_id> --task \"$(cat "
+        f"{work_dir}/<issue_id>-task.md)\"` (it commits and authors pr-body.md, and "
+        "returns a one-line summary plus a suggested title). If the spawn is refused "
+        "(it exits non-zero and prints `error:` on stderr), the claim from step 4 is "
+        "still held by this run: record the refusal text with mcp__ops__issue_comment("
+        "issue_id, kind=\"note\", body=<the refusal text>), then mcp__ops__issue_release("
+        f"issue_id, owner=\"{owner}\"), and move on to the next issue.\n"
+        "6. Title, then publish: the suggested title comes from the filer's text too, so "
+        f"write it to {work_dir}/<issue_id>-title.txt with your file-writing tool before "
+        "anything is pushed. A refused write follows the REFUSED FILE WRITES rule and stops "
+        "this item. Then run agentctl publish and agentctl pr-open (ARCH-055 + ARCH-058 "
+        "gates), with the title `[nightly-bugfix] fix: <title>` passed as `--title \"$(cat "
+        f"{work_dir}/<issue_id>-title.txt)\"`.\n"
+        "7. Record the PR on the issue IMMEDIATELY: mcp__ops__issue_link_pr(issue_id, "
+        f"pr=\"<N>\", url=\"<pr_url>\", owner=\"{owner}\") — the issue moves to pr-open and shows a link in "
+        "/issues. This is the close-loop. Pass the url: the Library derives the PR's "
+        "repo from it, and the cost report joins reviewer runs to the item through that "
+        "repo and PR number.\n"
+        "8. Dispatch reviewer + security-reviewer in parallel, with no --issue: "
+        "`agentctl spawn reviewer --on " + product + " --pr <N>` and `agentctl spawn "
+        "security-reviewer --on " + product + " --pr <N>`. A reviewer runs on its roster "
+        "model, not the item's. (ARCH-027, ARCH-347 — --pr self-pins the live head; "
+        "--pr now REQUIRES --on naming the repo, or spawn refuses.) If a reviewer "
+        "dispatch is refused, re-dispatch that reviewer once; if the second attempt is "
+        "refused too, record the PR as unreviewed in your final report and move on. "
+        "Auto-cycle on any finding or red CI: write the findings verbatim to "
+        f"{work_dir}/<issue_id>-findings-<round>.md with your file-writing tool, where "
+        "<round> is this revise round's number, counting from 1, then re-dispatch "
+        "bug-fixer: `agentctl spawn bug-fixer --on " + product + " --pr <N> --issue "
+        f"<issue_id> --task \"$(cat {work_dir}/<issue_id>-findings-<round>.md)\"`, re-publish "
+        "with --pr <N>, re-review. If that revise dispatch is refused, record the refusal on "
+        "the issue thread with mcp__ops__issue_comment and stop revising this PR; its "
+        "findings stay on the PR. A refused file write for this text follows the REFUSED "
+        "FILE WRITES rule above. "
+        f"{cap_sentence} A finding that repeats one an earlier round raised, in a round past the document cap, "
+        "ends the cycle: a headless run dispatches no further round, leaves the PR pr-open, and records "
+        "the repeat on the issue thread with mcp__ops__issue_comment.\n"
+        "9. Terminal state is a ready-to-merge PR. Per ARCH-020 do NOT merge — the operator "
+        "merges. The issue stays pr-open; a later in-box merge marks it fixed. When the "
+        f"pass ends, remove the directory with `rm -rf \"{work_dir}\"`: it holds the "
+        "filer's text. The drain does not remove it after a detached dispatch, which "
+        "returns before the pass ends.\n\n"
+        "If an issue needs the operator's call rather than a fix (a design decision, an "
+        "ambiguous spec): mcp__ops__signal_log(kind=\"needs-decision\", "
+        "product=\"" + product + "\", body=<what needs deciding>), then "
+        "mcp__ops__issue_comment(issue_id, kind=\"note\", body=<the same summary>), "
+        f"then mcp__ops__issue_release(issue_id, owner=\"{owner}\") so "
+        "it goes back to open with your note on the thread rather than staying "
+        "claimed.\n\n"
+        "IMPORTANT — never leave a claimed issue with no recorded outcome. Once you "
+        "claim an issue you own recording where it went (pr-open / released-with-a-"
+        "note / resolved). A claimed issue with no outcome is invisible to the next "
+        "pass until its 24h TTL expires. So if bug-fixer FAILS to produce a PR (it "
+        f"errors, or hits the review-round cap in step 8 before a PR opens), do not move on silently "
+        "— record what's stuck with signal_log and issue_comment as above, then "
+        f"mcp__ops__issue_release(issue_id, owner=\"{owner}\"), so it surfaces in /issues "
+        "for the operator rather than staying "
+        f"stuck-claimed. At the step 8 cap for that PR's kind AFTER a PR opened, leave it pr-open; its "
+        "findings are on the PR. Per ARCH-030 verify every code-specific claim.\n\n"
+        "Do NOT run `mark-fresh` — that is `issue-drain`'s daytime cost-shift "
+        "bookkeeping, which tells the next overnight to skip its bug-fix phase. This "
+        "nightly drain runs alongside the overnight rather than standing in for it, so "
+        "suppressing a product's bug-fix phase here would be wrong."
+    )
+
+
+def _spawn(product: str, task: str, detach: bool, work_dir: pathlib.Path) -> bool:
+    """Dispatch the orchestrator for one product. True if it started.
+
+    Detached by default: this command runs from launchd with nothing to notify,
+    and the orchestrator records its own outcomes on the issues rather than
+    returning anything this caller needs to read. That is the opposite of
+    changelog-drain, which runs --foreground precisely because it must have the
+    entry text in hand before it can post.
+
+    NO `--pr`, and nothing PR-scoped: an issue has no PR until the drain opens one.
+
+    `work_dir` holds the filer's text. It is removed here when no reader is left: a
+    refused spawn, or a foreground dispatch that returned. A detached dispatch that
+    started keeps it for the orchestrator (brief step 9). A timed-out dispatch keeps it
+    too: the kill stops agentctl, and the orchestrator it started may still be writing.
+    """
+    cmd = [str(AGENTCTL), "spawn", _ORCHESTRATOR, "--on", product]
+    agents_dir = _agents_dir()
+    if agents_dir:
+        cmd += ["--agents-dir", str(agents_dir)]
+    cmd += ["--task", task]
+    cmd += ["--detach"] if detach else ["--foreground"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        # One stuck dispatch is one failure, not a lost pass — the same lesson
+        # changelog-drain's review recorded (#250). Uncaught, this would abort the
+        # loop and every product behind it would be skipped with no account.
+        print(f"  {product}: dispatch exceeded 30m and was killed", file=sys.stderr)
+        return False
+    if proc.returncode != 0 or not detach:
+        shutil.rmtree(work_dir, ignore_errors=True)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout).strip().splitlines()
+        print(f"  {product}: dispatch failed — {detail[-1] if detail else 'no output'}",
+              file=sys.stderr)
+        return False
+    out = (proc.stdout or "") + (proc.stderr or "")
+    for tok in out.split():
+        if tok.startswith("run-"):
+            print(f"  dispatched {product} ({tok})", flush=True)
+            return True
+    print(f"  dispatched {product}", flush=True)
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="issue-queue-drain", description=__doc__)
+    ap.add_argument("--product", help="drain only this product")
+    ap.add_argument("--max-products", type=int, default=0,
+                    help="dispatch at most this many products in one pass "
+                         "(0 = every product, the default)")
+    ap.add_argument("--max-issues", type=int, default=0,
+                    help="issues each product's orchestrator may work "
+                         "(0 = every claimable issue, the default)")
+    ap.add_argument("--type", dest="types",
+                    help="comma-separated issue types to drain (bug,nit,improvement,"
+                         "task,epic); default is every type")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the plan and dispatch nothing")
+    ap.add_argument("--foreground", action="store_true",
+                    help="run each dispatch attached, for watching one live")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    types = None
+    if args.types:
+        types = {t.strip() for t in args.types.split(",") if t.strip()}
+        unknown = types - _ISSUE_TYPES
+        if unknown:
+            print(f"issue-queue-drain: unknown --type {','.join(sorted(unknown))}; "
+                  f"valid types are {','.join(sorted(_ISSUE_TYPES))}", file=sys.stderr)
+            return 2
+
+    by_product, warnings = _claimable(types)
+    for w in warnings:
+        print(f"issue-queue-drain: WARNING — {w}", file=sys.stderr)
+
+    # BEFORE the --product early return, not after. An operator issue is invisible
+    # to every other part of this command, so the one thing that must not be
+    # conditional is saying it exists. Placed after the early return, a
+    # `--product X` run against an empty queue returned before reporting operator
+    # issues for ANY product — the same silent-drop this watch exists to end.
+    for line in _operator_watch():
+        print(f"issue-queue-drain: {line}", file=sys.stderr)
+
+    if args.product:
+        by_product = {k: v for k, v in by_product.items() if k == args.product}
+        if not by_product:
+            print(f"issue-queue-drain: no claimable issues for {args.product}",
+                  flush=True)
+            return 0
+
+    total = sum(len(v) for v in by_product.values())
+    print(f"issue-queue-drain: {total} claimable issue(s) across "
+          f"{len(by_product)} product(s)", flush=True)
+
+    # Most issues first: the deepest queue is where a bounded pass buys the most.
+    ordered = sorted(by_product.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+
+    # Both skip classes are reported BY NAME. A product with no primary checkout
+    # is skipped on every pass forever, and a count with no names hides which —
+    # today's lesson is that a queue with no consumer looks exactly like an
+    # empty one.
+    undispatchable = [(p, len(v)) for p, v in ordered if not _dispatchable(p)]
+    if undispatchable:
+        print(f"issue-queue-drain: skipping {len(undispatchable)} product(s) with no "
+              f"primary checkout agentctl can dispatch against: "
+              f"{', '.join(f'{p} ({n})' for p, n in undispatchable)}", file=sys.stderr)
+    ordered = [(p, v) for p, v in ordered if _dispatchable(p)]
+
+    plan = []
+    for product, issues in ordered:
+        if args.max_products and len(plan) >= args.max_products:
+            break
+        plan.append((product, issues))
+
+    deferred = [p for p, _ in ordered if p not in {q for q, _ in plan}]
+    if deferred:
+        print(f"issue-queue-drain: deferring {len(deferred)} product(s) to the next "
+              f"pass (--max-products {args.max_products}): {', '.join(deferred)}",
+              file=sys.stderr)
+
+    if args.dry_run:
+        for product, issues in plan:
+            bound = (f"up to {args.max_issues}" if args.max_issues
+                     else f"all {len(issues)}")
+            print(f"  would drain {product}: {len(issues)} claimable, "
+                  f"{bound} this run", flush=True)
+        return 0
+
+    started = failed = 0
+    for i, (product, issues) in enumerate(plan):
+        # WAVE, don't fan out (ARCH-422). This loop used to dispatch every product
+        # at once. On 2026-07-29 that put nine planning-orchestrators into the
+        # 16-slot registry, so nine slots were held by supervisors all night and
+        # every worker in the fleet fought over the remaining seven. constance's
+        # drain opened PR #555 and was then refused a reviewer nine times over ~55
+        # minutes; under draft-gated CI (ARCH-364) that PR could never run CI and
+        # could never merge. The starvation stranded work rather than delaying it.
+        #
+        # `_wait_for_supervisor_slot` blocks until the registry will admit another
+        # supervisor. The registry enforces the cap either way, so without this the
+        # spawn would simply be REFUSED and the product silently dropped from the
+        # night — trading a starvation bug for a coverage bug, which is worse
+        # because it looks like an empty queue.
+        # Unconditional, including the first product. The first draft skipped the
+        # wait for i==0 on the reasoning that nothing is holding a slot yet — true
+        # only when the cap starts empty, which is an assumption rather than a
+        # guarantee. An overnight stage agent plus three planning-orchestrators from
+        # an earlier pass puts the cap at its limit before this loop begins, and
+        # product 0 would then fail immediately while products 1..N correctly
+        # waited. When a slot is free this returns on its first check, so waiting
+        # unconditionally costs nothing in the common case.
+        if not _wait_for_supervisor_slot():
+            print(f"issue-queue-drain: WARNING — timed out waiting for a supervisor "
+                  f"slot; {len(plan) - i} product(s) NOT dispatched this pass: "
+                  f"{', '.join(p for p, _ in plan[i:])}. They stay claimable and the "
+                  f"next pass picks them up.", flush=True)
+            break
+        # mkdtemp makes a fresh 0700 directory, so no brief file name is predictable in
+        # /tmp and no file from an earlier night is there for the Write tool to refuse.
+        work_dir = pathlib.Path(tempfile.mkdtemp(prefix="issue-queue-drain-"))
+        ok = _spawn(product, _task_for(product, len(issues), args.max_issues, types, issues,
+                                       work_dir=work_dir),
+                    detach=not args.foreground, work_dir=work_dir)
+        if ok:
+            started += 1
+        else:
+            failed += 1
+
+    print(f"issue-queue-drain: dispatched {started}, failed {failed}", flush=True)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,59 @@
+{
+  "Profiles": [
+    {
+      "Name": "co-selector",
+      "Guid": "co-selector-2026-06-26",
+      "Dynamic Profile Parent Name": "Default",
+      "Semantic History": {
+        "action": "raw command",
+        "text": "$HOME/bin/open-md-link \\1 \\2"
+      },
+      "Background Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.961,
+        "Green Component": 0.961,
+        "Blue Component": 0.992,
+        "Alpha Component": 1.0
+      },
+      "Foreground Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.122,
+        "Green Component": 0.18,
+        "Blue Component": 0.239,
+        "Alpha Component": 1.0
+      },
+      "Cursor Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.31,
+        "Green Component": 0.275,
+        "Blue Component": 0.898,
+        "Alpha Component": 1.0
+      },
+      "Selection Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.851,
+        "Green Component": 0.839,
+        "Blue Component": 0.969,
+        "Alpha Component": 1.0
+      },
+      "Tab Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.31,
+        "Green Component": 0.275,
+        "Blue Component": 0.898,
+        "Alpha Component": 1.0
+      },
+      "Use Tab Color": true,
+      "Badge Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.31,
+        "Green Component": 0.275,
+        "Blue Component": 0.898,
+        "Alpha Component": 0.25
+      },
+      "Badge Text": "selector",
+      "Badge Max Width": 0.2,
+      "Badge Max Height": 0.04
+    }
+  ]
+}

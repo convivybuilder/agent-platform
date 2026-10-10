@@ -1,0 +1,59 @@
+{
+  "Profiles": [
+    {
+      "Name": "co-nyh-etc",
+      "Guid": "co-nyh-etc-2026-06-09",
+      "Dynamic Profile Parent Name": "Default",
+      "Semantic History": {
+        "action": "raw command",
+        "text": "$HOME/bin/open-md-link \\1 \\2"
+      },
+      "Background Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.91,
+        "Green Component": 0.969,
+        "Blue Component": 0.961,
+        "Alpha Component": 1.0
+      },
+      "Foreground Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.043,
+        "Green Component": 0.18,
+        "Blue Component": 0.169,
+        "Alpha Component": 1.0
+      },
+      "Cursor Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.106,
+        "Green Component": 0.71,
+        "Blue Component": 0.678,
+        "Alpha Component": 1.0
+      },
+      "Selection Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.776,
+        "Green Component": 0.925,
+        "Blue Component": 0.91,
+        "Alpha Component": 1.0
+      },
+      "Tab Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.106,
+        "Green Component": 0.71,
+        "Blue Component": 0.678,
+        "Alpha Component": 1.0
+      },
+      "Use Tab Color": true,
+      "Badge Color": {
+        "Color Space": "sRGB",
+        "Red Component": 0.106,
+        "Green Component": 0.71,
+        "Blue Component": 0.678,
+        "Alpha Component": 0.25
+      },
+      "Badge Text": "etc",
+      "Badge Max Width": 0.2,
+      "Badge Max Height": 0.04
+    }
+  ]
+}

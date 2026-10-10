@@ -1,0 +1,170 @@
+#!/usr/bin/env python3.11
+"""Post a co-authored changelog entry to the team site.
+
+WHY THIS EXISTS, AND WHY IT REPLACES A GIT-DERIVED FEED.
+
+`/engineering/changelog` has been rendering `changelog`-kind signals that
+`github_capture.signal_from_merge` synthesises from each merged PR — which means
+the entry IS the pull-request body. A PR body is written for a reviewer: it opens
+with `## Summary`, carries code blocks, and explains implementation. Read back as
+a changelog it is unusable. Compare the two for the same merge:
+
+    git-derived : "ci: grant pull-requests:read so docs-only detection actually
+                   works\n\n## Summary\n\nThe docs-only CI skip merged in #1029
+                   was a no-op: the `changes` job called `gh api …`" (700+ chars,
+                   three code blocks)
+    co-authored : "*Merged:* the docs-only CI skip now actually skips — the
+                   detection job was missing a token permission. #1032"
+
+The co-authored form is the one worth keeping (the operator, 2026-07-23), so the site now
+takes the same entry the co writes, and the git-derived feed is retired.
+
+ONE IMPLEMENTATION, NOT ONE PER REPO. Only vivy and sous-chef ever had a
+`scripts/post_changelog.py`; the other six products had nothing, so "every co
+posts its own entry" would otherwise mean writing the script six more times and
+watching the copies drift. That is the ARCH-340 lesson (a rule copy-pasted into
+two launchers is a rule that drifts) applied before the copies exist rather than
+after. Products call this; the behaviour lives here.
+
+FAIL-SAFE. The signal write is the deliverable, so a signal failure is a non-zero
+exit the caller sees.
+
+Usage:
+    post-changelog --product vivy "*Merged:* … #1032"
+    post-changelog --product vivy --file /tmp/entry.md
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import pathlib
+import re
+import sys
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                pathlib.Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "signal_client.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+import signal_client as SC  # noqa: E402
+
+# A changelog entry without a PR link has no click-through to the work it
+# describes, which is most of what makes the log worth keeping. vivy's script
+# enforced this and the habit is worth carrying, not re-litigating.
+_PR_LINK_RE = re.compile(r"#\d+|/pull/\d+")
+
+
+def _read_message(args) -> str:
+    if args.file:
+        return pathlib.Path(args.file).read_text(encoding="utf-8")
+    if args.message:
+        return args.message
+    raise SystemExit("post-changelog: pass the entry as an argument or via --file")
+
+
+def _post_signal(product: str, message: str, pr: str | None) -> str:
+    """Write the entry as a `changelog` signal. This is the deliverable."""
+    payload = {
+        "product": product,
+        "kind": "changelog",
+        "source": "co",
+        # Who wrote the entry. The store requires an actor; naming the co rather
+        # than a git identity is what distinguishes a written entry from the
+        # github-captured PR bodies this replaces.
+        "actor": os.environ.get("AGENTCTL_AGENT_NAME") or f"{product}-co",
+        "stream": product,
+        "body": message,
+        # The PR this entry describes, in the SAME shape github_capture uses, so
+        # an entry and the merge it answers are comparable by (product, refs.pr).
+        # Omitting refs made an entry structurally unattributable: changelog-drain
+        # decides a merge still needs writing when no entry carries its PR, so an
+        # entry with no ref matched nothing and the merge was re-explained on
+        # every pass — an unbounded re-dispatch loop, caught on the first live run
+        # (ARCH-411). The site reads the same fields for the card's PR link, which
+        # rendered as dead plain text for the same reason.
+        "refs": ({"pr": int(pr), "url": f"https://github.com/convivy/{product}/pull/{pr}"}
+                 if pr and str(pr).isdigit() else {}),
+        # /engineering/changelog orders by produced_at, and the store leaves it
+        # NULL when the payload omits it — so an entry without this lands in the
+        # table but renders last or not at all. Caught only by reading the row
+        # back after a "duplicate"/201 that looked like success.
+        "produced_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        # dedup_key mirrors the shape github_capture used (`gh:<repo>:pr<n>:merged`)
+        # so a re-run of the merge ceremony is a no-op rather than a second entry.
+        # The store IGNORES a collision — it returns the existing row and does not
+        # rewrite it — so a re-post cannot repair a row that was written wrong;
+        # only a delete can. (An earlier note here said "updates"; it does not.)
+        # Without a PR number we fall back to the body hash, which is still
+        # idempotent for an identical re-post.
+        "dedup_key": (f"co:{product}:pr{pr}:changelog" if pr
+                      else f"co:{product}:{abs(hash(message)) & 0xFFFFFFFF:08x}"),
+    }
+    # Through signal_client on the DELIVERY budget, not the tee's 2s. post_signal
+    # gained an explicit `timeout` when the tee and delivery paths were split
+    # (fix/signal-client-delivery-timeout), so this no longer needs its own
+    # urlopen to escape the 2s the tee imposes — the reason it once posted
+    # directly is gone. A changelog entry is written once per merge and must land,
+    # so it takes the same generous budget the platform's scheduled reports use.
+    #
+    # The cross-version note still holds and is now satisfied: `bin/` tools resolve
+    # their lib from the DEPLOYED ~/.local/lib/agent-platform, which is main, and
+    # `post_signal`'s timeout parameter is on main — so this runs from its own
+    # branch against main's library. post_signal returns 'skip' itself when there
+    # is no token, so the no-token path is unchanged.
+    return SC.post_signal(payload, timeout=SC._DELIVERY_TIMEOUT)
+
+
+
+def main(argv: list[str] | None = None) -> int:
+    # Adding or removing a CLI flag here requires sweeping the callers in
+    # every product that invokes this tool (bin/check-cli-contracts enforces
+    # the contract cross-repo). Update _TOOL_CALLERS there and drop/add the
+    # flag in each caller.
+    ap = argparse.ArgumentParser(prog="post-changelog", description=__doc__)
+    ap.add_argument("message", nargs="?", help="the entry text")
+    ap.add_argument("--product", required=True, help="product/repo name, e.g. vivy")
+    ap.add_argument("--file", help="read the entry from this UTF-8 file instead")
+    ap.add_argument("--pr", help="PR number, used for the idempotency key")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    message = _read_message(args).strip()
+    if not message:
+        raise SystemExit("post-changelog: refusing to post an empty entry")
+    if not _PR_LINK_RE.search(message):
+        raise SystemExit(
+            "post-changelog: refusing to post — the entry has no PR link (`#N` or "
+            "a /pull/N URL). A changelog entry with no click-through to the work "
+            "it describes is most of the value gone.")
+
+    pr = args.pr
+    if not pr:
+        # Both forms _PR_LINK_RE accepts, so a URL-only entry gets a stable
+        # pr-keyed dedup_key rather than falling to the body-hash fallback —
+        # which, being str hash under a randomized PYTHONHASHSEED, differs every
+        # process and would duplicate the entry on each re-run instead of
+        # updating it. Leftmost of either form wins, matching how the refusal
+        # above treats `#N` and `/pull/N` as equivalent.
+        m = re.search(r"#(\d+)|/pull/(\d+)", message)
+        pr = (m.group(1) or m.group(2)) if m else None
+
+    sig = _post_signal(args.product, message, pr)
+    print(f"post-changelog: signal {sig}")
+    if sig.startswith("error"):
+        # The site is the deliverable — say so loudly rather than let a merge
+        # ceremony report success on an entry that never landed.
+        print("post-changelog: the entry did NOT reach the team site.", file=sys.stderr)
+        return 1
+    if sig == "skip":
+        print("post-changelog: no ops token — the entry did NOT reach the team site.",
+              file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

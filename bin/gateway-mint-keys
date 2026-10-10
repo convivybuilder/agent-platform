@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""gateway-mint-keys — mint one tagged LiteLLM virtual key per consumer (E17·1).
+
+The consumers come from gateway/consumers.json: each names a consumer tag and the
+keys-file entry its key is written to. For each one this calls POST /key/generate
+with metadata.consumer set to that consumer, and writes the key into its
+{account, key} entry of litellm-keys.json at mode 0600. The file lives in
+LLM_GATEWAY_CONFIG_DIR, which defaults to ~/.config/convivy. The readers are
+lib/agent-platform/gateway-vkey and bin/agentctl, and they read the same directory.
+
+Refuses to store a key whose sha256 equals the master key's or another stored
+key's, comparing the `key` field. Stores nothing unless every key passes. Reports
+each key by consumer and a sha256 prefix; never prints a key.
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import json
+import os
+import sys
+import tempfile
+import urllib.error
+import urllib.request
+
+DEFAULT_BASE_URL = "http://127.0.0.1:4000"
+PREFIX_LEN = 12
+# The declaration, found from this script's real path so a symlink in ~/.local/bin
+# still resolves to the repo. LLM_GATEWAY_CONSUMERS_FILE overrides it.
+CONSUMERS_FILE = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), os.pardir, "gateway", "consumers.json")
+
+
+class MintError(Exception):
+    """A refusal or failure. The message names a consumer or entry, never a key."""
+
+
+def _digest(key):
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _load_consumers(path):
+    """Return [(consumer tag, keys-file entry)] from the declaration, or refuse."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            declared = json.load(fh)
+    except OSError as exc:
+        raise MintError(f"cannot read consumer declaration {path}: {exc.strerror}") from None
+    except ValueError:
+        raise MintError(f"{path} is not valid JSON")
+    if not isinstance(declared, list) or not declared:
+        raise MintError(f"{path} must be a non-empty JSON list")
+    consumers = []
+    for item in declared:
+        name = item.get("consumer") if isinstance(item, dict) else None
+        entry = item.get("entry") if isinstance(item, dict) else None
+        if not (isinstance(name, str) and name and isinstance(entry, str) and entry):
+            raise MintError(f"{path}: each item needs a non-empty string consumer and entry")
+        consumers.append((name, entry))
+    for index, label in ((0, "consumer"), (1, "entry")):
+        values = [pair[index] for pair in consumers]
+        repeated = [v for v in values if values.count(v) > 1]
+        if repeated:
+            raise MintError(f"{path}: {label} {repeated[0]} is declared more than once")
+    return consumers
+
+
+def _read_master_key(env_file):
+    with open(env_file, encoding="utf-8") as fh:
+        for line in fh:
+            name, sep, value = line.strip().partition("=")
+            if sep and name == "LITELLM_MASTER_KEY":
+                value = value.strip().strip("\"'")
+                if value:
+                    return value
+    raise MintError(f"{env_file} defines no LITELLM_MASTER_KEY")
+
+
+def _load_entries(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        raise MintError(f"{path} is not valid JSON; refusing to overwrite it")
+    if not isinstance(data, dict):
+        raise MintError(f"{path} is not a JSON object; refusing to overwrite it")
+    return data
+
+
+def _mint(base_url, master_key, consumer):
+    body = json.dumps({"metadata": {"consumer": consumer}}).encode("utf-8")
+    req = urllib.request.Request(
+        base_url.rstrip("/") + "/key/generate",
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {master_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        raise MintError(f"{consumer}: /key/generate answered HTTP {exc.code}") from None
+    except (urllib.error.URLError, OSError, ValueError):
+        raise MintError(f"{consumer}: no usable /key/generate answer from {base_url}") from None
+    key = payload.get("key") if isinstance(payload, dict) else None
+    if not isinstance(key, str) or not key:
+        raise MintError(f"{consumer}: /key/generate returned no usable key")
+    return key
+
+
+def _write_atomic(path, entries):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".litellm-keys.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(entries, fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL,
+                        help="gateway base URL (default: %(default)s)")
+    args = parser.parse_args(argv)
+
+    home = os.path.expanduser("~")
+    config_dir = os.environ.get("LLM_GATEWAY_CONFIG_DIR") or os.path.join(home, ".config", "convivy")
+    env_file = os.environ.get("LLM_GATEWAY_ENV_FILE") or os.path.join(config_dir, "llm-gateway.env")
+    keys_file = os.path.join(config_dir, "litellm-keys.json")
+    consumers_file = os.environ.get("LLM_GATEWAY_CONSUMERS_FILE") or CONSUMERS_FILE
+
+    minted = []
+    try:
+        consumers = _load_consumers(consumers_file)
+        replaced = {service for _, service in consumers}
+        master_key = _read_master_key(env_file)
+        entries = _load_entries(keys_file)
+
+        # Digests of every value that must stay distinct from a new key.
+        taken = {_digest(master_key): "the master key"}
+        for service, entry in entries.items():
+            if service in replaced or not isinstance(entry, dict) or not entry.get("key"):
+                continue
+            taken.setdefault(_digest(entry["key"]), f"entry {service}")
+
+        for consumer, service in consumers:
+            key = _mint(args.base_url, master_key, consumer)
+            digest = _digest(key)
+            if digest in taken:
+                raise MintError(
+                    f"{consumer}: key sha256 {digest[:PREFIX_LEN]} equals {taken[digest]}; "
+                    f"nothing was written")
+            taken[digest] = f"the key minted for {consumer}"
+            minted.append((consumer, service, key))
+
+        for _, service, key in minted:
+            previous = entries.get(service)
+            account = previous.get("account") if isinstance(previous, dict) else None
+            entries[service] = {"account": account or getpass.getuser(), "key": key}
+        _write_atomic(keys_file, entries)
+    except MintError as exc:
+        print(f"gateway-mint-keys: {exc}", file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print(f"gateway-mint-keys: {exc.strerror or exc}: {exc.filename}", file=sys.stderr)
+        return 1
+
+    for consumer, service, key in minted:
+        print(f"minted {consumer}: sha256 {_digest(key)[:PREFIX_LEN]} -> {service}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

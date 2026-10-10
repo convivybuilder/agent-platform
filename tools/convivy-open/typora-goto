@@ -1,0 +1,104 @@
+#!/bin/zsh
+# Open a LOCAL markdown file in Typora and scroll to a line.
+#
+# Like the line half of ~/bin/open-md-link, but does NO path remapping — the
+# caller (convivy-open-server) has already resolved the path for THIS machine.
+# Typora has no line API, so we read the line's text and drive Find (⌘F) to it.
+#
+# The System-Events control is delegated to ConvivyTyporaGoto.app (built by
+# install-laptop.sh) rather than run inline: Accessibility can't be granted
+# reliably to a launchd daemon's interpreter, but a real app bundle gets a stable
+# TCC identity and a normal "allow" prompt. If the app isn't present we fall back
+# to driving it inline (works only when THIS process already has Accessibility,
+# e.g. run by hand from a terminal that does).
+#
+# Degrades to a plain `open` for non-markdown, a missing/zero line, or no Typora.
+#
+# Args:  $1 local file path   $2 line number
+emulate -L zsh
+set -u
+
+path="${1:-}"
+line="${2:-}"
+[[ -z "$path" ]] && exit 0
+if [[ ! -e "$path" ]]; then
+  /usr/bin/open "$path" 2>/dev/null
+  exit 0
+fi
+
+is_markdown=false
+case "${path:l}" in
+  *.md|*.markdown|*.mdown|*.mkd|*.mkdn) is_markdown=true ;;
+esac
+
+has_typora=false
+/usr/bin/osascript -e 'id of application "Typora"' >/dev/null 2>&1 && has_typora=true
+
+if ! $is_markdown || [[ -z "$line" || "$line" == "0" ]] || ! [[ "$line" =~ ^[0-9]+$ ]] || ! $has_typora; then
+  /usr/bin/open "$path"
+  exit 0
+fi
+
+typora_running=$(/usr/bin/osascript -e 'application "Typora" is running' 2>/dev/null)
+/usr/bin/open -a Typora "$path"
+
+# Pull a search snippet from $line (or a nearby non-empty line), stripping
+# leading whitespace + common markdown markers so it matches Typora's rendering.
+clean_line() {
+  /usr/bin/sed -n "${1}p" "$path" \
+    | /usr/bin/sed -E 's/^[[:space:]]*//; s/^#+[[:space:]]+//; s/^[-*+][[:space:]]+//; s/^[0-9]+\.[[:space:]]+//; s/^>[[:space:]]*//' \
+    | /usr/bin/awk '{ sub(/[[:space:]]+$/, ""); print }' \
+    | /usr/bin/cut -c1-60
+}
+
+snippet=""
+for offset in 0 1 -1 2 -2 3 -3; do
+  cand_line=$((line + offset))
+  (( cand_line < 1 )) && continue
+  cand=$(clean_line "$cand_line")
+  if [[ -n "$cand" && "${#cand}" -ge 8 ]]; then
+    snippet="$cand"
+    break
+  fi
+done
+
+# Doc is open; if we couldn't find a usable snippet, leave it at the top.
+[[ -z "$snippet" ]] && exit 0
+
+# Hand the snippet to the app via a temp file (NOT a launch arg — AppleScript
+# applets don't reliably receive argv from `open --args`).
+printf '%s' "$snippet" > /tmp/convivy-typora-find
+
+# Give Typora time to load (longer on a cold start) before driving Find.
+if [[ "$typora_running" == "true" ]]; then
+  sleep 0.4
+else
+  sleep 1.6
+fi
+
+APP="${CONVIVY_OPEN_TYPORA_APP:-$HOME/Applications/ConvivyTyporaGoto.app}"
+if [[ -d "$APP" ]]; then
+  # App bundle drives System Events with its own (grantable) TCC identity.
+  /usr/bin/open -a "$APP"
+  exit 0
+fi
+
+# Fallback: drive inline. Only effective if this process has Accessibility
+# (a terminal-launched run), NOT the launchd daemon — build the app for that.
+as_snippet="${snippet//\\/\\\\}"
+as_snippet="${as_snippet//\"/\\\"}"
+/usr/bin/osascript <<APPLESCRIPT
+  tell application "Typora" to activate
+  delay 0.2
+  tell application "System Events"
+    tell process "Typora"
+      keystroke "f" using command down
+      delay 0.15
+      keystroke "$as_snippet"
+      delay 0.05
+      key code 36
+      delay 0.2
+      key code 53
+    end tell
+  end tell
+APPLESCRIPT

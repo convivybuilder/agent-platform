@@ -1,0 +1,356 @@
+#!/usr/bin/env python3.11
+"""Cross-repo KB-agreement check (substrate ARCH-436).
+
+Several tests across the platform repos assert that a constant HERE agrees with
+the knowledge repo — the project allowlist against the KB validator, the roster
+directory against where the roster actually is, the browsable-kind set against
+the KB's own schema. Each such test needs a knowledge checkout, and no repo's CI
+has one, so each of them called `pytest.skip` in CI.
+
+THAT MADE THE GREEN MEANINGLESS IN THE DANGEROUS DIRECTION. Main reads green
+because the check did not run, while the same assertion fails on any machine that
+has the KB. Phase 0 step 5's PR E2 drifted three separate copies of the scope
+vocabulary that way, and PR F found them by hand rather than by any check firing.
+
+This runs the marked set where the checkouts are. Same structural constraint as
+`check-cli-contracts` (a cross-repo check CI cannot perform because CI has no
+sibling checkouts) and the same answer: a launchd job on the mini.
+
+WHY THE ALTERNATIVE WAS NOT TAKEN. Checking out convivy/knowledge inside each
+repo's workflow closes the gap in CI, which is strictly better placement — but it
+needs a standing credential with read access to the entire private KB, available
+to every workflow run in two repos, for a handful of tests. That is a real
+security surface for a drift check. Revisit if the marked set grows into
+something a PR must not merge without.
+
+BEHAVIOUR. A pass is silent. A breach logs an alert signal against the affected
+repo (with dedup_key scoped to the UTC day: a break logs once a day while it persists,
+and again after it clears and returns on a later day). A break that clears and returns
+within the same UTC day logs nothing after that day's first signal, unless its key differs:
+the key carries the set of failing tests (or the reason, when no tests ran), so a return
+with a different set logs again.
+It never creates a work item: only a co session does (platform/decisions/0073).
+A missing checkout degrades gracefully — the repo is simply not checked.
+
+THREE THINGS COUNT AS A BREACH, and the last two are the reason this tool exists
+rather than a one-line `pytest -m needs_kb` in a plist:
+
+  - a marked test FAILED — the drift this is looking for;
+  - NO marked test was collected — the marker was renamed or the guards were
+    deleted, and a runner that reports OK on an empty selection is exactly the
+    blind green being replaced;
+  - every marked test SKIPPED — the checkout this runs beside has gone missing,
+    so the run proved nothing while looking clean.
+
+SAFETY. Only ever runs the repo's own test suite, read-only against the KB. No
+writes, no dispatch.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+from typing import Any
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR  # noqa: E402
+
+CONVIVY_ROOT = BR.root()
+KNOWLEDGE_REPO = CONVIVY_ROOT / "knowledge"
+
+# The repos carrying `needs_kb` guards, and the interpreter each suite needs.
+#
+# DECLARED, not discovered. A repo whose checkout is missing must read as absent
+# rather than as "no problems found", and discovery cannot tell those apart. Add a
+# row in the same PR that adds the first marked test to a repo.
+_REPOS: dict[str, dict[str, Any]] = {
+    "agent-platform": {
+        # The repo's own shebang interpreter; the suite is stdlib + pytest.
+        "python": "python3.11",
+    },
+    "convivy-orient": {
+        # orient's control plane runs in its own venv (ARCH-102 isolation) and the
+        # suite imports sqlite_vec/fastapi from it. System python cannot collect it.
+        "python": str(pathlib.Path.home() / ".local" / "venv-orient" / "bin" / "python"),
+    },
+}
+
+MARKER = "needs_kb"
+
+# Track how many report attempts failed. Reset each run. Distinguishes "breaches
+# logged OK" (exit 2) from "breaches but reporting failed" (exit 3).
+_report_failures: int = 0
+
+_LIB_DIR = pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"
+
+
+def _ensure_lib_on_path() -> None:
+    """Put the installed platform lib on sys.path exactly once.
+
+    Resolved relative to this file, not ~/.local/lib/agent-platform: that farm
+    symlinks into whichever branch the agent-platform checkout is on
+    (platform/decisions/0059 rule 1), which is exactly the hazard a
+    deploy-pinned copy of this script must not reach back into. A deployed
+    copy resolves this to its own deploy area's lib/; the interactive symlink
+    at ~/.local/bin resolves it to the checkout, same as before.
+    """
+    entry = str(_LIB_DIR)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+
+def _log(message: str, *, file=None) -> None:
+    """One log line, stamped in UTC. The err log is appended to daily with no
+    other date on it, so without the stamp nobody could tell which failure
+    belonged to which run."""
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{stamp} {message}", file=file)
+
+
+def _post_signal(product: str, title: str, body: str, dedup_key: str,
+                 *, dry_run: bool = False, severity: str = "medium") -> dict[str, Any]:
+    """Log an alert signal for a breach. Best-effort. A signal, never a work item.
+
+    The title leads the body, since a signal has no title field."""
+    global _report_failures
+    if dry_run:
+        return {"status": "dry-run"}
+    try:
+        _ensure_lib_on_path()
+        import signal_client  # noqa: E402
+        status = signal_client.post_alert(
+            "kb-guards", signal_client.sanitise_body(f"{title}\n\n{body}"),
+            product=product, dedup_key=dedup_key, meta={"severity": severity})
+        return {"status": status}
+    except Exception as exc:
+        _report_failures += 1
+        _log(f"[REPORT-ERROR] {product}: {exc}", file=sys.stderr)
+        return {"status": f"error:{type(exc).__name__}"}
+
+
+def parse_counts(junit_xml: str) -> dict[str, int]:
+    """Test counts from pytest's JUnit XML report.
+
+    THE TERMINAL SUMMARY IS NOT SAFE TO PARSE HERE, which is worth stating because
+    the obvious implementation does exactly that. agent-platform's pyproject sets
+    `addopts = "-q"`, so this tool passing its own `-q` produced `-qq` — and at
+    `-qq` pytest prints the progress dots and NO summary line at all. Five tests
+    passed and the parse saw zero of everything, which this tool then reported as
+    "no tests were collected": a false breach, from a runner built to catch a
+    false pass. The XML is written whatever the verbosity.
+
+    `tests` counts collected, including skips and failures; `passed` is derived,
+    because the attribute is absent in some pytest versions and computing it is
+    stable across all of them.
+    """
+    counts = {"tests": 0, "failed": 0, "error": 0, "skipped": 0, "passed": 0}
+    try:
+        root = ET.fromstring(junit_xml)
+    except ET.ParseError:
+        return counts
+    # pytest ≥5 wraps <testsuite> in <testsuites>; older emits the bare element.
+    suites = list(root.iter("testsuite"))
+    for s in suites:
+        counts["tests"] += int(s.get("tests", 0))
+        counts["failed"] += int(s.get("failures", 0))
+        counts["error"] += int(s.get("errors", 0))
+        counts["skipped"] += int(s.get("skipped", 0))
+    counts["passed"] = max(
+        0, counts["tests"] - counts["failed"] - counts["error"] - counts["skipped"])
+    return counts
+
+
+def failing_ids(junit_xml: str) -> list[str]:
+    """`classname::name` of every test the report marks failed or errored, sorted.
+
+    The breach's identity. A count cannot be one: on 2026-09-16 agent-platform had
+    two standing failures filed the day before, and a third (knowledge.py missing
+    the instruction-block kind) would have been reported `duplicate` had it
+    replaced one of them instead of adding to them."""
+    try:
+        root = ET.fromstring(junit_xml)
+    except ET.ParseError:
+        return []
+    return sorted(
+        f"{case.get('classname', '')}::{case.get('name', '')}"
+        for case in root.iter("testcase")
+        if case.find("failure") is not None or case.find("error") is not None)
+
+
+def _utc_today() -> str:
+    """Today's UTC date, ISO format: the day scope of this monitor's dedup_key.
+
+    A named seam so a test can pin the day. main() reads it once per run and
+    passes that one value to every key the run writes."""
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def breach_key(repo: str, reason: str, failing: list[str]) -> str:
+    """The signal's dedup_key: the set of failing tests when there is one, so a
+    different failure logs a new signal, and the reason otherwise (no tests
+    collected, all skipped, pytest did not run), which names the whole breach."""
+    if failing:
+        digest = hashlib.sha256("\n".join(failing).encode()).hexdigest()[:16]
+        return f"kb-guards:{repo}:tests:{digest}"
+    return f"kb-guards:{repo}:{reason[:40]}"
+
+
+def classify(returncode: int, counts: dict[str, int]) -> tuple[bool, str]:
+    """(ok, reason). `ok` False means log an alert signal; `reason` says why.
+
+    Ordered so the most specific finding wins. A run with failures AND an empty
+    collection cannot happen, but a run with failures and skips can, and calling
+    that one "everything skipped" would name the wrong problem.
+    """
+    if counts.get("failed") or counts.get("error"):
+        return False, (f"{counts.get('failed', 0)} failed, {counts.get('error', 0)} "
+                       f"errored")
+    if returncode == 5 or not counts.get("tests"):
+        return False, f"no `{MARKER}` tests were collected"
+    if not counts.get("passed"):
+        return False, (f"every `{MARKER}` test skipped ({counts.get('skipped', 0)}) — "
+                       f"the knowledge checkout is missing, so nothing was checked")
+    if returncode != 0:
+        return False, f"pytest exited {returncode}"
+    return True, f"{counts['passed']} passed"
+
+
+def run_repo(repo: str, cfg: dict[str, Any], convivy_root: pathlib.Path,
+             *, verbose: bool = False) -> tuple[bool, str, str, list[str]]:
+    """Run one repo's marked set. Returns (ok, reason, output, failing test ids)."""
+    repo_dir = convivy_root / repo
+    if not repo_dir.is_dir():
+        return True, "checkout not found; not checked", "", []
+
+    with tempfile.TemporaryDirectory() as tmp:
+        report = pathlib.Path(tmp) / "report.xml"
+        cmd = [cfg["python"], "-m", "pytest", "-m", MARKER, "--tb=short",
+               "-p", "no:cacheprovider", f"--junit-xml={report}"]
+        # Name the checkout explicitly rather than letting each conftest fall back
+        # to `<root>/knowledge`. Under `--convivy-root` the two would otherwise
+        # disagree — this tool checking one tree while the guards read another —
+        # and a test harness that silently checks the wrong KB is the same defect
+        # class as everything else in this file.
+        env = {**os.environ, "KNOWLEDGE_REPO": str(convivy_root / "knowledge")}
+        try:
+            proc = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True,
+                                  timeout=900, check=False, env=env)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return False, f"could not run pytest: {exc}", "", []
+        output = proc.stdout + proc.stderr
+        # An unwritten report is itself a finding: pytest died before collection
+        # (a broken conftest, a missing interpreter), and treating that as zero
+        # tests would report "no guards" for what is really "the suite is broken".
+        if not report.is_file():
+            return False, "pytest wrote no report; the suite did not run", output, []
+        junit = report.read_text(encoding="utf-8")
+        counts = parse_counts(junit)
+        failing = failing_ids(junit)
+
+    ok, reason = classify(proc.returncode, counts)
+    if verbose:
+        _log(f"[{'OK' if ok else 'BREACH'}] {repo}: {reason}")
+    return ok, reason, output, failing
+
+
+def _tail(output: str, lines: int = 40) -> str:
+    return "\n".join(output.splitlines()[-lines:])
+
+
+# The failing list is bounded like the output tail below it: a shared fixture
+# breaking a large parametrized set would otherwise list every case.
+_FAILING_LISTED = 30
+
+
+def _failing_block(failing: list[str]) -> str:
+    """The failing tests as a markdown list. A test id is repository test code's
+    own text (a parametrize value lands in it verbatim), and a backtick in one
+    would close its code span, so backticks become apostrophes
+    (security-reviewer, #602)."""
+    if not failing:
+        return ""
+    shown = [t.replace("`", "'") for t in failing[:_FAILING_LISTED]]
+    more = len(failing) - len(shown)
+    return ("Failing:\n" + "".join(f"- `{t}`\n" for t in shown)
+            + (f"- …and {more} more\n" if more else "") + "\n")
+
+
+def _breach_body(repo: str, reason: str, output: str, convivy_root: pathlib.Path,
+                 failing: list[str] | None = None) -> str:
+    """The Reproduce line names THIS machine's resolved root, not a fixed one:
+    the mini's root and the operator's chosen one can differ
+    (company/decisions/0008). The failing tests are listed by name, because two
+    breaches with the same count are different breaches."""
+    failing_block = _failing_block(failing or [])
+    return (
+        f"**KB-agreement guard breach.** `pytest -m {MARKER}` in `{repo}` "
+        f"reported: {reason}.\n\n"
+        f"{failing_block}"
+        f"These guards assert that a constant in `{repo}` still agrees with the "
+        f"knowledge repo. They skip in CI (no KB checkout there), so this daily "
+        f"run on the mini is the only thing that executes them — a breach here "
+        f"means `{repo}`'s main is green while the invariant is broken.\n\n"
+        f"```\n{_tail(output)}\n```\n\n"
+        f"Reproduce: `cd {convivy_root}/{repo} && "
+        f"{_REPOS[repo]['python']} -m pytest -m {MARKER}`"
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="check-kb-guards", description=__doc__)
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="print per-repo details even when passing")
+    parser.add_argument("--convivy-root", default=str(CONVIVY_ROOT),
+                        help="override the machine's root (for testing)")
+    parser.add_argument("--no-report", action="store_true",
+                        help="detect breaches but do not log signals (dry run)")
+    opts = parser.parse_args(argv)
+
+    global _report_failures
+    _report_failures = 0
+
+    convivy_root = pathlib.Path(opts.convivy_root)
+
+    # The KB itself being absent is not a per-repo breach — it is the one
+    # condition under which this whole check is meaningless, and logging a signal
+    # against each repo for it would name the wrong component twice.
+    if not (convivy_root / "knowledge" / "projects").is_dir():
+        _log(f"[SKIP] no knowledge checkout at {convivy_root / 'knowledge'}; "
+              f"nothing to check against", file=sys.stderr)
+        return 0
+
+    day = _utc_today()
+    breaches = 0
+    for repo in sorted(_REPOS):
+        ok, reason, output, failing = run_repo(repo, _REPOS[repo], convivy_root,
+                                               verbose=opts.verbose)
+        if ok:
+            continue
+        breaches += 1
+        title = f"[kb-guards] {repo}: {reason}"
+        body = _breach_body(repo, reason, output, convivy_root, failing)
+        res = _post_signal(repo, title, body,
+                           dedup_key=f"{breach_key(repo, reason, failing)}:{day}",
+                           dry_run=opts.no_report)
+        _log(f"[BREACH] {repo}: {reason} → {res.get('status', '?')}", file=sys.stderr)
+
+    if breaches == 0:
+        if opts.verbose:
+            _log("[OK] every KB-agreement guard passed")
+        return 0
+
+    _log(f"[DONE] {breaches} repo(s) with breaches", file=sys.stderr)
+    if _report_failures > 0:
+        _log(f"[REPORT-FAIL] {_report_failures} report(s) failed — "
+              "breaches not all logged", file=sys.stderr)
+        return 3
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

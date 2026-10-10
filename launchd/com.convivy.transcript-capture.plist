@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  Captures interactive Claude Code session transcripts into the Library's
+  Archives (issue_01M0BRGVMXGQKM4GXBEFG2Z7PS). ~/.claude/projects is a rolling
+  ~30-day window, so this runs every 15 minutes to keep up with it — the same
+  interval com.convivy.orient-github-capture.plist uses for the analogous job.
+
+  Black-box crews (projects.private_slugs(), today just cfo) are excluded at
+  the directory-name level before this ever opens a file inside them.
+
+  RunAtLoad is deliberately false, matching the sibling capture jobs: a
+  capture that fires on every login/reload is a capture whose timing an
+  operator can't reason about.
+
+  A plist change needs bootout + bootstrap, not kickstart (ARCH-104).
+
+  Deploy-pinned per platform/decisions/0059 rule 1
+  (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is production
+  USE of transcript-capture, not someone working on it, so this reads a COPY
+  installed from `main` into ~/.local/deploy/agent-platform-shared/ (rules 2,
+  6, 7) instead of naming the checkout directly — the checkout still exists
+  and is still reached by the person who re-invokes transcript-capture
+  interactively while working on it (rule 5). bin/agent-platform-autopull
+  refreshes the deploy area on every origin/main advance;
+  bin/install-agent-platform-shared is what actually builds it.
+  ProgramArguments names the deploy area's own pinned interpreter explicitly
+  (rule 4), not the shebang or launchd's PATH.
+-->
+<dict>
+  <key>Label</key>
+  <string>com.convivy.transcript-capture</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+    <string>__HOME__/.local/deploy/agent-platform-shared/bin/transcript-capture</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+  <key>StartInterval</key>
+  <integer>900</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Convivy/agent-runs/transcript-capture.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Convivy/agent-runs/transcript-capture.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+</dict>
+</plist>

@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""issue-pr-reconcile — close a `pr-open` issue once its fix PR merges.
+
+`issue_link_pr` moves an issue to `pr-open` and its own docstring says the state is
+non-terminal: "the issue stays open until the PR merges, when you issue_resolve it
+fixed." Nothing did that second half. No job polled linked PRs, so an issue whose fix
+shipped stayed `pr-open` forever and kept counting as active work.
+
+Measured 2026-07-30, which is why this exists: of 59 active issues, 39 were `pr-open`
+and **14 of those had already-merged PRs**. The queue read as a growing backlog while
+the crew was in fact draining it, and the number the operator reads each morning drifted
+further from the truth every night.
+
+WHAT IT DOES NOT DO, deliberately:
+
+  - A PR closed WITHOUT merging is reported, never resolved. The fix was abandoned,
+    so the issue is live work again — but deciding that is a judgment call about why
+    it was abandoned, and a sweep that silently reopened or silently closed those
+    would be wrong in opposite directions. It surfaces them instead.
+  - An issue whose PR reference cannot be resolved is skipped and reported, never
+    guessed at. See the repo-resolution note below.
+  - AN EPIC IS NEVER RESOLVED ON A MERGED PR, only reported. An epic is delivered in
+    slices, and the first slice to merge would otherwise close the whole thing:
+    `issue_link_pr` is the only way to record which PR is doing the work, so an agent
+    shipping step 1 of 5 links it to the epic and this sweep reads that as done. An
+    epic's completion is a judgment against its `definition_of_done`, not a fact about
+    one PR — nothing here can make that call, so it hands it to whoever can.
+
+    Found live on 2026-08-25, before it fired: `issue_01M0N82N1PE8KEHY91HM8FCGTW` (the
+    Bosun's five-step failure-detection epic) sat `pr-open` against a merged step-1 PR,
+    and was the ONLY `pr-open` item in the queue — so that night's pass would have
+    resolved exactly one issue and been wrong about it. The false close is also the
+    expensive direction: nothing looks at a terminal state again, so an epic closed on
+    its first slice loses the other four silently.
+  - A MERGED PR ON A BLOCKED ITEM IS NEVER RESOLVED, only reported. `blocked` and
+    its `prerequisites` say whether the item is actually done; a merged PR is not
+    that answer. Found live on 2026-10-07 at 12:30Z:
+    `issue_01M3BFJFKDCYPP4417RGZC75FJ` (Deck's run-register item) was resolved
+    fixed because convivy/convivy-deck#326 merged, while it read `blocked: true`
+    and its prerequisite — the run register's docs_given route — had not been
+    built. The false close hid the missing route from everyone until Deck
+    investigated.
+
+REPO RESOLUTION — the one way this could silently corrupt the queue. A product can
+span several repos (`selector` covers convivy/selector AND convivy/selector-backend),
+so `product + pr` resolves to the wrong repo and would mark live work fixed against a
+coincidentally-numbered PR. `mcp-ops-server.issue_link_pr` states the rule: use
+`pr_url`, or `pr_repo` + `pr`, never `product + pr`; when both are absent the
+reference is unresolvable, so skip. This tool obeys that and pins it with a test.
+
+`pr_repo` is server-derived and org-pinned (the parse accepts only a convivy PR URL),
+which is why it is preferred over `pr_url` — the latter is stored as supplied, as the
+audit trail of what was claimed. Both are checked against the convivy org here anyway,
+so a malformed or out-of-org reference skips rather than reaching `gh`.
+
+THE THREE CASES ABOVE THAT USED TO ONLY REPORT NOW ALSO CALL THE LIBRARY, since
+convivy/library#116 gave `pr-open` a route back out: `POST /items/{id}/reconcile-pr`
+(`issue_client.reconcile_pr`), called with the outcome this sweep just observed —
+`"merged"` for an epic whose slice merged, `"closed"` for a PR closed without
+merging, `"abandoned"` for a PR still open. The route decides nothing itself; it only
+knows what each ending does to the item, and that matches the refusals above exactly:
+`merged`/`closed` return the item to `open` (never to a terminal resolution, so an
+epic is still never resolved here), and `abandoned` moves nothing — the item stays
+`pr-open` — and only raises its `needs` to `operator` so a human sees a PR that still
+looks live. A route call is skipped entirely in `--dry-run`, matching every other
+write this tool makes; a non-2xx from it is reported (`reconcile-failed`), never
+swallowed.
+
+Usage:
+    issue-pr-reconcile              # reconcile, writing to the queue
+    issue-pr-reconcile --dry-run    # report what it would do, write nothing
+    issue-pr-reconcile --product X  # narrow to one product
+
+Exits 0 on a clean pass (including a pass with nothing to do), 1 if the queue could
+not be read. An unreadable queue is a failure, not an empty queue — the ARCH-311
+silent no-op is exactly the class of bug this tool was written to end.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import issue_client as ic  # noqa: E402
+import safe_path as SP  # noqa: E402
+from signal_client import post_alert, sanitise  # noqa: E402
+
+# `safe_which` never reads PATH: it checks a fixed list of system
+# directories (gh resolves from `/opt/homebrew/bin` there today), so there is
+# no PATH for a dispatched agent to plant a `gh` onto — the running account's
+# home and a worktree are never on that list (platform/decisions/0090's
+# Handoff). GH_BIN overrides it for tests. No bare "gh" fallback: that would
+# hand subprocess the unfiltered PATH to search instead, reopening exactly
+# the gap this routes around. None here means main() fails closed below.
+GH_BIN = os.environ.get("GH_BIN") or SP.safe_which("gh")
+
+# Accept only a convivy PR URL. Anything else is unresolvable rather than a hint —
+# `pr_url` is stored as supplied, so it is attacker-influenced in a way `pr_repo`
+# is not, and a permissive parse here is what would let a crafted URL point `gh` at
+# an arbitrary repo.
+_PR_URL_RE = re.compile(
+    r"^https://github\.com/(convivy/[A-Za-z0-9][A-Za-z0-9._-]*)/pull/(\d+)/?$")
+# The repo name must START alphanumeric. A leading hyphen is not reachable today
+# (`pr_repo` is server-derived and GitHub rejects such names), but a name that can
+# be mistaken for a flag has no business being built into an argv, and the cost of
+# excluding it is one character class.
+_REPO_RE = re.compile(r"^convivy/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def pr_ref(issue: dict[str, Any]) -> tuple[str, str] | None:
+    """(repo, number) for an issue's fix PR, or None when unresolvable.
+
+    Prefers the server-derived repo over the as-supplied url. Never falls back to
+    `product` — see the module docstring.
+
+    TWO SHAPES, because the two clients disagree and both reach this function. The
+    loopback `/api/issues` returns the stored `refs` dict (`{url, pr, repo}`), while
+    `mcp-ops-server._shape_issue` flattens the same values to `pr_url` / `pr_repo` /
+    `pr` at the top level. Reading only the flattened shape is a silent no-op against
+    the loopback client — every issue reads as unresolvable and the sweep reports a
+    clean pass having done nothing, which is precisely how this was caught (a live
+    dry run said "39 unresolvable" while all 39 carried a perfectly good `refs`).
+    """
+    refs = issue.get("refs")
+    refs = refs if isinstance(refs, dict) else {}
+    repo = issue.get("pr_repo") or refs.get("repo")
+    num = issue.get("pr") or refs.get("pr")
+    if isinstance(repo, str) and _REPO_RE.match(repo) and str(num or "").isdigit():
+        return repo, str(num)
+    url = issue.get("pr_url") or refs.get("url")
+    if isinstance(url, str):
+        m = _PR_URL_RE.match(url.strip())
+        if m:
+            return m.group(1), m.group(2)
+    return None
+
+
+def prerequisite_text(prerequisites: Any) -> str:
+    """Render an item's `prerequisites` for a report line.
+
+    Each entry is `{"item": "<id>"}` or `{"text": "<condition>"}` (ADR-0074).
+    Both shapes are written by whoever filed or corrected the item, not a
+    platform-derived value, and nothing in this repo constrains either one's
+    content — so both are sanitised the same way a title is before either
+    reaches a report or an alert.
+    """
+    if not isinstance(prerequisites, list) or not prerequisites:
+        return "(none recorded)"
+    parts = []
+    for p in prerequisites:
+        if not isinstance(p, dict):
+            continue
+        if p.get("text"):
+            parts.append(sanitise(str(p["text"]), max_len=70))
+        elif p.get("item"):
+            parts.append(f"item {sanitise(str(p['item']), max_len=70)}")
+    return "; ".join(parts) if parts else "(none recorded)"
+
+
+def pr_state(repo: str, number: str) -> str | None:
+    """"MERGED" | "CLOSED" | "OPEN", or None when GitHub could not be asked.
+
+    None is distinct from every real state on purpose: a `gh` failure must not read
+    as "not merged" (which would silently do nothing forever) nor as "merged" (which
+    would close live issues). The caller reports it and moves on.
+    """
+    try:
+        out = subprocess.run(
+            [GH_BIN, "pr", "view", number, "--repo", repo, "--json", "state"],
+            capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        state = json.loads(out.stdout).get("state")
+    except (ValueError, AttributeError):
+        return None
+    return state if isinstance(state, str) else None
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Close pr-open issues whose fix PR merged.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what would change; write nothing")
+    ap.add_argument("--product", default=None, help="narrow to one product")
+    args = ap.parse_args()
+
+    if not GH_BIN:
+        print("issue-pr-reconcile: no safe gh found (set GH_BIN, or put gh "
+              "in a directory safe_which checks)", file=sys.stderr)
+        return 1
+
+    try:
+        issues = ic.list_issues_by_state("pr-open", product=args.product)
+    except ic.IssueQueueUnavailable as e:
+        print(f"issue-pr-reconcile: {e}", file=sys.stderr)
+        return 1
+
+    resolved: list[str] = []
+    abandoned: list[str] = []   # PR closed without merging — live work again
+    unresolvable: list[str] = []
+    unreachable: list[str] = []
+    # Kept apart from `unreachable` deliberately. A gh failure is transient and
+    # self-healing, so it stays quiet. A write that failed AFTER GitHub confirmed
+    # the merge means the queue is knowably wrong and only a log file says so —
+    # different class, so it alerts.
+    write_failed: list[str] = []
+    epics: list[str] = []       # merged PR, but an epic is not closed by one slice
+    epic_keys: list[str] = []   # one dedup key per (epic, merged PR) — see the alert
+    blocked_merged: list[str] = []      # merged PR, but the item is blocked — prerequisites unmet
+    blocked_merged_keys: list[str] = []  # one dedup key per (item, merged PR) — see the alert
+    still_open = 0
+    # Failures of the NEW `reconcile_pr` calls below, kept apart from `write_failed`
+    # (which is scoped to the ordinary `resolve_issue` write) because the alert text
+    # for each says something different about what is now wrong with the queue.
+    reconcile_failed: list[str] = []
+
+    for issue in issues:
+        iid = issue.get("id") or "?"
+        product = issue.get("product") or "?"
+        # An issue title is free text authored by agents (or anyone with queue
+        # access), not a platform-authored value, so it is sanitised before it
+        # reaches the console rows or the alert body. Same rule as every other
+        # API response body — see signal_client.sanitise. The 70-char cap rides
+        # on max_len so the sanitiser sees the full title first: truncating
+        # first would leave a bisected credential value too short for the
+        # redaction regexes to match.
+        title = sanitise(issue.get("title") or "", max_len=70)
+        ref = pr_ref(issue)
+        if ref is None:
+            unresolvable.append(f"{iid} [{product}] {title}")
+            continue
+        repo, number = ref
+        state = pr_state(repo, number)
+        if state is None:
+            unreachable.append(f"{iid} [{product}] {repo}#{number}")
+            continue
+        if state == "OPEN":
+            still_open += 1
+            # The PR still looks live, so the item must not move on its own —
+            # `reconcile_pr("abandoned")` moves nothing either; it only raises
+            # `needs` to `operator` so a human sees it. Never derived as a
+            # judgment here: the sweep reports what `gh` said and lets the route's
+            # own conservative handling decide what, if anything, changes.
+            if not args.dry_run:
+                res = ic.reconcile_pr(iid, "abandoned")
+                if res.get("status") != "ok":
+                    reconcile_failed.append(
+                        f"{iid} [{product}] {repo}#{number} — reconcile(abandoned) "
+                        f"failed: {res.get('status')}")
+            continue
+        if state == "CLOSED":
+            abandoned.append(f"{iid} [{product}] {repo}#{number} — {title}")
+            if not args.dry_run:
+                res = ic.reconcile_pr(iid, "closed")
+                if res.get("status") != "ok":
+                    reconcile_failed.append(
+                        f"{iid} [{product}] {repo}#{number} — reconcile(closed) "
+                        f"failed: {res.get('status')}")
+            continue
+        # MERGED
+        url = f"https://github.com/{repo}/pull/{number}"
+        line = f"{iid} [{product}] {repo}#{number} — {title}"
+        # An epic is delivered in slices; the first one to merge must not close it.
+        # Reported rather than skipped silently, because a `pr-open` epic whose PR
+        # has merged is a real state somebody has to act on — the epic is either
+        # done, or its next slice needs linking — and this sweep is the only thing
+        # that looks. `reconcile_pr("merged")` unsticks it (pr-open → open) without
+        # resolving it, so it stays claimable; the epic itself is still never
+        # resolved here. An epic that is ALSO blocked takes this path, not the
+        # blocked one below, because the check runs first and the per-slice
+        # hold is a separate judgment from `blocked` (ADR-0074). Either report
+        # says a human has to look; this just picks the one that fits the item.
+        if (issue.get("type") or "") == "epic":
+            epics.append(line)
+            epic_keys.append(f"reconcile-epic-held:{iid}:{repo}#{number}")
+            if not args.dry_run:
+                res = ic.reconcile_pr(iid, "merged")
+                if res.get("status") != "ok":
+                    reconcile_failed.append(
+                        f"{iid} [{product}] {repo}#{number} — reconcile(merged) "
+                        f"failed: {res.get('status')}")
+            continue
+        # A blocked item's PR merging does not mean the item is done — `blocked`
+        # and `prerequisites` are what decide that, and a merged PR is not that
+        # answer (see the module docstring's 2026-10-07 incident). Reported and
+        # unstuck via `reconcile_pr("merged")`, exactly like the epic hold above,
+        # never resolved here.
+        if issue.get("blocked"):
+            prereqs = prerequisite_text(issue.get("prerequisites"))
+            blocked_merged.append(f"{line} — prerequisites unmet: {prereqs}")
+            blocked_merged_keys.append(f"reconcile-blocked-merged-held:{iid}:{repo}#{number}")
+            if not args.dry_run:
+                res = ic.reconcile_pr(iid, "merged")
+                if res.get("status") != "ok":
+                    reconcile_failed.append(
+                        f"{iid} [{product}] {repo}#{number} — reconcile(merged) "
+                        f"failed: {res.get('status')}")
+            continue
+        if args.dry_run:
+            resolved.append(f"[dry-run] {line}")
+            continue
+        res = ic.resolve_issue(
+            iid, "fixed",
+            outcome_note=f"Fix PR {repo}#{number} merged; reconciled by issue-pr-reconcile.",
+            fix_pr=url)
+        if res.get("status") == "ok":
+            resolved.append(line)
+        else:
+            write_failed.append(f"{iid} [{product}] {repo}#{number} — resolve failed: "
+                                f"{res.get('status')}")
+
+    for label, rows in (("resolved", resolved), ("PR closed unmerged — live work again", abandoned),
+                        ("epic with a merged PR — NOT closed, needs a human call",
+                         epics),
+                        ("blocked item with a merged PR — NOT resolved, "
+                         "prerequisites unmet", blocked_merged),
+                        ("unresolvable PR reference — skipped", unresolvable),
+                        ("merged, but the resolve write failed", write_failed),
+                        ("PR outcome recorded, but the reconcile-pr write failed",
+                         reconcile_failed),
+                        ("could not check — skipped", unreachable)):
+        if rows:
+            print(f"issue-pr-reconcile: {len(rows)} {label}:")
+            for r in rows:
+                print(f"    {r}")
+
+    print(f"issue-pr-reconcile: {len(issues)} pr-open, {len(resolved)} resolved, "
+          f"{still_open} PR still open, {len(abandoned)} abandoned, "
+          f"{len(epics)} epic(s) held, {len(blocked_merged)} blocked item(s) held, "
+          f"{len(unresolvable)} unresolvable, {len(write_failed)} write-failed, "
+          f"{len(reconcile_failed)} reconcile-failed, "
+          f"{len(unreachable)} unreachable")
+
+    # Only the states that need a human decision, or that leave the queue knowably
+    # wrong, raise an alert. A merged PR closing its issue is the normal path and
+    # stays quiet; a routine sweep that alerted every night would train the alerts
+    # page to be ignored, which costs the alerts that matter.
+    # THE EPIC ALERT IS SEPARATE AND DEDUPED, because it is the only one of these
+    # that is an EXPECTED, LONG-LIVED state rather than an exception. An epic sits
+    # between slices for days or weeks, and the combined alert below carries no
+    # suppression — so folding epics into it would post the same body every night
+    # until a human acted, which is precisely what the comment under it warns
+    # trains the alerts page to be ignored. That would cost the alerts that matter,
+    # and this one is not safe to ignore.
+    #
+    # Keyed on the epic AND the merged PR, so the alert fires once on the
+    # TRANSITION — an epic's slice merged, it now needs a call — and not again
+    # while nothing has changed. The next slice's PR is a new key, so it alerts
+    # again then. The nightly report block above still lists every held epic, so
+    # the standing state stays visible without being re-announced.
+    if not args.dry_run and epics:
+        for line, key in zip(epics, epic_keys):
+            post_alert("agent-platform",
+                       "An epic's fix PR merged and the epic was deliberately NOT closed. "
+                       "An epic ships in slices, so one merged PR does not mean done — "
+                       "check its definition_of_done, then either resolve it or link the "
+                       f"next slice's PR.\n\n  {line}",
+                       dedup_key=key)
+
+    # Deduped the same way as the epic alert above, on the item AND the merged PR,
+    # keyed separately so one alert's dedup never suppresses the other — a nightly
+    # re-run must not repeat this once it has fired for a given transition, but a
+    # different merged PR on the same still-blocked item is a new transition and
+    # alerts again.
+    if not args.dry_run and blocked_merged:
+        for line, key in zip(blocked_merged, blocked_merged_keys):
+            post_alert("agent-platform",
+                       "A blocked item's fix PR merged while its prerequisites are unmet. "
+                       "A merged PR does not finish an item whose prerequisites are "
+                       "unmet — check them, then either resolve the item or link the PR "
+                       f"that completes them.\n\n  {line}",
+                       dedup_key=key)
+
+    if not args.dry_run and (abandoned or unresolvable or write_failed or reconcile_failed):
+        body = ["issue-pr-reconcile found issues needing a human call.", ""]
+        if abandoned:
+            body.append(f"{len(abandoned)} PR(s) closed without merging — the fix was "
+                        "abandoned, so the issue is live work again:")
+            body.extend(f"  {r}" for r in abandoned)
+            body.append("")
+        if unresolvable:
+            body.append(f"{len(unresolvable)} issue(s) carry a PR reference that cannot be "
+                        "resolved to a convivy repo, so merged state is unknowable:")
+            body.extend(f"  {r}" for r in unresolvable)
+            body.append("")
+        if write_failed:
+            body.append(f"{len(write_failed)} issue(s) have a CONFIRMED-merged PR whose "
+                        "resolve write failed. The queue is overcounting these until the "
+                        "next pass retries; a repeat across passes means the write path "
+                        "is broken rather than flaky:")
+            body.extend(f"  {r}" for r in write_failed)
+            body.append("")
+        if reconcile_failed:
+            body.append(f"{len(reconcile_failed)} issue(s) have a PR outcome this sweep "
+                        "observed, but the Library's reconcile-pr write failed to record "
+                        "it — the item may still be stuck in pr-open, or missing its "
+                        "operator flag, until the next pass retries; a repeat across "
+                        "passes means the write path is broken rather than flaky:")
+            body.extend(f"  {r}" for r in reconcile_failed)
+        post_alert("agent-platform", "\n".join(body))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

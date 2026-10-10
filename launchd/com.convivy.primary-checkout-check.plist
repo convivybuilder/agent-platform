@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.primary-checkout-check</string>
+
+    <!-- Are the live-deployed primary checkouts still on main? (ARCH-437)
+         agent-platform's working tree IS the deployment (~/.local symlinks,
+         ARCH-229), orient renders from its checkout live, the watcher indexes the
+         knowledge checkout, and lab publishes from its own. A checkout left on a
+         feature branch serves un-merged code to every scheduled job on the box.
+         ARCH-396's post-checkout hook warns and CANNOT block, and when an agent
+         does the switch the warning reaches nobody — twice now. Logs an alert signal on
+         breach; silent on pass. -->
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of check-primary-checkouts, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes check-primary-checkouts interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/check-primary-checkouts</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- EVERY 15 MINUTES, and the interval is the whole point rather than a
+         default. What this costs is a window: the 2026-07-22 incident ran an
+         off-main tree for a DAY, and a daily check like cli-contract-check would
+         have caught it a day late. Four `git symbolic-ref` calls is cheap enough
+         that the cadence can be set by the harm instead of by the cost. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Fire at load too. A checkout is most likely to be off main right after a
+         reboot or a re-bootstrap, which is exactly when nothing has run yet. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/primary-checkout-check.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/primary-checkout-check.err.log</string>
+
+    <!-- launchd jobs get a thin PATH without ~/.local/bin (ARCH-086). `git` is
+         what this shells out to; Homebrew's or the system one both serve. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

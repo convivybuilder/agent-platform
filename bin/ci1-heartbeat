@@ -1,0 +1,558 @@
+#!/usr/bin/env python3.11
+"""ci1-heartbeat — logs one alert signal when ci1 stops taking Linux CI jobs, and a second when it recovers.
+
+Runs every five minutes from launchd (launchd/com.convivy.ci1-heartbeat.plist). The operator is often away
+for weeks and does not read Slack, so a dead ci1 has to reach the alerts page on its own. It logs
+signals, never work items: only a co session creates an item (platform/decisions/0073).
+
+TWO CONDITIONS, EACH A FACT READ THIS RUN:
+
+  ci1-offline  `tailscale status --json` on the macstudio reads BackendState "Running" and either lists
+               no peer named ci1 (absent) or lists every peer named ci1 with Online false. Peers
+               named ci1 are one node, so an Online true on any of them is up. When all are
+               offline, the latest LastSeen that is a time starts the outage. Online peers carry
+               LastSeen 0001-01-01T00:00:00Z, so LastSeen is read only when Online is false. An
+               absent ci1, or an offline ci1 whose LastSeen values are all the zero time or
+               unparseable, has no usable start: the outage starts at the first run that saw ci1
+               down. STATE_FILE holds that time as down_since until a run sees ci1 online, so the
+               start stays the same across runs.
+  queued-job   a job in a repository listed in lib/agent-platform/ci1_heartbeat_repos.txt has
+               status "queued", a label "convivy-linux", and created_at at least 15 minutes old.
+               Runs in status "queued" and "in_progress" are both read, since a multi-job run
+               queues its later jobs while it is in progress.
+
+Fifteen minutes covers the 03:30 MST unattended-upgrade reboot plus VM boot and runner
+registration (platform/runbooks/standing-up-the-linux-ci-box, "Unattended recovery").
+
+GITHUB AUTHENTICATION is the convivy-bosun App through lib/agent-platform/github_app.py, never
+`gh` and never a personal token (platform/decisions/0051). The installation token is narrowed to
+`actions: read` and `metadata: read`, so code here that tried to write would be refused by GitHub.
+The App cannot list the runner group's repositories (403), so the repository list is the file
+above. Job names and URLs come from GitHub, so they reach the signal body as bounded inline code,
+and the whole body passes through signal_client.sanitise_body.
+
+ONE INCIDENT PER CONDITION. Each condition opens its own incident, with its own opened signal. STATE_FILE
+records each open incident's dedup_key under its condition's name, so while `ci1-offline` is open a
+second ci1 outage logs nothing, and a `queued-job` incident that never clears does not mute it. The
+key is built from the condition and its start time, so a retry after a lost state write answers
+`duplicate` instead of logging twice, and a new outage is a new key. The signal store keeps every
+dedup_key for all time, so nothing here reads a prior signal back: STATE_FILE is the only memory of
+an open incident.
+
+RECOVERY. Each incident clears on the first run where its own condition reads clear: ci1 Online now
+for `ci1-offline`, no convivy-linux job 15 minutes old for `queued-job`. That run logs a cleared
+signal keyed `ci1-heartbeat-cleared:<once_key>`. An offline or absent ci1 under 15 minutes blocks
+ci1's recovery, and so does a job 15 minutes old or more. A younger job does not block recovery.
+
+CLEARING BY HAND. `bin/ci1-heartbeat --clear CONDITION` ends an open incident without reading either
+source. It logs a cleared signal keyed `ci1-heartbeat-cleared-by-hand:<once_key>`, which is not the
+recovery's key, and drops the incident's state. What the next run does depends on how the outage
+started. With a LastSeen start, the run finds the same start, so the same once_key answers
+`duplicate`: the incident is re-adopted and no second opened
+signal is logged. The recovery still logs its own cleared signal. With an unseen start (ci1 absent,
+or Online false with no usable LastSeen), the state's down_since is dropped, so the next run
+measures the start from its own time. That run is pending for fifteen minutes, then opens a new
+incident under a new once_key: a second opened signal. A failure that began later opens a new
+incident either way.
+
+CHECK FAILURE. A check failure is a failure to read a source: tailscale missing, failing, or
+printing no usable JSON; BackendState not "Running"; a peer named ci1 whose Online is not a
+boolean; the App token refused; a GitHub read failing or raising; the repository list unreadable.
+Each condition is evaluated on its own. An exception from one check is that condition's UNKNOWN,
+logged, and the other condition still logs if it fired. An UNKNOWN never fires a signal and never
+counts as clear, so it holds its own incident open and no other condition's. The run logs it and
+exits 1. An unreadable STATE_FILE stops the run before any
+logging or clearing.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Callable, NamedTuple
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import builder_root as BR  # noqa: E402
+import github_app as GA  # noqa: E402
+import signal_client as SC  # noqa: E402
+
+# The convivy-bosun App, as bin/pr-state-capture reads it. Its installation is derived and
+# checked on every run, never stored.
+APP_ID = "4666673"
+OWNER = "convivy"
+KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
+_READ_PERMISSIONS = {"actions": "read", "metadata": "read"}
+
+TAILSCALE = "/usr/local/bin/tailscale"
+TAILSCALE_TIMEOUT = 30
+CI_NODE = "ci1"
+RUNNER_LABEL = "convivy-linux"
+THRESHOLD = timedelta(minutes=15)
+REPOS_FILE = Path(__file__).resolve().parent.parent / "lib" / "agent-platform" / "ci1_heartbeat_repos.txt"
+
+_PER_PAGE = 100
+_PAGE_CAP = 10
+_FIELD_LIMIT = 120  # longest GitHub-supplied field the signal body carries
+
+STATE_DIR = BR.real_account_home() / ".local" / "state" / "agent-platform" / "ci1-heartbeat"
+STATE_FILE = STATE_DIR / "incident.json"
+
+
+class CheckFailed(Exception):
+    """A check could not be read, so it says nothing about ci1 or the queue this run."""
+
+
+class StateUnreadable(Exception):
+    """STATE_FILE exists but does not say what incident is open or when ci1 went down."""
+
+
+class Verdict(NamedTuple):
+    # "fired": the condition holds and a signal is warranted.
+    # "clear": the condition does not hold now; recovery needs both clear.
+    # "pending": ci1 is offline but under 15 minutes; neither fires nor recovers.
+    # "unknown": the check could not be read.
+    kind: str
+    since: datetime | None = None
+    summary: str = ""
+    detail: str = ""
+    # True when `since` is the first run that saw ci1 down, not a LastSeen time. The caller
+    # records it in STATE_FILE so the next run reads the same start.
+    unseen: bool = False
+
+
+UNKNOWN = Verdict("unknown")
+
+
+def _stamp(when: datetime) -> str:
+    return when.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_time(text: object) -> datetime:
+    try:
+        return datetime.fromisoformat(str(text))
+    except ValueError as e:
+        raise CheckFailed(f"unreadable timestamp {text!r}: {e}")
+
+
+def _inert(text: object) -> str:
+    """A GitHub-supplied field as one line of inline code: sanitised, no backticks, bounded length."""
+    s = SC.sanitise(str(text)).replace("`", "")
+    if len(s) > _FIELD_LIMIT:
+        s = s[:_FIELD_LIMIT - 3] + "..."
+    return f"`{s}`"
+
+
+# --- condition 1: ci1 in tailscale ------------------------------------------------
+
+def tailscale_status(run: Callable = subprocess.run) -> dict:
+    try:
+        proc = run([TAILSCALE, "status", "--json"], capture_output=True,
+                   timeout=TAILSCALE_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise CheckFailed(f"tailscale status did not run: {e}")
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise CheckFailed(f"tailscale status exited {proc.returncode}: {err}")
+    try:
+        status = json.loads(proc.stdout)
+    except ValueError:
+        raise CheckFailed("tailscale status printed no JSON")
+    if not isinstance(status, dict):
+        raise CheckFailed("tailscale status printed JSON that is not an object")
+    return status
+
+
+def _last_seen(text: object) -> datetime | None:
+    """LastSeen as a time, or None when it is unparseable or the zero time (never seen)."""
+    try:
+        seen = datetime.fromisoformat(str(text))
+    except ValueError:
+        return None
+    return None if seen.year == 1 else seen
+
+
+def _unseen(now: datetime, down_since: datetime | None, what: str) -> Verdict:
+    since = down_since or now
+    detail = f"tailscale status: {what}; down since {_stamp(since)}, the first run that saw it down"
+    if now - since < THRESHOLD:
+        return Verdict("pending", since=since, unseen=True)
+    return Verdict("fired", since=since, summary=f"{CI_NODE} offline in tailscale status",
+                   detail=detail, unseen=True)
+
+
+def ci1_verdict(status: dict, now: datetime, down_since: datetime | None = None) -> Verdict:
+    # A stopped local daemon reports its peers as offline, which would read as a dead ci1.
+    backend = status.get("BackendState")
+    if backend != "Running":
+        raise CheckFailed(f"the macstudio's tailscale BackendState is {backend!r}, not 'Running'")
+    # Peers named ci1 are one node: a rebuild can leave an old offline entry beside the live one.
+    # Any of them online is up. When all are offline, the latest usable LastSeen is the start.
+    peers = [p for p in (status.get("Peer") or {}).values() if p.get("HostName") == CI_NODE]
+    if not peers:
+        return _unseen(now, down_since, f"{CI_NODE} absent from the peer list")
+    for peer in peers:
+        if not isinstance(peer.get("Online"), bool):
+            raise CheckFailed(f"{CI_NODE} Online is {peer.get('Online')!r}, not a boolean")
+    if any(peer["Online"] for peer in peers):
+        return Verdict("clear")
+    usable = [t for t in (_last_seen(p.get("LastSeen")) for p in peers) if t is not None]
+    if not usable:
+        return _unseen(now, down_since, f"{CI_NODE} Online=false with no usable LastSeen")
+    seen = max(usable)
+    if now - seen < THRESHOLD:
+        return Verdict("pending", since=seen)
+    return Verdict("fired", since=seen, summary=f"{CI_NODE} offline in tailscale status",
+                   detail=f"tailscale status: {CI_NODE} Online=false, LastSeen {_stamp(seen)}")
+
+
+# --- condition 2: convivy-linux jobs queued in GitHub Actions ---------------------
+
+def load_repos(path: Path = REPOS_FILE) -> list[str]:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        raise CheckFailed(f"cannot read the repository list {path}: {e}")
+    return [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+
+
+def github_getter(*, key_path: Path = KEY_PATH) -> Callable[[str], tuple[int, dict]]:
+    problem = GA.key_problem(key_path, label="the convivy-bosun App")
+    if problem:
+        raise CheckFailed(problem)
+    try:
+        jwt = GA.app_jwt(key_path, APP_ID)
+        inst = GA.single_installation(jwt, OWNER)
+        inst_id = str(inst.get("id") or "")
+        if not inst_id:
+            raise GA.Unreadable("the installation carries no id")
+        token = GA.installation_token(jwt, inst_id, permissions=_READ_PERMISSIONS)
+    except (GA.Unreadable, OSError, ValueError) as e:
+        raise CheckFailed(f"the convivy-bosun App token: {e}")
+    return lambda path: GA.request("GET", GA.API + path, token, None)
+
+
+def _paged(get: Callable, path: str, key: str) -> list[dict]:
+    out: list[dict] = []
+    sep = "&" if "?" in path else "?"
+    for page in range(1, _PAGE_CAP + 1):
+        code, payload = get(f"{path}{sep}per_page={_PER_PAGE}&page={page}")
+        items = payload.get(key) if isinstance(payload, dict) else None
+        if code != 200 or not isinstance(items, list):
+            raise CheckFailed(f"GET {path} answered {code}")
+        out.extend(items)
+        if len(items) < _PER_PAGE:
+            return out
+    raise CheckFailed(f"GET {path} runs past {_PAGE_CAP} pages; refusing a partial list")
+
+
+def queue_verdict(get: Callable, repos: list[str], now: datetime) -> Verdict:
+    oldest: datetime | None = None
+    oldest_at: tuple[str, object, object] | None = None
+    for repo in repos:
+        for status in ("queued", "in_progress"):
+            runs = _paged(get, f"/repos/{repo}/actions/runs?status={status}", "workflow_runs")
+            for run in runs:
+                jobs = _paged(get, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest",
+                              "jobs")
+                for job in jobs:
+                    if job.get("status") != "queued" or RUNNER_LABEL not in (job.get("labels") or []):
+                        continue
+                    created = _parse_time(job.get("created_at"))
+                    if now - created < THRESHOLD:
+                        continue
+                    if oldest is None or created < oldest:
+                        oldest = created
+                        oldest_at = (repo, job.get("name"), job.get("html_url"))
+    if oldest is None:
+        return Verdict("clear")
+    repo, name, url = oldest_at
+    return Verdict("fired", since=oldest,
+                   summary=f"a {RUNNER_LABEL} job queued",
+                   detail=f"{repo}: job {_inert(name)} queued since {_stamp(oldest)} ({_inert(url)})")
+
+
+def queue_check(now: datetime, *, repos_file: Path = REPOS_FILE,
+                github: Callable = github_getter) -> Verdict:
+    repos = load_repos(repos_file)
+    return queue_verdict(github(), repos, now)
+
+
+# --- the incident state -----------------------------------------------------------
+
+# What each condition's recovery note reports as observed.
+_CLEAR_FACT = {
+    "ci1-offline": f"{CI_NODE} online in tailscale status",
+    "queued-job": f"no {RUNNER_LABEL} job 15 minutes old",
+}
+CONDITIONS = tuple(_CLEAR_FACT)
+
+
+def load_state(path: Path) -> dict:
+    """STATE_FILE as a dict, {} when absent. It names each open incident under its condition
+    (`incidents`) and/or the time ci1 was first seen down (down_since); a file that names neither
+    is unreadable.
+
+    A file written before incidents were per condition holds one incident at the top level
+    (once_key, opened_at, conditions, and issue_id, which is dropped). It is read as that same
+    incident for each of its conditions, so an open incident from before this change still
+    clears on recovery."""
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        raise StateUnreadable(f"cannot read {path}: {e}")
+    try:
+        state = json.loads(text)
+    except ValueError:
+        raise StateUnreadable(f"{path} is not JSON")
+    if not isinstance(state, dict):
+        raise StateUnreadable(f"{path} is not a JSON object")
+    if "once_key" in state:
+        conditions = state.get("conditions")
+        if not isinstance(state["once_key"], str) or not state["once_key"]:
+            raise StateUnreadable(f"{path} names no once_key")
+        if not isinstance(conditions, list) or not set(conditions) <= set(CONDITIONS):
+            raise StateUnreadable(f"{path} names no known conditions")
+        incidents = state.setdefault("incidents", {})
+        for name in conditions:
+            incidents.setdefault(name, {"once_key": state["once_key"],
+                                        "opened_at": state.get("opened_at")})
+        for key in ("once_key", "opened_at", "conditions", "issue_id"):
+            state.pop(key, None)
+    if "incidents" not in state and "down_since" not in state:
+        raise StateUnreadable(f"{path} names no incident and no down_since")
+    incidents = state.get("incidents", {})
+    if not isinstance(incidents, dict) or any(
+            name not in CONDITIONS or not isinstance(inc, dict)
+            or not isinstance(inc.get("once_key"), str) or not inc.get("once_key")
+            for name, inc in incidents.items()):
+        raise StateUnreadable(f"{path} names an incident that is not readable")
+    if "down_since" in state:
+        try:
+            datetime.fromisoformat(state["down_since"])
+        except (TypeError, ValueError):
+            raise StateUnreadable(f"{path} has an unreadable down_since")
+    return state
+
+
+def _write_state(path: Path, state: dict) -> None:
+    if not state:
+        path.unlink(missing_ok=True)
+        return
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    with os.fdopen(fd, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+def save_incident(path: Path, state: dict) -> None:
+    _write_state(path, state)
+
+
+def _persist(path: Path, state: dict) -> bool:
+    try:
+        _write_state(path, state)
+    except OSError as e:
+        _log(f"could not write {path}: {e}")
+        return False
+    return True
+
+
+def _set_down_since(state: dict, when: datetime | None) -> None:
+    if when is None:
+        state.pop("down_since", None)
+    else:
+        state["down_since"] = _stamp(when)
+
+
+def _end_incident(state: dict, name: str) -> None:
+    state["incidents"].pop(name, None)
+    if not state["incidents"]:
+        state.pop("incidents", None)
+
+
+# --- logging and clearing -----------------------------------------------------------
+
+# The severity the opened item was filed at before this moved to signals; meta carries it now.
+_OPENED_SEVERITY = "high"
+
+
+def _post_signal(text: str, dedup_key: str, edge: str) -> str:
+    """Log one alert signal for an incident edge: `edge` is "opened" or "cleared". Returns the
+    signal_client status: created, duplicate, skip (no token) or error:<tail>. The opened edge
+    carries the severity the work item it replaced was filed at. The recovery carries none, since
+    resolving that item set none."""
+    meta = {"edge": edge}
+    if edge == "opened":
+        meta["severity"] = _OPENED_SEVERITY
+    return SC.post_alert("ci1-heartbeat", SC.sanitise_body(text), product="bosun",
+                         dedup_key=dedup_key, meta=meta)
+
+
+def _log(msg: str) -> None:
+    print(f"ci1-heartbeat: {msg}", file=sys.stderr)
+
+
+def open_incident(name: str, v: Verdict, now: datetime, state: dict, state_path: Path,
+                  post: Callable) -> bool:
+    title = f"ci1 heartbeat: {v.summary} since {_stamp(v.since)}"
+    lines = ["The ci1 heartbeat (bin/ci1-heartbeat, launchd com.convivy.ci1-heartbeat) saw:", "",
+             f"- {v.detail}", "", "Check first:",
+             "- ssh ci1",
+             "- systemctl status garm",
+             "- garm-cli runner list",
+             "- incus list --project ci-runners", "",
+             f"Detected {_stamp(now)}. The heartbeat logs a cleared signal on the first run where "
+             f"{_CLEAR_FACT[name]}."]
+    once_key = f"ci1-heartbeat:{name}@{_stamp(v.since)}"
+    status = post(f"{title}\n\n" + "\n".join(lines), once_key, "opened")
+    if status not in ("created", "duplicate"):
+        _log(f"could not log the {name} incident: {status!r}; the next run will try again")
+        return False
+    state.setdefault("incidents", {})[name] = {"once_key": once_key, "opened_at": _stamp(now)}
+    if not _persist(state_path, state):
+        _log(f"logged {once_key} ({status}) but did not record it; the next run's "
+             f"dedup_key answers duplicate")
+        return False
+    _log(f"logged {once_key} ({status}): {title}")
+    return True
+
+
+def clear_incident(name: str, now: datetime, state: dict, state_path: Path,
+                   post: Callable) -> bool:
+    inc = state["incidents"][name]
+    note = (f"ci1 heartbeat: recovered. First observed at {_stamp(now)} with {_CLEAR_FACT[name]}. "
+            f"Incident opened {inc['opened_at']} for: {name}.")
+    once_key = inc["once_key"]
+    status = post(f"ci1 heartbeat: cleared\n\n{note}", f"ci1-heartbeat-cleared:{once_key}",
+                  "cleared")
+    # A failed log keeps the incident open, so the next run tries the cleared signal again. A
+    # `duplicate` means it was already logged, which is the same outcome as created.
+    if status not in ("created", "duplicate"):
+        _log(f"could not log the cleared signal for {once_key}: {status!r}; "
+             f"incident kept open, the next run will try again")
+        return False
+    _end_incident(state, name)
+    if not _persist(state_path, state):
+        _log(f"logged cleared for {once_key} but did not clear the state; the next run reads it "
+             f"as still open and logs cleared again, which the dedup_key answers as duplicate")
+        return False
+    _log(f"logged cleared for {once_key} at {_stamp(now)}")
+    return True
+
+
+def clear_by_hand(name: str, now: datetime, state_path: Path, post: Callable) -> int:
+    """`--clear CONDITION`: end the named condition's open incident without reading its source.
+    It logs that incident's cleared signal under its own key, `ci1-heartbeat-cleared-by-hand:`,
+    not the recovery's key, so the recovery of an outage that still fails logs its own cleared
+    signal. It drops the condition's state too. For ci1-offline with a LastSeen start, the next
+    run finds the same start and re-adopts the incident under the same once_key. For an unseen
+    start, down_since is dropped, so the next run starts the outage again at its own time."""
+    try:
+        state = load_state(state_path)
+    except StateUnreadable as e:
+        _log(f"incident state unreadable, nothing cleared: {e}")
+        return 1
+    inc = state.get("incidents", {}).get(name)
+    if inc is None:
+        _log(f"no open {name} incident; nothing to clear")
+        return 0
+    once_key = inc["once_key"]
+    note = (f"{name} was cleared by an operator at {_stamp(now)} "
+            f"with `bin/ci1-heartbeat --clear {name}`, without being read. Incident opened "
+            f"{inc['opened_at']}.")
+    status = post(f"ci1 heartbeat: cleared\n\n{note}",
+                  f"ci1-heartbeat-cleared-by-hand:{once_key}", "cleared")
+    if status not in ("created", "duplicate"):
+        _log(f"could not log the cleared signal for {once_key}: {status!r}; the incident is "
+             f"still open")
+        return 1
+    if name == "ci1-offline":
+        _set_down_since(state, None)
+    _end_incident(state, name)
+    if not _persist(state_path, state):
+        _log(f"logged cleared for {once_key} but did not clear the state")
+        return 1
+    _log(f"cleared {name} by hand; logged cleared for {once_key}")
+    return 0
+
+
+# --- one run --------------------------------------------------------------------------
+
+def run_once(*, now: datetime, state_path: Path, ci1_check: Callable[[datetime | None], Verdict],
+             queue_check_fn: Callable[[datetime], Verdict], post: Callable) -> int:
+    try:
+        state = load_state(state_path)
+    except StateUnreadable as e:
+        _log(f"incident state unreadable, nothing logged or cleared: {e}")
+        return 1
+    failed = False
+    down_since = (datetime.fromisoformat(state["down_since"])
+                  if "down_since" in state else None)
+    ci1 = queue = UNKNOWN
+    try:
+        ci1 = ci1_check(down_since)
+    except Exception as e:
+        failed = True
+        _log(f"ci1-offline check failed: {e}")
+    try:
+        queue = queue_check_fn(now)
+    except Exception as e:
+        failed = True
+        _log(f"queued-job check failed: {e}")
+
+    if ci1.kind != "unknown":
+        # A start that LastSeen cannot date is recorded before anything is logged on it, so a
+        # retry after a lost write files under the same once_key.
+        want = ci1.since if ci1.unseen else None
+        if want != down_since:
+            _set_down_since(state, want)
+            if not _persist(state_path, state):
+                failed = True
+                if ci1.unseen:
+                    ci1 = UNKNOWN
+                    _log("ci1 is down with no usable LastSeen and its start could not be "
+                         "recorded; not counted this run")
+
+    verdicts = (("ci1-offline", ci1), ("queued-job", queue))
+    _log(f"ci1={ci1.kind} queued={queue.kind} "
+         f"incidents={', '.join(sorted(state.get('incidents', {}))) or 'none'}")
+    # Each condition is its own incident: a fired condition with no open incident opens one, and a
+    # clear condition with an open incident closes it. Neither waits on the other.
+    for name, v in verdicts:
+        if v.kind == "fired" and name not in state.get("incidents", {}):
+            failed |= not open_incident(name, v, now, state, state_path, post)
+    for name, v in verdicts:
+        if v.kind == "clear" and name in state.get("incidents", {}):
+            failed |= not clear_incident(name, now, state, state_path, post)
+    return 1 if failed else 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Log one signal when ci1 stops taking Linux CI jobs; log a second on recovery.",
+        epilog="--clear CONDITION ends that condition's open incident by hand: it logs the "
+               "incident's cleared signal and drops its state, without reading either source. "
+               f"Conditions: {', '.join(CONDITIONS)}.")
+    parser.add_argument("--clear", metavar="CONDITION", choices=CONDITIONS,
+                        help="end the open incident for CONDITION by hand, without re-reading it")
+    args = parser.parse_args(argv)
+    now = datetime.now(timezone.utc)
+    if args.clear:
+        return clear_by_hand(args.clear, now, STATE_FILE, _post_signal)
+    return run_once(
+        now=now, state_path=STATE_FILE,
+        ci1_check=lambda down_since: ci1_verdict(tailscale_status(), now, down_since),
+        queue_check_fn=queue_check, post=_post_signal)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

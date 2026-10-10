@@ -1,0 +1,125 @@
+#!/usr/bin/env python3.11
+"""Print the one-line "what needs a human here" summary a co session opens with.
+
+WHY THIS EXISTS.
+
+The operator, 2026-07-26: "there's some decisions/issues I decided recently that just kind
+of disappeared into the void… these are the issues that will get lost if we don't
+have a system."
+
+He was right, and the audit was worse than the question implied. The team site
+has a Home "waiting on you" strip (waiting_build.py, ARCH-362 Phase 2), which is
+HIS surface. But `co` reads the auth token TTL, the model lane and the knowledge
+repo at startup, and has never touched the ops plane — so no interactive session
+has ever learned what was waiting for it. The queue was product-scoped and
+addressable the whole time; nothing read it at the one moment a human was
+present.
+
+WHY A COMMAND, NOT A BLOCK INSIDE `co`. `co` is zsh, and this needs the ops token
+and an HTTP call. A separate command is testable, is callable by hand when a
+session wants to re-check, and keeps `co`'s startup path to one line. It follows
+the token-status check's precedent, which already shells out for the same reason.
+
+WHY IT NEVER FAILS LOUDLY. It runs on the startup path of every session. A store
+that is down, slow, or unreachable must cost a line of output, never a session —
+so every error path prints nothing and exits 0. A missing line is a small loss; a
+co that will not start is not.
+
+Usage:
+    issues-waiting <product>          # one line to stderr, or nothing
+    issues-waiting <product> --list   # the issues themselves, for a human read
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import sys
+import urllib.parse
+import urllib.request
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                pathlib.Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "term_safe.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+# A hard ceiling on the startup path. The store is loopback, so this is generous;
+# what it buys is the guarantee that a wedged server cannot hang a session open.
+_TIMEOUT = 4
+
+
+def _fetch(product: str) -> list[dict]:
+    """The product's open issues that no agent can finish.
+
+    THE RESPONSE IS RE-CHECKED, NOT TRUSTED, and that is not paranoia — it is the
+    observed behaviour. An unknown query parameter is IGNORED by the store, so
+    against a server predating the `needs` column this asks for operator-only
+    issues and is handed every open issue instead. Tested live on 2026-07-26: it
+    reported "3 issues need you on vivy" when the real answer was zero, and every
+    word of that line was wrong in the direction that erodes trust in it.
+
+    Filtering on the serialised field closes it in both directions. An old server
+    omits `needs` entirely, so nothing matches and the line is correctly silent
+    until the column ships; a current one sets it, and the client agrees with the
+    server instead of assuming it was obeyed.
+    """
+    import signal_client as SC
+    import vault_plane
+    tok = SC.token()
+    if not tok:
+        return []
+    params = {"product": product, "state": "open", "needs": "operator"}
+    url = vault_plane.url(f"/api/issues?{urllib.parse.urlencode(params)}")
+    req = urllib.request.Request(url, headers=vault_plane.headers(token=tok))
+    with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        items = json.loads(resp.read().decode("utf-8")).get("items", [])
+    return [i for i in items if i.get("needs") == "operator"]
+
+
+from term_safe import safe as _safe  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="issues-waiting", description=__doc__)
+    ap.add_argument("product")
+    ap.add_argument("--list", action="store_true",
+                    help="print each waiting issue rather than a count")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    try:
+        items = _fetch(args.product)
+    except Exception:
+        # Deliberately bare. Anything at all — no token, store down, DNS, a schema
+        # change — costs the line, not the session. See the module docstring.
+        return 0
+
+    if not items:
+        return 0
+
+    if args.list:
+        for it in items:
+            print(f"  {_safe(it.get('id'))}  {_safe(it.get('title'))}", file=sys.stderr)
+            print(f"      {_safe(it.get('url'))}", file=sys.stderr)
+        return 0
+
+    n = len(items)
+    noun = "issue needs" if n == 1 else "issues need"
+    # To stderr, like every other co startup line, so it never lands in something
+    # capturing stdout. The URL is a full path per ARCH-043 — the operator cmd-clicks these.
+    # `product` is a local directory basename, so it is trusted in the sense that
+    # matters — but a directory name CAN carry control bytes, it costs nothing to
+    # be sure, and a rule with an exception is the one that gets forgotten. Every
+    # non-literal in this line goes through _safe or is an int.
+    print(f"co: 🙋 {n} {noun} you on {_safe(args.product)} "
+          f"(no agent can finish them) — "
+          f"https://team.convivy.com/engineering/issues?needs=operator",
+          file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

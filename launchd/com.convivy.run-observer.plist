@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.run-observer</string>
+
+    <!-- Reports what happened to runs that nothing else reports.
+
+         THREE FINDINGS, not one. A run that died without ever finalizing (below),
+         a run that died with a working recovery target beside it and had the
+         fail-over REFUSED, and a run that finished at a provider nobody chose
+         because the fail-over was TAKEN. The epic's rule is that a refusal is
+         reported as loudly as an action and neither is satisfied by a field
+         written to metadata that nothing reads — and measured over 13,707
+         June-August 2026 run directories, 103 refusals and 68 fail-overs had
+         exactly one reader in the whole repo, `agentctl status <run-id>`, which
+         someone has to think to run against a run id they must already hold.
+         48 of the refusals were review agents attached to a pull request.
+         (No double hyphen anywhere in this comment: XML forbids one inside a
+         comment, `plutil -lint` accepts it anyway, and the repo's plist test
+         is the check that catches it.)
+
+         The first sweep announces the whole backlog once and the Library's per-run
+         dedup silences it thereafter, which is what the abandonment finding
+         already did with 72. A cut-over date was considered and rejected: it is a
+         way of not looking, and `started_at` is agent-written anyway, so it would
+         not even be a reliable one.
+
+         Reports runs that died without ever finalizing.
+
+         A dispatched run classifies its own death: `_finalize_run` writes
+         outcome.json with the exit status, the cost and the harness's terminal
+         reason. Which is exactly why this exists — when the process disappears
+         (SIGKILL, the machine sleeping, an OOM, the harness dying) there is no
+         in-process moment left in which to notice. The run leaves a meta.json, a
+         transcript, and nothing else. Nobody is told.
+
+         Measured before it was built: across 10,965 run-* dispatches in
+         July-August 2026, twenty ended this way, and ten of the twenty were review
+         agents — ten PRs that received substantial review work and no verdict.
+         run-af1adcd7 did 444 transcript lines on agent-platform#398 and vanished.
+         Both reviewers on vivy#1132 died fourteen seconds apart, so that PR got
+         neither.
+
+         WHY NOT READ THE STALE LOG INSTEAD. registry._log_stale already records
+         reaped entries, but that log holds 1,414 distinct run ids over the same
+         period because healthy runs are reaped there too. Reporting off it alone
+         would be about 98.6% noise. The signal is the intersection: the process is
+         gone AND no outcome.json was ever written.
+
+         06:30, after the 05:30 reconcile and alongside the morning report, because
+         the finding is something the operator reads rather than something that must beat
+         another job to the queue. Nothing depends on the ordering.
+
+         Safe to overlap with anything: it reads run directories and writes
+         NOTHING to disk at all. It NEVER recovers a run —
+         one that vanished mid-flight may have left a worktree, a branch or a
+         half-posted comment, and re-running it would duplicate whatever it
+         reached. It names what happened and hands it over.
+
+         Findings are announced ONCE per run rather than nightly. They never
+         resolve — nothing will ever come back and write the missing outcome.json —
+         so an un-deduped alert would repeat forever, which is what trains an
+         alerts page to be ignored.
+
+         That suppression is SERVER-SIDE, via the Library's per-run dedup_key, and
+         deliberately not a local file. A seen-list kept beside the runs would sit
+         inside the tree this audits, which every dispatched agent can write — so
+         hiding a run's abandonment forever would be a one-line append, defeating
+         this sweep with the exact capability it exists to catch.
+
+         It narrows rather than closes, and bin/run-observer's own comment carries
+         the full version: the Library currently accepts any caller-supplied
+         dedup_key from the agent role, so an agent holding the same-user bearer
+         token can still pre-post the key. Suppressing now costs a credentialed
+         call rather than a file edit. -->
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of run-observer, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes run-observer interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/run-observer</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- STDIO DELIBERATELY OUTSIDE RUNS_ROOT, unlike ~37 sibling plists.
+
+         launchd opens these by plain path with no O_NOFOLLOW. Pointing them at
+         ~/Convivy/agent-runs — the tree this job audits, writable by every
+         dispatched agent — would let an agent pre-create the log as a symlink to
+         any file this user can write (a shell rc file, another LaunchAgent
+         plist), and the 06:30 job would then append to it. The write happens
+         under a trusted, unattended job rather than in the agent's own reviewed
+         transcript: the same laundering that `bin/run-observer` refuses on every
+         read it does, arriving through the one path the program does not open
+         itself.
+
+         ~/.local/state/agent-platform is where com.convivy.agent-platform-autopull
+         already puts its stdio. It NARROWS rather than closes: same OS user, so
+         an agent that thinks to plant a symlink there can still do it. What it
+         removes is the planting site inside the tree agents already enumerate
+         and write to as a matter of course. -->
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/agent-platform/run-observer.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/agent-platform/run-observer.err.log</string>
+</dict>
+</plist>

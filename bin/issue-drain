@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# issue-drain — daytime cost-shift packaging for the issue-queue drain against a
+# single product. ARCH-075 (cost-shift) + ARCH-359/360 (the in-box queue).
+# Renamed from bug-drain (ARCH-361).
+#
+# Subscription-billed: launches an interactive co session on the
+# planning-orchestrator inside the product repo. The session drains the in-box
+# issue queue (/issues on team.convivy.com, via the ops MCP tools) end-to-end —
+# claim → bug-fixer → reviewer + security-reviewer → auto-cycle → record the
+# outcome back on /issues (pr-open / released-with-a-note) — and runs
+# `mark-fresh <product> bug-fix` when complete, so the next overnight (within
+# 72h) skips its bug-fix phase for this product.
+#
+# The queue moved off Slack (ARCH-359): issues are memory items in /issues
+# (entered manually via the Log-a-bug form + synced from GitHub issues), not
+# #*-bugs messages with 👀/✅ emoji. The drain's result lands in /issues, not a
+# Slack ✅.
+#
+# Independent of bug-sweep per ARCH-075: issue-drain only marks bug-fix fresh.
+#
+# Usage:
+#   issue-drain <product>
+#
+#   product: constance | vivy | sous-chef
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: issue-drain <constance|vivy|sous-chef>" >&2
+    exit 1
+}
+
+[[ $# -eq 1 ]] || usage
+product=$1
+
+case $product in
+    constance|vivy|sous-chef) ;;
+    *) echo "issue-drain: invalid product '$product'" >&2; usage ;;
+esac
+
+# The product lives under the machine's root (company/decisions/0008), printed by
+# the bin/builder-root beside this file's real path; HOME does not move it.
+_self_path="${BASH_SOURCE[0]}"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+root="$("$(dirname "$_self_path")/builder-root" --root)" && [[ -n "$root" ]] \
+    || { echo "issue-drain: cannot resolve the machine's root (bin/builder-root --root)" >&2; exit 1; }
+product_dir="$root/$product"
+[[ -d "$product_dir" ]] || { echo "issue-drain: no product dir at $product_dir" >&2; exit 1; }
+
+# The review-round cap sentence the brief states below: review_rounds_code (the
+# code cap) and review_rounds_per_role (the document cap) from the policy file at
+# the knowledge repo's freshly fetched origin/main (agent_policy.load), or the
+# AP.FALLBACK_* values when that file is missing, unreadable or breaks a rule — the
+# same read registry.limits() does for the concurrency caps. Reading it here, rather
+# than writing the numbers into this script, is why the operator's 2026-10-01 raise (5 -> 7,
+# sig_01M3W9600TWE8SVKQNXX6G282A) needed no edit to this file; platform/decisions/0083
+# raising it 3 -> 5 did. The Python loader builds the sentence, so the bash side does
+# no policy parsing.
+data_root="$("$(dirname "$_self_path")/builder-root")" && [[ -n "$data_root" ]] \
+    || { echo "issue-drain: cannot resolve the machine's data root (bin/builder-root)" >&2; exit 1; }
+cap_sentence=$(PYTHONPATH="$(dirname "$_self_path")/../lib/agent-platform" python3 -c '
+import sys
+import agent_policy as AP
+try:
+    policy = AP.load(AP.policy_text_at_origin_main(sys.argv[1]))
+except Exception:
+    policy = AP.Fallback("review-round cap read raised an exception")
+print(AP.review_round_cap_sentence(policy))
+' "$data_root/knowledge") && [[ -n "$cap_sentence" ]] \
+    || { echo "issue-drain: cannot read the review-round cap from the policy file" >&2; exit 1; }
+
+prompt="Task: Drain the in-box issue queue for $product end-to-end. Subscription-billed daytime cost-shift per ARCH-075; the queue is /issues on team.convivy.com (ARCH-359/360), read + updated through the ops MCP tools (mcp__ops__issue_*).
+
+Scope (ARCH-027 + ARCH-068 review cycle; ARCH-359/360 in-box outcomes):
+
+1. List the open issues: mcp__ops__issue_list(product=\"$product\", state=\"open\"). These are the issues to drain — the queue never returns the operator's \"Won't do\" (wontfix) issues, so you naturally skip them.
+
+For each open issue:
+
+2. Claim it: mcp__ops__issue_claim(issue_id). If it returns error:409 it is already claimed by another worker — skip it.
+3. Dispatch bug-fixer in fix mode (it commits + authors pr-body.md, returns a one-line summary + suggested title).
+4. On return: agentctl publish then agentctl pr-open (ARCH-055 + ARCH-058 gates), title \`[nightly-bugfix] fix: <title>\`.
+5. Record the fix PR on the issue immediately: mcp__ops__issue_link_pr(issue_id, pr=\"<N>\", url=\"<pr_url>\") — the issue moves to pr-open and shows a link in /issues. This is the close-loop; there is no Slack ✅.
+6. Dispatch reviewer + security-reviewer in parallel with --pr <N> (ARCH-027). Auto-cycle on any finding or red CI: re-dispatch bug-fixer with findings verbatim, re-publish --pr, re-review. ${cap_sentence} A finding that repeats one an earlier round raised, in a round past the document cap, ends the cycle: a headless run dispatches no further round, leaves the PR pr-open, and records the repeat on the issue thread.
+7. Terminal = a ready-to-merge PR. Per ARCH-020 do NOT merge — the operator merges. The issue stays pr-open (its outcome + PR link are the record); a later in-box merge (ARCH-359 step 4) will mark it fixed.
+
+If an issue needs the operator's call rather than a fix (a design decision, an ambiguous spec): record it with mcp__ops__signal_log(kind=\"needs-decision\", product=\"$product\", body=<what needs deciding>), then mcp__ops__issue_comment(issue_id, kind=\"note\", body=<the same summary, so it's on the thread>), then mcp__ops__issue_release(issue_id, owner=<your session identity>) — the issue goes back to open with your note on it, visible in /issues, rather than staying claimed. Do NOT call mcp__ops__issue_escalate for this: it requires a decision_id, and there is no decision queue left to raise one into.
+
+IMPORTANT — never leave a claimed issue with no recorded outcome. Once you claim an issue you own recording where it went (pr-open / released-with-a-note / resolved), because a claimed issue with no PR is invisible on the next drain (issue_list only returns open) and there is no unclaim. So if bug-fixer FAILS to produce a PR (it errors, or hits the review-round cap in step 6 before a PR opens), do not move on silently — record what's stuck with signal_log and issue_comment as above, then issue_release it, so it surfaces in /issues for the operator rather than staying stuck-claimed. At the step 6 cap for that PR's kind AFTER a PR opened, leave it pr-open (its findings are on the PR). Per ARCH-030 verify every code-specific claim.
+
+Use Task dispatch (not agentctl spawn --detach) so the work stays inside this subscription-billed session — agentctl spawn --detach uses claude -p which is metered Agent SDK.
+
+When every open issue is worked (or claimed-and-in-flight), run \`mark-fresh $product bug-fix\` from Bash before ending the session — the next overnight then skips its bug-fix phase for $product within 72h. If the queue is empty when you start, just run mark-fresh and exit (a valid no-op — the marker records the queue was confirmed clear)."
+
+cd "$product_dir"
+# co's contract is `co <agent> [prompt...]` — the first positional is ALWAYS
+# the agent name (bare `co` defaults to planning-orchestrator only when $1 is
+# empty). Pass the agent explicitly; otherwise the whole prompt string is
+# parsed as an agent name and co fails with "agent '<prompt>' not individuated".
+# (Siblings bug-sweep/arch-review already do this: `co bug`, `co arch`.)
+exec co planning-orchestrator "$prompt"

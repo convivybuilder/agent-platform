@@ -1,0 +1,207 @@
+#!/usr/bin/env python3.11
+"""work-item-cost — run cost totalled by the work item each run served (E16·4).
+
+Reads every work item from the Library (every state) and the run directories under
+telemetry's RUNS_ROOT, then totals each run's cost against the item it joined through
+cost_join.build_item_costs. Attribution is meta.issue first, then the run's PR matched
+to an item's linked PR; anything else is unattributed and shown as its own total.
+
+The source is run directories, not the Library ledger. The Library's per-run record is
+the authoritative one (platform/decisions/0020); this report says so in its output. A
+run older than the run-retention window is gone from the directories, so its cost is
+gone from this report too.
+
+With --course or --product, the report instead joins by epic and rolls up to a Course
+(E16·2): per-epic lanes beside the epic's progress and the Course's position, Course
+totals per lane broken down by model, and a persona (agent) x model x item-type table.
+This mode needs the Library's Course and item reads and exits 1 if either is unreachable.
+
+CLI: --days N (default 30) · --json · --course <id> · --product <name>.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import cost_join as cj  # noqa: E402
+import issue_client as IC  # noqa: E402
+
+# Every state an item can be in. `claimable` is left out: it is open plus expired
+# claims, so it would fetch the same items twice.
+ITEM_STATES = ("open", "claimed", "pr-open", "fixed", "wontfix", "duplicate", "redirected")
+
+
+def fetch_items() -> list[dict]:
+    """Every work item in every state, once each. Raises IssueQueueUnavailable."""
+    seen: dict[str, dict] = {}
+    for state in ITEM_STATES:
+        for item in IC.list_issues_by_state(state):
+            seen.setdefault(item["id"], item)
+    return list(seen.values())
+
+
+def _money(lane: dict) -> str:
+    if lane["usd"] is not None:
+        return f"${lane['usd']:,.2f}"
+    why = []
+    if lane["cost_missing_runs"]:
+        why.append(f"cost missing: {lane['cost_missing_runs']}")
+    if lane["unpriced_models"]:
+        why.append(f"unpriced: {', '.join(_printable(m) for m in lane['unpriced_models'])}")
+    return f"None ({'; '.join(why)})"
+
+
+def _printable(text: str) -> str:
+    """`text` with every control or format character (Unicode category C*) and every
+    line or paragraph separator (Zl, Zp: U+2028 and U+2029, which str.splitlines() breaks
+    a line on) replaced by a space. Titles, billing lanes, model names and products come
+    from whoever filed an item or dispatched a run, so none of them may start a line."""
+    out = []
+    for ch in text:
+        cat = unicodedata.category(ch)
+        out.append(" " if cat[0] == "C" or cat in ("Zl", "Zp") else ch)
+    return "".join(out)
+
+
+def _lane_lines(label: str, title: str, lanes: dict) -> list[str]:
+    if not lanes:
+        return [f"{label:<26} {title:<30} {'—':<26} {0:>5} {'—':>12}"]
+    out = []
+    for bs, lane in lanes.items():
+        out.append(f"{label:<26} {title:<30} {_printable(bs):<26} {lane['runs']:>5} "
+                   f"{_money(lane):>12}")
+    return out
+
+
+def render(report: dict) -> str:
+    """The terminal table. Every lane is its own line; no line sums across lanes."""
+    lines = [
+        f"Work-item cost, runs that started {report['window']['start']} to "
+        f"{report['window']['end']} ({report['run_count']} runs).",
+        f"Source: run directories under {cj.RUNS_ROOT}, NOT the Library ledger "
+        "(platform/decisions/0020).",
+        "",
+        f"{'ITEM':<26} {'TITLE':<30} {'LANE (billing_source)':<26} {'RUNS':>5} "
+        f"{'COST':>12}",
+    ]
+    for row in report["items"]:
+        label = _printable(f"{row['id']} ({row['product'] or '?'})")
+        lines += _lane_lines(label[:26], _printable(row["title"] or "")[:30],
+                             row["by_billing_source"])
+    lines += _lane_lines("(unattributed)", "", report["unattributed"]["by_billing_source"])
+    lines += [
+        "",
+        f"Unattributed runs: {report['unattributed']['count']} "
+        f"({', '.join(f'{k} {v}' for k, v in report['unattributed']['by_reason'].items()) or 'none'}).",
+        f"Disagreements (meta.issue names a different item than the PR's): "
+        f"{report['disagreements']}; these runs counted under meta.issue.",
+    ]
+    return "\n".join(lines)
+
+
+def resolve_course(product: str | None, course_id: str | None) -> dict:
+    """The Course to report on: `course_id` read directly when given, else
+    `product`'s one live Course. Raises IssueQueueUnavailable — the same
+    failure a direct read would — when neither names a Course, or when a
+    product's live Courses don't number exactly one to default to."""
+    if course_id:
+        return IC.get_course(course_id)
+    if not product:
+        raise IC.IssueQueueUnavailable("no --course given and no --product to default from")
+    courses = IC.list_courses(product)
+    if len(courses) != 1:
+        raise IC.IssueQueueUnavailable(
+            f"{product} has {len(courses)} live Courses; name one with --course")
+    return IC.get_course(courses[0]["id"])
+
+
+def _money_value(usd: float | None) -> str:
+    return f"${usd:,.2f}" if usd is not None else "None"
+
+
+def render_course(course_report: dict, persona: dict) -> str:
+    """The terminal table for --course/--product: per-epic lanes, Course totals
+    per lane broken down by model, and the persona x model x item-type table.
+    Every lane is its own line; nothing here sums across lanes."""
+    lines = [
+        f"Course cost, runs that started {course_report['window']['start']} to "
+        f"{course_report['window']['end']}.",
+        f"Source: run directories under {cj.RUNS_ROOT}, NOT the Library ledger "
+        "(platform/decisions/0020).",
+    ]
+    if course_report["cannot_be_measured"]:
+        lines.append(f"cannot be measured: {course_report['reason']}")
+    lines += ["", f"{'EPIC':<26} {'TITLE':<30} {'LANE (billing_source)':<26} {'RUNS':>5} "
+              f"{'COST':>12}"]
+    for epic in course_report["epics"]:
+        label = _printable(f"{epic['id']} [{epic['position']}]")[:26]
+        lines += _lane_lines(label, _printable(epic["title"] or "")[:30], epic["lanes"])
+    lines += _lane_lines("(corrections)", "", course_report["corrections"]["lanes"])
+    lines += _lane_lines("(unattributed)", "",
+                         course_report["unattributed"]["by_billing_source"])
+    lines += ["", "Course totals, per lane, by model:"]
+    for lane, totals in course_report["totals"].items():
+        models = ", ".join(f"{_printable(m)} {_money_value(u)}"
+                           for m, u in totals["by_model"].items())
+        lines.append(f"  {_printable(lane)}: {_money(totals)} ({models or 'no models'})")
+    lines += ["", f"{'AGENT':<18} {'MODEL':<26} {'TYPE':<10} {'LANE':<22} {'RUNS':>5} "
+              f"{'COST':>12} {'FINISHED':>9} {'MEDIAN':>10}"]
+    for row in persona["rows"]:
+        for lane, lb in row["lanes"].items():
+            median = (f"${lb['median_finished_item_usd']:,.2f}"
+                      if lb["median_finished_item_usd"] is not None else "—")
+            lines.append(
+                f"{_printable(row['agent'])[:18]:<18} {_printable(row['model'])[:26]:<26} "
+                f"{_printable(row['item_type'])[:10]:<10} {_printable(lane)[:22]:<22} "
+                f"{lb['runs']:>5} {_money(lb):>12} {lb['finished_items']:>9} {median:>10}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="work-item-cost", description=__doc__)
+    ap.add_argument("--days", type=int, default=30,
+                    help="report runs that started in the last N days (default 30)")
+    ap.add_argument("--json", action="store_true", help="print the report as JSON")
+    ap.add_argument("--course", help="a Course id to report cost and progress against")
+    ap.add_argument("--product", help="the product whose live Course --course defaults to")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=args.days)
+    try:
+        items = fetch_items()
+    except IC.IssueQueueUnavailable as e:
+        print(f"work-item-cost: cannot read the work items from the Library ({e}); "
+              "no report written", file=sys.stderr)
+        return 1
+
+    if args.course or args.product:
+        try:
+            course = resolve_course(args.product, args.course)
+            epic_progress = {eid: IC.get_item(eid).get("progress")
+                             for eid in course.get("entries") or []}
+        except IC.IssueQueueUnavailable as e:
+            print(f"work-item-cost: cannot read the Course ({e}); no report written",
+                  file=sys.stderr)
+            return 1
+        course_report = cj.build_course_costs(start, end, items, course, epic_progress)
+        persona = cj.build_persona_table(start, end, items)
+        if args.json:
+            print(json.dumps({"course": course_report, "persona": persona},
+                             indent=2, sort_keys=True))
+        else:
+            print(render_course(course_report, persona))
+        return 0
+
+    report = cj.build_item_costs(start, end, items)
+    print(json.dumps(report, indent=2, sort_keys=True) if args.json else render(report))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

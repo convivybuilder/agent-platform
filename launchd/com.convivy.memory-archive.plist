@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.memory-archive</string>
+
+    <!-- Moves each co's cold reference and project memories into the
+         Archives, and never a feedback memory (platform/decisions/0089,
+         issue_01M3QX4K2WYRFYDJJ783NYY1QE). Every co loads its own MEMORY.md
+         index in full at startup, and the index only grows; this is the
+         watcher that keeps it bounded. -->
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q), same as
+         com.convivy.limit-resume.plist: a timer firing unattended is production
+         USE of memory-archive, not someone working on it, so this reads a
+         COPY installed from `main` into
+         ~/.local/deploy/agent-platform-shared/ (rules 2, 6, 7) rather than
+         the ~/.local/bin symlink into the checkout. bin/agent-platform-autopull
+         refreshes the deploy area on every origin/main advance;
+         bin/install-agent-platform-shared is what actually builds it, and
+         needs to have run at least once after this file's bin/ and
+         lib/agent-platform/ additions land before this plist's target paths
+         exist.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/memory-archive</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- Once a day, well off any other job's own slot. A memory is cold at
+         30 days regardless of exactly when in the day this checks, and the
+         job's own recall gate makes a missed or doubled firing harmless
+         (the dedup_key makes a retried write a no-op; the lock file below
+         makes two overlapping firings a no-op too). -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Hour</key><integer>3</integer><key>Minute</key><integer>30</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/memory-archive.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/memory-archive.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

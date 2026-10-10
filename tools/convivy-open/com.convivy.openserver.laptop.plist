@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.openserver</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>$HOME/.local/bin/convivy-open-server</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- laptop: the mini's Convivy as mounted over SMB. This is a reference
+             copy, not read by any script; install-laptop.sh generates the real
+             installed plist itself, rendering this laptop's own resolved base
+             and share name in place of these placeholders (xml-escaped). -->
+        <key>CONVIVY_OPEN_BASE</key>
+        <string>@CONVIVY_OPEN_BASE@</string>
+        <!-- if the mount is missing when you click, auto-mount this share first -->
+        <key>CONVIVY_OPEN_MOUNT</key>
+        <string>smb://mini.local/@CONVIVY_OPEN_MOUNT_USER@</string>
+        <key>CONVIVY_OPEN_PORT</key>
+        <string>8765</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/convivy-open-server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/convivy-open-server.log</string>
+</dict>
+</plist>

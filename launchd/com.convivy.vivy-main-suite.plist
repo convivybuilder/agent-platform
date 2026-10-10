@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.vivy-main-suite</string>
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of vivy-main-suite, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes vivy-main-suite interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/vivy-main-suite</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- 20:00 local time, every day. Runs vivy's full test suite against current
+         origin/main in a dedicated clone (~/.local/state/vivy-main-suite/checkout).
+         Silent on pass; logs an alert signal on failure.
+
+         WHY 20:00. vivy is the only fleet repo without a push:[main] trigger —
+         the suite is too expensive to run per-merge (a 25-minute serial gate plus
+         three shards) and the org is over budget on Actions minutes. The 20:00
+         slot catches combination drift from the day's merges before any overnight
+         spend begins.
+
+         The existing overnight schedule: 21:00 preflight, 01:00 overnight,
+         02:30 hollis, 03:30 issue-queue-drain, 05:00 healthcheck, 06:00 wrapup.
+         20:00 is the last gap before that cycle. A broken main discovered at 20:00
+         is in the operator's hands before the preflight opens PRs against it; a broken main
+         discovered at 06:00 has already burned a full overnight run and all its
+         CI minutes on an unrelated root cause. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>20</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/vivy-main-suite/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/vivy-main-suite/logs/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hourly a fast-forward-only `git pull` into the convivy-app-kit PRIMARY checkout.
+
+  It invoked /usr/bin/git directly until ARCH-441. The wrapper exists so the pull
+  ASSERTS the checkout is on main first: on a feature branch a pull either
+  fast-forwards that branch to whatever origin holds for it, on the checkout a
+  rails deploy ships from, or fails into a log nobody reads. ARCH-437's monitor
+  sees the same state within fifteen minutes and files a bug — which bounds how
+  long it lasts, and cannot stop this job acting on it meanwhile.
+
+  Tracked here because the live copy in ~/Library/LaunchAgents was not under git
+  at all, so nothing recorded what it ran.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.appkit.autoupdate</string>
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of appkit-autoupdate, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes appkit-autoupdate interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/appkit-autoupdate</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+    <!-- launchd hands a job a THIN PATH with no /opt/homebrew and no
+         ~/.local/bin (ARCH-086). The script's own paths are absolute, but the
+         check it calls is `#!/usr/bin/env python3.11`, and python3.11 lives in
+         /opt/homebrew/bin — so without this the guard cannot execute and the
+         pull refuses every hour. Caught by deploying it, not by review: the
+         review reasoned about the script and the check is a second hop.
+         Matches com.convivy.primary-checkout-check and com.convivy.kb-guards-check,
+         which carry the identical PATH for the identical reason. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/convivy-app-kit/autoupdate.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/convivy-app-kit/autoupdate.log</string>
+</dict>
+</plist>

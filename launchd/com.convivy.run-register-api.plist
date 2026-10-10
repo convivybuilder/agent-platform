@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.run-register-api</string>
+
+    <!-- Serves the live active-runs register over a unix socket for the
+         Library (Chart House) to pull from — Bosun's half of the live-status
+         chain (issue_01KZBWEYQS2RJHBMD8VX9WESX7, the operator's 2026-08-20 direction
+         via the Steward: "chain pull — Orient/Deck from Chart House, Chart
+         House from Bosun"). A long-running daemon, like llm-gateway, not a
+         scheduled job.
+
+         KeepAlive, unlike bin/session-view (started on demand, under a
+         human's control): the Library needs to reliably pull "live" status
+         at any time, not only when the operator happens to have it running — an
+         on-demand service would defeat the point of this being a live feed.
+         Security review on #417 flagged this as a real posture difference
+         worth naming rather than an oversight: the 0600 socket permissions
+         are the same control either way, just standing for longer.
+
+         Deploy-pinned per platform/decisions/0059 rule 1: this plist and the
+         code it execs both live outside the agent-platform checkout. The
+         plist itself is a COPY landed in ~/Library/LaunchAgents by
+         bin/install-run-register-api (rule 8) — this file in the repo is only
+         the versioned template, never what launchd loads. ProgramArguments
+         names the venv's own interpreter explicitly (rule 4: the interpreter
+         is pinned alongside the code, not inherited from the shebang or
+         launchd's PATH) and the code path is a copy installed from `main`
+         (rules 2, 6, 7), never a symlink into the checkout. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/run-register-api/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/run-register-api/bin/run-register-api</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/run-register-api</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/run-register-api.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/run-register-api.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

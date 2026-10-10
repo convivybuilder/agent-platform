@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.agent-activity-report</string>
+
+    <!-- Snapshots the session-activity corpus (cost_join: parent->child dispatch
+         trees + cost summed per chain) to activity/sessions.json every 15 min, so
+         the orient /activity log and the /cost-performance cost-per-outcome section
+         (ARCH-191 / ARCH-239) are never >15 min stale. Deterministic, no LLM cost
+         (run-dir reads only). Runs at :02/:17/:32/:47 — offset from the cost-report
+         refresh (:05/:20/:35/:50) so the two never write under agent-runs/ at the
+         same instant. RunAtLoad so the snapshot exists immediately on install. -->
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of agent-activity-report, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes agent-activity-report interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/agent-activity-report</string>
+        <string>--days</string>
+        <string>90</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Minute</key><integer>2</integer></dict>
+        <dict><key>Minute</key><integer>17</integer></dict>
+        <dict><key>Minute</key><integer>32</integer></dict>
+        <dict><key>Minute</key><integer>47</integer></dict>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/agent-activity-report.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/agent-activity-report.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

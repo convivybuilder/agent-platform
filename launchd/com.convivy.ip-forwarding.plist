@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.convivy.ip-forwarding</string>
+  <!-- Re-enable IPv4/IPv6 forwarding at boot so the mini's Tailscale exit node
+       keeps routing across reboots (sysctl -w is otherwise lost on restart).
+
+       NOTE: this is a system LaunchDaemon (needs root to set sysctl), UNLIKE the
+       com.convivy.* files here, which are user LaunchAgents. Install it into the
+       SYSTEM domain, not gui/$uid:
+         sudo cp com.convivy.ip-forwarding.plist /Library/LaunchDaemons/
+         sudo chown root:wheel /Library/LaunchDaemons/com.convivy.ip-forwarding.plist
+         sudo launchctl bootstrap system /Library/LaunchDaemons/com.convivy.ip-forwarding.plist
+       It is RunAtLoad-only (no KeepAlive): fires once at boot, sets forwarding,
+       exits — so `launchctl print system/com.convivy.ip-forwarding` shows
+       state=not running between boots, which is correct. Added for the mini
+       exit-node work, 2026-07-02. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/sbin/sysctl</string>
+    <string>-w</string>
+    <string>net.inet.ip.forwarding=1</string>
+    <string>net.inet6.ip6.forwarding=1</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>

@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+"""claude-sub — switch the machine-wide Claude subscription credential.
+
+Every co/claude session on this machine reads ONE shared OAuth credential: the
+macOS Keychain item `Claude Code-credentials` (mirrored to
+~/.claude/.credentials.json). Swapping that item swaps the subscription every
+*new* session launches on. Already-running sessions keep their in-memory token
+until it refreshes (~8h) or 401s — restart to force.
+
+This tool keeps each subscription's credential in a named Keychain "slot"
+(`claude-sub-<id>`, acct = login email) and copies a chosen slot into the live
+item on `use`/`toggle`. `save` captures the current live credential into a new
+slot (run it right after `claude auth login` for a fresh account).
+
+Subscription rate-limit headroom is NOT queryable from the CLI — there's no
+usage endpoint; a 429+reset only shows up reactively during use. So `auto`
+(switch to whichever sub has headroom) is intentionally absent; this is a
+deliberate manual switch. See substrate decisions.md (ARCH for dual-sub switch).
+
+Commands:
+  status            Active account + tier + token expiry; one line per slot.
+  list              Slot ids and their emails.
+  use <id>          Make slot <id> live (syncs the leaving account first).
+  toggle            With exactly two slots, switch to the other one.
+  save <id> [email] Capture the current live credential into slot <id>.
+  current           Print the active slot id (for scripting); empty if unknown.
+"""
+
+import getpass
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+LIVE_SERVICE = "Claude Code-credentials"
+SLOT_PREFIX = "claude-sub-"
+CRED_FILE = os.path.expanduser("~/.claude/.credentials.json")
+
+
+def die(msg, code=1):
+    print(f"claude-sub: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def _redact(cmd):
+    """Join a command for display, masking the value after -w — that argument
+    is a credential blob and must never reach stderr/logs."""
+    out, mask_next = [], False
+    for tok in cmd:
+        if mask_next:
+            out.append("<redacted>")
+            mask_next = False
+        else:
+            out.append(tok)
+            mask_next = tok == "-w"
+    return " ".join(out)
+
+
+def run(cmd, check=True, capture=True):
+    r = subprocess.run(cmd, capture_output=capture, text=True)
+    if check and r.returncode != 0:
+        die(f"command failed: {_redact(cmd)}\n{r.stderr.strip()}")
+    return r
+
+
+# ---- Keychain primitives ---------------------------------------------------
+
+def kc_read_blob(service, account=None):
+    """Return the password (JSON blob string) for a service, or None."""
+    cmd = ["security", "find-generic-password", "-s", service, "-w"]
+    if account:
+        cmd[2:2] = ["-a", account]
+    r = run(cmd, check=False)
+    if r.returncode != 0:
+        return None
+    return r.stdout.rstrip("\n")
+
+
+def kc_read_acct(service):
+    """Return the acct attribute (email for slots) for a service, or None."""
+    r = run(["security", "find-generic-password", "-s", service], check=False)
+    if r.returncode != 0:
+        return None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('"acct"'):
+            # form:  "acct"<blob>="value"
+            return line.split('="', 1)[1].rstrip('"')
+    return None
+
+
+def kc_write(service, account, blob, update=True):
+    """Write/replace a generic-password item. update=True uses -U (in place).
+    update=False does delete-then-add to guarantee a single item, but stashes
+    the prior blob first and restores it if the add fails — a slot is never
+    lost to a half-completed write (Keychain prompt denied, item locked)."""
+    if update:
+        run(["security", "add-generic-password", "-s", service,
+             "-a", account, "-w", blob, "-U"])
+        return
+    stash = kc_read_blob(service)
+    stash_acct = kc_read_acct(service)
+    run(["security", "delete-generic-password", "-s", service], check=False)
+    add = ["security", "add-generic-password", "-s", service,
+           "-a", account, "-w", blob]
+    r = run(add, check=False)
+    if r.returncode == 0:
+        return
+    if stash is not None:
+        run(["security", "add-generic-password", "-s", service,
+             "-a", stash_acct or account, "-w", stash], check=False)
+        die(f"failed to write slot '{service}'; restored the prior credential\n"
+            f"{r.stderr.strip()}")
+    die(f"failed to write slot '{service}'\n{_redact(add)}\n{r.stderr.strip()}")
+
+
+def enumerate_slots():
+    """Return sorted slot ids (the part after claude-sub-)."""
+    r = run(["security", "dump-keychain"], check=False)
+    ids = set()
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.startswith('"svce"') and SLOT_PREFIX in line:
+            svc = _attr_value(line)
+            if svc and svc.startswith(SLOT_PREFIX):
+                ids.add(svc[len(SLOT_PREFIX):])
+    return sorted(ids)
+
+
+def _attr_value(line):
+    """Parse the value after `<blob>=` in a `security dump-keychain`
+    attribute line, across the three forms it actually prints: a quoted
+    string (`="value"`), `<NULL>` (an item with no value for this attribute
+    — returns None), and a hex-encoded blob for a non-printable value,
+    optionally followed by its quoted printable rendering
+    (`=0x<HEX>  "text"` — the quoted text wins when present, else the hex
+    bytes decoded as UTF-8). Returns None for anything that matches none of
+    the three forms; callers must treat that as "no value", never raise."""
+    if "=" not in line:
+        return None
+    value = line.split("=", 1)[1].strip()
+    if value == "<NULL>":
+        return None
+    if value.startswith('"'):
+        return value[1:].rstrip('"')
+    if value.startswith("0x"):
+        hex_part, _, quoted = value[2:].partition(" ")
+        quoted = quoted.strip()
+        if quoted.startswith('"'):
+            return quoted[1:].rstrip('"')
+        try:
+            return bytes.fromhex(hex_part).decode("utf-8")
+        except ValueError:
+            return None
+    return None
+
+
+def _keychain_item_pairs(dump_output):
+    """Yield (svce, acct) for each item block in `security dump-keychain`
+    output. A block is delimited by its `keychain: ` line; the two
+    attributes may appear in either order within it, so both are captured
+    before the next block boundary flushes the pair. This walks EVERY item
+    in the whole keychain, not just claude-sub's own, so a `<NULL>` or
+    hex-encoded attribute value (real on this machine — WiFi/other apps'
+    items, not something claude-sub controls) is expected here, parsed by
+    `_attr_value` rather than raised on."""
+    svce = acct = None
+    for raw in dump_output.splitlines():
+        line = raw.strip()
+        if line.startswith("keychain:"):
+            if svce is not None or acct is not None:
+                yield (svce, acct)
+            svce = acct = None
+        elif line.startswith('"svce"'):
+            svce = _attr_value(line)
+        elif line.startswith('"acct"'):
+            acct = _attr_value(line)
+    if svce is not None or acct is not None:
+        yield (svce, acct)
+
+
+def kc_accounts(service):
+    """Every account carrying `service`, across the whole keychain, in
+    Keychain order (duplicates kept, not deduped). A scoped
+    `find-generic-password -a` returns at most one match, so this is the
+    only way to see that more than one item shares a service name.
+    `dump-keychain` (no `-d`) lists attributes only, never a password, so
+    this is as safe as `enumerate_slots` above."""
+    r = run(["security", "dump-keychain"], check=False)
+    return [acct for svce, acct in _keychain_item_pairs(r.stdout)
+            if svce == service and acct is not None]
+
+
+def refuse_if_live_service_duplicated():
+    """Refuse only when more than one Keychain item shares BOTH LIVE_SERVICE
+    and the live account — the one shape `-a <account>` cannot resolve,
+    since every read and write this tool makes for the live item passes
+    that exact pair (the write is always `-U` in place, never a
+    delete-then-add — there is no delete of the live item anywhere in this
+    tool) and Keychain still has to pick one silently.
+
+    A duplicate service under a DIFFERENT account is not refused here: it is
+    the shape this bug actually had (acct "operator" beside a stale acct
+    "unknown"), and `-a <account>` on every call above already addresses the
+    live item precisely through it, so refusing would only stop this tool
+    from working until someone deletes the stale item by hand — which the
+    issue this fixes explicitly leaves for the operator to do separately, not this
+    tool to force."""
+    accounts = kc_accounts(LIVE_SERVICE)
+    account = live_account()
+    dupes = sum(1 for a in accounts if a == account)
+    if dupes > 1:
+        die(f"{dupes} Keychain items carry service '{LIVE_SERVICE}' for "
+            f"account '{account}' — `-a` cannot tell them apart, refusing "
+            "to guess. Remove the duplicate by hand, then retry.")
+
+
+def slot_service(slot_id):
+    return f"{SLOT_PREFIX}{slot_id}"
+
+
+# ---- credential helpers ----------------------------------------------------
+
+def oauth(blob):
+    """Parse a credential blob, return the claudeAiOauth dict (or die)."""
+    try:
+        return json.loads(blob)["claudeAiOauth"]
+    except (ValueError, KeyError, TypeError) as e:
+        die(f"malformed credential blob: {e}")
+
+
+def refresh_sha(blob):
+    rt = oauth(blob).get("refreshToken")
+    if not rt:
+        die("credential blob has no refreshToken")
+    return hashlib.sha256(rt.encode()).hexdigest()
+
+
+def auth_status_email():
+    """Email of the currently live credential per `claude auth status`."""
+    claude = os.path.expanduser("~/.local/bin/claude")
+    bin_ = claude if os.path.exists(claude) else "claude"
+    r = run([bin_, "auth", "status"], check=False)
+    if r.returncode != 0:
+        return None
+    try:
+        return json.loads(r.stdout).get("email")
+    except ValueError:
+        return None
+
+
+def active_slot(live_blob, slots):
+    """Identify which slot is live. Primary: exact refreshToken match
+    (offline). Fallback: email from `claude auth status`."""
+    if live_blob:
+        live_sha = refresh_sha(live_blob)
+        for sid in slots:
+            b = kc_read_blob(slot_service(sid))
+            if b and refresh_sha(b) == live_sha:
+                return sid
+    email = auth_status_email()
+    if email:
+        for sid in slots:
+            if kc_read_acct(slot_service(sid)) == email:
+                return sid
+    return None
+
+
+def fmt_expiry(o):
+    exp_ms = o.get("expiresAt")
+    if exp_ms is None:
+        return "unknown"
+    secs = exp_ms / 1000 - time.time()
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(exp_ms / 1000))
+    if secs <= 0:
+        return f"{when} (EXPIRED)"
+    hrs = secs / 3600
+    rel = f"{hrs:.1f}h" if hrs < 48 else f"{hrs / 24:.1f}d"
+    return f"{when} (in {rel})"
+
+
+def mirror_to_file(blob):
+    os.makedirs(os.path.dirname(CRED_FILE), exist_ok=True)
+    # Create with 0o600 atomically (O_CREAT mode) so the blob is never briefly
+    # world-readable on first write; chmod fixes an existing looser file too.
+    fd = os.open(CRED_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, blob.encode())
+    finally:
+        os.close(fd)
+    os.chmod(CRED_FILE, 0o600)
+
+
+def live_account():
+    """The account that addresses the live item — always the macOS user
+    running this tool, never read back from an unqualified Keychain lookup.
+    That unqualified read is what silently resolved to the stale acct
+    "unknown" instead of the account Claude Code itself reads and refreshes."""
+    return getpass.getuser()
+
+
+# ---- commands --------------------------------------------------------------
+
+def cmd_status():
+    refuse_if_live_service_duplicated()
+    slots = enumerate_slots()
+    if not slots:
+        die("no slots found (expected Keychain items claude-sub-<id>)")
+    live_blob = kc_read_blob(LIVE_SERVICE, live_account())
+    active = active_slot(live_blob, slots)
+    print("Live subscription:")
+    if active:
+        active_blob = live_blob or kc_read_blob(slot_service(active))
+        email = kc_read_acct(slot_service(active)) or "?"
+        if active_blob:
+            o = oauth(active_blob)
+            print(f"  slot {active}  {email}  [{o.get('rateLimitTier', '?')}]")
+            print(f"  access token: {fmt_expiry(o)}")
+        else:
+            print(f"  slot {active}  {email}  (credential unreadable)")
+    else:
+        print("  (could not identify active slot — live cred matches no slot)")
+    print("\nSlots:")
+    for sid in slots:
+        b = kc_read_blob(slot_service(sid))
+        email = kc_read_acct(slot_service(sid)) or "?"
+        mark = "*" if sid == active else " "
+        if b:
+            o = oauth(b)
+            print(f" {mark}{sid}  {email}  [{o.get('rateLimitTier', '?')}]"
+                  f"  token {fmt_expiry(o)}")
+        else:
+            print(f" {mark}{sid}  {email}  (unreadable)")
+    print("\nNote: subscription rate-limit headroom is not CLI-queryable; "
+          "switch manually based on which account you've been hammering.")
+
+
+def cmd_list():
+    slots = enumerate_slots()
+    if not slots:
+        die("no slots found")
+    for sid in slots:
+        print(f"{sid}\t{kc_read_acct(slot_service(sid)) or '?'}")
+
+
+def cmd_use(slot_id):
+    refuse_if_live_service_duplicated()
+    slots = enumerate_slots()
+    if slot_id not in slots:
+        die(f"unknown slot '{slot_id}' (have: {', '.join(slots) or 'none'})")
+    target_blob = kc_read_blob(slot_service(slot_id))
+    if not target_blob:
+        die(f"slot {slot_id} has no readable credential")
+
+    live_blob = kc_read_blob(LIVE_SERVICE, live_account())
+    # Sync the leaving account's (possibly refreshed) token back to its slot.
+    current = active_slot(live_blob, slots)
+    if current and current != slot_id and live_blob:
+        cur_email = kc_read_acct(slot_service(current)) or getpass.getuser()
+        # update in place — the leaving slot already exists, so no delete window.
+        kc_write(slot_service(current), cur_email, live_blob, update=True)
+        print(f"synced live credential back to slot {current}")
+    elif current == slot_id:
+        print(f"slot {slot_id} is already live; refreshing the live item")
+
+    # Load target into the live item + the mirrored file.
+    kc_write(LIVE_SERVICE, live_account(), target_blob, update=True)
+    mirror_to_file(target_blob)
+
+    email = kc_read_acct(slot_service(slot_id)) or "?"
+    print(f"switched live subscription -> slot {slot_id} ({email})")
+
+    # Verify by matching the now-live refreshToken against the target slot —
+    # authoritative and offline. (Don't trust `claude auth status`/`/status`
+    # email here: those read the cached oauthAccount in ~/.claude.json, which
+    # only a full `claude auth login` updates. Billing follows this token, not
+    # that cache, so the display can lag while the switch is real.) Read back
+    # through the same account-scoped path as the write above, so a still-
+    # present stale duplicate can't make this report false success.
+    new_live = kc_read_blob(LIVE_SERVICE, live_account())
+    if new_live and refresh_sha(new_live) == refresh_sha(target_blob):
+        print(f"verified: live credential is now slot {slot_id}")
+    else:
+        print("WARNING: live credential does not match the target slot — "
+              "the switch may not have taken", file=sys.stderr)
+    print("Note: `claude auth status` / in-session /status may still show the "
+          "previous account (cached display); billing follows this token.")
+    print("Note: already-running sessions keep their old token until it "
+          "refreshes (~8h) or 401s — restart them to switch now.")
+
+
+def cmd_toggle():
+    refuse_if_live_service_duplicated()
+    slots = enumerate_slots()
+    if len(slots) != 2:
+        die(f"toggle needs exactly 2 slots, found {len(slots)} "
+            f"({', '.join(slots) or 'none'}); use `use <id>`")
+    live_blob = kc_read_blob(LIVE_SERVICE, live_account())
+    current = active_slot(live_blob, slots)
+    if current is None:
+        die("cannot identify the active slot; use `use <id>` explicitly")
+    target = slots[1] if slots[0] == current else slots[0]
+    cmd_use(target)
+
+
+def cmd_save(slot_id, email=None):
+    refuse_if_live_service_duplicated()
+    live_blob = kc_read_blob(LIVE_SERVICE, live_account())
+    if not live_blob:
+        die("no live credential to save (is anyone logged in?)")
+    if not email:
+        email = auth_status_email()
+        if not email:
+            die("could not determine email; pass it: claude-sub save "
+                f"{slot_id} <email>")
+    kc_write(slot_service(slot_id), email, live_blob, update=False)
+    print(f"saved current live credential -> slot {slot_id} ({email})")
+
+
+def cmd_current():
+    refuse_if_live_service_duplicated()
+    slots = enumerate_slots()
+    live_blob = kc_read_blob(LIVE_SERVICE, live_account())
+    active = active_slot(live_blob, slots)
+    if active:
+        print(active)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd, rest = args[0], args[1:]
+    if cmd == "status":
+        cmd_status()
+    elif cmd == "list":
+        cmd_list()
+    elif cmd == "use":
+        if len(rest) != 1:
+            die("usage: claude-sub use <id>")
+        cmd_use(rest[0])
+    elif cmd == "toggle":
+        cmd_toggle()
+    elif cmd == "save":
+        if not rest:
+            die("usage: claude-sub save <id> [email]")
+        cmd_save(rest[0], rest[1] if len(rest) > 1 else None)
+    elif cmd == "current":
+        cmd_current()
+    else:
+        die(f"unknown command '{cmd}' (try: status, list, use, toggle, "
+            "save, current)")
+
+
+if __name__ == "__main__":
+    main()

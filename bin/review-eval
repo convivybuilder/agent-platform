@@ -1,0 +1,467 @@
+#!/usr/bin/env python3
+"""review-eval: the review-replay eval harness (agent-platform#807).
+
+Answers one question before moving any review traffic off the subscription:
+does a cheaper model (the gateway's deepseek/kimi/kimi-code/glm, or a
+cheaper/faster Anthropic baseline) find what our current reviewers find?
+Reviews have an objective answer key — findings a later head fixed — so this
+replays past reviews against candidate models at the historical commit and
+scores recall against that key, judging anything extra as real or not
+rather than assuming it's noise.
+
+Four subcommands, meant to run in this order:
+
+  corpus build   — scan run records, select CONFIRMED + CLEAN rounds, write
+                    the corpus JSON (one LLM call per confirmed round, to
+                    extract its answer-key findings).
+  estimate       — print a per-model dollar estimate from the corpus's
+                    recorded tokens and the gateway's pinned prices, BEFORE
+                    spending anything.
+  replay run     — dispatch every (corpus entry, model) pair via `agentctl
+                    spawn --eval-mode` (never posts, never stamps — see
+                    bin/agentctl's `cmd_review_post`/`_disallowed_tools`),
+                    bounded concurrency, resumable, spend-capped per model.
+  score          — match each replay's findings against the answer key (an
+                    Anthropic judge), classify every unmatched finding as
+                    real or not against the diff (an Opus judge), and write
+                    the markdown table + JSON report.
+
+`corpus build` and `score` are the two steps that call a model — every
+other step, and every corpus/replay/scoring function underneath this CLI, is
+pure and testable without one. This CLI does not call any of them itself
+when imported; only running the actual subcommand does, and only the
+subcommand that needs it.
+
+THE CO RUNS THIS, NOT THE BUILDER OF THIS HARNESS: estimate first, then
+`replay run`, under the spend cap — see the PR body for the exact commands.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, requires=("yaml",))
+import builder_root as BR  # noqa: E402
+import dispatch_env as DE  # noqa: E402
+import review_eval_corpus as REC  # noqa: E402
+import review_eval_replay as RER  # noqa: E402
+import review_eval_scoring as RSC  # noqa: E402
+import review_eval_spend as RES  # noqa: E402
+
+VARIANT_AGENTS_DIR = REPO / "tools" / "review-eval" / "variant-agents"
+PRE828_AGENTS_DIR = REPO / "tools" / "review-eval" / "pre828-agents"
+POST828_AGENTS_DIR = REPO / "tools" / "review-eval" / "post828-agents"
+FIX832_AGENTS_DIR = REPO / "tools" / "review-eval" / "fix832-agents"
+GATEWAY_CONFIG = REPO / "gateway" / "config.yaml"
+OUT_ROOT = BR.runs_root() / "review-eval"
+
+# The harness's standard model arms (agent-platform#807's spec). `is_gateway`
+# decides CapTracker membership — only these four spend against the gateway
+# cap; every Anthropic arm is subscription-billed and reported separately.
+# The two "noise-floor" keys are the SAME config run twice, to measure
+# sonnet-5's own replay-to-replay spread.
+STANDARD_ARMS: dict[str, RER.ModelArm] = {
+    "deepseek":  RER.ModelArm(key="deepseek", model="deepseek", is_gateway=True),
+    "kimi":      RER.ModelArm(key="kimi", model="kimi", is_gateway=True),
+    "kimi-code": RER.ModelArm(key="kimi-code", model="kimi-code", is_gateway=True),
+    "glm":       RER.ModelArm(key="glm", model="glm", is_gateway=True),
+    "sonnet-noise-a": RER.ModelArm(key="sonnet-noise-a", model="sonnet"),
+    "sonnet-noise-b": RER.ModelArm(key="sonnet-noise-b", model="sonnet"),
+    "sonnet-5-5": RER.ModelArm(key="sonnet-5-5", model="sonnet-5-5"),
+    "haiku":      RER.ModelArm(key="haiku", model="haiku"),
+    "sonnet-medium": RER.ModelArm(key="sonnet-medium", model="sonnet", effort="medium"),
+    "sonnet-variant-prompt": RER.ModelArm(
+        key="sonnet-variant-prompt", model="sonnet", agents_dir=str(VARIANT_AGENTS_DIR)),
+    # The reviewer/security-reviewer wording immediately before and after
+    # knowledge#828 (merged 2026-10-08), which rewrote both definitions —
+    # every other arm above resolves the Library's LIVE definition, so it
+    # moved silently to the new wording the moment #828 merged. Model
+    # "sonnet" with default effort, like sonnet-noise-a/b and
+    # sonnet-variant-prompt; differs from those only in agents_dir.
+    "sonnet-pre828": RER.ModelArm(
+        key="sonnet-pre828", model="sonnet", agents_dir=str(PRE828_AGENTS_DIR)),
+    "sonnet-post828": RER.ModelArm(
+        key="sonnet-post828", model="sonnet", agents_dir=str(POST828_AGENTS_DIR)),
+    # The reviewer/security-reviewer wording knowledge#832 (merged) adds on top
+    # of knowledge#828 — the paragraph stating a defect with a concrete way it
+    # goes wrong is a finding at its real severity, and that the occurrence
+    # bar covers only a proposed guard. Same mechanism and effort as
+    # sonnet-pre828/sonnet-post828; differs only in agents_dir.
+    "sonnet-fix832": RER.ModelArm(
+        key="sonnet-fix832", model="sonnet", agents_dir=str(FIX832_AGENTS_DIR)),
+}
+# Model sets that default to the 30-round baseline subset rather than the
+# full corpus (the spec's cost/time containment for the gateway's pricier
+# trial candidates and the Anthropic baselines) — a flag widens any of these
+# to the full corpus.
+SUBSET_DEFAULT_KEYS = {"kimi", "kimi-code", "glm", "sonnet-noise-a", "sonnet-noise-b",
+                       "sonnet-5-5", "haiku", "sonnet-medium", "sonnet-variant-prompt",
+                       "sonnet-pre828", "sonnet-post828", "sonnet-fix832"}
+
+
+def _merged_head_via_gh(repo: str, pr: str) -> str | None:
+    slug = repo if "/" in repo else f"convivy/{repo}"
+    try:
+        out = subprocess.run(
+            ["gh", "pr", "view", pr, "--repo", slug, "--json", "state,headRefOid"],
+            capture_output=True, text=True, timeout=30)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if out.returncode != 0:
+        return None
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+    if (data.get("state") or "").upper() != "MERGED":
+        return None
+    return data.get("headRefOid") or None
+
+
+def cmd_corpus_build(args: argparse.Namespace) -> int:
+    runs_root = Path(args.runs_root) if args.runs_root else BR.runs_root()
+    corpus = REC.build_corpus(
+        runs_root, since_date=args.since, sample_size=args.sample_size,
+        seed=args.seed, merged_head=_merged_head_via_gh)
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(corpus, indent=2) + "\n")
+    print(f"corpus: {len(corpus['confirmed'])} confirmed, {len(corpus['clean'])} clean "
+         f"-> {out_path}")
+    return 0
+
+
+def _load_corpus(path: str) -> dict:
+    return json.loads(Path(path).read_text())
+
+
+def _gateway_spend_records(runs_root: Path) -> list[dict]:
+    """Every record in the gateway's global per-day spend logs
+    (`gateway-spend/*.jsonl`) — used only to find a historical cache-hit
+    ratio for the estimate; a replay's OWN cost comes from its own run dir's
+    cost.json instead (`review_eval_replay.collect_run_result`)."""
+    out = []
+    spend_dir = runs_root / "gateway-spend"
+    if not spend_dir.is_dir():
+        return out
+    for path in sorted(spend_dir.glob("*.jsonl")):
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def cmd_estimate(args: argparse.Namespace) -> int:
+    corpus = _load_corpus(args.corpus)
+    models = args.models or sorted(RES.DEFAULT_PER_MODEL_CAP_USD)
+    prices = RES.load_gateway_prices(args.gateway_config)
+    runs_root = Path(args.runs_root) if args.runs_root else BR.runs_root()
+    spend_records = _gateway_spend_records(runs_root)
+    ratios = {m: r for m in models
+             if (r := RES.historical_cache_hit_ratio(m, spend_records)) is not None}
+    out = RES.estimate_batch(corpus, models, prices, cache_hit_ratios=ratios)
+    total = 0.0
+    for model, info in out.items():
+        usd = info["usd"]
+        total += usd or 0.0
+        shown = f"${usd:.2f}" if usd is not None else "unknown"
+        print(f"{model:>16}: {shown:>10}  ({info['note']})")
+    print(f"{'TOTAL (gateway)':>16}: ${total:.2f}  "
+         f"(cap default ${RES.DEFAULT_TOTAL_CAP_USD:.0f})")
+    return 0
+
+
+def _arms_for(keys: list[str], *, full: bool) -> list[RER.ModelArm]:
+    return [STANDARD_ARMS[k] for k in keys]
+
+
+def cmd_replay_run(args: argparse.Namespace) -> int:
+    corpus = _load_corpus(args.corpus)
+    keys = args.models or sorted(STANDARD_ARMS)
+    unknown = [k for k in keys if k not in STANDARD_ARMS]
+    if unknown:
+        print(f"error: unknown model arm(s): {', '.join(unknown)}. Known: "
+              f"{', '.join(sorted(STANDARD_ARMS))}", file=sys.stderr)
+        return 2
+    arms = _arms_for(keys, full=args.full_corpus)
+
+    per_model_cap = dict(RES.DEFAULT_PER_MODEL_CAP_USD)
+    for item in args.model_cap or []:
+        model, _, value = item.partition("=")
+        per_model_cap[model] = float(value)
+    results_dir = Path(args.results_dir)
+    existing = RER.load_existing_results(results_dir)
+    already_spent: dict[str, float] = {}
+    for (_, model_key), r in existing.items():
+        already_spent[model_key] = already_spent.get(model_key, 0.0) + (r.get("usd") or 0.0)
+    cap_tracker = RES.CapTracker(total_cap=args.total_cap, per_model_cap=per_model_cap,
+                                 already_spent=already_spent)
+
+    for kind in ("confirmed", "clean"):
+        entries = corpus.get(kind) or []
+        if not args.full_corpus:
+            subset_arms = [a for a in arms if a.key in SUBSET_DEFAULT_KEYS]
+            full_arms = [a for a in arms if a.key not in SUBSET_DEFAULT_KEYS]
+        else:
+            subset_arms, full_arms = [], arms
+        if full_arms:
+            RER.run_batch(entries, full_arms, results_dir=results_dir,
+                          runs_root=BR.runs_root(), concurrency=args.concurrency,
+                          cap_tracker=cap_tracker, wait_timeout=args.wait_timeout)
+        if subset_arms:
+            subset = REC.select_baseline_subset(
+                {"confirmed": corpus.get("confirmed") or [],
+                 "clean": corpus.get("clean") or []},
+                seed=corpus.get("seed", 0)).get(kind) or []
+            RER.run_batch(subset, subset_arms, results_dir=results_dir,
+                          runs_root=BR.runs_root(), concurrency=args.concurrency,
+                          cap_tracker=cap_tracker, wait_timeout=args.wait_timeout)
+    print(f"replay: results under {results_dir}; gateway spend "
+         f"${cap_tracker.total_spent:.2f} of ${cap_tracker.total_cap:.2f}")
+    return 0
+
+
+def _anthropic_judge_call(prompt: str, *, model: str) -> dict:
+    """ONE live model call: `claude -p` in one-shot JSON mode. The sole
+    live-call boundary in `score` — `match_fn`/`judge_fn` below wrap this,
+    and nothing else in this CLI calls a model except `corpus build`."""
+    # No explicit env means a bare inherit, which carries the launching session's tmux
+    # identity and the operator's git/gh credential helpers straight through —
+    # `dispatch_env()` strips/redirects both (CQ·418 round 4).
+    result = subprocess.run(
+        ["claude", "-p", "--model", model, "--output-format", "json", prompt],
+        capture_output=True, text=True, timeout=120, env=DE.dispatch_env())
+    if result.returncode != 0:
+        raise RuntimeError(f"judge call failed (exit {result.returncode}): "
+                           f"{result.stderr.strip()}")
+    payload = json.loads(result.stdout)
+    text = payload.get("result") if isinstance(payload, dict) else result.stdout
+    import re
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise RuntimeError(f"judge call returned no JSON object: {text!r}")
+    return json.loads(m.group(0))
+
+
+def _match_fn(candidate: str, answer_key: list[str]) -> tuple[int | None, str]:
+    if not answer_key:
+        return None, "answer key is empty"
+    numbered = "\n".join(f"{i}: {k}" for i, k in enumerate(answer_key))
+    prompt = (
+        "Does this candidate finding describe the SAME underlying issue as one "
+        "of these answer-key findings? Reply as JSON: "
+        '{"matched_index": <int or null>, "reason": "<one line>"}.\n\n'
+        f"Candidate: {candidate}\n\nAnswer key:\n{numbered}")
+    data = _anthropic_judge_call(prompt, model="claude-haiku-4-5")
+    return data.get("matched_index"), data.get("reason", "")
+
+
+def _judge_fn(finding: str, diff_text: str) -> tuple[bool, str]:
+    prompt = (
+        "Is this finding a REAL issue in the diff below, or not? Reply as JSON: "
+        '{"real": <true/false>, "reason": "<one line>"}.\n\n'
+        f"Finding: {finding}\n\nDiff:\n{diff_text[:20000]}")
+    data = _anthropic_judge_call(prompt, model="claude-opus-5-5")
+    return bool(data.get("real")), data.get("reason", "")
+
+
+def _diff_for_entry(entry: dict, *, repo_root: Path) -> str:
+    """The cumulative diff the ORIGINAL reviewer saw at `entry["sha"]`: every
+    commit on the PR's branch up to that round, not only the last one.
+
+    Round-1 review (agent-platform#813): this used to run `git show
+    entry["sha"]`, which shows only that one commit's own change. A PR with more
+    than one commit by a given review round (this very PR had two) fed the
+    Opus "is this finding real" judge an incomplete diff, and a finding about an
+    EARLIER commit would misjudge as unverifiable against it — skewing
+    `judged_real_extra`/`judged_false_extra`, the numbers this harness exists to
+    produce.
+
+    `git merge-base <base>..sha` finds the fork point and `git diff
+    <fork-point>..sha` is the cumulative change since — the PR's base-to-sha
+    diff a reviewer actually saw. Every repo this harness draws corpus entries
+    from bases its PRs on `main` (every CLAUDE.md in this org's repos names it
+    "Main branch" — there is no per-PR base recorded in a corpus entry to read
+    instead). `origin/main` is tried first (a full clone with a remote), `main`
+    second (a local-only checkout); neither existing is a local-repo-shape
+    problem the diff can't solve, so this returns "" rather than guessing a
+    third ref name."""
+    for base_ref in ("origin/main", "main"):
+        try:
+            merge_base = subprocess.run(
+                ["git", "-C", str(repo_root), "merge-base", base_ref, entry["sha"]],
+                capture_output=True, text=True, timeout=30)
+        except (subprocess.SubprocessError, OSError):
+            return ""
+        fork_point = merge_base.stdout.strip()
+        if merge_base.returncode == 0 and fork_point:
+            break
+    else:
+        return ""
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", f"{fork_point}..{entry['sha']}"],
+            capture_output=True, text=True, timeout=30)
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return out.stdout if out.returncode == 0 else ""
+
+
+# A corpus entry's ORIGINAL verdict is implied by its kind — that is what
+# "confirmed" (a REQUEST_CHANGES a later head fixed) and "clean" (an APPROVE
+# at the merged head) mean — so it is derived here rather than carried as a
+# separate field two places could disagree about.
+_ORIGINAL_VERDICT_BY_KIND = {"confirmed": "REQUEST_CHANGES", "clean": "APPROVE"}
+
+
+def _score_kind(kind: str, entries: list[dict], existing: dict, model_keys: list[str],
+                args: argparse.Namespace) -> dict[str, dict]:
+    """Per model: the scored `EntryScore`s, verdict agreements, and raw
+    replay results for one corpus kind — the inputs `build_model_report`
+    needs, kept un-aggregated so `cmd_score` can both report this kind alone
+    and combine it with the other kind for the "in total" numbers."""
+    entries_by_id = {e["entry_id"]: e for e in entries}
+    original_verdict = _ORIGINAL_VERDICT_BY_KIND[kind]
+    per_model: dict[str, dict] = {
+        mk: {"scores": [], "agreements": [], "replay_results": [], "judged_for_audit": []}
+        for mk in model_keys}
+    for (entry_id, model_key), result in existing.items():
+        if model_key not in per_model or entry_id not in entries_by_id:
+            continue
+        bucket = per_model[model_key]
+        bucket["replay_results"].append(result)
+        entry = entries_by_id[entry_id]
+        candidate_findings = []  # the replay's own extracted findings
+        if result.get("body"):
+            candidate_findings = REC.default_finding_extractor(result["body"])
+        repo_root = Path(args.repo_root_base) / entry["repo"]
+        diff_text = _diff_for_entry(entry, repo_root=repo_root)
+        score = RSC.score_entry(entry_id, candidate_findings, entry.get("answer_key") or [],
+                                diff_text, match_fn=_match_fn, judge_fn=_judge_fn)
+        bucket["scores"].append(score)
+        bucket["agreements"].append(RSC.verdict_agreement(result.get("verdict"), original_verdict))
+        bucket["judged_for_audit"].extend(
+            (model_key, entry_id, j, diff_text) for j in score.judged)
+    return per_model
+
+
+def cmd_score(args: argparse.Namespace) -> int:
+    corpus = _load_corpus(args.corpus)
+    results_dir = Path(args.results_dir)
+    existing = RER.load_existing_results(results_dir)
+    model_keys = sorted({mk for (_, mk) in existing})
+
+    confirmed = _score_kind("confirmed", corpus.get("confirmed") or [], existing, model_keys, args)
+    clean = _score_kind("clean", corpus.get("clean") or [], existing, model_keys, args)
+
+    confirmed_reports = [RSC.build_model_report(mk, confirmed[mk]["scores"],
+                                                confirmed[mk]["agreements"],
+                                                confirmed[mk]["replay_results"])
+                        for mk in model_keys]
+    clean_reports = [RSC.build_model_report(mk, clean[mk]["scores"], clean[mk]["agreements"],
+                                            clean[mk]["replay_results"])
+                     for mk in model_keys]
+    total_reports = [RSC.build_model_report(
+        mk, confirmed[mk]["scores"] + clean[mk]["scores"],
+        confirmed[mk]["agreements"] + clean[mk]["agreements"],
+        confirmed[mk]["replay_results"] + clean[mk]["replay_results"])
+        for mk in model_keys]
+    judged_for_audit = [t for mk in model_keys
+                       for t in confirmed[mk]["judged_for_audit"] + clean[mk]["judged_for_audit"]]
+
+    markdown_confirmed, payload_confirmed = RSC.build_report(confirmed_reports)
+    markdown_clean, payload_clean = RSC.build_report(clean_reports)
+    markdown_total, payload_total = RSC.build_report(total_reports)
+    payload = {"confirmed": payload_confirmed, "clean": payload_clean, "total": payload_total}
+    markdown = (f"## Confirmed rounds\n\n{markdown_confirmed}\n\n"
+               f"## Clean rounds\n\n{markdown_clean}\n\n"
+               f"## Total\n\n{markdown_total}")
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    # A random sample of judged findings, for a person to check by hand — never
+    # the whole set (that's `payload`/`markdown`'s job), and never skipped just
+    # because nothing was judged (an empty sample is still written, so its
+    # absence is never mistaken for "forgot to write it"). Pooled across both
+    # kinds, per the spec: "Bucket every unmatched finding, on CONFIRMED and
+    # CLEAN rounds alike."
+    audit_sample = RSC.sample_for_audit(judged_for_audit, seed=args.audit_seed)
+    audit_path = out_path.with_name(out_path.stem + "-audit-sample" + out_path.suffix)
+    audit_path.write_text(json.dumps(audit_sample, indent=2) + "\n")
+
+    print(markdown)
+    print(f"\nscore: wrote {out_path}")
+    print(f"score: wrote {audit_path} "
+         f"({len(audit_sample['judged_real'])} judged-real, "
+         f"{len(audit_sample['judged_false'])} judged-false)")
+    return 0
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(prog="review-eval", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="command", required=True)
+
+    sp_corpus = sp.add_parser("corpus", help="build the answer-keyed corpus")
+    corpus_sub = sp_corpus.add_subparsers(dest="corpus_command", required=True)
+    sp_build = corpus_sub.add_parser("build")
+    sp_build.add_argument("--runs-root", default=None)
+    sp_build.add_argument("--since", default=REC.DEFAULT_SINCE_DATE)
+    sp_build.add_argument("--sample-size", type=int, default=REC.DEFAULT_SAMPLE_SIZE)
+    sp_build.add_argument("--seed", type=int, required=True)
+    sp_build.add_argument("--out", required=True)
+    sp_build.set_defaults(func=cmd_corpus_build)
+
+    sp_est = sp.add_parser("estimate", help="print a per-model dollar estimate")
+    sp_est.add_argument("--corpus", required=True)
+    sp_est.add_argument("--models", nargs="*", default=None)
+    sp_est.add_argument("--gateway-config", default=str(GATEWAY_CONFIG))
+    sp_est.add_argument("--runs-root", default=None)
+    sp_est.set_defaults(func=cmd_estimate)
+
+    sp_replay = sp.add_parser("replay", help="dispatch replays")
+    replay_sub = sp_replay.add_subparsers(dest="replay_command", required=True)
+    sp_run = replay_sub.add_parser("run")
+    sp_run.add_argument("--corpus", required=True)
+    sp_run.add_argument("--models", nargs="*", default=None,
+                        help=f"model arm keys (default: all). Known: {', '.join(sorted(STANDARD_ARMS))}")
+    sp_run.add_argument("--full-corpus", action="store_true",
+                        help="run every model on the full corpus rather than the "
+                             "default 30-round subset for subset-default arms")
+    sp_run.add_argument("--results-dir", required=True)
+    sp_run.add_argument("--concurrency", type=int, default=3)
+    sp_run.add_argument("--total-cap", type=float, default=RES.DEFAULT_TOTAL_CAP_USD)
+    sp_run.add_argument("--model-cap", nargs="*", default=None,
+                        help="override a model's cap: deepseek=20.0")
+    sp_run.add_argument("--wait-timeout", type=float, default=1800.0)
+    sp_run.set_defaults(func=cmd_replay_run)
+
+    sp_score = sp.add_parser("score", help="score replay results against the answer key")
+    sp_score.add_argument("--corpus", required=True)
+    sp_score.add_argument("--results-dir", required=True)
+    sp_score.add_argument("--repo-root-base", default=str(BR.root()))
+    sp_score.add_argument("--audit-seed", type=int, default=0,
+                         help="seed for the random judged-finding audit sample")
+    sp_score.add_argument("--out", required=True)
+    sp_score.set_defaults(func=cmd_score)
+
+    args = p.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

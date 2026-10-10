@@ -1,0 +1,1219 @@
+#!/usr/bin/env python3.11
+"""model-scorecard — per-(agent, model) success-vs-cost harvester (ARCH-107, Phase 1).
+
+A read-only harvester that joins each PR-producing run to its PR and resolves the
+objective outcome (opened / CI-first-pass / merged), appending one row per run to a
+persistent ledger so success can be tracked against cost over time. It does NOT
+touch the spawn/finalize/pr-open hot path — it reconstructs the run→PR join from
+artifacts + `gh`.
+
+  Ledger membership: a run gets a row iff it recorded a `pr-link.json` (written
+  by `agentctl pr-open --run` at PR-open time) and its task isn't close-loop
+  mode. Nothing else decides membership — not agent name, not a PR number
+  parsed from the task text. An earlier reconstructed join (branch-derived-
+  from-worktree, or a `#N` found in the task) is deliberately gone: measured
+  over a real window, 88% of reviewer-family runs cite a `#N` in their brief
+  (they're reviewing a PR, not producing one), so any task-text or branch
+  heuristic floods the ledger with non-producers attributed as producers.
+  `pr-link.json` is producer-specific by construction — only a run that
+  actually opened a PR has one.
+
+    • close-loop — a run whose task says so produces NO PR by design;
+                    excluded from both the ledger and the skip-report below.
+
+  A producer-shaped run with no `pr-link.json` (many runs commit while their
+  co opens the PR separately, so no link gets written) is dropped from the
+  ledger but counted and named by agent in the skip report the harvest
+  prints — that residual is the visible measure of the coverage gap.
+
+  Ledger: <root>/agent-runs/scorecard/scorecard.jsonl, upserted by run_id (a
+  still-open PR is re-resolved on the next pass as its state evolves). The ledger
+  IS the time series — weekly trend (Phase 4) is a GROUP BY over the `date` field.
+
+  Phase 1 records the objective signals only. The `merged AND survives 7d` success
+  bar (ARCH-107) needs the Phase-2 look-back (reverts / follow-up bugs); this writes
+  `merged` + `merged_at` so Phase 2 can finalize `survived` later.
+
+CLI: `--days N` (window, default 14), `--no-write` (don't update the ledger),
+`--ledger PATH` (override), `--report` (print the per-(agent,model) summary).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from itertools import zip_longest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import telemetry as T  # noqa: E402
+import signal_client   # noqa: E402  (structured Reports signal, ARCH-353 Build 2c)
+import issue_client    # noqa: E402  (POST /ledger-entries, the Bosun's first ledger writer)
+import dispatch_env as DE  # noqa: E402
+import review_protocol as RP  # noqa: E402
+
+import builder_root as BR
+RUNS_ROOT = BR.runs_root()
+LEDGER_PATH = RUNS_ROOT / "scorecard" / "scorecard.jsonl"
+JUDGE_PATH = RUNS_ROOT / "scorecard" / "judge.jsonl"
+
+# Phase 3 (T3) — sampled LLM judge. Sonnet, not Opus: judging is moderate-leverage,
+# sampled (bounded $), and feeds a human-reviewed gate (ARCH-020/079 tiering). The
+# diff is capped so a large PR can't blow the token budget on one verdict.
+# Moved off `claude-sonnet-4-6` with the alias on 2026-08-08. The comment above
+# names a TIER — "Sonnet, not Opus" — rather than pinning a version, so leaving it
+# behind would have frozen the judge on a superseded model by accident rather than
+# by a decision.
+#
+# CHANGING THE JUDGE IS A COMPARABILITY BOUNDARY IN THE LEDGER, and that is worth
+# knowing rather than discovering: verdicts either side of this change came from
+# different models, so a trend line crossing 2026-08-08 is measuring two things. If
+# a future change wants the judge frozen FOR that comparability, pin it here and
+# say so — the reason is what makes a pin legible rather than stale.
+JUDGE_MODEL = "claude-sonnet-5"
+JUDGE_SAMPLE = 3
+JUDGE_DIFF_CAP = 30000
+CLAUDE_BIN = str(Path.home() / ".local" / "bin" / "claude")  # absolute: launchd thin PATH
+
+# CI workflow file per repo (the "Frontend type check" + suite live here, ARCH-106).
+# hollis (formerly personal-assistant, ARCH-290) runs its own ci.yml (ruff + pytest)
+# — harvested GitHub-only (its dev crew runs via the Task tool, not agentctl, so
+# emits no run telemetry).
+CI_WORKFLOW = {"vivy": "ci.yml", "constance": "ci.yml", "sous-chef": "ci.yml",
+               "hollis": "ci.yml"}
+
+# The success bar (ARCH-107): a merged PR "survives" if within this many days it is
+# neither reverted (Phase 2) nor followed by a bug it plausibly caused (Phase 2b).
+SURVIVAL_DAYS = 7
+
+
+# --- pure: run classification + join ----------------------------------------
+
+
+def is_close_loop(meta: dict) -> bool:
+    """A run whose task says close-loop mode produces NO PR by design —
+    excluded from both the ledger and the skip report regardless of agent
+    or link state."""
+    return "close-loop" in (meta.get("task") or "").lower()
+
+
+# Reviewer-family agent names (`reviewer`, `security-reviewer`, or a
+# `<product>-` prefixed variant like `sel-reviewer`) — excluded from the
+# skip-report's producer-shaped bucket only. This is NOT a ledger-membership
+# gate (see is_ledger_member: that's pr-link.json, full stop) — it exists
+# purely so the skip report's residual count isn't reflooded by the same
+# reviewer briefs that motivated dropping the old PRODUCER_AGENTS allowlist.
+# A NEGATIVE pattern (exclude reviewer-shaped names) rather than a positive
+# enumeration, so a newly named `<product>-coder` agent is counted in the
+# residual automatically instead of silently vanishing the way a hardcoded
+# finite set did (it never listed orient-coder / sel-coder / deck-coder).
+_REVIEWER_AGENT_RE = re.compile(r"(?:^|-)(?:security-)?reviewer$", re.IGNORECASE)
+
+
+def is_producer_shaped(meta: dict) -> bool:
+    """Best-effort SHAPE bucket for the skip report's coverage count only —
+    close-loop is filtered upstream (list_candidate_runs), so this just
+    excludes reviewer-family agents."""
+    return not _REVIEWER_AGENT_RE.search(meta.get("agent") or "")
+
+
+def is_ledger_member(meta: dict, pr_link: dict | None) -> bool:
+    """The whole membership decision, in one place: NOT close-loop AND a
+    valid pr-link.json. Nothing else — not agent name in either direction
+    (ARCH-107 producer-gate fix: a hardcoded agent allowlist both silently
+    dropped new producer agents and, when widened to a task-text/branch
+    heuristic instead, flooded the ledger with reviewer-family runs that
+    merely cite a PR number in their brief)."""
+    return not is_close_loop(meta) and linked_pr_number(pr_link) is not None
+
+
+def linked_pr_number(pr_link: dict | None) -> int | None:
+    """The first-class run→PR link recorded by `agentctl pr-open --run` (ARCH-107
+    Phase 0): the `pr_number` from a run dir's `pr-link.json`. It is recorded at
+    PR-open time, so it covers the arch-led runs whose worktree carries no
+    `<repo>.` purpose. None when there's no link or it's malformed.
+
+    This is now the ONLY join. The line this docstring used to carry — "prefer
+    this over the reconstructed branch/PR-ref join" — invited a comparison with a
+    path that no longer exists; the module docstring above records why that join
+    was removed."""
+    if not pr_link:
+        return None
+    n = pr_link.get("pr_number")
+    if isinstance(n, bool):
+        return None
+    if isinstance(n, int):
+        return n
+    if isinstance(n, str) and n.isdigit():
+        return int(n)
+    return None
+
+
+def build_row(run: dict, pr: dict | None, ci_first_pass,
+              join_source: str = "linked") -> dict:
+    """One ledger row for a producer run: identity + cost + objective outcome.
+
+    `join_source` records how the run→PR link was made, and it now has exactly
+    two values: "linked" when a `pr-link.json` resolved to a PR, "unresolved"
+    when it did not (see the emit below, which is the only place it is set). It
+    used to be documented as a three-way linked/reconstructed/unresolved, which
+    sent a reader looking for a reconstructed branch/PR-ref path that has been
+    deliberately removed. It remains the coverage metric Phase 0's pr-link.json
+    is meant to move."""
+    meta, cost = run["meta"], run["cost"]
+    started = meta.get("started_at") or ""
+    row = {
+        "run_id": run["run_id"],
+        "date": started[:10],
+        "agent": meta.get("agent"),
+        "model": meta.get("model"),
+        "billing_source": meta.get("billing_source"),
+        "repo": meta.get("repo"),
+        "cost_usd": round(float(cost.get("usd", 0.0) or 0.0), 6),
+        "exit_status": run["outcome"].get("exit_status"),
+        "pr_number": None,
+        "pr_state": None,        # OPEN / MERGED / CLOSED / unresolved
+        "join_source": join_source if pr is not None else "unresolved",
+        "merged": None,
+        "merged_at": None,
+        "ci_first_pass": ci_first_pass,
+        # survived (merged AND no revert/follow-up bug within 7d) is Phase 2.
+        "survived": None,
+        # Horizon-reliability proxy (ARCH-158 brief): this run needed an ARCH-131
+        # respawn — it died and was re-driven once on the fallback model. A rising
+        # respawn-rate flags a lane degrading under repetition before merge-rate
+        # (≈ pass@1) moves. `fallback_from` is set only on the respawned attempt.
+        "respawned": bool(meta.get("fallback_from")),
+    }
+    if pr is not None:
+        merged = pr.get("state") == "MERGED"
+        row.update({
+            "pr_number": pr.get("number"),
+            "pr_state": pr.get("state"),
+            "merged": merged,
+            "merged_at": pr.get("mergedAt"),
+        })
+    else:
+        row["pr_state"] = "unresolved"
+    return row
+
+
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def survival_status(merged: bool, merged_at, reverted, now: datetime, follow_up=False):
+    """The merged-AND-survived label (ARCH-107 success bar: merged AND NOT reverted
+    AND NOT follow-up-bug within 7d). Returns:
+      None  — not merged, no merge time, still inside the 7-day window, or the
+              revert state is unknown (gh failure) → leave for the next pass.
+      True  — merged, window elapsed, not reverted, no detected follow-up bug.
+      False — merged, window elapsed, reverted OR a follow-up bug landed in-window.
+
+    `follow_up` is downgrade-only: a positive detection (True) flips a would-be
+    survivor to False, but an unknown/absent follow-up (None / False) never holds
+    up or fails the verdict — the revert check is the primary bar, and follow-up
+    detection is an inherently fuzzy issue-linking heuristic biased to under-flag
+    (a false positive would unfairly punish a model and could trip the wrong gate).
+    Rows are re-resolved every pass while in-window, so a True committed now flips
+    to False if a follow-up bug surfaces later."""
+    m = _parse_iso(merged_at)
+    if not merged or m is None:
+        return None
+    if (now - m) < timedelta(days=SURVIVAL_DAYS):
+        return None  # window not yet elapsed — re-resolve on a later pass
+    if reverted is None:
+        return None  # couldn't determine — don't guess
+    if reverted:
+        return False
+    return follow_up is not True  # True survives unless a follow-up bug was detected
+
+
+def upsert_ledger(existing: list[dict], fresh: list[dict]) -> list[dict]:
+    """Merge fresh rows over existing by run_id (fresh wins — a re-resolved row
+    reflects the PR's newer state), sorted by date then run_id."""
+    by_id = {r["run_id"]: r for r in existing}
+    for r in fresh:
+        by_id[r["run_id"]] = r
+    return sorted(by_id.values(), key=lambda r: (r.get("date") or "", r["run_id"]))
+
+
+def report_to_ledger(rows: list[dict]) -> dict:
+    """POST each row to the Library's ledger (`POST /ledger-entries`,
+    issue_01M0TP37M3RRRY5BD1Z4B8GCB0 Part 1 — the Bosun's first ledger writer).
+
+    Callers must restrict `rows` to runs `is_cost_final` is True for — see its
+    docstring and `harvest`'s `finished` return value. This function does not
+    check itself: it is also exercised directly by tests against synthetic
+    rows that carry no real run directory to check.
+
+    `dedup_key` is the row's `run_id`, the same key the local ledger is
+    already upserted by, so a row re-resolved on a later harvest pass
+    collides at the Library and is answered with the existing entry rather
+    than double-counted.
+
+    Best-effort over the WHOLE set: one row's refusal or an unreachable
+    Library never stops the rest, and never undoes the local upsert this
+    pass already wrote — `issue_client.post_ledger_entry` itself never
+    raises, and its `"not-recorded"` (no live ledger for the product) and
+    `"error:*"` (a disproportionate-spend refusal, a bad call, or a dead
+    Library) statuses are both counted here rather than retried.
+
+    Returns {"recorded": n, "not_recorded": n,
+             "errors": [(run_id, status, error), ...]}."""
+    recorded = 0
+    not_recorded = 0
+    errors: list[tuple[str, str, str]] = []
+    for r in rows:
+        run_id = r["run_id"]
+        res = issue_client.post_ledger_entry(
+            r.get("repo"), r.get("cost_usd"), run_id=run_id, dedup_key=run_id,
+            agent=r.get("agent"), model=r.get("model"))
+        status = res.get("status")
+        if status == "recorded":
+            recorded += 1
+        elif status == "not-recorded":
+            not_recorded += 1
+        else:
+            errors.append((run_id, status, res.get("error", "")))
+    return {"recorded": recorded, "not_recorded": not_recorded, "errors": errors}
+
+
+def summarize(rows: list[dict]) -> dict:
+    """Aggregate per (agent, model): runs, resolved, merged, merge-rate over
+    resolved, CI-first-pass rate, total $ and $/merged. The Phase-4 rollup grows
+    from this; printed by --report for an immediate read."""
+    agg: dict = defaultdict(lambda: {
+        "runs": 0, "resolved": 0, "merged": 0, "ci_runs": 0, "ci_first_pass": 0,
+        "scored": 0, "survived": 0, "respawned": 0, "usd": 0.0})
+    for r in rows:
+        k = (r.get("agent"), r.get("model"))
+        a = agg[k]
+        a["runs"] += 1
+        a["usd"] += float(r.get("cost_usd", 0.0) or 0.0)
+        if r.get("respawned"):
+            a["respawned"] += 1
+        if r.get("pr_state") not in (None, "unresolved"):
+            a["resolved"] += 1
+        if r.get("merged"):
+            a["merged"] += 1
+        if r.get("ci_first_pass") is not None:
+            a["ci_runs"] += 1
+            if r["ci_first_pass"]:
+                a["ci_first_pass"] += 1
+        if r.get("survived") is not None:   # merged + 7-day window elapsed
+            a["scored"] += 1
+            if r["survived"]:
+                a["survived"] += 1
+    return dict(agg)
+
+
+# --- impure: gh joins + ledger IO -------------------------------------------
+
+
+def _gh_json(args: list[str]) -> list | dict | None:
+    """Run a `gh` command returning JSON; None on any failure (read-only harvester
+    must degrade, never crash, on a gh/network hiccup)."""
+    try:
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        if cp.returncode != 0 or not cp.stdout.strip():
+            return None
+        return json.loads(cp.stdout)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def pr_maps(repo: str, limit: int = 300) -> dict:
+    """pr_number → PR record for a repo, from one `gh pr list` call."""
+    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+                     "--limit", str(limit), "--json",
+                     "number,headRefName,state,mergedAt"]) or []
+    return {p["number"]: p for p in data}
+
+
+def ci_first_pass(repo: str, branch: str):
+    """True/False if CI's first pull_request run on the branch passed; None when
+    indeterminate (no runs / gh failure). The earliest pull_request run is the
+    opener — ARCH-106's CI-first-pass signal."""
+    wf = CI_WORKFLOW.get(repo)
+    if not wf or not branch:
+        return None
+    data = _gh_json(["run", "list", "--repo", f"convivy/{repo}", "--branch", branch,
+                     "--workflow", wf, "--json", "conclusion,event,createdAt"]) or []
+    pr_runs = [d for d in data if d.get("event") == "pull_request" and d.get("createdAt")]
+    if not pr_runs:
+        return None
+    earliest = min(pr_runs, key=lambda d: d["createdAt"])
+    return earliest.get("conclusion") == "success"
+
+
+def revert_in_window(matches: list[dict], pr_number: int, merged_at: str) -> bool:
+    """Given `gh pr list --search "Reverts #N"` results, is there a TRUE revert of
+    #pr_number merged within the window? Two filters matter: (1) the search also
+    matches the ORIGINAL PR's own thread, so exclude `number == pr_number` (else
+    every PR looks like its own revert); (2) require a `Revert ...` title — GitHub's
+    revert PR is titled `Revert "<original>"` — so a PR merely mentioning the number
+    in discussion doesn't count."""
+    m = _parse_iso(merged_at)
+    if m is None:
+        return False
+    for p in matches:
+        if p.get("number") == pr_number:
+            continue
+        if not str(p.get("title", "")).lower().startswith("revert"):
+            continue
+        rm = _parse_iso(p.get("mergedAt"))
+        if rm is not None and m <= rm <= m + timedelta(days=SURVIVAL_DAYS):
+            return True
+    return False
+
+
+def was_reverted(repo: str, pr_number: int, merged_at: str) -> bool | None:
+    """True if a PR reverting #pr_number merged within SURVIVAL_DAYS of the merge.
+    None on gh failure / unparseable time."""
+    if not pr_number or _parse_iso(merged_at) is None:
+        return None
+    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+                     "--search", f"Reverts #{pr_number}", "--json", "number,title,mergedAt"])
+    if data is None:
+        return None
+    return revert_in_window(data, pr_number, merged_at)
+
+
+# Title/label signals that a follow-up issue or PR is a *bug* (a regression the
+# merged PR plausibly caused), not a feature follow-up. Deliberately tight — only
+# title + labels, never body — to bias toward under-flagging (a false positive
+# unfairly tanks a model's survival% and could trip the ARCH-079 gate).
+_BUG_TITLE_RE = re.compile(
+    r"\b(regress(?:ion|ed|es)?|broke|broken|breaks|revert|regressi)\b", re.IGNORECASE)
+
+
+def _references_pr(text: str, pr_number: int) -> bool:
+    """True if text cites PR/issue #pr_number (`#N`, `pull/N`, `issues/N`), not a
+    longer number that merely starts with those digits."""
+    return re.search(rf"(?:#|pull/|issues/)0*{pr_number}(?!\d)", text or "") is not None
+
+
+def _is_bug_typed(item: dict) -> bool:
+    """A candidate looks like a bug: a label name containing 'bug', or a title with
+    a regression keyword."""
+    for lab in item.get("labels") or []:
+        name = (lab.get("name") if isinstance(lab, dict) else str(lab)) or ""
+        if "bug" in name.lower():
+            return True
+    return bool(_BUG_TITLE_RE.search(item.get("title") or ""))
+
+
+def follow_up_bug_in_window(matches: list[dict], pr_number: int, merged_at: str) -> bool:
+    """Given `gh search issues` results, is there a bug-typed issue/PR that (1) was
+    created within SURVIVAL_DAYS of the merge, (2) references #pr_number, and (3)
+    isn't the PR itself? The conservative half of the survival bar — references AND
+    a bug signal must both hold, so a feature follow-up that merely cites the PR
+    doesn't count.
+
+    Deliberately does NOT treat the `[Follow-up from PR #N]` title prefix as a bug
+    signal: that convention spans real regressions (e.g. "...CSV column misalignment")
+    AND deferred features (e.g. "...Implement renderer"), so the prefix alone would
+    over-flag. Distinguishing those needs to read the issue — that's the Phase-3
+    LLM judge's job; this heuristic catches only the cheaply-certain cases."""
+    m = _parse_iso(merged_at)
+    if m is None:
+        return False
+    for it in matches:
+        if it.get("number") == pr_number:
+            continue
+        created = _parse_iso(it.get("createdAt"))
+        if created is None or not (m <= created <= m + timedelta(days=SURVIVAL_DAYS)):
+            continue
+        if not _references_pr(f"{it.get('title','')}\n{it.get('body','')}", pr_number):
+            continue
+        if _is_bug_typed(it):
+            return True
+    return False
+
+
+def had_follow_up_bug(repo: str, pr_number: int, merged_at: str) -> bool | None:
+    """True if a bug-typed issue/PR referencing #pr_number was filed within
+    SURVIVAL_DAYS of its merge. None on gh failure / unparseable merge time.
+    The gh search narrows by repo + created-date; `follow_up_bug_in_window` does
+    the precise reference + bug-type filtering."""
+    m = _parse_iso(merged_at)
+    if not pr_number or m is None:
+        return None
+    since = m.date().isoformat()
+    data = _gh_json(["search", "issues", str(pr_number), "--repo", f"convivy/{repo}",
+                     "--created", f">={since}", "--limit", "100", "--json",
+                     "number,title,body,createdAt,labels,isPullRequest"])
+    if data is None:
+        return None
+    return follow_up_bug_in_window(data, pr_number, merged_at)
+
+
+def load_ledger(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def write_ledger(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+
+
+def list_candidate_runs(days: int) -> list[dict]:
+    """Load every non-close-loop run (any agent) started within the last `days`,
+    each annotated with its pr_link (pr-link.json, or None). Ledger membership
+    is decided later by is_ledger_member (link presence, nothing else) — this
+    only excludes close-loop, which by design has no PR to join and must never
+    enter the ledger or the skip report.
+
+    `run["cost"]` is left at its `{}` default here, not read eagerly: a run's
+    cost.json can be written at any point between this scan and `harvest`'s
+    loop reaching that member, so the cost figure and the finality decision
+    both have to come from one read done there, not from a snapshot taken
+    here (see `read_final_cost`'s docstring for the bug this avoids)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    out = []
+    for i in range(days + 1):
+        d = (datetime.now(timezone.utc) - timedelta(days=i)).date()
+        day_dir = RUNS_ROOT / d.isoformat()
+        if not day_dir.is_dir():
+            continue
+        for p in sorted(day_dir.glob("run-*")):
+            if not p.is_dir():
+                continue
+            run = {"run_id": p.name, "dir": p, "meta": {}, "outcome": {}, "cost": {}}
+            try: run["meta"] = T.read_meta(p)
+            except (FileNotFoundError, json.JSONDecodeError): continue
+            if is_close_loop(run["meta"]):
+                continue
+            started = run["meta"].get("started_at")
+            try:
+                if not started or datetime.fromisoformat(started.replace("Z", "+00:00")) < cutoff:
+                    continue
+            except ValueError:
+                continue
+            try: run["outcome"] = T.read_outcome(p)
+            except (FileNotFoundError, json.JSONDecodeError): pass
+            run["pr_link"] = _read_pr_link(p)
+            out.append(run)
+    return out
+
+
+def skip_counts(candidates: list[dict]) -> dict:
+    """{agent: count} of producer-shaped runs with no pr-link.json — the
+    residual now that ledger membership is link-only. Diagnostic grouping
+    only; it never feeds the ledger."""
+    counts: dict = defaultdict(int)
+    for run in candidates:
+        meta = run["meta"]
+        if linked_pr_number(run.get("pr_link")) is not None:
+            continue
+        if not is_producer_shaped(meta):
+            continue
+        counts[meta.get("agent") or "?"] += 1
+    return dict(counts)
+
+
+def _read_pr_link(p: Path) -> dict | None:
+    """The first-class run→PR link (pr-link.json), stamped by `agentctl pr-open
+    --run` (ARCH-107 Phase 0). None when absent/unreadable."""
+    fp = p / "pr-link.json"
+    if not fp.is_file():
+        return None
+    try:
+        return json.loads(fp.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def read_final_cost(run: dict) -> dict | None:
+    """The one read that decides whether a run is finished AND supplies the
+    cost its row is posted with — the same read, not two. A member run still
+    in flight has no `cost.json` yet (`agentctl spawn --pr N` stamps
+    `pr-link.json`, and therefore `is_ledger_member`, at DISPATCH time, before
+    the run has done any work). Round 2 of this feature decided finality from
+    a fresh `.exists()` check here while pricing the row from a `cost.json`
+    read `list_candidate_runs` had already taken before `harvest`'s loop
+    started — a run that finished in the interval between the two was posted
+    final with that stale (often `0.0` placeholder) figure, pinned forever by
+    the Library's `dedup_key=run_id` dedup. Reading the file exactly once,
+    at the point this run is actually processed, and using that same read's
+    content as the price, closes the gap: there is no second checkpoint left
+    for the file to change under.
+
+    Returns the parsed `cost.json`, or `None` while the run is still in
+    flight (or the file is unreadable) — callers must only post rows this
+    is not `None` for; posting a `None` row's placeholder would have the real
+    cost, once the run finishes and a later pass re-resolves the row,
+    answered by the Library with the existing (wrong) entry instead of
+    recorded (see `issue_client.post_ledger_entry`'s docstring on what a
+    changed cost under the same `dedup_key` does).
+
+    A run that dies before `_finalize_run` ever writes `cost.json` (a host
+    reboot, an OOM kill, a task-lifetime-cap kill mid-run) returns `None`
+    forever: it is never posted to the Library, in either direction, once it
+    ages out of `--days`. This is a known limitation, not a bug this function
+    fixes — see the PR body's known-limitations section."""
+    try:
+        return T.read_cost(run["dir"])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def is_cost_final(run: dict) -> bool:
+    """Whether `read_final_cost(run)` has a figure to post. Exists as the
+    named boolean the module's docstrings and tests refer to; `harvest`
+    itself calls `read_final_cost` directly so the one read serves both the
+    decision and the posted figure (see its docstring) rather than this
+    function's own read being a second, separately-timed check."""
+    return read_final_cost(run) is not None
+
+
+# --- report ------------------------------------------------------------------
+
+
+def _rates(a: dict) -> dict:
+    """Turn a summarize() entry into display rates (None where the denominator is 0)."""
+    pct = lambda n, d: (100.0 * n / d) if d else None
+    return {
+        "runs": a["runs"],
+        "merge_pct": pct(a["merged"], a["resolved"]),
+        "surv_pct": pct(a["survived"], a["scored"]),
+        "ci_pct": pct(a["ci_first_pass"], a["ci_runs"]),
+        # ARCH-131 respawn-rate over all runs — a pass^k proxy (ARCH-158 brief).
+        "respawn_pct": pct(a.get("respawned", 0), a["runs"]),
+        "usd": a["usd"],
+        "per_merged": (a["usd"] / a["merged"]) if a["merged"] else None,
+    }
+
+
+def rollup(rows: list[dict], now: datetime, window_days: int = 7) -> dict:
+    """Trailing-window vs prior-window aggregates per (agent, model) — the trend
+    that answers 'is the system improving'. Buckets by the row `date` (run start,
+    lexical ISO compares chronologically): this = last `window_days`, prior = the
+    `window_days` before that."""
+    this_start = (now - timedelta(days=window_days)).date().isoformat()
+    prior_start = (now - timedelta(days=2 * window_days)).date().isoformat()
+    this_rows = [r for r in rows if (r.get("date") or "") >= this_start]
+    prior_rows = [r for r in rows if prior_start <= (r.get("date") or "") < this_start]
+    return {
+        "window_days": window_days,
+        "this_start": this_start,
+        "asof": now.date().isoformat(),
+        "this": {k: _rates(v) for k, v in summarize(this_rows).items()},
+        "prior": {k: _rates(v) for k, v in summarize(prior_rows).items()},
+    }
+
+
+def model_comparison(this: dict) -> list[dict]:
+    """For each agent run on ≥2 models this window, the side-by-side that drives
+    the ARCH-079 model-tiering gate: baseline = priciest per-merged model, others
+    compared on merge% within a 5-point band (the gate's default)."""
+    by_agent: dict = defaultdict(list)
+    for (agent, model), r in this.items():
+        by_agent[agent].append((model, r))
+    out = []
+    for agent, entries in by_agent.items():
+        if len(entries) < 2:
+            continue
+        priced = [(m, r) for m, r in entries if r["per_merged"] is not None]
+        if len(priced) < 2:
+            continue
+        base_model, base = max(priced, key=lambda mr: mr[1]["per_merged"])  # premium = priciest/merged
+        for model, r in priced:
+            if model == base_model:
+                continue
+            within = (base["merge_pct"] is not None and r["merge_pct"] is not None
+                      and r["merge_pct"] >= base["merge_pct"] - 5)
+            out.append({"agent": agent, "baseline": base_model, "base": base,
+                        "candidate": model, "cand": r, "within_band": within})
+    return out
+
+
+def _fmt_pct(p):
+    return f"{p:.0f}%" if p is not None else "—"
+
+
+def render_weekly_md(ru: dict) -> str:
+    lines = [f"# Agent scorecard — week of {ru['this_start']} (asof {ru['asof']})\n",
+             f"_Trailing {ru['window_days']}d vs the prior {ru['window_days']}d. "
+             f"Survived = merged and not reverted within {SURVIVAL_DAYS}d. "
+             f"Respawn% = ARCH-131 fallback rate, a pass^k reliability proxy._\n",
+             "| Agent | Model | Runs | Merge% | Survived% | CI-1st% | Respawn% | $ | $/merged | Δmerge% vs prior |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for (agent, model), r in sorted(ru["this"].items(), key=lambda kv: -kv[1]["usd"]):
+        prior = ru["prior"].get((agent, model))
+        if prior and prior["merge_pct"] is not None and r["merge_pct"] is not None:
+            dm = f"{r['merge_pct'] - prior['merge_pct']:+.0f}"
+        else:
+            dm = "—"
+        pm = f"${r['per_merged']:.4f}" if r["per_merged"] is not None else "—"
+        lines.append(f"| {agent} | `{model}` | {r['runs']} | {_fmt_pct(r['merge_pct'])} "
+                     f"| {_fmt_pct(r['surv_pct'])} | {_fmt_pct(r['ci_pct'])} | {_fmt_pct(r['respawn_pct'])} "
+                     f"| ${r['usd']:.4f} | {pm} | {dm} |")
+    comps = model_comparison(ru["this"])
+    if comps:
+        lines.append("\n## Model comparison (same agent, different models)\n")
+        for c in comps:
+            b, cd = c["base"], c["cand"]
+            flag = "✅ within 5pts" if c["within_band"] else "⚠️ below baseline >5pts"
+            lines.append(
+                f"- **{c['agent']}** — `{c['baseline']}` merge {_fmt_pct(b['merge_pct'])} "
+                f"@ ${b['per_merged']:.4f}/merged  vs  `{c['candidate']}` merge {_fmt_pct(cd['merge_pct'])} "
+                f"@ ${cd['per_merged']:.4f}/merged → {flag}")
+    return "\n".join(lines) + "\n"
+
+
+def render_weekly_slack(ru: dict) -> dict:
+    lines = [f"*Agent scorecard — week of {ru['this_start']}* _(trailing {ru['window_days']}d vs prior; "
+             f"success vs cost)_"]
+    for (agent, model), r in sorted(ru["this"].items(), key=lambda kv: -kv[1]["usd"])[:8]:
+        prior = ru["prior"].get((agent, model))
+        dm = (f" (Δ{r['merge_pct'] - prior['merge_pct']:+.0f})"
+              if prior and prior["merge_pct"] is not None and r["merge_pct"] is not None else "")
+        pm = f"${r['per_merged']:.4f}/merged" if r["per_merged"] is not None else "—"
+        lines.append(f"• {agent} `{model}` — {r['runs']} runs · merge {_fmt_pct(r['merge_pct'])}{dm} "
+                     f"· surv {_fmt_pct(r['surv_pct'])} · CI-1st {_fmt_pct(r['ci_pct'])} · {pm}")
+    comps = model_comparison(ru["this"])
+    for c in comps:
+        b, cd = c["base"], c["cand"]
+        flag = "✅ within 5pts" if c["within_band"] else "⚠️ >5pts below"
+        ratio = (f", {b['per_merged']/cd['per_merged']:.0f}× cheaper"
+                 if cd["per_merged"] else "")
+        lines.append(f"• *{c['agent']} model gate:* `{c['candidate']}` vs `{c['baseline']}` — "
+                     f"merge {_fmt_pct(cd['merge_pct'])} vs {_fmt_pct(b['merge_pct'])} → {flag}{ratio}")
+    text = "\n".join(lines)
+    return {"text": text, "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": text}}]}
+
+
+def _agg_key_order(kv: tuple) -> tuple:
+    """Sort key for an (agent, model) -> stats item. A PR without a `model:<id>`
+    label yields a None model (and a judge row may lack an agent); a bare
+    sorted() over those keys raises TypeError against a str beside a None."""
+    return tuple(part or "" for part in kv[0])
+
+
+def render_report(rows: list[dict]) -> str:
+    agg = summarize(rows)
+    if not agg:
+        return "No producer runs in window.\n"
+    lines = ["| Agent | Model | Runs | Resolved | Merged | Merge% | Survived (7d) | CI-1st% | $ total | $/merged |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
+    for (agent, model), a in sorted(agg.items(), key=lambda kv: -kv[1]["usd"]):
+        merge_pct = f"{100*a['merged']/a['resolved']:.0f}%" if a["resolved"] else "—"
+        ci_pct = f"{100*a['ci_first_pass']/a['ci_runs']:.0f}%" if a["ci_runs"] else "—"
+        per_merged = f"${a['usd']/a['merged']:.4f}" if a["merged"] else "—"
+        surv = f"{a['survived']}/{a['scored']}" if a["scored"] else "—"  # — = none past the 7d window yet
+        lines.append(f"| {agent} | {model} | {a['runs']} | {a['resolved']} | {a['merged']} "
+                     f"| {merge_pct} | {surv} | {ci_pct} | ${a['usd']:.4f} | {per_merged} |")
+    return "\n".join(lines) + "\n"
+
+
+# --- Phase 3: sampled LLM judge ----------------------------------------------
+# The dimensions objective data can't see — review thoroughness and fix
+# minimality/correctness (the canonical miss: a min/max calibration bug that the
+# author, reviewer, and security-reviewer all cleared). Bounded sample per window,
+# never exhaustive (real token cost); writes verdicts to a separate judge.jsonl.
+
+
+def select_judge_sample(rows: list[dict], judged_ids: set, now: datetime,
+                        window_days: int = 7, sample: int = JUDGE_SAMPLE) -> list[dict]:
+    """Pick up to `sample` merged PRs in the trailing window not already judged,
+    spread round-robin across (agent, model) so one busy cell can't crowd out the
+    others, most-recent-first within a cell. Pure (selection only)."""
+    this_start = (now - timedelta(days=window_days)).date().isoformat()
+    cands = [r for r in rows
+             if r.get("merged") and r.get("pr_number") and r.get("repo")
+             and (r.get("date") or "") >= this_start
+             and r.get("run_id") not in judged_ids]
+    buckets: dict = defaultdict(list)
+    for r in sorted(cands, key=lambda r: (r.get("date") or ""), reverse=True):
+        buckets[(r.get("agent"), r.get("model"))].append(r)
+    ordered = [r for grp in zip_longest(*buckets.values()) for r in grp if r is not None]
+    return ordered[:sample]
+
+
+def build_judge_prompt(row: dict, ctx: dict) -> str:
+    """The self-contained judge prompt (rubric + PR context). Strict-JSON-only
+    output so `parse_verdict` can read it. Pure — testable without a model call."""
+    return (
+        "You are a senior engineer auditing one merged pull request for the quality the "
+        "objective metrics (merge, CI, revert) can't see. Judge two things:\n"
+        "1. review_thoroughness (1-5): did the human/agent reviews catch the real risks, or "
+        "rubber-stamp? 5 = caught the substantive issues; 1 = missed an obvious defect.\n"
+        "2. fix_quality (1-5): is the change minimal and correct for its stated goal? 5 = "
+        "tight and correct; 1 = buggy, over-broad, or misses the point.\n"
+        "Look specifically for defects everyone missed — off-by-one, min/max swaps, boundary "
+        "and null cases, silent behavior changes.\n\n"
+        f"## PR #{row.get('pr_number')} in convivy/{row.get('repo')} "
+        f"(produced by agent `{row.get('agent')}`, model `{row.get('model')}`)\n"
+        f"### Task\n{ctx.get('task','(unknown)')}\n\n"
+        f"### Title\n{ctx.get('title','')}\n\n"
+        f"### Reviews\n{ctx.get('reviews','(none)')}\n\n"
+        f"### Diff (truncated to {JUDGE_DIFF_CAP} chars)\n{ctx.get('diff','(unavailable)')}\n\n"
+        "Output ONLY a JSON object, no prose, no code fence:\n"
+        '{"review_thoroughness": <1-5>, "fix_quality": <1-5>, '
+        '"flagged_issues": ["<short issue>", ...], "rationale": "<=2 sentences"}'
+    )
+
+
+def parse_verdict(text: str) -> dict | None:
+    """Extract + validate the judge's JSON verdict from the model's raw text (which
+    may wrap it in a ```json fence or prose). None when no valid object is found or
+    both scores are unusable."""
+    if not text:
+        return None
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+    def score(k):
+        v = obj.get(k)
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            return None
+        return v if 1 <= v <= 5 else None
+
+    rt, fq = score("review_thoroughness"), score("fix_quality")
+    if rt is None and fq is None:
+        return None  # a verdict with neither usable score is worthless
+    issues = obj.get("flagged_issues") or []
+    return {
+        "review_thoroughness": rt,
+        "fix_quality": fq,
+        "flagged_issues": [str(x)[:200] for x in issues][:10] if isinstance(issues, list) else [],
+        "rationale": str(obj.get("rationale") or "")[:1000],
+    }
+
+
+def build_judge_row(row: dict, verdict: dict, cost_usd, judge_model: str, judged_at: str) -> dict:
+    return {
+        "run_id": row.get("run_id"),
+        "date": (judged_at or "")[:10],
+        "agent": row.get("agent"),
+        "model": row.get("model"),
+        "repo": row.get("repo"),
+        "pr_number": row.get("pr_number"),
+        "review_thoroughness": verdict.get("review_thoroughness"),
+        "fix_quality": verdict.get("fix_quality"),
+        "flagged_issues": verdict.get("flagged_issues"),
+        "rationale": verdict.get("rationale"),
+        "judge_model": judge_model,
+        "judge_cost_usd": round(float(cost_usd or 0.0), 6),
+        "judged_at": judged_at,
+    }
+
+
+def render_judge_report(judge_rows: list[dict]) -> str:
+    if not judge_rows:
+        return "No judge verdicts recorded.\n"
+    agg: dict = defaultdict(lambda: {"n": 0, "rt": 0, "rtn": 0, "fq": 0, "fqn": 0, "cost": 0.0})
+    for j in judge_rows:
+        a = agg[(j.get("agent"), j.get("model"))]
+        a["n"] += 1
+        a["cost"] += float(j.get("judge_cost_usd", 0.0) or 0.0)
+        if j.get("review_thoroughness") is not None:
+            a["rt"] += j["review_thoroughness"]; a["rtn"] += 1
+        if j.get("fix_quality") is not None:
+            a["fq"] += j["fix_quality"]; a["fqn"] += 1
+    avg = lambda s, n: f"{s/n:.1f}" if n else "—"
+    lines = ["| Agent | Model | Judged | Avg review/5 | Avg fix/5 | Judge $ |",
+             "|---|---|---|---|---|---|"]
+    for (agent, model), a in sorted(agg.items(), key=_agg_key_order):
+        lines.append(f"| {agent} | `{model}` | {a['n']} | {avg(a['rt'], a['rtn'])} "
+                     f"| {avg(a['fq'], a['fqn'])} | ${a['cost']:.4f} |")
+    return "\n".join(lines) + "\n"
+
+
+def _gh_text(args: list[str]) -> str | None:
+    """A `gh` call returning raw text (e.g. `pr diff`); None on failure."""
+    try:
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        return cp.stdout if cp.returncode == 0 else None
+    except OSError:
+        return None
+
+
+def _fmt_reviews(meta: dict) -> str:
+    """Compact the PR's reviews + top-level comments into judge-readable text."""
+    out = []
+    for rv in (meta.get("reviews") or [])[:12]:
+        who = (rv.get("author") or {}).get("login", "?")
+        body = (rv.get("body") or "").strip()
+        out.append(f"[{rv.get('state','')}] @{who}: {body[:600]}")
+    for c in (meta.get("comments") or [])[:12]:
+        who = (c.get("author") or {}).get("login", "?")
+        out.append(f"[comment] @{who}: {(c.get('body') or '').strip()[:400]}")
+    return "\n".join(out) or "(none)"
+
+
+def fetch_pr_context(repo: str, pr_number: int, task: str, diff_cap: int = JUDGE_DIFF_CAP) -> dict | None:
+    """Gather the diff + reviews + title for one PR. None when the diff is
+    unavailable (the judge needs the diff; without it there's nothing to score)."""
+    full = f"convivy/{repo}"
+    diff = _gh_text(["pr", "diff", str(pr_number), "--repo", full])
+    if diff is None:
+        return None
+    meta = _gh_json(["pr", "view", str(pr_number), "--repo", full, "--json",
+                     "title,reviews,comments"]) or {}
+    capped = diff[:diff_cap] + ("\n…(diff truncated)…" if len(diff) > diff_cap else "")
+    return {"task": task, "title": meta.get("title", ""),
+            "reviews": _fmt_reviews(meta), "diff": capped}
+
+
+def run_judge(prompt: str, model: str) -> dict | None:
+    """Call `claude -p` headless for one verdict. Returns {text, cost_usd} or None
+    on any failure (the judge degrades like the gh joins — never crashes the run)."""
+    try:
+        # No explicit env means a bare inherit, which carries the launching
+        # session's tmux identity straight through — dispatch_env() drops it
+        # (issue_01M2EG40BSYN7MXM2EWBT9VKBN).
+        cp = subprocess.run([CLAUDE_BIN, "-p", "--output-format", "json", "--model", model],
+                            input=prompt, capture_output=True, text=True, check=False,
+                            env=DE.dispatch_env())
+    except OSError:
+        return None
+    if cp.returncode != 0 or not cp.stdout.strip():
+        return None
+    try:
+        env = json.loads(cp.stdout)
+    except json.JSONDecodeError:
+        return None
+    if env.get("is_error"):
+        return None
+    return {"text": env.get("result") or "", "cost_usd": env.get("total_cost_usd") or 0.0}
+
+
+def _task_for_run(run_id: str) -> str:
+    """Best-effort task brief for a judged run (context for the judge). Empty when
+    the run dir / meta is gone (judging the ledger, which outlives run dirs), or
+    when `run_id` resolves under more than one date directory — the same
+    ambiguity refusal `review_protocol.find_run_dir` gives the merge gate's stamp
+    authentication (issue_01M1JWB7M75SZ160VRJRCGARBF), so a planted duplicate
+    can't supply a forged task brief into the judge prompt either."""
+    try:
+        run_dir = RP.find_run_dir(run_id, RUNS_ROOT)
+    except RP.AmbiguousRunDir:
+        return ""
+    if run_dir is None:
+        return ""
+    try:
+        return (T.read_meta(run_dir).get("task") or "")[:2000]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return ""
+
+
+def judge_sample(rows: list[dict], judge_path: Path, *, sample: int, model: str,
+                 write: bool = True) -> list[dict]:
+    """Judge up to `sample` un-judged merged PRs; append verdicts to judge.jsonl."""
+    judged = load_ledger(judge_path)
+    judged_ids = {j.get("run_id") for j in judged}
+    now = datetime.now(timezone.utc)
+    picks = select_judge_sample(rows, judged_ids, now, sample=sample)
+    if not picks:
+        print("judge: no un-judged merged PRs in the trailing window.", file=sys.stderr)
+        return []
+    new_rows = []
+    for r in picks:
+        ctx = fetch_pr_context(r["repo"], r["pr_number"], _task_for_run(r["run_id"]))
+        if ctx is None:
+            print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): no diff.", file=sys.stderr)
+            continue
+        res = run_judge(build_judge_prompt(r, ctx), model)
+        if res is None:
+            print(f"judge: skip {r['run_id']}: judge call failed.", file=sys.stderr)
+            continue
+        verdict = parse_verdict(res["text"])
+        if verdict is None:
+            print(f"judge: skip {r['run_id']}: unparseable verdict.", file=sys.stderr)
+            continue
+        jr = build_judge_row(r, verdict, res["cost_usd"], model, T.now_iso())
+        new_rows.append(jr)
+        print(f"judge: {r.get('agent')}/{r.get('model')} PR #{r['pr_number']} → "
+              f"review {verdict['review_thoroughness']}/5, fix {verdict['fix_quality']}/5 "
+              f"(${jr['judge_cost_usd']:.4f})", file=sys.stderr)
+    if write and new_rows:
+        write_ledger(judge_path, upsert_ledger(judged, new_rows))
+    return new_rows
+
+
+# --- entry -------------------------------------------------------------------
+
+
+def harvest(days: int) -> tuple[list[dict], dict, set[str]]:
+    """Resolve every run with a valid pr-link.json (the whole membership test —
+    see is_ledger_member) into a ledger row. Returns (rows, skipped, finished)
+    where `skipped` is the {agent: count} of producer-shaped runs dropped for
+    having no link (skip_counts) — the coverage-gap residual — and `finished`
+    is the run_ids among `rows` whose run has actually finished: the local
+    ledger is upserted from the whole of `rows` (a still-open run is
+    re-resolved on the next pass, same as a still-open PR), but the Library
+    post must be restricted to `finished` — see read_final_cost's docstring,
+    including why that read (and the cost it prices the row with) happens
+    here, per member, rather than earlier in `list_candidate_runs`."""
+    runs = list_candidate_runs(days)
+    members = [r for r in runs if is_ledger_member(r["meta"], r.get("pr_link"))]
+    repos = {r["meta"].get("repo") for r in members if r["meta"].get("repo")}
+    pr_by_number = {repo: pr_maps(repo) for repo in repos}
+    now = datetime.now(timezone.utc)
+    ci_cache: dict = {}
+    revert_cache: dict = {}
+    follow_up_cache: dict = {}
+    rows = []
+    finished = set()
+    for run in members:
+        repo = run["meta"].get("repo")
+        linked = linked_pr_number(run["pr_link"])
+        pr = pr_by_number.get(repo, {}).get(linked)
+        cfp = None
+        if pr is not None:
+            branch = pr.get("headRefName")
+            key = (repo, branch)
+            if key not in ci_cache:
+                ci_cache[key] = ci_first_pass(repo, branch)
+            cfp = ci_cache[key]
+        final_cost = read_final_cost(run)
+        if final_cost is not None:
+            run = {**run, "cost": final_cost}
+        row = build_row(run, pr, cfp)
+        # Survival (Phase 2): only resolve once a merged PR's 7-day window has
+        # elapsed — bounds the revert lookups to the 7–14d-old slice of the window.
+        if row["merged"] and row["merged_at"]:
+            m = _parse_iso(row["merged_at"])
+            if m is not None and (now - m) >= timedelta(days=SURVIVAL_DAYS):
+                rk = (repo, row["pr_number"])
+                if rk not in revert_cache:
+                    revert_cache[rk] = was_reverted(repo, row["pr_number"], row["merged_at"])
+                # follow-up-bug lookup only when the revert check would otherwise
+                # pass (saves a gh call on already-failed survivals).
+                follow_up = False
+                if revert_cache[rk] is False:
+                    if rk not in follow_up_cache:
+                        follow_up_cache[rk] = had_follow_up_bug(repo, row["pr_number"], row["merged_at"])
+                    follow_up = follow_up_cache[rk]
+                row["survived"] = survival_status(True, row["merged_at"], revert_cache[rk], now,
+                                                  follow_up=follow_up)
+        rows.append(row)
+        if final_cost is not None:
+            finished.add(run["run_id"])
+    return rows, skip_counts(runs), finished
+
+
+# --- GitHub-only repo scorecard (telemetry-less crews, e.g. hollis) -----------
+# Some products' dev crews run via the Task tool, not `agentctl`, so they emit no
+# run telemetry — but their PR *quality* (merge / CI-first-pass / survival) is all
+# in GitHub. This harvests a repo's decided PRs directly, no run join. No per-agent
+# cost/attribution (that needs telemetry the Task-tool flow doesn't produce); the
+# crew's *runtime* LLM cost lives in its own local ledger (PA: data/llm-spend.jsonl).
+
+
+def _model_from_labels(pr: dict):
+    """The producing model id from a `model:<id>` GitHub label, or None. A
+    telemetry-less repo (e.g. PA) can't join a run, so its orchestrator stamps the
+    model it dispatched the producer with as a PR label (substrate ARCH-169). The id
+    is the raw resolved model id (e.g. claude-sonnet-4-6), no friendly name. One
+    label per PR by contract; if more than one is present, take the first sorted so
+    the pick is deterministic."""
+    ids = sorted(
+        (lab.get("name") if isinstance(lab, dict) else str(lab) or "")[len("model:"):]
+        for lab in (pr.get("labels") or [])
+        if (lab.get("name") if isinstance(lab, dict) else str(lab) or "").startswith("model:")
+    )
+    return ids[0] if ids else None
+
+
+def build_repo_row(pr: dict, repo: str, crew_label: str, ci_first_pass, survived) -> dict:
+    """One quality row from a GitHub PR (no agent/cost — telemetry-less). Model is
+    read from a `model:` PR label when present (ARCH-169), else None."""
+    merged = pr.get("state") == "MERGED"
+    return {
+        # synthetic run_id so the shared upsert_ledger (keyed by run_id) works and
+        # a PR is re-resolved on later passes as its state evolves.
+        "run_id": f"{repo}#{pr.get('number')}",
+        "pr_number": pr.get("number"),
+        "date": (pr.get("createdAt") or "")[:10],
+        "agent": crew_label,
+        "model": _model_from_labels(pr),
+        "repo": repo,
+        "cost_usd": None,          # dev-crew cost not attributable from GitHub alone
+        "source": "github-pr",
+        "pr_state": pr.get("state"),
+        "merged": merged,
+        "merged_at": pr.get("mergedAt"),
+        "ci_first_pass": ci_first_pass,
+        "survived": survived,
+        "title": pr.get("title"),
+        "author": (pr.get("author") or {}).get("login"),
+    }
+
+
+def render_repo_report(rows: list[dict]) -> str:
+    """Quality table for a telemetry-less crew (no cost columns — those are N/A
+    from GitHub alone)."""
+    agg = summarize(rows)
+    if not agg:
+        return "No decided PRs in window.\n"
+    lines = ["| Crew | Decided | Merged | Merge% | Survived (7d) | CI-1st% |",
+             "|---|---|---|---|---|---|"]
+    for (agent, _model), a in sorted(agg.items(), key=_agg_key_order):
+        merge_pct = f"{100*a['merged']/a['resolved']:.0f}%" if a["resolved"] else "—"
+        ci_pct = f"{100*a['ci_first_pass']/a['ci_runs']:.0f}%" if a["ci_runs"] else "—"
+        surv = f"{a['survived']}/{a['scored']}" if a["scored"] else "—"
+        lines.append(f"| {agent} | {a['resolved']} | {a['merged']} | {merge_pct} "
+                     f"| {surv} | {ci_pct} |")
+    return "\n".join(lines) + "\n"
+
+
+def harvest_repo_prs(repo: str, days: int, crew_label: str) -> list[dict]:
+    """Quality rows for a repo's *decided* (merged/closed) PRs created within the
+    window. Open PRs are skipped — no quality verdict yet. Reuses the shared CI +
+    revert + follow-up-bug logic."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+                     "--limit", "200", "--json",
+                     "number,headRefName,state,mergedAt,createdAt,title,author,labels"]) or []
+    rows = []
+    for pr in data:
+        created = _parse_iso(pr.get("createdAt"))
+        if created is None or created < cutoff:
+            continue
+        if pr.get("state") not in ("MERGED", "CLOSED"):
+            continue  # still open — no verdict yet
+        cfp = ci_first_pass(repo, pr.get("headRefName"))
+        survived = None
+        if pr.get("state") == "MERGED" and pr.get("mergedAt"):
+            m = _parse_iso(pr["mergedAt"])
+            if m is not None and (now - m) >= timedelta(days=SURVIVAL_DAYS):
+                rev = was_reverted(repo, pr["number"], pr["mergedAt"])
+                fu = had_follow_up_bug(repo, pr["number"], pr["mergedAt"]) if rev is False else False
+                survived = survival_status(True, pr["mergedAt"], rev, now, follow_up=fu)
+        rows.append(build_repo_row(pr, repo, crew_label, cfp, survived))
+    return rows
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Per-(agent, model) success-vs-cost harvester (ARCH-107).")
+    p.add_argument("--days", type=int, default=14, help="window in days (default 14)")
+    p.add_argument("--ledger", default=str(LEDGER_PATH), help="ledger path override")
+    p.add_argument("--no-write", action="store_true", help="resolve but don't update the ledger")
+    p.add_argument("--report", action="store_true", help="print the per-(agent, model) summary")
+    p.add_argument("--rollup", action="store_true",
+                   help="compute + print the weekly trend rollup (this 7d vs prior 7d)")
+    p.add_argument("--post", action="store_true",
+                   help="post the weekly rollup to the team-site Reports page (implies --rollup)")
+    p.add_argument("--judge", action="store_true",
+                   help="Phase 3: run the sampled LLM judge over un-judged merged PRs "
+                        "(real token cost; bounded by --judge-sample) → judge.jsonl")
+    p.add_argument("--judge-sample", type=int, default=JUDGE_SAMPLE,
+                   help=f"max PRs to judge this pass (default {JUDGE_SAMPLE})")
+    p.add_argument("--judge-model", default=JUDGE_MODEL,
+                   help=f"model for the judge (default {JUDGE_MODEL})")
+    p.add_argument("--judge-report", action="store_true",
+                   help="print the per-(agent, model) judge-score summary from judge.jsonl")
+    p.add_argument("--repo-scorecard", default=None, metavar="REPO",
+                   help="GitHub-only quality scorecard for a telemetry-less crew's repo "
+                        "(e.g. hollis): harvest decided PRs from gh, no run join, "
+                        "→ scorecard/<repo>.jsonl. No per-agent cost.")
+    p.add_argument("--crew-label", default=None,
+                   help="crew label for --repo-scorecard rows (default: the repo name)")
+    args = p.parse_args(argv)
+
+    # GitHub-only repo scorecard — a separate data source (no run telemetry) and a
+    # separate ledger, kept apart from the agent×model run ledger (also keeps a
+    # data-local product like hollis out of the shared ledger).
+    if args.repo_scorecard:
+        repo = args.repo_scorecard
+        crew = args.crew_label or repo
+        repo_rows = harvest_repo_prs(repo, args.days, crew)
+        repo_path = Path(args.ledger).parent / f"{repo}.jsonl"
+        out_rows = upsert_ledger(load_ledger(repo_path), repo_rows)
+        if not args.no_write:
+            write_ledger(repo_path, out_rows)
+        print(f"repo-scorecard {repo}: harvested {len(repo_rows)} decided PRs → ledger "
+              f"{len(out_rows)} rows at {repo_path}", file=sys.stderr)
+        sys.stdout.write(render_repo_report(out_rows))
+        return 0
+
+    ledger_path = Path(args.ledger)
+    fresh, skipped, finished = harvest(args.days)
+    merged = upsert_ledger(load_ledger(ledger_path), fresh)
+    ledger_report = None
+    if not args.no_write:
+        write_ledger(ledger_path, merged)
+        # Only a finished run's row goes to the Library — a run still in flight
+        # has no cost.json yet, so its row carries a $0.00 placeholder that
+        # must never be posted under dedup_key=run_id (see is_cost_final).
+        ledger_report = report_to_ledger([r for r in fresh if r["run_id"] in finished])
+
+    by_src = defaultdict(int)
+    for r in fresh:
+        by_src[r.get("join_source") or "unresolved"] += 1
+    print(f"harvested {len(fresh)} producer runs "
+          f"({by_src['linked']} linked, {by_src['unresolved']} unresolved) "
+          f"→ ledger {len(merged)} rows at {ledger_path}", file=sys.stderr)
+    skipped_total = sum(skipped.values())
+    if skipped_total:
+        by_agent = ", ".join(f"{a} {n}" for a, n in sorted(skipped.items(), key=lambda kv: -kv[1]))
+        print(f"skipped {skipped_total} runs with no pr-link.json: {by_agent}", file=sys.stderr)
+    if ledger_report is not None:
+        msg = (f"Library ledger: {ledger_report['recorded']} recorded, "
+               f"{ledger_report['not_recorded']} not-recorded (no live ledger for the product)")
+        if ledger_report["errors"]:
+            msg += (f", {len(ledger_report['errors'])} failed to report: "
+                    + "; ".join(f"{rid} {status}" for rid, status, _ in ledger_report["errors"]))
+        print(msg, file=sys.stderr)
+    if args.report:
+        sys.stdout.write(render_report(merged))
+    if args.rollup or args.post:
+        ru = rollup(merged, datetime.now(timezone.utc))
+        md = render_weekly_md(ru)
+        sys.stdout.write(md)
+        if not args.no_write:
+            (ledger_path.parent / f"weekly-{ru['asof']}.md").write_text(md)
+        if args.post:
+            # Structured signal for the team-site Reports page (ARCH-353 Build
+            # 2c): the scorecard rows as `meta` for a rich table render, the
+            # mrkdwn as `body` so it reads before that lands.
+            payload = render_weekly_slack(ru)
+            rows = [{"agent": a, "model": m, "runs": r["runs"],
+                     "merge_pct": r["merge_pct"], "surv_pct": r["surv_pct"],
+                     "ci_pct": r["ci_pct"], "per_merged": r["per_merged"], "usd": r["usd"]}
+                    for (a, m), r in sorted(ru["this"].items(), key=lambda kv: -kv[1]["usd"])]
+            signal_client.post_report(
+                "model-scorecard", payload["text"],
+                meta={"report": "model-scorecard", "week": ru["this_start"],
+                      "window_days": ru["window_days"], "rows": rows},
+                dedup_key=f"scorecard:weekly:{ru['this_start']}")
+    judge_path = ledger_path.parent / "judge.jsonl"
+    if args.judge:
+        judge_sample(merged, judge_path, sample=args.judge_sample,
+                     model=args.judge_model, write=not args.no_write)
+    if args.judge_report:
+        sys.stdout.write(render_judge_report(load_ledger(judge_path)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

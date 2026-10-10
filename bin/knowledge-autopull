@@ -1,0 +1,86 @@
+#!/bin/zsh
+# knowledge-autopull — periodic sync of <root>/knowledge/ AND its search index.
+#
+# Run by launchd (com.convivy.knowledge-autopull, every 10min). A thin wrapper over
+# `agentctl kb sync`, which owns fast-forward and reindex as one step.
+#
+# It used to fast-forward only. That left the index to the watcher's filesystem
+# observer, which has missed the batched changes a fast-forward produces —
+# silently, until someone noticed a stale read and kickstarted launchd by hand.
+# Pulling without indexing is what opened that window, so the pull now carries
+# its own reindex and verifies the result.
+#
+# Failure modes stay safe: `--ff-only` refuses a divergent merge, an offline
+# fetch is a no-op that retries next cycle, and a verification mismatch triggers
+# a full reconcile rather than leaving a wrong index in place.
+#
+# Logs at ~/.knowledge-index/autopull.log (alongside the watcher's log).
+
+set -u
+
+# Resolve this script's OWN location, following symlinks — so a deployed copy
+# (platform/decisions/0059 rule 1) reaches its own deploy-area sibling, and
+# the ~/.local/bin symlink into the checkout (rule 5) still reaches the
+# checkout's sibling. Bash equivalent of bin/check-cli-contracts's
+# pathlib.Path(__file__).resolve(): a real file is already its own answer, a
+# symlink chain is followed back to what it points at. Bounded at 20 hops so a
+# symlink CYCLE errors out rather than spinning forever in an unattended job —
+# pathlib.Path.resolve() raises on a cycle; this is bash's version of the same
+# guard (security-reviewer, round 6).
+_self="$0"
+_hops=0
+while [ -L "$_self" ]; do
+    _hops=$((_hops + 1))
+    if [ "$_hops" -gt 20 ]; then
+        echo "$(basename "$0"): symlink cycle resolving \$0 (>20 hops) — aborting" >&2
+        exit 1
+    fi
+    _link_dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in
+        /*) ;;
+        *) _self="$_link_dir/$_self" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+
+# A fresh account has no ~/.knowledge-index yet, and `log()` below appends to
+# LOG without creating its parent, at the default mode, matching
+# indexer.ensure_db.
+mkdir -p "$HOME/.knowledge-index"
+
+LOG=$HOME/.knowledge-index/autopull.log
+# Sibling-resolved (above), not hardcoded to ~/.local/bin: that symlink farm
+# resolves into whichever branch the agent-platform checkout is on
+# (platform/decisions/0059 rule 5), which this deploy-pinned copy must not
+# reach back into.
+AGENTCTL=$SCRIPT_DIR/agentctl
+
+log() {
+    print -r -- "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $*" >>$LOG
+}
+
+if [[ ! -x $AGENTCTL ]]; then
+    log "ERROR: $AGENTCTL not found or not executable; skipping"
+    exit 1
+fi
+
+# `--quiet` drops the one healthy line (up to date, index verified or partly
+# checked), so a no-op cycle writes nothing to the log. Anything it still says is worth
+# keeping — a fast-forward, an invalid doc, a verification failure, a heal.
+# Without the flag `kb sync` says what it verified, which is what an operator
+# at a keyboard wants; a timer wants the log to stay readable.
+out=$($AGENTCTL kb sync --quiet 2>&1)
+rc=$?
+
+if [[ -n $out ]]; then
+    log "$out"
+fi
+
+if (( rc == 2 )); then
+    log "INDEX INCONSISTENT — see above; a full reconcile has already been attempted"
+elif (( rc != 0 )); then
+    log "kb sync failed (exit $rc)"
+fi
+
+exit 0

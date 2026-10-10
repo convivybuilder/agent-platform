@@ -1,0 +1,234 @@
+#!/usr/bin/env python3.11
+r"""Decide whether a `push` to main's merge commit already passed as a PR
+head, so `.github/workflows/ci.yml`'s `bash` and `python` jobs can skip
+re-running tests they already ran (issue_01M36FKG4QJQ2SPQSW0VDY0A66).
+
+18 of the last 30 merge commits (measured 2026-09-23) carried the same git
+tree as the PR head that produced them — the merge commit's only difference
+from its head is the merge itself, so re-running the suite on push re-tests
+inputs the PR's own head run already tested. Skip ONLY when the merge tree
+exactly equals a PR head's tree AND that head's own `bash` and `python` jobs
+of THIS workflow both concluded success; every other case (no PR found,
+trees differ, a run missing/pending/failed, any git or API failure) leaves
+`tree_skip=false` and the jobs run in full, exactly as before this script
+existed. FAIL SAFE BY CONSTRUCTION, same discipline the `changes` job's
+`code`/`installer_tests` decision already uses: every branch below defaults
+to "do not skip" and flips only after a positive match.
+
+SCOPED TO THIS WORKFLOW, NOT TO A CHECK-RUN NAME. An earlier version read
+the PR head's check-runs (`commits/{sha}/check-runs`) and matched by
+`name == "bash"` / `"python"` alone — safe only because `ci.yml` happened to
+be the repo's one workflow with jobs by those names. A second workflow file,
+a job elsewhere renamed to `bash`/`python`, or any GitHub App with
+`checks:write` on the repo could satisfy that match without ever having run
+this suite. This version instead lists the PR head's workflow RUNS
+(`actions/runs?head_sha=`), keeps only the ones whose `path` is
+`WORKFLOW_PATH` below, and reads JOBS off those runs
+(`actions/runs/{id}/jobs`) — a job object only exists for an actual
+execution of that exact workflow file, so the scoping is structural, not a
+name match. `_matching_run_ids` and `_jobs_from_payloads` are the pure
+pieces of that filter; `tests/test_ci_tree_skip_decide.py` plants a
+same-named job on a different workflow path and confirms it is excluded.
+
+A PR HEAD CARRIES MORE THAN ONE JOB RUN PER NAME. This repo's draft-stage
+CI (ARCH-364) leaves a `skipped` `bash`/`python` job on a PR's first push,
+then a later one concluding `success` once review marks it ready —
+confirmed live on PR #643's head (17a00d4f085d7b047de45540a186d84fbebfa3b0),
+which carries both. Picking the most RECENT job per name without excluding
+`skipped` would read that draft-stage entry as authoritative on a repo where
+it happens to sort last, or the ready-stage `success` as stale on one where
+reruns reorder it — either way an accident of ordering, not the PR's real
+outcome. `_latest_verdict` below excludes `skipped` explicitly and takes the
+most recently *started* run among what remains, which is the run that
+actually decided the PR's `review-status` verdict.
+
+WHY THIS IS A SEPARATE, UNIT-TESTED SCRIPT rather than inline shell in the
+workflow (as an early version of this change was): the skipped-vs-success
+ordering above is exactly the kind of one-character-off logic a YAML-embedded
+`jq` pipeline hides until it silently mis-decides on a real PR. Pure decision
+functions here run in pytest against fixture check-run lists, including the
+two-runs-per-name shape above, with no GitHub API involved.
+
+WHY THIS LIVES IN scripts/ci/, NOT bin/. `install.sh` symlinks every
+`bin/*` entry onto every machine's interactive `PATH`. This script is
+CI-only — it reads `GITHUB_*`/`GH_TOKEN` env vars a workflow sets and does
+nothing useful typed at a local prompt — so it does not belong on that PATH.
+
+Invoked as a step in `.github/workflows/ci.yml`'s `changes` job, on `push`
+events only. Needs `GH_TOKEN` (or `GITHUB_TOKEN`) with `contents: read`,
+`pull-requests: read` and `actions: read` — the last one is what lets this
+script list workflow runs and their jobs; nothing here needs a write scope.
+Writes `tree_skip`, `skip_pr`, `skip_head` and `skip_run_url` to
+`$GITHUB_OUTPUT`.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+
+WORKFLOW_PATH = ".github/workflows/ci.yml"
+
+
+def _latest_verdict(check_runs: list[dict], name: str) -> dict | None:
+    """The most recently started job named `name`, excluding any concluded
+    `skipped` — see the module docstring for why `skipped` must be excluded
+    rather than merely out-sorted. None if `name` has no non-skipped run at
+    all (never run for real, or only ever skipped)."""
+    candidates = [c for c in check_runs
+                  if c.get("name") == name
+                  and (c.get("conclusion") or "").lower() != "skipped"]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c.get("started_at") or "")
+    return candidates[-1]
+
+
+def decide_tree_skip(*, pr_number, head_sha: str, merge_tree: str | None,
+                      head_tree: str | None, check_runs: list[dict]) -> dict:
+    """The full decision, over already-fetched data — no I/O.
+
+    Returns `{"tree_skip": bool, "skip_pr": str, "skip_head": str,
+    "skip_run_url": str}`. `tree_skip` is True only when: a PR and head sha
+    were found, the two trees are both present and equal, and the head's
+    latest non-skipped `bash` and `python` jobs (of `WORKFLOW_PATH` — see
+    `_matching_run_ids`) both concluded `success`. Every other combination —
+    a missing tree, unequal trees, a missing/pending/failed/only-skipped run
+    of either name — returns False, which is the fail-open default."""
+    out = {"tree_skip": False, "skip_pr": "", "skip_head": "", "skip_run_url": ""}
+    if not pr_number or not head_sha:
+        return out
+    if not merge_tree or not head_tree or merge_tree != head_tree:
+        return out
+
+    bash_run = _latest_verdict(check_runs, "bash")
+    python_run = _latest_verdict(check_runs, "python")
+    bash_ok = bool(bash_run) and (bash_run.get("conclusion") or "").lower() == "success"
+    python_ok = bool(python_run) and (python_run.get("conclusion") or "").lower() == "success"
+    if not (bash_ok and python_ok):
+        return out
+
+    out["tree_skip"] = True
+    out["skip_pr"] = str(pr_number)
+    out["skip_head"] = head_sha
+    out["skip_run_url"] = bash_run.get("html_url") or ""
+    return out
+
+
+def _matching_run_ids(runs_payload: object, workflow_path: str = WORKFLOW_PATH) -> list[int]:
+    """The ids of workflow runs, from a `GET .../actions/runs?head_sha=`
+    payload, produced by `workflow_path` specifically — not merely by
+    GitHub Actions in general. A run from a different workflow file has a
+    different `path` and is excluded here rather than trusted by a job name
+    it might happen to share."""
+    runs = runs_payload.get("workflow_runs") if isinstance(runs_payload, dict) else None
+    if not isinstance(runs, list):
+        return []
+    return [r["id"] for r in runs
+            if isinstance(r, dict) and r.get("path") == workflow_path and "id" in r]
+
+
+def _jobs_from_payloads(job_payloads: list[dict]) -> list[dict]:
+    """Flatten a list of `GET .../actions/runs/{id}/jobs` payloads into the
+    job list `_latest_verdict`/`decide_tree_skip` read."""
+    out: list[dict] = []
+    for payload in job_payloads:
+        jobs = payload.get("jobs") if isinstance(payload, dict) else None
+        if isinstance(jobs, list):
+            out.extend(j for j in jobs if isinstance(j, dict))
+    return out
+
+
+# --- I/O: gh/git wrappers, each None (or the safe empty value) on any failure ---
+# so a caller that only sees these return values, never an exception, still
+# flows into decide_tree_skip's fail-open defaults.
+
+def _gh_api_json(path: str) -> object | None:
+    r = subprocess.run(["gh", "api", path], capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"::warning::gh api {path} failed: {r.stderr.strip()}", file=sys.stderr)
+        return None
+    try:
+        return json.loads(r.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _merging_pr(repo: str, sha: str) -> tuple[object, str]:
+    """(pr_number, head_sha) for the PR whose merge produced `sha`, or
+    (None, "") if none is found or the read fails."""
+    payload = _gh_api_json(f"repos/{repo}/commits/{sha}/pulls")
+    if not isinstance(payload, list) or not payload:
+        return None, ""
+    pr = payload[0]
+    return pr.get("number"), ((pr.get("head") or {}).get("sha") or "")
+
+
+def _git_tree(sha: str) -> str | None:
+    r = subprocess.run(["git", "rev-parse", f"{sha}^{{tree}}"],
+                        capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def _fetch(sha: str) -> bool:
+    r = subprocess.run(["git", "fetch", "--depth=1", "origin", sha],
+                        capture_output=True, text=True)
+    if r.returncode != 0:
+        print(f"::warning::could not fetch PR head {sha}: {r.stderr.strip()}",
+              file=sys.stderr)
+    return r.returncode == 0
+
+
+def _workflow_jobs(repo: str, sha: str) -> list[dict]:
+    """The head's `bash`/`python` job runs, scoped to `WORKFLOW_PATH` — see
+    the module docstring's "SCOPED TO THIS WORKFLOW" section for why this
+    goes through `actions/runs` + `actions/runs/{id}/jobs` rather than
+    `commits/{sha}/check-runs` matched by name alone."""
+    runs_payload = _gh_api_json(f"repos/{repo}/actions/runs?head_sha={sha}")
+    run_ids = _matching_run_ids(runs_payload)
+    job_payloads = []
+    for run_id in run_ids:
+        payload = _gh_api_json(f"repos/{repo}/actions/runs/{run_id}/jobs")
+        if payload is not None:
+            job_payloads.append(payload)
+    return _jobs_from_payloads(job_payloads)
+
+
+def main() -> int:
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    sha = os.environ.get("GITHUB_SHA", "")
+    event = os.environ.get("GITHUB_EVENT_NAME", "")
+    output_path = os.environ.get("GITHUB_OUTPUT")
+
+    result = {"tree_skip": False, "skip_pr": "", "skip_head": "", "skip_run_url": ""}
+    if event == "push" and repo and sha:
+        pr_number, head_sha = _merging_pr(repo, sha)
+        if pr_number and head_sha:
+            merge_tree = _git_tree(sha)
+            head_tree = _git_tree(head_sha) if _fetch(head_sha) else None
+            jobs = _workflow_jobs(repo, head_sha) if merge_tree and merge_tree == head_tree else []
+            result = decide_tree_skip(pr_number=pr_number, head_sha=head_sha,
+                                       merge_tree=merge_tree, head_tree=head_tree,
+                                       check_runs=jobs)
+        else:
+            print(f"::warning::could not find the merging PR for {sha}; running the full suite",
+                  file=sys.stderr)
+
+    print(f"tree_skip={str(result['tree_skip']).lower()}")
+    lines = [
+        f"tree_skip={str(result['tree_skip']).lower()}",
+        f"skip_pr={result['skip_pr']}",
+        f"skip_head={result['skip_head']}",
+        f"skip_run_url={result['skip_run_url']}",
+    ]
+    if output_path:
+        with open(output_path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+    else:
+        print("\n".join(lines))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

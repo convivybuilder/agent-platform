@@ -1,0 +1,1128 @@
+#!/usr/bin/env python3.11
+"""run-observer — report runs that died without ever finalizing.
+
+A dispatched run finalizes itself: `_finalize_run` writes `outcome.json` with the
+exit status, the cost and the harness's terminal reason. Every failure the
+platform can classify is classified there, from inside the process.
+
+WHICH IS EXACTLY WHY THIS EXISTS. If the process disappears — SIGKILL, the
+machine sleeping, an OOM, the harness dying — there is no in-process moment left
+in which to notice. The run leaves a `meta.json`, a transcript, and nothing else.
+No exit status, no cost, no terminal reason, no signal to anyone. This is the one
+failure that is genuinely observable only from outside, which is what makes it the
+observer's work rather than the dying run's.
+
+MEASURED BEFORE IT WAS BUILT. Across 10,965 `run-*` dispatches in July-August
+2026, twenty ended this way, and they were not trivial:
+
+    run-af1adcd7  security-reviewer  agent-platform#398   444 transcript lines
+    run-0d5f1a4c  reviewer           vivy#1132            412 lines
+    run-c40227f3  reviewer           constance            110 lines
+    run-99201cd2  kb-sync-verifier   sous-chef             75 lines
+
+Ten of the twenty are review agents. Ten PRs received substantial review work and
+no verdict, and whoever waited on them learned nothing.
+
+WHY NOT JUST READ THE STALE LOG. `registry._reap_in_place` already drops dead-PID
+entries and `_log_stale` appends them to `stale-runs.jsonl`, so a record of sorts
+exists. But that log holds 1,414 distinct run ids over the same period, because
+runs that finished perfectly well are reaped there too. Reporting off it alone
+would be about 98.6% noise — and a report that is mostly noise is not a report.
+
+The precise signal is the INTERSECTION: the process is gone AND no `outcome.json`
+was ever written. The first is cheap to check and nearly meaningless alone; the
+second is what makes it mean something.
+
+REPORT ONLY, NEVER RECOVER. A run that vanished mid-flight may have left a
+worktree, a branch, a pushed commit or a half-posted comment. Re-running it would
+duplicate whichever of those it got to, which is the failure `_api_retry_refusal`
+exists to prevent — and unlike that path, there is no terminal record here to
+reason from. So this names what happened and hands it over.
+
+Usage:
+    run-observer                # sweep, alert on new findings
+    run-observer --dry-run      # report, write and alert nothing
+    run-observer --days N       # narrow to the last N days (default: everything)
+
+Exits 0 on a clean pass, including a pass with nothing to find.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import stat
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "signal_client.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+from signal_client import post_alert, sanitise  # noqa: E402
+
+import builder_root as BR  # noqa: E402
+RUNS_ROOT = BR.runs_root()
+
+# A run directory the trusted generator produced. `telemetry` only ever mints
+# `run-<8 lowercase hex>`, and ONLY that shape is treated as a run here.
+#
+# The name is displayed, and `agent-runs` is writable by every dispatched agent —
+# they all run as the same OS user with shell access (platform/decisions/0056).
+# So a directory name is attacker-chosen text, and a permissive prefix match would
+# let a crafted one carry control characters into the log a human tails and into
+# the alert body. Matching the real shape costs nothing and removes the question.
+# `\Z`, NOT `$`. In Python `$` also matches just before a trailing newline, and
+# a filename may legally contain one — so `run-deadbeef\n` matched this pattern
+# and was treated as a run id. That defeats the whole point of constraining the
+# name at the gate: `describe` skips sanitising `run_id` on the strength of this
+# regex, so the embedded newline would have split its printed line in two, and
+# `run-deadbeef` and `run-deadbeef\n` would mint two distinct dedup keys for what
+# a reader calls one run. Verified: `re.match(r"^x$", "x\n")` is a match and
+# `re.match(r"^x\Z", "x\n")` is not.
+_RUN_DIR_RE = re.compile(r"^run-[0-9a-f]{8}\Z")
+
+# What `glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]")` used to match, as a
+# filter over a listing that reports its own failure. The name is still not
+# evidence about the run inside — see `abandoned_runs` — it only bounds which
+# directories are walked at all.
+_DAY_DIR_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")   # `\Z` for the reason above
+
+# `_transcript_lines` reads a file inside that same writable tree, so it is a
+# denial-of-service surface for an unattended job: a symlink to /dev/zero never
+# yields a line terminator and the 06:30 sweep would simply never finish, with no
+# timeout anywhere to end it. Symlinks are refused outright and the read is
+# bounded. `telemetry.write_owner_only` already treats a same-user symlink as a
+# threat on the WRITE side via O_NOFOLLOW; this is the same rule on the read side.
+_MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024
+_READ_CHUNK = 1024 * 1024
+_MAX_META_BYTES = 1024 * 1024
+
+# A VOLUME THAT IS ITSELF WORTH REPORTING — and deliberately NOT a cap.
+#
+# A previous round of this PR made it a cap, because the two fail-over findings
+# are gated on a single string in a run's own meta.json and are therefore cheap
+# to manufacture at volume by anything that can write under `agent-runs`, which
+# is every dispatched agent. Bounding the posts looked like the containment.
+#
+# IT WAS STRICTLY WORSE THAN THE FLOOD IT FIXED, and the reproduction is three
+# lines: a cap has to deliver in SOME order, this sweep's order is the walk
+# order, and the walk sorts day directories by name. So `mkdir
+# agent-runs/1900-01-01/run-<8hex>` sorts ahead of every real day, costs nothing,
+# and mints a fresh never-deduped key each night. Sixty of them pushed a genuine
+# `failover-refused` on vivy#1219 to position 60 of 61 and past a budget of 50 —
+# forever, since the forger renames rather than repeats. The flood merely added
+# noise a human had to sift; the cap let the forger choose WHICH real alert
+# nobody sees, including one about its own run.
+#
+# THERE IS NO SAFE CAP HERE, and that is a property of the tree rather than of
+# this attempt. A cap must prioritise, prioritising needs an ordering key, and
+# every key available — day name, run name, mtime, anything in meta.json — is
+# written by the actor being reported on. Persisting a first-seen time elsewhere
+# only moves the primitive, because that store is same-user writable too.
+#
+# So everything found is delivered, and the flood stays what the security review
+# called it before the cap existed: noise, within a trust model that already
+# concedes this actor the strictly stronger primitive of posting to the Library
+# directly with the agent-role token. What IS new is that an anomalous volume
+# says so in its own alert — surfacing a flood without letting a flood decide
+# what gets surfaced.
+#
+# THAT ALERT IS ITSELF PRE-CLAIMABLE, and this is the honest limit of the
+# arrangement rather than a footnote. Its dedup key is
+# `run-observer:finding-volume:<sweep date>`, computed from the calendar and
+# nothing else, so anyone can predict tomorrow's. An agent about to flood can
+# post that key first with a harmless body, using the same agent-role token this
+# file already concedes it holds; the Library then answers the real sweep with
+# the existing row and the volume notice never lands, while the individual forged
+# findings — each under its own unique run id — arrive normally. The flood
+# proceeds unannounced as a flood.
+#
+# TWO THINGS BLUNT IT AND NEITHER CLOSES IT. The stdout line below is printed
+# whatever the post returns, so the log file records the volume even when the
+# alert is buried — a second channel, though a weak one, since nothing tails it.
+# And the real fix is the same Library-side capability restriction already
+# deferred for the abandoned and unreadable-day keys
+# (issue_01M0R0BFE0CFHJM6XR5NG13PF4): a key the server derives cannot be
+# pre-claimed by the party it describes. Hardening it locally does not work —
+# every input available to make the key less predictable, the finding count
+# included, is one the forger can enumerate off the same tree.
+_ANOMALOUS_FINDING_COUNT = 50
+
+# Spacing between outbound alerts. See `_deliver`: a delay is not a cap,
+# because nothing is deferred past this sweep and nothing is dropped.
+_ALERT_SPACING_S = 0.05
+
+# A CEILING ON THE PACING, AND ON NOTHING ELSE. Read the next paragraph before
+# trusting this to bound the sweep, because it does not.
+#
+# Unbounded, the spacing above was a self-inflicted denial of the sweep: nothing
+# limits how many findings a sweep produces, and manufacturing a fail-over
+# finding costs one `mkdir` and one line, so 10^5 of them is minutes of an
+# attacker's local disk I/O and hours of this job's sleep. This budget removes
+# that particular multiplier. Past it the spacing stops and every remaining
+# finding posts back to back — a bound on the DELAY, never on the posting, and
+# abandoning a delay defers nothing.
+#
+# IT IS NOT THE DOMINANT TERM AND DOES NOT CLOSE THE ATTACK. `post_alert` makes a
+# real HTTP round trip per finding — `signal_client` puts the warm case at about
+# 0.18s — so N findings cost roughly 0.18N seconds whatever this budget says. At
+# N=10^5 that is about five hours, and this ceiling stops contributing after
+# roughly six hundred findings. A "duplicate" answer from server-side dedup still
+# costs a full round trip, so re-walking a forged tree is not free on later
+# nights either. An earlier version of this comment claimed the denial of the
+# sweep was closed; a reviewer measured the two terms and it was not.
+#
+# AND THE REAL TERM CANNOT BE BOUNDED HERE, which is why it is tracked rather
+# than fixed. Capping how many findings get delivered truncates by walk order,
+# and the walk sorts by an attacker-chosen directory name — precisely the attack
+# that killed the alert cap in `12229b7`. A deadline on the whole sweep has
+# the same defect for the same reason. A bound is only safe in this file when it
+# chooses nothing, and a bound on delivery chooses.
+#
+# The lever that does work is reducing N, which means retention on `agent-runs` —
+# a tree with none today, 11GB over 100 days, walked in full every night.
+# `issue_01M109N0BN6N0H47XFASSN2FJJ` holds it, including why the obvious
+# retention key is unsafe: a day directory's name is written by the party being
+# retained.
+_MAX_TOTAL_PACING_S = 30.0
+
+# A run whose process is gone but which started moments ago may simply be between
+# its last write and `_finalize_run`'s. That is the ONE thing this grace buys, and
+# one hour is far longer than finalize takes and far shorter than the daily cadence.
+#
+# IT DOES NOT MITIGATE PID REUSE, and an earlier version of this comment claimed it
+# did. The two are different failures. The grace is keyed off `started_at`, so it
+# answers "did this run just begin"; it has no way to answer "has this pid since
+# been handed to another process", because nothing here records WHEN a process
+# died, only whether one is alive now. A run whose process died at once and whose
+# pid was later recycled reads as alive, forever, and is silently never reported —
+# and a LONGER grace makes that more likely rather than less, by leaving more time
+# for the recycle.
+#
+# So: pid reuse is an accepted, unmitigated blind spot. `registry._is_alive` has
+# the identical one. It is tolerable here because the failure is a silent miss in a
+# report rather than a wrong action, and because every OTHER ambiguity in this file
+# is resolved toward reporting.
+GRACE = timedelta(hours=1)
+
+
+def _alive(pid) -> bool:
+    """Whether `pid` names a live process.
+
+    A missing or unreadable pid reads as NOT alive, which is the direction that
+    matters: this decides whether a run gets REPORTED, and a report is cheap.
+    Reading an unknown pid as alive would silence exactly the abandoned runs with
+    the most damaged metadata.
+
+    STILL AN ACCEPTED GAP: a pid that is positive and belongs to some OTHER live
+    process — `1`, or a recycled one — reads as alive and the run is never
+    reported. Nothing here can tell "this run's process" from "a process". The
+    honest bound is that a suppressing agent must name a pid that stays alive
+    indefinitely, and that pid reuse is the same blind spot `registry._is_alive`
+    carries. Requiring recent writes as well would close it and would also
+    false-positive every reviewer sitting in a long CI poll, which is worse.
+    """
+    # A pid names ONE process, so it must be a positive int and nothing coercible
+    # into one: `os.kill` gives 0 and negatives process-GROUP meaning and both
+    # succeed, `int(3.7)` is a plausible pid belonging to something unrelated, and
+    # `bool` is an `int` subclass that arrives as pid 1. An enormous value raises
+    # OverflowError, which is caught rather than allowed to end the sweep.
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return False
+    if pid <= 0:
+        return False
+    real = pid
+    try:
+        os.kill(real, 0)
+    except (ProcessLookupError, OverflowError):
+        return False
+    except PermissionError:
+        # Alive, owned by somebody else. Not ours to judge, but it IS running.
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _open_regular_file(path: Path):
+    """A read fd for `path`, or None unless it is a plain regular file.
+
+    O_NOFOLLOW REFUSES A SYMLINK AND NOTHING ELSE, which is not the same as
+    refusing everything that is not a file. `open()` on a FIFO with no writer
+    BLOCKS AT THE SYSCALL — it never raises, so none of the guards in this file
+    ever run; it simply never returns. `rm meta.json && mkfifo meta.json` in an
+    agent's own run directory hangs the 06:30 job forever, and launchd will not
+    start a calendar job over a still-running instance, so every later day is
+    silently skipped too.
+
+    O_NONBLOCK makes the open return instead of waiting, and `fstat` on the
+    resulting descriptor answers the question actually being asked — which was
+    never "is this a symlink" but "is this a regular file".
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        raise
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _as_text(value) -> str:
+    """Any JSON value as a short string, never raising.
+
+    Everything read out of `meta.json` passes through here before it is stored,
+    displayed or sanitised. That file is agent-writable, so its values have no
+    guaranteed type — a dict where a name is expected is not an edge case, it is
+    an input.
+    """
+    if value is None:
+        return "?"
+    if isinstance(value, str):
+        return value or "?"
+    try:
+        return repr(value)[:200]
+    except Exception:   # noqa: BLE001 — repr can raise; RecursionError on deep nesting
+        return "?(unrenderable)"
+
+
+def _read_json_nofollow(path: Path):
+    """The JSON at `path`, or None — refusing to follow a symlink, atomically.
+
+    Bounded as well as unfollowed: this file is agent-writable, and a meta.json
+    the size of a disk would be read whole by `read_text()`.
+    """
+    # Every failure returns None. Both callers decide for themselves what that
+    # means — `meta.json` reports with unknown fields, `outcome.json` treats it as
+    # "not finalized" and falls through to the ordinary checks.
+    try:
+        fd = _open_regular_file(path)
+    except OSError:
+        return None
+    if fd is None:
+        return None
+    try:
+        with os.fdopen(fd, "rb") as f:
+            raw = f.read(_MAX_META_BYTES)
+    except OSError:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        # RecursionError, not ValueError, is what deeply-nested JSON raises — and
+        # it is not a subclass, so a narrow `except ValueError` let it through.
+        return None
+
+
+def _has_real_outcome(run_dir: Path) -> bool:
+    """Whether this run genuinely finalized.
+
+    Deliberately NOT `(run_dir / "outcome.json").exists()`. See the call site: an
+    empty file passed that test and hid the run forever.
+    """
+    data = _read_json_nofollow(run_dir / "outcome.json")
+    if not isinstance(data, dict):
+        return False
+    status = data.get("exit_status")
+    return isinstance(status, str) and bool(status.strip())
+
+
+def _quiet_for_longer_than_grace(run_dir: Path, now: datetime) -> bool:
+    """Whether nothing in `run_dir` has been written for longer than GRACE.
+
+    The fallback for a run whose meta cannot be read, so neither its pid nor its
+    start time is available. A live run writes its transcript continuously and a
+    dead process cannot touch anything, so the newest mtime in the directory
+    answers "is this still going" without trusting a byte of the file's CONTENT.
+
+    AN UNREADABLE DIRECTORY REPORTS. "I could not look" is not a safer state than
+    "I looked and it was ambiguous": this tree is writable by every dispatched
+    agent, so an unreadable directory is something the adversary manufactures with
+    one `chmod`. Nothing here can tell that from the innocent version, so it gets
+    the same answer as every other ambiguity.
+    """
+    newest = None
+    try:
+        for child in run_dir.iterdir():
+            try:
+                mtime = child.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+    except OSError:
+        return True         # could not list it — see the docstring
+    if newest is None:
+        return True         # nothing in it to date, and it is not empty by accident
+    age = now - datetime.fromtimestamp(newest, timezone.utc)
+    # Bounded at BOTH ends. A future mtime makes `age` negative, and a one-sided
+    # `age >= GRACE` would then read it as active and suppress the run forever
+    # from a single `os.utime`. A file cannot be written after now, so a negative
+    # age is evidence rather than absence.
+    return age < timedelta(0) or age >= GRACE
+
+
+def _parse_iso(s):
+    """A timezone-AWARE datetime, or None.
+
+    A naive one is rejected rather than assumed to be UTC. `fromisoformat`
+    happily parses "2026-08-25" into a naive datetime, and subtracting that from
+    an aware `now` raises TypeError — uncaught, in a loop with no per-run guard,
+    which takes the whole sweep down. `meta.json` is agent-writable, so that is a
+    one-field kill switch on the nightly job: worse than suppressing a single run,
+    because it suppresses every run at once and leaves a traceback nobody reads.
+
+    Rejecting returns None, which reports. Same rule as everywhere else here.
+    """
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo is not None else None
+
+
+def _transcript_lines(run_dir: Path) -> int | None:
+    """How much work the run had done. This is the fact that makes a finding
+    actionable rather than merely true — 444 lines and no verdict is a different
+    thing from a run that died at startup."""
+    p = run_dir / "transcript.jsonl"
+    # OPENED WITH O_NOFOLLOW AND READ IN FIXED CHUNKS. Both halves are the fix for
+    # one threat: `agent-runs` is writable by every dispatched agent, so this file
+    # is hostile input to an unattended job.
+    #
+    # O_NOFOLLOW rather than a stat-then-open. Checking `is_symlink()` first leaves
+    # a window in which the file can be swapped for a link to /dev/zero between the
+    # check and the open, which is the very hang the check exists to prevent.
+    # `telemetry.write_owner_only` already refuses to follow on the WRITE side for
+    # this reason; this is the same guarantee, obtained the same way.
+    #
+    # Chunks rather than line iteration. Iterating a file yields one line per
+    # `readline()`, and `readline()` reads until a newline OR EOF — so the cap,
+    # checked between lines, never fires on a file containing no newline at all.
+    # A single-line multi-gigabyte transcript would be loaded whole before the loop
+    # body ran once. Chunked reading bounds the work regardless of content.
+    #
+    # ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS, and returning 0 for both was a
+    # suppression switch. `chmod 000` on its own transcript costs an agent one
+    # syscall and made `lines` read as 0, which short-circuits the report gate
+    # before staleness is even consulted — the run vanished forever with its 444
+    # lines of evidence still sitting on disk, merely unreadable by a sweep running
+    # as the same unprivileged user that locked it.
+    #
+    # Deletion is genuinely different and is still not reported: it destroys the
+    # evidence, so a report would name a run about which nothing can be said.
+    # Concealment leaves the evidence intact. Only the first justifies silence.
+    try:
+        fd = _open_regular_file(p)
+    except FileNotFoundError:
+        return 0            # genuinely absent
+    if fd is None:
+        return None         # withheld, or not a regular file — itself the finding
+    lines = 0
+    read = 0
+    try:
+        with os.fdopen(fd, "rb") as f:
+            while read < _MAX_TRANSCRIPT_BYTES:
+                chunk = f.read(min(_READ_CHUNK, _MAX_TRANSCRIPT_BYTES - read))
+                if not chunk:
+                    break
+                read += len(chunk)
+                lines += chunk.count(b"\n")
+    except OSError:
+        return None
+    # Bounded rather than exact, and counted by newline rather than by non-blank
+    # line. This number exists to say how much work was lost; "at least this much"
+    # answers that as well as a precise figure would.
+    return lines
+
+
+def _failover_findings(run_dir: Path, meta) -> list[dict]:
+    """What the platform decided about this run's provider, if anything.
+
+    TWO DECISIONS, NOT ONE, and the epic requires both be reported: a fail-over
+    that was REFUSED, and one that was TAKEN.
+
+    THE NUMBERS BELOW ARE A READING WITH A DATE ON IT, not a constant. Taken from
+    the live tree at 2026-08-26T23:33Z, 13,922 run directories: 103 refusals, 68
+    fail-overs, 72 abandoned. Refusals accrue at roughly three a day, so a reader
+    in a month should expect a larger figure and should not treat a mismatch as a
+    defect — an earlier draft of this file quoted 102 and 103 in different places
+    because the two were measured forty minutes apart, and both were true when
+    written.
+
+    The one reader of either field in the whole repo was `agentctl status
+    <run-id>`, a command someone has to think to run against a run id they must
+    already hold.
+
+    A REFUSAL IS NOT A NON-EVENT. 48 of the refusals were review agents holding a
+    `--pr`, so 48 pull requests lost a review to a run that died with a working
+    recovery target sitting beside it. The decision was recorded correctly and
+    reached nobody, which is precisely the failure this epic names: a refusal
+    satisfied by a field written to metadata that nothing reads.
+
+    Read from `meta.json`, which the run itself writes — its directory is exported
+    into its own environment. So the finding says what the RECORD claims rather
+    than what happened, and every value it carries is normalised through `_as_text`
+    here and sanitised at render, the same treatment the abandonment finding gives
+    the same file.
+
+    AND THIS WIDENS WHAT A PLANTED meta.json CAN DO, which is worth naming rather
+    than leaving implicit. Before this, a FINALIZED run's meta was never read
+    again — the sweep short-circuited on its outcome — so planting a field in a
+    finished run's directory was inert. Now every run in the corpus is read every
+    night, forever, and an agent can write `fallback_blocked_to` into a sibling's
+    months-old completed directory and mint an alert against that run and its PR.
+
+    Accepted rather than closed, for the reason the rest of this file gives: the
+    same actor already holds the strictly stronger primitive of posting to the
+    Library directly with the agent-role token (platform/decisions/0056).
+
+    AND NOTHING HERE BOUNDS HOW MANY CAN BE MANUFACTURED. `055ad31` capped alerts
+    per sweep and this docstring claimed that cap as the containment; `12229b7`
+    removed the cap as a suppression primitive (see `_ANOMALOUS_FINDING_COUNT`)
+    and the claim outlived it, asserting a bound that no longer existed.
+
+    NAMED BY SHA RATHER THAN BY DISTANCE, here and above, because a
+    commit-relative count is a claim that goes stale every time the paragraph
+    around it moves. The counter here read "two commits ago", was accurate in
+    `fbe1cc3` where it was written, and was wrong by `793d7e1` — the very next
+    commit — inside the paragraph whose whole subject is that a comment asserting
+    something untrue is worse than no comment.
+
+    THE FIRST ATTEMPT AT THIS SENTENCE GOT IT WRONG THE SAME WAY, saying the
+    counter went stale two commits after `fbe1cc3` when it went stale at the very
+    next one. A reviewer checked the claim about the stale claim and found it
+    stale. That is the whole argument for shas, made better than the argument
+    itself: a count invites you to reason about distance, and reasoning about
+    distance is what fails.
+
+    AND THE SENTENCE AFTER THAT ONE CLAIMED "there are no counts left in this
+    paragraph", which a reviewer then falsified by pointing at a count one line
+    above it. Three attempts, three false claims, and the third failed for a
+    different reason than the first two: a comment that DESCRIBES ITSELF creates
+    an invariant that has to be re-verified every time the text moves, and nobody
+    re-verifies prose. The self-description is gone. What remains are the two
+    shas, which are facts about the history rather than facts about this
+    paragraph, and cannot be falsified by editing it. `_ANOMALOUS_FINDING_COUNT` alerts on volume
+    and does not limit it. These two kinds have none of the pid, staleness or
+    transcript conditions the abandoned kind needs, so one truthy string is the
+    whole cost of manufacturing one, and the supply is unbounded.
+    """
+    if not isinstance(meta, dict):
+        return []
+    out = []
+    common = {
+        "run_id": run_dir.name,
+        "agent": _as_text(meta.get("agent")),
+        "repo": _as_text(meta.get("repo")),
+        "pr": _as_text(meta.get("pr")) if meta.get("pr") else None,
+        "path": str(run_dir),
+    }
+    if meta.get("fallback_blocked_to"):
+        out.append({**common, "kind": "failover-refused",
+                    "target": _as_text(meta.get("fallback_blocked_to")),
+                    "reason": _as_text(meta.get("fallback_blocked_reason"))})
+    if meta.get("fallback_from"):
+        out.append({**common, "kind": "failover-taken",
+                    "target": _as_text(meta.get("model")),
+                    "came_from": _as_text(meta.get("fallback_from")),
+                    "reason": _as_text(meta.get("fallback_reason"))})
+    return out
+
+
+def abandoned_runs(days: int | None, now: datetime) -> list[dict]:
+    """Runs that started, left a transcript, and never wrote an outcome.
+
+    SCANS EVERYTHING BY DEFAULT, because the day-directory NAME is not evidence
+    about the run inside it. Nothing ties the two together, and `agent-runs` is
+    agent-writable — so a run moved into an old, already-past-cutoff day directory
+    fell outside the window before any other check ran, and vanished from every
+    future sweep. A trusted bucketing key whose bucket the adversary chooses is not
+    a filter, it is a third way to disappear.
+
+    Measured before making it the default: 99 day directories and 13,770 run
+    directories take 2.5 seconds to walk. That is nothing for a daily job, so
+    there is no reason to trade correctness for it. `--days` remains for ad-hoc
+    narrowing by a human who knows what they are asking for.
+    """
+    found = []
+    cutoff = None if days is None else (now - timedelta(days=days)).date()
+    # LIST THE ROOT WITH A CALL THAT REPORTS FAILURE. `glob` is not one: pathlib's
+    # wildcard selector wraps its own body in `except PermissionError: return`, so
+    # an unreadable RUNS_ROOT yields zero day directories and raises nothing —
+    # measured on 3.11.15, the interpreter this file's shebang names, both for a
+    # root already unreadable and for a chmod landing during the call. Every guard
+    # written around `glob` was therefore decoration, and this function returned
+    # "nothing abandoned" for a tree it could not open.
+    #
+    # `iterdir` uses `os.listdir` and does propagate, which is why the day loop
+    # below has always had a guard that genuinely fires. Using it here makes the
+    # LISTING ITSELF the proof of readability, so there is no window between
+    # checking and looking for a permission change to slip through — `main`'s
+    # up-front check is now an early, friendlier refusal rather than the defence.
+    try:
+        day_dirs = sorted(
+            d for d in RUNS_ROOT.iterdir() if _DAY_DIR_RE.match(d.name))
+    except OSError as exc:
+        print(f"run-observer: {RUNS_ROOT} could not be listed "
+              f"({type(exc).__name__}) — NOTHING is accounted for, this is "
+              f"NOT a clean pass", file=sys.stderr)
+        raise
+    for day_dir in day_dirs:
+        # AND THE DAY LOOP IS GUARDED TOO. The per-run guard below wraps the
+        # body of the run loop — but `day_dir.iterdir()` sits OUTSIDE it, and
+        # `is_dir()` returns True on a `chmod 000` directory (stat needs no
+        # permission on the target), so the symlink filter passes it and the
+        # very next call raises PermissionError. Uncaught, that killed the whole
+        # sweep — including every run already found in earlier days.
+        #
+        # One hostile directory costs that DAY, not the sweep. Same rule as the
+        # run guard, one level up, which is where six rounds of this kept
+        # landing: the containment was always one level shallower than the reach.
+        try:
+            if cutoff is not None:
+                try:
+                    if datetime.strptime(day_dir.name, "%Y-%m-%d").date() < cutoff:
+                        continue
+                except ValueError:
+                    continue
+            # A symlinked DAY directory would let the sweep walk a tree outside the one
+            # it audits — the same reason the run directory below refuses one, applied
+            # one level up, where it had not been.
+            #
+            # STILL AN ACCEPTED GAP, and check-then-use is why. Every leaf FILE is
+            # opened with O_NOFOLLOW, which is atomic and has no window; this is a
+            # check followed by a separate traversal, so a same-user agent could in
+            # principle unlink the directory and put a symlink in its place in
+            # between. Closing it properly means opening each directory O_NOFOLLOW
+            # and resolving children against that fd.
+            #
+            # NOT CLOSED HERE because it grants no capability the threat model does
+            # not already concede. Every agent runs as this user and can write any
+            # file under agent-runs directly, so anything reachable by winning this
+            # race — planting fabricated run directories, or making a real one look
+            # finalized — it can already do by editing the files in place. What the
+            # check does buy is that a symlink left sitting there is not followed,
+            # which covers the un-raced case and the accidental one. The leaf
+            # O_NOFOLLOW is not redundant with that: it defends AVAILABILITY, since
+            # a link to a fifo or /dev/zero would hang the unattended sweep forever,
+            # and a directory swap cannot do that.
+            if day_dir.is_symlink() or not day_dir.is_dir():
+                continue
+            for run_dir in sorted(day_dir.iterdir()):
+                # ONE RUN MUST NEVER TAKE DOWN THE SWEEP. Every specific crash found in
+                # this file — a naive datetime, an overflowing pid, a wrong-typed agent —
+                # was one hostile field killing the whole batch, including the genuinely
+                # abandoned runs sitting beside it. Each was fixed where it occurred; this
+                # is the guard that makes the NEXT one cost a single run instead.
+                try:
+                    # Only the shape the trusted generator mints. This excludes `sub-*`
+                    # Task-tool subagent records, which never write an outcome.json and
+                    # would otherwise be reported every sweep forever — and it excludes a
+                    # hand-made directory whose NAME is attacker-chosen text, since that
+                    # name is displayed in a log a human tails.
+                    if not _RUN_DIR_RE.match(run_dir.name):
+                        continue
+                    # A symlinked run directory would let the sweep read, and report, a
+                    # file outside the tree it audits.
+                    if run_dir.is_symlink() or not run_dir.is_dir():
+                        continue
+                    # THE PRIMARY DISCRIMINATOR IS PARSED, NOT MERELY COUNTED. Its
+                    # existence alone was the test until now, and it was never read — so
+                    # `touch outcome.json`, one command with no content, made any run
+                    # permanently invisible to this sweep. That is a complete bypass of
+                    # the whole feature, it predates every other fix here, and it is the
+                    # sixth appearance of one shape: a thing being PRESENT treated as
+                    # equivalent to that thing being VALID.
+                    #
+                    # A real outcome always carries an `exit_status`; `write_outcome`
+                    # refuses to write one without a valid value. So anything that does
+                    # not parse, or parses without that field, is not a finalized run — it
+                    # is an unfinalized run with a file next to it.
+                    #
+                    # It falls through to the ordinary checks rather than reporting on the
+                    # spot, because `write_owner_only` is O_TRUNC-then-write and NOT
+                    # atomic: a run finalizing at this instant has a window of partial
+                    # content, and the pid and staleness tests below already distinguish
+                    # that from an abandoned one.
+                    # META IS READ BEFORE THE FINALIZED-RUN SHORT CIRCUIT, because a
+                    # provider decision is recorded on runs that FINISHED. All 68
+                    # fail-overs that happened completed or were killed, and 17 of the
+                    # 103 refusals completed — so a check placed after the `continue`
+                    # below would have seen none of the first group and a sixth of the
+                    # second.
+                    #
+                    # O_NOFOLLOW rather than is_symlink()-then-read, for the reason given
+                    # on the transcript read: a check followed by an open leaves a window
+                    # to swap the file for a link, and the atomic form has no window.
+                    meta = _read_json_nofollow(run_dir / "meta.json")
+                    # COSTS ABOUT FOUR SECONDS A NIGHT. Measured by running the
+                    # pre-change and post-change programs alternately, four pairs, on
+                    # the real tree of 13,922 run directories: 5.6-7.8s before,
+                    # 9.6-11.4s after. Alternating matters — the first attempt at this
+                    # measurement ran the two versions in separate batches and the page
+                    # cache moved more than the change did, giving a 2.5s-to-19.5s
+                    # figure that is not the delta and was briefly published as one.
+                    #
+                    # Nothing for a daily job, and the alternative — reading meta only
+                    # for unfinalized runs, as before — is what would make the
+                    # finished-run decisions invisible.
+                    # ITS OWN GUARD, narrower than the per-run one around it, and
+                    # this is not belt-and-braces.
+                    #
+                    # The per-run guard's job is to report an unexaminable run as
+                    # ABANDONED. Before the read moved, a finalized run hit
+                    # `continue` before reaching any fallible code, so it could never
+                    # reach that guard; now it passes through here first. A raise in
+                    # the fail-over check would therefore turn a run that finished
+                    # cleanly into a false abandonment finding — worse than a missing
+                    # one, because it sends someone to inspect a healthy run.
+                    #
+                    # I wrote this as a comment claiming the helpers were
+                    # exception-safe so it could not happen, then wrote the test, and
+                    # the test failed: the claim was about today's helpers rather than
+                    # about the structure, and the structure is what a future edit
+                    # meets. A raise here now costs the fail-over finding for this run
+                    # and says so, which is the same trade the guards above make.
+                    try:
+                        found.extend(_failover_findings(run_dir, meta))
+                    except Exception as exc:   # noqa: BLE001 — see above
+                        print(f"run-observer: {run_dir.name}: could not check its "
+                              f"provider decisions ({type(exc).__name__}) — a "
+                              f"refused or taken fail-over would not be reported "
+                              f"for it", file=sys.stderr)
+                    if _has_real_outcome(run_dir):
+                        continue
+                    if meta is None:
+                        # A run whose meta cannot be read still reports — skipping
+                        # would mean "corrupt your own meta.json and never be seen",
+                        # and that file is the run's own to write.
+                        #
+                        # It cannot report on sight: `write_owner_only` is
+                        # O_TRUNC-then-write, so a LIVE run rewriting its meta has a
+                        # partial-content window. Staleness falls back to the newest
+                        # mtime in the directory, which does not need the file to parse.
+                        #
+                        # Gated on the transcript having content: every meta-less
+                        # directory on the real tree is a run that never STARTED, and
+                        # reporting those adds 40 findings with no lost work. Deleting
+                        # both files is an accepted, unclosed gap — see
+                        # `_transcript_lines` for why concealment is not.
+                        lines = _transcript_lines(run_dir)
+                        if (lines is None or lines > 0) and _quiet_for_longer_than_grace(
+                                run_dir, now):
+                            found.append({
+                                "kind": "abandoned",
+                                "run_id": run_dir.name, "agent": "?", "repo": "?",
+                                "pr": None, "started_at": "unknown (meta unreadable)",
+                                "lines": lines, "path": str(run_dir),
+                            })
+                        continue
+                    if _alive(meta.get("pid")):
+                        continue
+                    # THE GRACE IS BOUNDED IN BOTH DIRECTIONS, and only the lower bound was
+                    # there at first. `meta.json` is writable by the run itself, so a
+                    # one-sided window is a suppression switch:
+                    #
+                    #   unreadable  — skipping would mean "corrupt your own started_at and
+                    #                 never be reported". Reports instead.
+                    #   in the FUTURE — a perfectly valid ISO timestamp dated 2099 makes
+                    #                 `now - started` NEGATIVE, which is `< GRACE` for any
+                    #                 grace, so the run was skipped forever. This is the
+                    #                 same hole one step over, and strictly EASIER than the
+                    #                 corrupt-string version: nothing malformed, nothing
+                    #                 that looks wrong in a log. Reports instead.
+                    #
+                    # A run cannot have started after now, so a negative age is not "just
+                    # started" — it is a lie, and the answer to a lie is to report it.
+                    # Same rule as `_alive`: every ambiguity here resolves toward reporting,
+                    # because a report is cheap and a silent miss is not.
+                    started = _parse_iso(meta.get("started_at"))
+                    age = None if started is None else (now - started)
+                    if age is not None and timedelta(0) <= age < GRACE:
+                        continue
+                    found.append({
+                        "run_id": run_dir.name,
+                        # COERCED AT THE BOUNDARY, not at each use. `or "?"` only catches
+                        # FALSY values, so a non-empty dict, list or number sailed through
+                        # and reached `sanitise`, which raises TypeError on anything that
+                        # is not str or bytes — taking the whole sweep down and with it
+                        # every alert for every other run found that day.
+                        #
+                        # Normalising once here rather than defending at each call site is
+                        # the difference between fixing this field and fixing the class.
+                        "kind": "abandoned",
+                        "agent": _as_text(meta.get("agent")),
+                        "repo": _as_text(meta.get("repo")),
+                        "pr": _as_text(meta.get("pr")) if meta.get("pr") else None,
+                        "started_at": _as_text(meta.get("started_at")),
+                        "lines": _transcript_lines(run_dir),
+                        "path": str(run_dir),
+                    })
+                except Exception as exc:   # noqa: BLE001 — one run must not kill the sweep
+                    print(f"run-observer: {run_dir.name}: could not be examined "
+                          f"({type(exc).__name__}) — reporting rather than skipping",
+                          file=sys.stderr)
+                    found.append({
+                        "kind": "abandoned",
+                        "run_id": run_dir.name, "agent": "?", "repo": "?",
+                        "pr": None,
+                        "started_at": f"unknown ({type(exc).__name__} while examining)",
+                        "lines": f"not examined ({type(exc).__name__})",
+                        "path": str(run_dir),
+                    })
+
+        except Exception as exc:   # noqa: BLE001 — one day must not kill the sweep
+            # AND IT IS REPORTED, not merely printed. Skipping the day with a
+            # stderr line left the sweep returning normally, `main` printing
+            # "N abandoned" for a sweep that had not looked at a whole day, and
+            # `post_alert` — the channel anyone actually watches — saying nothing
+            # at all. So a `chmod 000` on today's directory hid every run inside
+            # it from that night's sweep AND from every future one, since the
+            # chmod stays put and the sweep rescans all of history. An agent
+            # about to die abnormally could suppress exactly the finding this
+            # tool exists to produce, for the cost of one command.
+            #
+            # The per-run guard immediately above already had the right shape —
+            # it appends a placeholder rather than dropping the run — and this
+            # was the same containment one level up, missing the reporting half.
+            print(f"run-observer: {day_dir.name}: could not be read "
+                  f"({type(exc).__name__}) — its runs are NOT accounted for",
+                  file=sys.stderr)
+            found.append({"kind": "unreadable-day", "day": day_dir.name,
+                          "error": type(exc).__name__})
+
+    return found
+
+
+def _lines_phrase(lines) -> str:
+    """How much work was lost, or that we were prevented from finding out.
+
+    `None` means the transcript is there and could not be read — which is a
+    stronger finding than any count, though not necessarily a deliberate act: a
+    disk error mid-read produces it too, which is why the rendered phrase says
+    "permissions or I/O error" rather than naming a cause.
+    """
+    if isinstance(lines, str):
+        # The per-run guard supplies its own phrase, and must NOT borrow the
+        # unreadable-transcript wording below. That names a specific cause; the
+        # guard fires on ANY exception — a date parse, a pid edge case, a future
+        # bug — so sending an operator to check file modes on a transcript that is
+        # fine would be this file's own recurring mistake, in a message this time.
+        return lines
+    if lines is None:
+        return "transcript present but UNREADABLE (permissions or I/O error)"
+    return f"{lines} transcript lines"
+
+
+def describe(r: dict) -> str:
+    """One line a human can act on.
+
+    EVERY value read out of `meta.json` is sanitised, without exception. That file
+    sits at `AGENTCTL_RUN_DIR`, which is exported into the agent's own environment,
+    so a run with shell access can write its own meta before it dies. `started_at`
+    was interpolated raw here while its neighbours were escaped — a rule stated and
+    then not fully applied, which is worse than no rule, because the next reader
+    trusts the ones that look guarded.
+
+    `run_id` needs no call: it is already constrained to `run-<8 hex>` by
+    `_RUN_DIR_RE` before a directory is treated as a run at all, which is a
+    stronger guarantee than escaping after the fact.
+    """
+    if r.get("kind") == "failover-refused":
+        where = f"{r['repo']}#{r['pr']}" if r.get("pr") else r["repo"]
+        return (f"{r['run_id']} [{sanitise(r['agent'], max_len=40)}] "
+                f"{sanitise(where, max_len=60)} — died with a recovery available "
+                f"and REFUSED it: fail-over to "
+                f"{sanitise(str(r['target']), max_len=60)} was blocked "
+                f"({sanitise(str(r['reason']), max_len=120)})")
+    if r.get("kind") == "failover-taken":
+        where = f"{r['repo']}#{r['pr']}" if r.get("pr") else r["repo"]
+        return (f"{r['run_id']} [{sanitise(r['agent'], max_len=40)}] "
+                f"{sanitise(where, max_len=60)} — ran on "
+                f"{sanitise(str(r['target']), max_len=60)}, not "
+                f"{sanitise(str(r['came_from']), max_len=60)} "
+                f"({sanitise(str(r['reason']), max_len=120)})")
+    if r.get("kind") == "unreadable-day":
+        # Nothing to escape: `_DAY_DIR_RE` admits only digits and dashes before
+        # a directory is walked at all, and `error` is a stdlib exception class
+        # name. Same reasoning as `run_id` above — constrained at the gate beats
+        # escaped at the exit.
+        return (f"{r['day']}: THE WHOLE DAY could not be read ({r['error']}) — "
+                f"every run inside it is unaccounted for")
+    where = f"{r['repo']}#{r['pr']}" if r.get("pr") else r["repo"]
+    return (f"{r['run_id']} [{sanitise(r['agent'], max_len=40)}] "
+            f"{sanitise(where, max_len=60)} — started "
+            f"{sanitise(str(r['started_at']), max_len=40)}, "
+            f"{_lines_phrase(r['lines'])}, never finalized")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Report runs that died without ever writing an outcome.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report what it would say; write and alert nothing")
+    ap.add_argument("--days", type=int, default=None,
+                    help="narrow the sweep to the last N days (default: all of them, "
+                         "because a day directory's NAME is agent-controlled and so "
+                         "is not evidence about the runs inside it)")
+    args = ap.parse_args()
+
+    # AN UNREADABLE TREE IS NOT AN EMPTY ONE, and it must not exit 0. Printing
+    # "0 abandoned" reads as all-clear and means "I could not look" — the same
+    # shape as every bug this file has fixed, one level up. `issue-pr-reconcile`
+    # names it in its own docstring as the ARCH-311 silent no-op, and it is worse
+    # here than a crash, because a crash at least leaves a traceback.
+    #
+    # TWO CHECKS, AND THE SECOND ONE IS THE DEFENCE. This `access` call is an
+    # early, legible refusal for the ordinary case; it cannot be the guarantee,
+    # because permissions can change between asking and looking. `abandoned_runs`
+    # lists the root with `iterdir`, which fails loudly when it cannot read —
+    # so the listing that would have to succeed for "0 abandoned" to be true is
+    # the same call that reports it could not. That is the property to preserve
+    # here; do not reintroduce `glob`, which swallows PermissionError internally
+    # and returns an empty listing indistinguishable from an empty tree.
+    if not RUNS_ROOT.is_dir() or not os.access(RUNS_ROOT, os.R_OK | os.X_OK):
+        print(f"run-observer: {RUNS_ROOT} is not a readable directory — cannot "
+              f"sweep. This is NOT a clean pass; nothing was examined.",
+              file=sys.stderr)
+        return 1
+
+    now = datetime.now(timezone.utc)
+    try:
+        found = abandoned_runs(args.days, now)
+    except OSError:
+        # `abandoned_runs` has already said what failed and that nothing is
+        # accounted for. Exit non-zero so launchd records a failure rather than
+        # a silent success with no findings.
+        return 1
+
+    for r in found:
+        print(f"run-observer: {describe(r)}")
+    window = f"the last {args.days}d" if args.days is not None else "all of history"
+    lost_days = [r for r in found if r.get("kind") == "unreadable-day"]
+    refused = [r for r in found if r.get("kind") == "failover-refused"]
+    took = [r for r in found if r.get("kind") == "failover-taken"]
+    abandoned = [r for r in found if r.get("kind") == "abandoned"]
+    print(f"run-observer: {len(abandoned)} abandoned across {window}")
+    # SEPARATE COUNTS, because these are separate findings about separate runs and
+    # a single total would be a number nobody could act on. A run can appear in two
+    # of them — a refusal and a fail-over are recorded in different fields and one
+    # run could carry both — which is another reason not to add them up.
+    if refused:
+        print(f"run-observer: {len(refused)} run(s) died with a recovery available "
+              f"and refused, across {window}")
+    if took:
+        print(f"run-observer: {len(took)} run(s) ran at a provider nobody chose, "
+              f"across {window}")
+    # THE CAVEAT RIDES WITH THE COUNT, on the same stream. A reader of stdout
+    # alone would otherwise take the number as a total when a whole day went
+    # unexamined — which is this file's recurring failure wearing a number
+    # instead of a clean exit.
+    if lost_days:
+        print(f"run-observer: that count is a FLOOR, not a total — "
+              f"{len(lost_days)} day(s) above could not be read at all")
+
+    if args.dry_run:
+        # A DRY RUN SAYS WHAT A REAL ONE WOULD DO, including the extra alert.
+        if len(found) > _ANOMALOUS_FINDING_COUNT:
+            print(f"run-observer: a real sweep would post all {len(found)} of "
+                  f"these and one more alert about the volume itself")
+        return 0
+
+    # ONE ALERT PER RUN, SUPPRESSED SERVER-SIDE. There is deliberately no
+    # local record of what has been reported.
+    #
+    # The obvious design — a seen-list beside the runs — is a suppression
+    # primitive sitting in the tree it audits. `agent-runs` is writable by every
+    # dispatched agent (same OS user, shell access, platform/decisions/0056), and
+    # any agent can list a sibling's run id, so any agent could append an id and
+    # hide that run's abandonment permanently. It would defeat this sweep using
+    # precisely the actor class it exists to catch, and a run that died badly
+    # enough never to finalize had every opportunity to write that line first.
+    #
+    # `dedup_key` is globally unique in the Library and lives nowhere on this
+    # filesystem, so it cannot be EDITED by anything with only local write access.
+    # A repeat post returns the existing row and lands no second alert, which is
+    # the suppression this needs. Per run rather than per batch, so a new finding
+    # is never withheld because an older one shares its key.
+    #
+    # STILL AN ACCEPTED GAP, and this is the honest version of the claim. The
+    # Library today accepts any caller-supplied `dedup_key` from the `agent` role,
+    # and the bearer token authorizing that (`~/.orient-control/agent-platform-token`)
+    # is a 0600 file owned by the same user every dispatched agent runs as, read
+    # through a lib already on their `sys.path`. So an agent CAN post this key
+    # first — under its own run id, to bury its own abandonment, or under a
+    # sibling's, which it can read off `agent-runs`. What the server-side key buys
+    # is that suppressing requires reaching the Library with a credential, rather
+    # than appending a line to a file in the tree this audits, which is what a
+    # local seen-list would have made a one-line edit. That is a narrowing, not a
+    # closure; the platform-wide fix is a capability restriction in the Library
+    # (platform/decisions/0056, issue_01M0R0BFE0CFHJM6XR5NG13PF4) and does not
+    # belong in this file.
+    # AND THE DELIVERY IS CHECKED, because it is now the only signal. `post_alert`
+    # returns "skip" when the token is absent and "error:<...>" on a failed
+    # delivery, logging both to stderr and no further. This sweep deliberately
+    # exits 0 on an unreadable day precisely BECAUSE the alert channel carries the
+    # finding — so an alert that silently failed to land leaves launchd recording
+    # a success for a night nobody was told about anything. That is this file's own
+    # recurring shape arriving at the last possible step, after ten rounds of
+    # closing it everywhere upstream.
+    #
+    # "skip" is NOT an error. It is the deliberate no-op on a box with no token,
+    # and treating it as failure would make every such box report a broken sweep.
+    undelivered = []
+    posted_any = False
+    paced_total = 0.0
+
+    def _deliver(body: str, *, dedup_key: str, what: str) -> None:
+        """Post one finding. EVERY finding, in every sweep, without exception.
+
+        No budget and no ordering, for the reason set out on
+        `_ANOMALOUS_FINDING_COUNT`: any limit has to choose what to drop, every
+        attribute it could choose by is written by the actor being reported on,
+        and the version of this that had a limit let a forger decide which real
+        alert nobody saw.
+        """
+        # PACED, which is not a cap. Removing the cap left one outbound call per
+        # finding with no spacing, so a forger minting N directories forces N
+        # near-simultaneous posts at the Library — an availability exposure
+        # against the Library itself rather than noise a human sifts, and one the
+        # cap had been bounding incidentally. A delay defers nothing and drops
+        # nothing, so it reintroduces no suppression primitive: every finding is
+        # still posted in this same sweep.
+        #
+        # BOUNDED IN TOTAL, for the reason on `_MAX_TOTAL_PACING_S`: unbounded,
+        # the delay was a denial of the sweep by anything that can run `mkdir` in
+        # a loop. Past the budget the spacing stops and the posts continue.
+        nonlocal posted_any, paced_total
+        if posted_any and paced_total < _MAX_TOTAL_PACING_S:
+            time.sleep(_ALERT_SPACING_S)
+            paced_total += _ALERT_SPACING_S
+            if paced_total >= _MAX_TOTAL_PACING_S:
+                print(f"run-observer: {_MAX_TOTAL_PACING_S:.0f}s of alert pacing "
+                      f"spent; posting the rest back to back. A sweep with this "
+                      f"many findings is itself worth looking at", file=sys.stderr)
+        posted_any = True
+        res = post_alert("agent-platform", body, dedup_key=dedup_key)
+        if isinstance(res, str) and res.startswith("error"):
+            undelivered.append((what, res))
+
+    for r in found:
+        if r.get("kind") == "failover-refused":
+            _deliver(
+                "A run died with a working recovery target beside it and the "
+                "platform refused to use it. The refusal is correct — an "
+                "interactive dispatch never swaps provider on its own, and a "
+                "target below an agent's model_floor is not a substitute — but "
+                "until now it was recorded in meta.json and read by nothing.\n\n"
+                f"  {describe(r)}\n\n"
+                "Report only: this run is long dead and re-running it would "
+                "duplicate whatever it reached. What the refusal asks for is a "
+                "human choosing the provider, which means re-dispatching with an "
+                "explicit --model if the work still matters.",
+                dedup_key=f"run-observer:failover-refused:{r['run_id']}",
+                what=f"refused fail-over on {r['run_id']}")
+            continue
+        if r.get("kind") == "failover-taken":
+            _deliver(
+                "A run finished at a provider nobody chose for it. The fail-over "
+                "is authorized, and reporting it is the other half of the same "
+                "rule: an action is reported as loudly as a refusal.\n\n"
+                f"  {describe(r)}\n\n"
+                "Judge the RESULT rather than the run — it completed, so whatever "
+                "it produced is already published, and it was produced at a tier "
+                "the dispatcher did not pick.",
+                dedup_key=f"run-observer:failover-taken:{r['run_id']}",
+                what=f"fail-over on {r['run_id']}")
+            continue
+        if r.get("kind") == "unreadable-day":
+            _deliver(
+                "A whole day of runs could not be examined, so this sweep's count "
+                "is a floor rather than a total.\n\n"
+                f"  {describe(r)}\n\n"
+                "The directory stays unreadable until someone changes it, and the "
+                "sweep rescans all of history every night — so this day is missing "
+                "from every future sweep too, not only this one. Everything under "
+                "agent-runs is writable by every dispatched agent, so treat a day "
+                "that became unreadable on its own as suspicious rather than as "
+                "a disk fault.",
+                # THE SWEEP DATE IS PART OF THE KEY, unlike the abandoned-run one.
+                # A run id is single-use by construction, so a per-run key that
+                # never repeats is right. A DAY is recurring mutable state: it can
+                # go unreadable, be restored, and go unreadable again — and with
+                # `day` alone the second occurrence returns the existing row and
+                # posts nothing. That hands the suppression attack this finding
+                # exists to catch a free second attempt. Keyed by the day observed
+                # AND the day it was observed on, it re-alerts once per calendar
+                # day the condition is actually seen.
+                dedup_key=(f"run-observer:unreadable-day:{r['day']}"
+                           f":{now.date().isoformat()}"),
+                what=f"unreadable day {r['day']}")
+            continue
+        _deliver(
+            "A run died without ever finalizing. No outcome.json was written, so "
+            "it has no exit status, no cost record and no terminal reason, and "
+            "nothing else will report it.\n\n"
+            f"  {describe(r)}\n\n"
+            "Report only: a run that vanished mid-flight may have left a worktree, "
+            "a branch or a half-posted comment, so re-running it would duplicate "
+            "whatever it reached. Inspect the run directory and decide.",
+            dedup_key=f"run-observer:abandoned:{r['run_id']}",
+            what=f"abandoned run {r['run_id']}")
+
+    if len(found) > _ANOMALOUS_FINDING_COUNT:
+        # THE VOLUME IS THE FINDING. Posted alongside everything else rather than
+        # instead of any of it, so a flood is named without a flood deciding what
+        # gets named. Keyed per sweep date: an ordinary backlog says this for the
+        # night or two it takes to be read, and a manufactured one keeps saying it.
+        res = post_alert(
+            "agent-platform",
+            f"This sweep produced {len(found)} findings, well above the roughly "
+            "three a day measured over June-August 2026. All of them were posted; "
+            "the count itself is what this alert is about.\n\n"
+            "A first sweep over an unreported backlog looks like this once and "
+            "then subsides, because the Library's per-run dedup silences what "
+            "already landed. A count that does NOT subside is worth treating as "
+            "manufactured: the two fail-over findings need only one field in a "
+            "run's own meta.json, and everything under agent-runs is writable by "
+            "every dispatched agent, so fabricating them costs a `mkdir` each.\n\n"
+            "Reported rather than throttled, deliberately. Throttling would mean "
+            "choosing which findings to defer, and every attribute available to "
+            "choose by is written by the party being reported on.",
+            dedup_key=f"run-observer:finding-volume:{now.date().isoformat()}")
+        if isinstance(res, str) and res.startswith("error"):
+            undelivered.append(("the finding-volume notice", res))
+        print(f"run-observer: {len(found)} findings in one sweep is above the "
+              f"usual few — all posted, and the volume is itself alerted on")
+
+    if undelivered:
+        for what, res in undelivered:
+            print(f"run-observer: the alert for {what} did NOT reach the Library "
+                  f"({res}) — the finding stands and nobody has been told",
+                  file=sys.stderr)
+        print(f"run-observer: {len(undelivered)} of {len(found)} alert(s) failed "
+              f"to deliver; this sweep found things and did not report them",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

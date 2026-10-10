@@ -1,0 +1,69 @@
+#!/bin/sh
+# Make "open a URL" harmless on a machine with no monitor.
+#
+# WHY. Claude Code's OAuth flow calls its openBrowser path. This mini had no
+# http/https handler registered, so macOS fell back to Safari — which launched on
+# 2026-07-17, never exited, and by 2026-08-13 held 29 processes and 5.7GB of
+# compressed memory. That exhausted swap, and macOS began SIGKILLing processes,
+# including the tmux session shells the operator reaches the machine through.
+#
+# The fix is not "stop authenticating". It is to make the fallback useful: this
+# registers a handler that WRITES THE URL DOWN instead of opening it, so a
+# headless login still works — you read the link out of the log and open it on a
+# machine that has a screen.
+#
+# IT IS AN APPLESCRIPT APP ON PURPOSE. macOS delivers a URL to a handler through
+# an Apple Event (GetURL), not through argv. The first version here was a shell
+# script in an .app wrapper: it was accepted as the handler, launched, and never
+# received the URL — so `open` reported success while the link vanished. That is
+# worse than failing, because the caller believes a browser opened. AppleScript's
+# `on open location` is the handler that actually receives the event.
+set -eu
+
+APP="$HOME/Applications/HeadlessBrowser.app"
+SRC="$(cd "$(dirname "$0")" && pwd)/HeadlessBrowser.applescript"
+LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
+[ -f "$SRC" ] || { echo "install: no source at $SRC" >&2; exit 1; }
+
+mkdir -p "$HOME/Applications" "$HOME/.local/state/headless-browser"
+rm -rf "$APP"
+osacompile -o "$APP" "$SRC"
+
+/usr/bin/python3 - "$APP/Contents/Info.plist" <<'PY'
+import plistlib, sys
+p = sys.argv[1]
+d = plistlib.load(open(p, 'rb'))
+d['CFBundleIdentifier'] = 'com.convivy.headlessbrowser'
+d['LSBackgroundOnly'] = True
+d['CFBundleURLTypes'] = [{'CFBundleURLName': 'Web',
+                          'CFBundleTypeRole': 'Viewer',
+                          'CFBundleURLSchemes': ['http', 'https']}]
+plistlib.dump(d, open(p, 'wb'))
+PY
+
+"$LSREG" -f "$APP"
+
+/usr/bin/python3 - <<'PY'
+import plistlib, pathlib
+p = pathlib.Path.home()/"Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist"
+d = plistlib.load(open(p, 'rb')) if p.exists() else {}
+keep = [h for h in d.get('LSHandlers', [])
+        if h.get('LSHandlerURLScheme') not in ('http', 'https')]
+for scheme in ('http', 'https'):
+    keep.append({'LSHandlerURLScheme': scheme,
+                 'LSHandlerRoleAll': 'com.convivy.headlessbrowser'})
+d['LSHandlers'] = keep
+plistlib.dump(d, open(p, 'wb'))
+PY
+
+killall -HUP lsd 2>/dev/null || true
+
+echo "installed: $APP is now the http/https handler"
+echo "URLs land in: $HOME/.local/state/headless-browser/urls.log"
+echo
+echo "VERIFY IT, over a window long enough to mean something — Safari takes"
+echo "tens of seconds to appear, and a 6-second check wrongly reported success"
+echo "the first time this was tested:"
+echo "  open 'https://example.com/probe' && sleep 45 && pgrep -f 'Safari.app/Contents/MacOS/Safari\$'"
+echo "  cat $HOME/.local/state/headless-browser/urls.log"

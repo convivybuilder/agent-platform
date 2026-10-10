@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# launch-weekly-curation — the deterministic weekly audit -> scribe -> curator
+# pipeline (ARCH-122), preceded by the weekly worktree reap (ARCH-126).
+#
+# Why this exists: the chain that feeds the curator its evidence base
+# (security-auditor -> observability-scribe -> curator) was specified only as a
+# prompt-handoff inside the overnight-orchestrator (ARCH-097). That handoff was
+# unreliable — the audit + scribe steps were silently dropped, so the two
+# input streams (<root>/agent-runs/{observations,audits}/) sat empty for 30+
+# days and the curator ran on its own narrative. This moves the dispatch off the
+# LLM prompt onto a deterministic launchd schedule (same lesson as ARCH-055).
+#
+# Fires Sunday morning, after the week's overnight arch-led nights (Mon/Tue/Wed)
+# have all run, so the curator reads the full week. Runs the agents FOREGROUND
+# and sequentially: the scribe must see the auditors' fresh reports, and the
+# curator must see the scribe's fresh observations. agentctl gates every spawn
+# on the daily budget ($50 soft / $80 hard), so a hot budget winds the pipeline
+# down rather than blowing the cap.
+#
+# Logs to <root>/agent-runs/weekly-curation-launcher.log.
+#
+# Usage: launch-weekly-curation [--dry-run]   (--dry-run prints the spawns, runs nothing)
+
+set -euo pipefail
+
+# Resolve this script's OWN location, following symlinks — so a deployed copy
+# (platform/decisions/0059 rule 1) reaches its own deploy-area sibling, and
+# the ~/.local/bin symlink into the checkout (rule 5) still reaches the
+# checkout's sibling. Bash equivalent of bin/check-cli-contracts's
+# pathlib.Path(__file__).resolve(): a real file is already its own answer, a
+# symlink chain is followed back to what it points at. Bounded at 20 hops so a
+# symlink CYCLE errors out rather than spinning forever in an unattended job —
+# pathlib.Path.resolve() raises on a cycle; this is bash's version of the same
+# guard (security-reviewer, round 6).
+_self="$0"
+_hops=0
+while [ -L "$_self" ]; do
+    _hops=$((_hops + 1))
+    if [ "$_hops" -gt 20 ]; then
+        echo "$(basename "$0"): symlink cycle resolving \$0 (>20 hops) — aborting" >&2
+        exit 1
+    fi
+    _link_dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in
+        /*) ;;
+        *) _self="$_link_dir/$_self" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+
+# Autonomous-origin tag for the budget caps (ARCH-156); inherited by every
+# agentctl spawn this pipeline starts. `curation` (ARCH-320) gives weekly
+# curation its OWN budget pool, so a heavy same-day overnight wave (the
+# `overnight` pool) can't spend the ceiling before the curation scribe+curator
+# run — the 2026-07-05 Sunday-stacking incident.
+export AGENT_RUN_ORIGIN=curation
+
+# Run records live under builder_root.data_root() (company/decisions/0008):
+# BUILDER_ROOT when set, else the machine's root, printed by the sibling
+# bin/builder-root.
+DATA_ROOT="${BUILDER_ROOT:-$("$SCRIPT_DIR/builder-root")}" || exit 1
+LOG_DIR="$DATA_ROOT/agent-runs"
+LOG_FILE="$LOG_DIR/weekly-curation-launcher.log"
+mkdir -p "$LOG_DIR"
+AGENTCTL="$SCRIPT_DIR/agentctl"
+AUDIT_PRODUCTS="constance vivy sous-chef"   # customer-facing products with real threat surface (ARCH-122)
+DATE="$(date +%F)"
+AUDIT_DIR="$LOG_DIR/audits/$DATE"
+OBS_FILE="$LOG_DIR/observations/$DATE.jsonl"
+
+# Wave key so cost_join nests this run's dispatches (security-auditor per product,
+# observability-scribe, curator) under one synthetic "curation · <date>" /activity
+# row instead of each orphaning as its own top-level scheduled session. Inherited
+# by every agentctl spawn below (the `<kind>:<scope>` form agentctl + cost_join
+# understand). Mirrors the ARCH-268 overnight wave; ARCH-122 follow-up.
+export AGENT_WAVE="curation:$DATE"
+
+DRY_RUN=0
+[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+
+log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG_FILE"; }
+
+# Self-alert on launcher failure (mirrors launch-overnight's ARCH-083 trap): a
+# non-zero exit is otherwise silent — the pipeline just doesn't run and the
+# curator's inputs stay stale.
+_on_exit() {
+    local rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    log "EXIT trap: non-zero exit ($rc)"
+}
+trap _on_exit EXIT
+
+# Spawn one agent FOREGROUND (blocks to completion) with the given on/profile/task.
+# Never aborts the pipeline on a single agent's failure — the downstream agents
+# read whatever landed. Tallies via the caller's $ok / $failed.
+ok=0
+failed=0
+run_agent() {
+    local agent="$1" on="$2" profile="$3" task="$4"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        printf 'DRY-RUN spawn: %s --on %s --profile %s\n  task: %s\n' "$agent" "$on" "$profile" "$task"
+        ok=$((ok + 1))
+        return 0
+    fi
+    log "spawn $agent --on $on --profile $profile"
+    if "$AGENTCTL" spawn "$agent" --on "$on" --profile "$profile" --foreground --task "$task" >> "$LOG_FILE" 2>&1; then
+        log "  $agent ($on) ok"
+        ok=$((ok + 1))
+    else
+        log "  ERROR: $agent ($on) failed (exit $?) — continuing pipeline"
+        failed=$((failed + 1))
+    fi
+}
+
+log "===== weekly curation pipeline start ($DATE) ====="
+
+# --- Stage 0: worktree reap (ARCH-126) ----------------------------------------
+# Weekly housekeeping before the week's spawns: drop finished worktrees (merged
+# PR or at base, no real uncommitted work, not held/locked). Safe-by-construction
+# — the reaper fails toward keeping — and best-effort here: a reap failure must
+# not block the curation pipeline.
+log "stage 0: worktrees-cleanup --commit"
+if [ "$DRY_RUN" -eq 1 ]; then
+    printf 'DRY-RUN reap: worktrees-cleanup --commit\n'
+elif "$SCRIPT_DIR/worktrees-cleanup" --commit >> "$LOG_FILE" 2>&1; then
+    log "  worktrees-cleanup ok"
+else
+    log "  WARNING: worktrees-cleanup failed (exit $?) — continuing pipeline"
+fi
+
+# --- Stage 1: security-auditor, one per product (sequential) -----------------
+# Per-product so each loads its own threat model (the agent has constance/vivy
+# overrides under projects/<product>/agents/security-auditor.md).
+for product in $AUDIT_PRODUCTS; do
+    run_agent security-auditor "$product" "$product/daytime" \
+"Weekly security audit of $product (ARCH-122). Sweep ACCUMULATED security posture per your prompt — the state per-PR security-reviewer can't see: committed secrets incl. git history, dependency vulns (npm audit / pip-audit), missing security headers, authN/authZ sampling, IAM/infra misconfig, stale credentials, logging/PII hygiene, drift from the security-conventions skill. Vary focus week-to-week; use the trends section for continuity. Write the report to $AUDIT_DIR/report-$product.md and append one observation per finding (kind: security_audit) to $OBS_FILE for the scribe + curator. Read-only on code; do not fix."
+done
+
+# --- Stage 2: observability-scribe (after the audits land) --------------------
+run_agent observability-scribe sous-chef shared/daytime \
+"Weekly observation sweep (ARCH-122). Read this week's agent-run telemetry under $LOG_DIR (costs, tool failures, timeouts, review-blockage counts, budget wind-downs) AND the security-auditor reports just written under $AUDIT_DIR/, and emit structured observations to $OBS_FILE for the curator. You are a FILTER, not a logger — surface only what's worth a curator proposal, with concrete evidence_refs."
+
+# --- Stage 3: curator (after the scribe's observations land) ------------------
+run_agent curator sous-chef shared/daytime \
+"Weekly curator pass (ARCH-122) — now dispatched deterministically, no longer via the overnight-orchestrator handoff. Read this week's observations ($OBS_FILE and recent days under $LOG_DIR/observations/), the security-audit reports under $AUDIT_DIR/, and the PRs merged across the three products this week. Produce your weekly proposal batch per your prompt: a standard targeted sweep (quarterly holistic only on its scheduled first-Sunday). Honor the evidence thresholds (>=2 observations to mutate a prompt; one substantive observation suffices for an ADR/reference). Open the batch as a PR to the knowledge repo for the operator; no autonomous merge (ARCH-020)."
+
+log "===== weekly curation pipeline done ($DATE): ok=$ok, failed=$failed ====="
+[ "$DRY_RUN" -eq 1 ] && printf '\n(dry-run — nothing spawned. ok=%s)\n' "$ok"
+exit 0

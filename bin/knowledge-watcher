@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""knowledge-watcher: keep ~/.knowledge-index/index.db in sync with <root>/knowledge/.
+
+Long-running daemon launched by launchd
+(~/Library/LaunchAgents/com.convivy.knowledge-watcher.plist).
+
+Strategy:
+- On startup: full scan + reconcile (drop rows whose source_ref no longer exists, or
+  whose file was refused; while the Library's roster cannot be read, no row is dropped).
+- Then: watchdog observer reacts to .md create/modify/delete in <root>/knowledge/.
+
+Validation: every doc passes through `knowledge.validate_frontmatter`. A failure
+is logged to ~/.knowledge-index/watcher.log and the doc's row is DROPPED, so a
+doc whose frontmatter breaks stops being served rather than continuing to serve
+its last-good content under metadata the validator has rejected. While the
+Library's roster cannot be read, a doc whose only undecided check is its `audience`
+or its `binds_agents` is deferred instead: logged, with its row left as it was, and
+decided by the next scan or event. A doc with any other refusal is still refused.
+
+The indexing itself lives in `indexer`, shared with `agentctl kb sync`. This
+daemon is the backstop: it catches edits made directly in the checkout, and it
+is the recovery path when a sync is broken.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import stat
+import sys
+import time
+from pathlib import Path
+
+# Prefer THIS checkout's lib over the installed copy.
+#
+# `~/.local/bin/knowledge-watcher` is a symlink into the agent-platform working
+# tree, but `~/.local/lib/knowledge/` is a real directory that only changes when
+# install.sh runs (ARCH-229's symlink-deploy split, in its sharpest form). So a
+# merge makes this script new while its library stays old, and a daemon that
+# imported only the installed path would fail to start on a module that ships in
+# the same commit as itself. Resolving through the symlink first removes the
+# ordering hazard: the script and the library it was written against move
+# together. The installed path stays as the fallback for a copied deployment.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "knowledge"),
+                Path.home() / ".local" / "lib" / "knowledge"):
+    if (_libdir / "indexer.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, requires=("watchdog", "yaml"))
+from watchdog.events import FileSystemEventHandler  # noqa: E402
+from watchdog.observers import Observer  # noqa: E402
+
+# The parse/upsert/reconcile primitives live in `indexer` so that this daemon and
+# `agentctl kb sync` index identically (they used to live here, which is why they
+# could not). `watchdog` stays this script's own dependency — the indexer must
+# import cleanly under agentctl's interpreter, which has no venv.
+from indexer import (
+    GONE_REASON,
+    KNOWLEDGE,
+    ensure_db,
+    full_scan_and_reconcile as _full_scan_and_reconcile,
+    index_one,
+    kept_suffix,
+    retire_vanished,
+)
+from knowledge import RosterRead
+
+LOG_DIR = Path.home() / ".knowledge-index"
+# A fresh account has no ~/.knowledge-index yet, and `logging.basicConfig`
+# opens LOG below at import time, so the directory has to exist first, at
+# the default mode, matching indexer.ensure_db.
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG = LOG_DIR / "watcher.log"
+
+logging.basicConfig(
+    filename=str(LOG),
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("knowledge-watcher")
+
+
+def handle_path(path: Path, deleted: bool = False,
+                roster: RosterRead | None = None) -> str | None:
+    """Index or retire one path. Returns the action taken, or None for a path the index
+    does not serve. `roster` is the event's one roster read; a caller handling two paths
+    from one event passes the same object to both."""
+    if path.suffix != ".md":
+        return None
+    try:
+        rel = path.relative_to(KNOWLEDGE)
+    except ValueError:
+        return None
+    read = RosterRead() if roster is None else roster
+    if deleted:
+        # A removal keeps its row while the roster cannot be read (see `retire_vanished`).
+        if retire_vanished(str(rel), read):
+            log.warning("deferred %s: %s%s", rel, GONE_REASON, kept_suffix(str(rel)))
+            return "deferred"
+        log.info("removed %s", rel)
+        return "removed"
+    action, err = index_one(path, read)
+    if action == "deferred":
+        log.warning("deferred %s: %s%s", rel, err, kept_suffix(str(rel)))
+    elif action == "refused":
+        log.warning("refused %s: %s%s", rel, err, kept_suffix(str(rel)))
+    elif err:
+        # The row is dropped, not merely skipped — `index_one` owns that rule so
+        # this handler and `kb sync` cannot disagree about it, which is exactly
+        # how the stale-row bug survived in one copy while being fixed in another.
+        log.warning("invalid doc %s: %s (row dropped)", rel, err)
+    elif action == "upserted":
+        log.info("upserted %s", rel)
+    elif action == "removed":
+        log.info("removed %s", rel)
+    return action
+
+
+def _is_in_git_dir(path: Path, root: Path) -> bool:
+    """Whether `path` is `root`'s OWN TOP-LEVEL `.git` directory, or sits
+    inside it, nested or not.
+
+    The watched tree is `root` recursively, which includes the knowledge
+    checkout's own `.git` — without this, routine git housekeeping
+    (`.git/objects/xx`, moving refs) triggers a full recursive walk on every
+    directory it touches (reviewer, PR #737 run-f656afba). A path outside
+    `root` entirely (not this tree's concern) reads as False, same as one
+    with no `.git` component.
+
+    Checks only the FIRST path component under `root`, not a `.git` name at
+    any depth. `full_scan_and_reconcile` (`indexer.py`) walks `projects/`
+    with a plain `rglob` that excludes nothing by name, and `handle_path`
+    filters a file event only on suffix — neither treats a project's own
+    vendored `.git` (nested under `projects/<x>/...`) as special, so a
+    document inside one is indexed by both exactly like any other document.
+    An earlier version of this check (and of `_walk_pruning_git_dir`) matched
+    `.git` at ANY depth, which made such a document silently unindexed when
+    reached only through its directory's create/move event — the window this
+    PR exists to close, reopened one layer down (reviewer, PR #737 round 4,
+    run-93318ce1) — while also making a document reachable by its own plain
+    file event silently absent when reached through a directory event instead
+    (reviewer, PR #737 run-f6a202ce, the dot-prefix case this docstring's
+    sibling finding fixed for `.obsidian` and the like).
+    """
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return False
+    return rel.parts[:1] == (".git",)
+
+
+def _open_dir_fd(directory: Path, root: Path):
+    """Open a descriptor on `directory`, walking from a descriptor on `root`
+    through every path component in turn — `O_NOFOLLOW` and `O_DIRECTORY` on
+    each — rather than opening `directory` by its full path string.
+
+    The same reasoning as `indexer._open_doc_file` (see there): `directory`
+    reaches this daemon as a path string off a filesystem event, and nothing
+    stops a writer from swapping any ancestor — or `directory` itself — for a
+    symlink between the event firing and this open. Walking by descriptor
+    from `root` means every directory on the way has been proven, at the
+    instant each was opened, to be a real directory, not a symlink, so there
+    is no path string left to re-walk and no window for a later swap to land
+    in. `_walk_pruning_git_dir` below uses this same fd-chain mechanism one
+    level deeper, for every directory it descends into during the walk.
+
+    Returns `(fd, None)` or `(None, error)`. The caller owns closing the
+    returned fd.
+    """
+    try:
+        rel = directory.relative_to(root)
+    except ValueError:
+        return None, f"refusing to walk {directory}: not under {root}"
+    parts = rel.parts
+    if any(part in (".", "..") for part in parts):
+        return None, f"refusing to walk {directory}: path has no safe component walk"
+
+    try:
+        dir_fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return None, f"refusing to walk {directory}: cannot open {root} ({exc})"
+
+    opened = [dir_fd]
+    try:
+        for i, part in enumerate(parts):
+            try:
+                fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=dir_fd)
+            except OSError as exc:
+                walked = "/".join(parts[:i + 1])
+                return None, (f"refusing to walk {directory}: cannot open "
+                              f"{walked!r} without following a symlink ({exc})")
+            opened.append(fd)
+            dir_fd = fd
+        opened.pop()  # the caller now owns this fd; the finally below must not close it too
+        return dir_fd, None
+    finally:
+        for fd in opened:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _lstat_for_walk(name: str, dir_fd: int):
+    """`os.lstat(name, dir_fd=dir_fd)` — the walk's own classification step
+    (is this entry a directory worth recursing into?), split out as its own
+    call so a test can monkeypatch it to land a directory-swapped-for-a-
+    symlink race at the exact instant between classification and the
+    `O_NOFOLLOW` open that is this call's only consumer (`_walk_fd` below).
+    This result is NEVER trusted on its own — same rule as
+    `indexer._refuse_unsafe_path` — only the open that follows it is."""
+    return os.lstat(name, dir_fd=dir_fd)
+
+
+def _walk_fd(dir_fd: int, dirpath: Path, is_root: bool):
+    """Yield every path under the already-open `dir_fd` (named by `dirpath`
+    for the paths this yields), descending into a subdirectory only through
+    a FRESH `O_NOFOLLOW`/`O_DIRECTORY` open relative to `dir_fd` — never by
+    re-resolving `dirpath` or any child path as a string.
+
+    `_lstat_for_walk` classifies a name as directory-shaped ONLY to decide
+    whether to ATTEMPT the recursive open at all; it is not what makes that
+    open safe. If a writer swaps the entry for a symlink after this lstat
+    but before the open, the open's own `O_NOFOLLOW` refuses it (`ELOOP`),
+    same as `indexer._open_doc_file`'s leaf open does for a document — the
+    walk never descends into, lists, or logs anything the symlink points at.
+    This is also what makes a genuine symlinked directory correctly skipped
+    without ever being opened: the entry is still yielded as a path (sharing
+    `_walk_pruning_git_dir`'s old behaviour of naming a symlink without
+    reading through it), but nothing under it is.
+
+    `is_root` prunes a `.git` directly under this call's own `dir_fd`; it is
+    true only for the very first level of the walk AND only when that level
+    is `root` itself (see `_walk_pruning_git_dir`) — a project's own nested
+    `.git`, reached one or more levels down, is never pruned.
+    """
+    try:
+        names = os.listdir(dir_fd)
+    except OSError:
+        return
+    for name in names:
+        if is_root and name == ".git":
+            continue
+        try:
+            st = _lstat_for_walk(name, dir_fd)
+        except OSError:
+            continue
+        child_path = dirpath / name
+        yield child_path
+        if not stat.S_ISDIR(st.st_mode):
+            continue
+        try:
+            child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                               dir_fd=dir_fd)
+        except OSError:
+            # Either a genuine symlinked directory (refused by O_NOFOLLOW,
+            # whatever it points at) or this exact name was swapped for one
+            # between the lstat above and this open — the race this
+            # function exists to close. Either way: skip, don't descend.
+            continue
+        try:
+            yield from _walk_fd(child_fd, child_path, is_root=False)
+        finally:
+            os.close(child_fd)
+
+
+def _walk_pruning_git_dir(directory: Path, root: Path):
+    """Yield every path under `directory`, never descending into `root`'s own
+    top-level `.git` — reached from inside this walk only if `directory` is
+    `root` itself or an ancestor of it, since the `on_created`/`on_moved`
+    handlers already apply `_is_in_git_dir` to the top-level directory before
+    calling this at all.
+
+    A project's OWN `.git` (a vendored repo nested anywhere under `root`'s
+    `projects/`) is walked and indexed like any other directory — see
+    `_is_in_git_dir` for why pruning it here would disagree with
+    `full_scan_and_reconcile`'s plain `rglob` and a plain file event, both of
+    which index it today.
+
+    THE WALK DESCENDS BY DESCRIPTOR FROM `root`, NEVER BY RE-RESOLVING A
+    PATH STRING (security-reviewer, PR #737 round 5). The old implementation
+    called `directory.iterdir()`, checked `entry.is_dir()` and
+    `entry.is_symlink()`, and — for anything that looked like an
+    undecorated directory — recursed by calling `.iterdir()` on THAT PATH
+    STRING again: two separate walks of the same name, at two different
+    instants, exactly the TOCTOU class `indexer._open_doc_file` exists to
+    close for a document's content. A directory swapped for a symlink to a
+    tree outside `root` in the window between the check and the recursive
+    `iterdir()` sent the walk into that outside tree — listing it (slow on
+    a large external directory, stalling this daemon's single-threaded
+    event dispatcher) and logging its filenames as `handle_path`/`index_one`
+    reported each one unindexable. `_open_dir_fd` opens `directory` itself
+    the same way, and `_walk_fd` opens every descendant the same way again,
+    one level at a time: a name is classified by `lstat` only to decide
+    whether to attempt a recursive open, and the open itself — `O_NOFOLLOW`,
+    relative to the parent's own already-open `dir_fd` — is what actually
+    refuses a symlink, whatever instant it was planted at. `parse_doc`'s
+    `_open_doc_file` (`lib/knowledge/indexer.py`) is what then safely reads
+    a `.md` file this walk turns up; the two no longer disagree about how a
+    path is safely reached, closing the asymmetry the finding named.
+    """
+    fd, err = _open_dir_fd(directory, root)
+    if err:
+        return
+    try:
+        yield from _walk_fd(fd, directory, is_root=(directory == root))
+    finally:
+        os.close(fd)
+
+
+def index_new_directory(directory: Path) -> None:
+    """Walk a just-created (or moved-into) directory and index every file already
+    inside it, through the same `handle_path` a file event uses.
+
+    The observer can drop the file-created event for a document that lands in a
+    directory created moments before it (issue_01M3V1DEPGD1HQX2C2V2G0DEF8) — the
+    directory's own create/move event is this function's only chance to pick the
+    document up before a restart's full scan would. `handle_path` is idempotent
+    (`index_one` upserts by id), so a file this walk indexes and then also
+    receives its own, undropped file event is indexed twice, not wrongly.
+
+    The event takes one roster read, so every file in the walk gets the same answer even
+    when the walk outlasts the roster's cache bound.
+    """
+    read = RosterRead()
+    for path in _walk_pruning_git_dir(directory, KNOWLEDGE):
+        if path.is_file():
+            handle_path(path, roster=read)
+
+
+def full_scan_and_reconcile() -> None:
+    """Walk projects/, upsert valid docs, drop rows for missing files, then log it.
+
+    The pass itself is `indexer.full_scan_and_reconcile`; this wrapper exists to
+    write the daemon's log lines from the counts it returns. Sharing the pass is
+    the point — the watcher's startup reconcile and a `kb sync` self-heal must
+    produce the same index, not merely similar ones.
+    """
+    result = _full_scan_and_reconcile()
+    for rel, err in result["invalid"]:
+        log.warning("invalid doc %s: %s", rel, err)
+    for rel, err in result["deferred"]:
+        log.warning("deferred %s: %s%s", rel, err, kept_suffix(rel))
+    for rel, err in result["refused"]:
+        log.warning("refused %s: %s%s", rel, err, kept_suffix(rel))
+    for ref in result["removed_refs"]:
+        # Per-path, as this logged before the extraction: knowing WHICH doc left
+        # the index is the whole value of the line when a doc disappears from
+        # search and someone is working out why.
+        log.info("reconciled out %s", ref)
+    log.info("full scan: %d indexed, %d reconciled out, %d invalid, %d refused, %d deferred",
+             result["indexed"], result["removed"], len(result["invalid"]),
+             len(result["refused"]), len(result["deferred"]))
+
+
+class Handler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.is_directory:
+            path = Path(event.src_path)
+            if _is_in_git_dir(path, KNOWLEDGE):
+                return
+            index_new_directory(path)
+            return
+        handle_path(Path(event.src_path))
+
+    def on_modified(self, event):
+        if not event.is_directory:
+            handle_path(Path(event.src_path))
+
+    def on_deleted(self, event):
+        if event.is_directory:
+            return
+        path = Path(event.src_path)
+        # Atomic saves (write-temp + rename-over-target) can emit a phantom
+        # on_deleted for the target whose inode was replaced. If the file is
+        # still on disk, the delete is spurious — re-index instead of removing.
+        if path.exists():
+            handle_path(path)
+            return
+        handle_path(path, deleted=True)
+
+    def on_moved(self, event):
+        if event.is_directory:
+            dest = Path(event.dest_path)
+            if _is_in_git_dir(dest, KNOWLEDGE):
+                return
+            index_new_directory(dest)
+            return
+        src = Path(event.src_path)
+        dest = Path(event.dest_path)
+        # One roster read decides both paths of the move, so they cannot disagree about
+        # the outage.
+        roster = RosterRead()
+        handle_path(dest, roster=roster)
+        if not src.exists():
+            handle_path(src, deleted=True, roster=roster)
+
+
+def _bootstrap() -> int | None:
+    """Schema + full scan, and the missing-checkout guard. Returns an exit code
+    to stop at, or None to continue into the watch loop.
+
+    Split out of `main` so a test can drive startup without also starting
+    `Observer`'s real watch loop.
+    """
+    log.info("starting; bootstrapping schema + full scan")
+    if not KNOWLEDGE.is_dir():
+        # Without this, watchdog's inotify backend hits the same missing
+        # directory when the emitter thread starts — inside that thread, so
+        # the failure never reaches this process's exit code or stderr; the
+        # daemon just sits there watching nothing. Naming the path here turns
+        # that into a diagnosable exit.
+        message = f"knowledge-watcher: no knowledge checkout at {KNOWLEDGE}"
+        log.error(message)
+        print(message, file=sys.stderr)
+        return 1
+    ensure_db()
+    full_scan_and_reconcile()
+    return None
+
+
+def main() -> int:
+    code = _bootstrap()
+    if code is not None:
+        return code
+
+    observer = Observer()
+    observer.schedule(Handler(), str(KNOWLEDGE), recursive=True)
+    observer.start()
+    log.info("watching %s", KNOWLEDGE)
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        observer.stop()
+    observer.join()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

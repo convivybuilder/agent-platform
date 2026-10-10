@@ -1,0 +1,100 @@
+#!/bin/bash
+# appkit-autoupdate — hourly `git pull --ff-only` into the convivy-app-kit PRIMARY,
+# refusing when that checkout is not on main (substrate ARCH-441).
+#
+# WHY THIS SCRIPT EXISTS AT ALL. The launchd job used to invoke git directly:
+#   ProgramArguments = /usr/bin/git -C <root>/convivy-app-kit pull --ff-only
+# which is fine while the checkout is on main and wrong in two distinct ways when
+# it is not. On a feature branch the pull either FAST-FORWARDS that branch to
+# whatever origin has for it — moving a branch nobody asked to move, on the
+# checkout a rails deploy ships from — or fails outright and logs into a file
+# nobody reads. Neither is what an hourly maintenance job should do unattended.
+#
+# ARCH-437's monitor sees the same bad state within fifteen minutes and files a
+# bug. That bounds how LONG it lasts; it cannot stop this job acting on it in the
+# meantime. A monitor and an assertion are complements, and the assertion belongs
+# in the actor, at the moment of the pull (both reviewers, agent-platform#347).
+#
+# THE ASSERTION IS THE MONITOR'S OWN. `check-primary-checkouts --assert` calls the
+# same `check()` over the same `_LIVE_CHECKOUTS` entry, so the two cannot drift
+# into disagreeing about whether this checkout is deployable.
+#
+# A REFUSAL IS NOT SILENT AND NOT FATAL-FOREVER. It prints why to the log and
+# exits non-zero, so launchd records a failed run; the durable alert is the
+# monitor's bug, filed on its own once_key rather than a second one from here.
+# The next hourly run pulls normally once the checkout is back on main.
+set -uo pipefail
+
+# Resolve this script's OWN location, following symlinks — so a deployed copy
+# (platform/decisions/0059 rule 1) reaches its own deploy-area sibling, and
+# the ~/.local/bin symlink into the checkout (rule 5) still reaches the
+# checkout's sibling. Bash equivalent of bin/check-cli-contracts's
+# pathlib.Path(__file__).resolve(): a real file is already its own answer, a
+# symlink chain is followed back to what it points at. Bounded at 20 hops so a
+# symlink CYCLE errors out rather than spinning forever in an unattended job —
+# pathlib.Path.resolve() raises on a cycle; this is bash's version of the same
+# guard (security-reviewer, round 6).
+_self="$0"
+_hops=0
+while [ -L "$_self" ]; do
+    _hops=$((_hops + 1))
+    if [ "$_hops" -gt 20 ]; then
+        echo "$(basename "$0"): symlink cycle resolving \$0 (>20 hops) — aborting" >&2
+        exit 1
+    fi
+    _link_dir="$(cd -P "$(dirname "$_self")" && pwd)"
+    _self="$(readlink "$_self")"
+    case "$_self" in
+        /*) ;;
+        *) _self="$_link_dir/$_self" ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$_self")" && pwd)"
+
+# The app kit lives under the machine's root (company/decisions/0008), printed by
+# the builder-root beside this script: the deploy area's own copy for the launchd
+# job, the checkout's for the ~/.local/bin link. HOME does not move it. An
+# unresolvable root is a broken install, not "nothing to pull", so it fails loudly
+# before the safety check runs.
+ROOT="$("$SCRIPT_DIR/builder-root" --root)" && [ -n "$ROOT" ] || {
+    echo "$(basename "$0"): cannot resolve the machine's root ($SCRIPT_DIR/builder-root --root)" >&2
+    exit 1
+}
+REPO="$ROOT/convivy-app-kit"
+CHECK="$SCRIPT_DIR/check-primary-checkouts"
+
+ts() { date -Iseconds; }
+
+if [ ! -d "$REPO/.git" ]; then
+    echo "[$(ts)] appkit-autoupdate: no checkout at $REPO — nothing to pull" >&2
+    exit 0
+fi
+
+# Degrade to the old behaviour rather than stopping the updates: a missing check
+# binary must not silently freeze an hourly job, and an un-asserted pull is what
+# ran here until today.
+if [ -x "$CHECK" ]; then
+    "$CHECK" --assert convivy-app-kit --actor "com.convivy.appkit.autoupdate (hourly git pull)"
+    _rc=$?
+    # 4 is the ONLY refusal. Any other non-zero means the check could not run —
+    # a missing interpreter, a broken install, an import error — and that is the
+    # same class as the check being absent, which this script already degrades
+    # through. Treating "the guard is broken" as "the guard said no" freezes the
+    # hourly pull indefinitely, which is this guard's own failure mode inverted;
+    # it did exactly that on first deploy, when launchd's thin PATH could not
+    # resolve the check's python3.11.
+    if [ "$_rc" -eq 4 ]; then
+        echo "[$(ts)] appkit-autoupdate: REFUSED — see above; not pulling this run" >&2
+        exit 4
+    elif [ "$_rc" -ne 0 ]; then
+        echo "[$(ts)] appkit-autoupdate: WARNING — the branch check exited $_rc (it could not run, which is not a refusal); pulling without it" >&2
+    fi
+else
+    echo "[$(ts)] appkit-autoupdate: WARNING — $CHECK not found; pulling without the branch assertion" >&2
+fi
+
+echo "[$(ts)] appkit-autoupdate: pulling $REPO"
+/usr/bin/git -C "$REPO" pull --ff-only
+rc=$?
+echo "[$(ts)] appkit-autoupdate: git pull exited $rc"
+exit $rc

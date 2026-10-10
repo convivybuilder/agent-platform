@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""Serve a Claude Code session as communication first (Deck WS1.5).
+
+Tool calls and results collapse to one expandable line; what a human typed and
+what the model said render at length. See lib/agent-platform/session_view.py for
+the classification rule and why it carries no summarization vocabulary.
+
+A UNIX SOCKET, NOT A LOOPBACK PORT — and that is a security decision, not a
+style one. This serves rendered transcripts: every prompt typed, every tool input
+and output, every file read. macOS has no per-user loopback isolation, so ANY
+local account can reach 127.0.0.1:<port> with no SSH tunnel and no credential. The
+mini is about to have a second tenant, which turns "loopback only" from a control
+into an assumption that is already false. A socket under the owner's home is
+enforced by filesystem permissions instead.
+
+Reach it from the laptop with an SSH forward, which speaks socket paths natively:
+
+    ssh -N -L 8788:<remote-home>/.local/run/session-view.sock <user>@<mini>
+    open http://127.0.0.1:8788
+
+<remote-home> is the remote user's home directory, <user> is the remote user
+name, and <mini> is the machine that runs the crews.
+
+`--port` still exists for a single-user machine, and warns, because it reopens
+exactly the exposure above.
+
+Absolute interpreter path (ARCH-086): launchd gives this no useful PATH.
+
+Usage:
+  session-view                          # serve on the unix socket (default)
+  session-view --port 8788              # loopback TCP instead; warns, see above
+  session-view --render <id>            # print one session's HTML to stdout
+  session-view --render-file <path|->   # render a Markdown file to stdout
+  session-view --render-kb <doc-id>     # render a KB document to stdout (read-only, no lease)
+  session-view --list                   # recent sessions, newest first
+"""
+from __future__ import annotations
+
+import argparse
+import getpass
+import html
+import os
+import socket
+import socketserver
+import signal
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "session_view.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, prefer_venv=True)
+import operator_config  # noqa: E402
+import session_view as SV  # noqa: E402
+import tmux_transcript as TT  # noqa: E402
+
+# Only used by the opt-in --port path. 8788, not 8787: ask-api (launchd, live
+# since 2026-06-27) already owns 8787 here. Found by trying to start on it.
+DEFAULT_PORT = 8788
+SOCKET_PATH = Path.home() / ".local" / "run" / "session-view.sock"
+LIST_LIMIT = 40
+
+
+def recent_sessions(limit: int = LIST_LIMIT) -> list[tuple[str, str, float]]:
+    """(session_id, project dir name, mtime), newest first."""
+    out = []
+    for p in SV.CLAUDE_PROJECTS.glob("*/*.jsonl"):
+        try:
+            out.append((p.stem, p.parent.name, p.stat().st_mtime))
+        except OSError:
+            continue
+    out.sort(key=lambda r: r[2], reverse=True)
+    return out[:limit]
+
+
+def _index_html() -> str:
+    rows = ["<!doctype html><meta charset=utf-8><title>sessions</title>",
+            f"<style>{SV.PAGE_CSS}</style><h1>recent sessions</h1>"]
+    entries = recent_sessions()
+    if not entries:
+        rows.append("<p class=empty>no transcripts found.</p>")
+    for sid, proj, _ in entries:
+        # The project dir encodes the cwd with slashes as dashes; showing the tail
+        # is enough to tell sessions apart at a glance.
+        label = proj.rsplit("-", 2)[-1] if "-" in proj else proj
+        rows.append(f"<div class=turn><a href='/session/{html.escape(sid)}'>"
+                    f"{html.escape(sid[:8])}</a> "
+                    f"<span class=who>{html.escape(label)}</span></div>")
+    return "\n".join(rows)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code: int, body: str) -> None:
+        raw = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        # Read-only local page, but the transcript body is arbitrary text: deny
+        # framing and sniffing rather than reason about whether it matters.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            return self._send(200, _index_html())
+        if path.startswith("/session/"):
+            sid = unquote(path[len("/session/"):]).strip("/")
+            # Same alphabet the library enforces. Checked here too so a malformed
+            # id is a 400 (you sent nonsense) rather than a 404 (it does not
+            # exist) — the library's guard is the security boundary, this one is
+            # the honest status code.
+            if not sid or not SV.SESSION_ID_RE.fullmatch(sid):
+                return self._send(400, "<p class=empty>bad session id.</p>")
+            page = SV.render_session(sid)
+            if page is None:
+                return self._send(404, "<p class=empty>no such session.</p>")
+            return self._send(200, page)
+        self._send(404, "<p class=empty>not found.</p>")
+
+    def log_message(self, *args) -> None:
+        """Silence per-request logging: the paths carry session ids."""
+        return
+
+
+class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn,
+                              socketserver.UnixStreamServer):
+    """HTTP over a unix socket.
+
+    BaseHTTPRequestHandler expects a (host, port) client_address; a unix peer has
+    none, so hand it a placeholder rather than let formatting blow up mid-request.
+    """
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def get_request(self):
+        conn, _ = self.socket.accept()
+        return conn, ("unix", 0)
+
+
+def _serve_unix(path: Path) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A stale socket from a killed run would make bind() fail with EADDRINUSE and
+    # read as "already running" when nothing is.
+    if path.exists():
+        try:
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            probe.connect(str(path))
+            probe.close()
+            print(f"session-view: already serving on {path}", file=sys.stderr)
+            return 1
+        except OSError:
+            path.unlink(missing_ok=True)
+
+    # Create it private BEFORE anything can connect: a window at the default umask
+    # is exactly the exposure the socket exists to close.
+    old = os.umask(0o177)
+    try:
+        srv = ThreadingUnixHTTPServer(str(path), Handler)
+    finally:
+        os.umask(old)
+    os.chmod(path, 0o600)
+
+    # SIGTERM is how this actually dies (pkill, launchd), and the default
+    # disposition skips the cleanup below — leaving a stale socket that reads as
+    # "already running" on the next start.
+    def _bye(_sig, _frm):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, _bye)
+
+    print(f"session-view: serving on {path} (owner-only)")
+    # The crew host is also set wherever the operator's ssh alias for the crew
+    # host is defined; change both when the crews move.
+    try:
+        tailnet_host = operator_config.get("tailnet_host")
+    except operator_config.OperatorConfigError as e:
+        print(f"session-view: no tailnet_host configured ({e}); skipping the laptop hint")
+    else:
+        print(f"session-view: from the laptop —\n"
+              f"  ssh -N -L {DEFAULT_PORT}:{path} {getpass.getuser()}@{tailnet_host}\n"
+              f"  open http://127.0.0.1:{DEFAULT_PORT}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nsession-view: stopped")
+    finally:
+        srv.server_close()
+        path.unlink(missing_ok=True)
+    return 0
+
+
+def _render_tmux(session_name: str, theme: str | None,
+                 background: str | None = None,
+                 scale: float | None = None,
+                 line_height: float | None = None,
+                 delta_since: "int | None" = None) -> int:
+    """Render by tmux session name, the way Deck asks for a pane.
+
+    With delta_since set, emits a JSON delta for the append bridge instead of a
+    full HTML page.  The failure is reported on stderr with its reason intact,
+    because the three ways this fails have three different fixes and a caller
+    showing a generic "not found" would send the reader looking in the wrong place.
+    """
+    try:
+        path = TT.transcript_for_tmux_session(session_name)
+    except TT.JoinError as e:
+        print(f"session-view: {e}", file=sys.stderr)
+        return 1
+    # Pane cwd for resolving relative paths in prose text.  TT.run returns None
+    # on failure (tmux absent, session gone), so None propagates and relative-path
+    # linking degrades gracefully without breaking the render.
+    raw_cwd = TT.run(["tmux", "display-message", "-t", session_name, "-p",
+                       "#{pane_current_path}"])
+    cwd = raw_cwd.strip() or None
+    if delta_since is not None:
+        import json as _json
+        result = SV.render_delta(path, delta_since, session_name, theme=theme,
+                                 background=background, scale=scale,
+                                 line_height=line_height, cwd=cwd)
+        print(_json.dumps(result))
+        return 0
+    # Same path render_delta uses for its "lines" count (_rows_for_lines on a
+    # single read), so the meta this stamps and the cursor a later delta
+    # reports can never drift apart. Do not reimplement the counting via
+    # read_rows()/len(splitlines()) separately — see render_html's
+    # transcript_lines docstring for why that number is load-bearing.
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        text = ""
+    lines = text.splitlines()
+    total, rows = SV._rows_for_lines(lines)
+    # Appended here, not inside _rows_for_lines, so the "lines" count above
+    # still describes the transcript alone and stays in step with what a later
+    # --delta-since call expects as its cursor — render_delta does the same
+    # thing for the same reason on its own path (see its docstring). `or []`:
+    # this is a full render with no earlier held set to reconcile against, so
+    # an unknown queue state (held_rows_for returning None) draws no held rows
+    # rather than raising — see held_rows_for's docstring for the None/[] split.
+    rows = rows + (SV.held_rows_for(lines) or [])
+    print(SV.render_html(rows, session_name, theme=theme,
+                         background=background, scale=scale, line_height=line_height,
+                         cwd=cwd, transcript_lines=total, heading=False))
+    return 0
+
+
+def _render_file(path_str: str, theme: str | None, name: str | None) -> int:
+    """Render a Markdown file as a self-contained HTML page and print to stdout.
+
+    Deck uses this entry point to display files in the viewer pane without
+    maintaining a second Markdown renderer.  PATH must be absolute, or '-' to
+    read the document from stdin.
+
+    STDIN IS HOW THIS STAYS CONTAINED. Deck's viewer pane already fetches the
+    file's bytes through session-agent's contained read-file verb; if this
+    command then opened PATH again by name, a symlink beneath an allowed root
+    that points outside it would pass Deck's own path check and get opened
+    here a second time with nothing in front of it. Piping in the bytes
+    read-file already fetched removes that second open. NAME is required with
+    '-' because, unlike --render-editor's KB case, the caller always holds
+    the file's real name.
+    """
+    if path_str == "-":
+        if not name:
+            print("session-view: --render-file - requires --name; the caller "
+                  "already has the file's real name in hand", file=sys.stderr)
+            return 1
+        # DECODE LENIENTLY, AS THE PATH BRANCH DOES. `sys.stdin.read()` uses
+        # the strict handler, so a malformed byte raises UnicodeDecodeError —
+        # which is a ValueError, not a RuntimeError, so the handler below
+        # would miss it and a traceback would reach stderr. Deck puts stderr
+        # into the viewer's error page, so that traceback is what the reader
+        # sees, carrying the interpreter and script paths with it.
+        content = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+        try:
+            page = SV.render_file_page(content, name, theme=theme)
+        except (OSError, RuntimeError) as e:
+            # OSError ALONGSIDE RuntimeError, matching what the path branch
+            # below already catches. The bridge writes its own JS modules to a
+            # temp directory and execs node, so a disk-full write, a
+            # permissions failure, or a race where `_find_node`'s stat passes
+            # and the binary is gone by exec time all raise OSError from in
+            # here — with nothing catching it, that is the same traceback-to-
+            # stderr disclosure the lenient decode above exists to prevent,
+            # arriving by a different exception class.
+            print(f"session-view: cannot render the document on stdin: {e}",
+                  file=sys.stderr)
+            return 1
+        print(page)
+        return 0
+
+    if name:
+        # Documented as stdin-only. Accepting it silently beside a path would
+        # let a caller believe they had renamed the heading when the filename
+        # still won.
+        print("session-view: --name is ignored with a path argument; it names "
+              "the document only with --render-file -", file=sys.stderr)
+
+    path = Path(path_str)
+    if not path.is_absolute():
+        print(f"session-view: --render-file requires an absolute path or '-', "
+              f"got: {path_str!r}", file=sys.stderr)
+        return 1
+    try:
+        page = SV.render_file_html(path, theme=theme)
+    except OSError as e:
+        print(f"session-view: cannot read {path_str}: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        # NodeMissingError and the bridge's own failures land here. Deck puts
+        # whatever reaches stderr into the viewer's error page, so a traceback
+        # would be shown to the reader verbatim — and this app is built for
+        # someone who does not work in a terminal.
+        print(f"session-view: cannot render {path_str}: {e}", file=sys.stderr)
+        return 1
+    print(page)
+    return 0
+
+
+def _render_editor(path_str: str, theme: str | None, name: str | None) -> int:
+    """Render a Markdown document as a self-contained WYSIWYG editor page.
+
+    Deck writes this page into the working-copy directory and loads it over the
+    loopback server.  PATH must be absolute, or `-` to read the document from
+    stdin.
+
+    STDIN IS HOW A KB DOCUMENT GETS HERE, because it has no path on this
+    machine: it lives in the knowledge repository and reaches Deck through
+    `agentctl kb checkout`, which returns content and a sha and writes nothing
+    to disk.  Deck holds those bytes and pipes them in, so the page edits
+    exactly the version its sha guards.  `--name` supplies the heading, which
+    for a KB document is its doc id rather than a filename.
+    """
+    if path_str == "-":
+        # DECODE LENIENTLY, AS THE FILE PATH DOES. `sys.stdin.read()` uses the
+        # strict handler, so a malformed byte raises UnicodeDecodeError — which
+        # is a ValueError, not a RuntimeError, so the handler below would miss
+        # it and a traceback would reach stderr. Deck puts stderr into the
+        # viewer's error page, so that traceback is what the reader sees, and
+        # it carries the interpreter and script paths with it. The file branch
+        # already passes errors="replace"; the two should agree.
+        content = sys.stdin.buffer.read().decode("utf-8", errors="replace")
+        try:
+            page = SV.render_editor_page(content, name=name or "document", theme=theme)
+        except RuntimeError as e:
+            print(f"session-view: cannot render the document on stdin: {e}",
+                  file=sys.stderr)
+            return 1
+        print(page)
+        return 0
+
+    if name:
+        # Documented as stdin-only. Accepting it silently beside a path would
+        # let a caller believe they had renamed the heading when the filename
+        # still won.
+        print("session-view: --name is ignored with a path argument; it names "
+              "the document only with --render-editor -", file=sys.stderr)
+
+    path = Path(path_str)
+    if not path.is_absolute():
+        print(f"session-view: --render-editor requires an absolute path or '-', "
+              f"got: {path_str!r}", file=sys.stderr)
+        return 1
+    try:
+        page = SV.render_editor_html(path, theme=theme)
+    except OSError as e:
+        print(f"session-view: cannot read {path_str}: {e}", file=sys.stderr)
+        return 1
+    except RuntimeError as e:
+        print(f"session-view: cannot render {path_str}: {e}", file=sys.stderr)
+        return 1
+    print(page)
+    return 0
+
+
+def _render_kb(doc_id: str, theme: str | None) -> int:
+    """Render a KB document as a self-contained HTML page and print to stdout.
+
+    Reads the index read-only; never acquires a lease. Returns non-zero with a
+    clear message when the doc is not found or the index is unreadable.
+    """
+    try:
+        page = SV.render_kb_html(doc_id, theme=theme)
+    except RuntimeError as e:
+        # Same reason as _render_file: a traceback here is shown to the reader.
+        print(f"session-view: cannot render {doc_id!r}: {e}", file=sys.stderr)
+        return 1
+    if page is None:
+        print(f"session-view: KB doc not found or index unreadable: {doc_id!r}",
+              file=sys.stderr)
+        return 1
+    print(page)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Serve a session as communication first.")
+    ap.add_argument("--port", type=int, default=None,
+                    help=f"serve loopback TCP instead of the unix socket. WARNS: "
+                         f"any local user can read it. Default port {DEFAULT_PORT}.")
+    ap.add_argument("--render", metavar="SESSION_ID",
+                    help="print one session's HTML to stdout and exit")
+    ap.add_argument("--list", action="store_true",
+                    help="list recent sessions, newest first")
+    ap.add_argument("--theme", choices=("light", "dark"), default=None,
+                    help="stamp a resolved appearance onto <html>. Deck passes "
+                         "this because its shell is the appearance authority; "
+                         "omitted, the page follows the system, which is right "
+                         "in a browser where nobody decides for it.")
+    ap.add_argument("--background", metavar="HEX", default=None,
+                    help="the page's canvas colour, as a CSS hex value. Deck "
+                         "sends the shade it painted beside the pane, because "
+                         "only the shell knows its own theme. Ignored unless it "
+                         "is a hex colour.")
+    ap.add_argument("--scale", type=float, default=None, metavar="FACTOR",
+                    help=f"scale the page's text by this factor "
+                         f"({SV.MIN_SCALE}-{SV.MAX_SCALE}). Deck sends what its "
+                         "Cmd-+/- has been set to, so the pane and the terminal "
+                         "resize together. Out of range is ignored.")
+    ap.add_argument("--line-height", type=float, default=None, metavar="RATIO",
+                    help=f"the prose line-height for the conversation "
+                         f"({SV.MIN_LINE_HEIGHT}-{SV.MAX_LINE_HEIGHT}). Deck "
+                         "sends the session typography set in its settings. "
+                         "Separate from --scale, which moves the whole page "
+                         "including tool output; this opens the leading of "
+                         "running prose only. Out of range is ignored.")
+    ap.add_argument("--render-tmux", metavar="SESSION_NAME",
+                    help="print the HTML for the co session running in a tmux "
+                         "session, by name. This is Deck's entry point: its rail "
+                         "rows are tmux names, not session ids.")
+    ap.add_argument("--delta-since", type=int, default=None, metavar="N",
+                    help="used with --render-tmux: emit a JSON delta for the "
+                         "session pane append bridge instead of a full HTML page. "
+                         "N is the number of transcript lines the client has "
+                         "already rendered. Stdout: "
+                         '{\"lines\":M,\"full\":false,\"rows\":[...],\"removed\":[...]} '
+                         '(\"removed\" names held-row keys the client is showing '
+                         "that release or a queue edit invalidated) "
+                         "or {\"full\":true,\"page\":\"...\"} when a delta cannot "
+                         "be produced (cursor past EOF, rotated transcript).")
+    ap.add_argument("--render-file", metavar="PATH",
+                    help="render a Markdown file as a self-contained HTML page and "
+                         "exit. Deck uses this entry point to display files in the "
+                         "viewer pane without a second Markdown renderer. PATH must "
+                         "be absolute, or '-' to read the document from stdin (with "
+                         "--name), which is how Deck renders a file it already read "
+                         "through session-agent's contained read-file verb without "
+                         "this command opening the path again itself. Non-Markdown "
+                         "handling is the Deck side's concern; this always renders "
+                         "through the markdown engine.")
+    ap.add_argument("--render-kb", metavar="DOC_ID",
+                    help="render a KB document as a self-contained HTML page and "
+                         "exit. Reads the knowledge index read-only — no lease is "
+                         "acquired. Exits non-zero with a clear message when the "
+                         "doc is not found or the index is unreadable.")
+    ap.add_argument("--render-editor", metavar="PATH",
+                    help="render a Markdown document as a self-contained WYSIWYG "
+                         "editor page and exit. Deck writes this page into the "
+                         "working-copy directory and serves it over the loopback "
+                         "server. PATH must be absolute, or '-' to read the document "
+                         "from stdin, which is how a KB document gets here: it has no "
+                         "path on this machine. Does not invoke Node — rendering is "
+                         "deferred to the browser.")
+    ap.add_argument("--name", metavar="NAME", default=None,
+                    help="the document's display name, used for the page's title "
+                         "and heading. Only read with --render-editor - or "
+                         "--render-file -, where the path argument that would "
+                         "otherwise supply it is '-'. Required with --render-file -; "
+                         "optional with --render-editor - (defaults to 'document'), "
+                         "since a KB document's doc id is a fallback name but a "
+                         "file being piped in already has a real one.")
+    args = ap.parse_args()
+
+    if args.render_editor:
+        return _render_editor(args.render_editor, args.theme, args.name)
+
+    if args.render_kb:
+        return _render_kb(args.render_kb, args.theme)
+
+    if args.render_file:
+        return _render_file(args.render_file, args.theme, args.name)
+
+    if args.render_tmux:
+        return _render_tmux(args.render_tmux, args.theme, args.background,
+                            args.scale, args.line_height, args.delta_since)
+
+    if args.list:
+        for sid, proj, _ in recent_sessions():
+            print(f"{sid}  {proj}")
+        return 0
+
+    if args.render:
+        page = SV.render_session(args.render, theme=args.theme,
+                                 background=args.background, scale=args.scale,
+                                 line_height=args.line_height)
+        if page is None:
+            print(f"session-view: no transcript for {args.render}", file=sys.stderr)
+            return 1
+        print(page)
+        return 0
+
+    if args.port is None:
+        return _serve_unix(SOCKET_PATH)
+
+    # Opt-in TCP. Say plainly what it costs rather than letting the default-looking
+    # flag hide it.
+    print("session-view: WARNING — loopback TCP has no per-user isolation on macOS.",
+          file=sys.stderr)
+    print("session-view: any local account can read every transcript served here. "
+          "Prefer the unix socket (omit --port).", file=sys.stderr)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    except OSError as e:
+        # A bare traceback here reads as "the tool is broken" when the real
+        # answer is "something else owns that port" — which is exactly what
+        # happened on 8787 (ask-api). Say so, and say how to move.
+        print(f"session-view: cannot bind 127.0.0.1:{args.port} — {e}", file=sys.stderr)
+        print(f"session-view: something else may own it; try --port {args.port + 1} "
+              f"(check with: lsof -nP -iTCP:{args.port} -sTCP:LISTEN)", file=sys.stderr)
+        return 1
+    print(f"session-view: http://127.0.0.1:{args.port}  (loopback only; ctrl-c to stop)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nsession-view: stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

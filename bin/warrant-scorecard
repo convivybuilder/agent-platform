@@ -1,0 +1,307 @@
+#!/usr/bin/env python3.11
+"""warrant-scorecard — the "should it have existed?" eval axis for agent PRs
+(ARCH-309). The spurious-work / warrant dimension, sibling to model-scorecard
+(does it work?) and security-scorecard (is it safe?).
+
+The failure it measures (vivy #764, 2026-07-03): an agent spun a plausible-but-
+false narrative from data it saw, decided the app "needed" an enhancement, built
+it, and it rode through a merged PR — the code was fine, but the CHANGE SHOULD NOT
+HAVE EXISTED. Such a PR scores POSITIVELY on every other axis (merged, survives 7d,
++velocity, zero security findings), so it is invisible unless measured directly.
+Correctness review can't catch it either: the defect is the premise, not the code.
+
+The only cheap ground-truth signal is the REVERT — but a plain revert lumps
+"reverted for a bug" (a quality-escape; fix = tighter review/CI) with "reverted
+because unwarranted" (a warrant-miss; fix = upstream task-grounding, not more code
+review). So the capture records the revert's REASON.
+
+  Convention (disseminated to every co via machine-global CLAUDE.md): a revert /
+  removal PR carries in its body
+      Reverts: #<original-PR>
+      Revert-reason: unwarranted | bug | superseded | other
+  This harvester also parses GitHub's native "Reverts #N" cross-reference; a
+  detected revert with no reason line is recorded `unclassified` (prompts a human
+  to classify), never silently dropped.
+
+  Metric: the UNWARRANTED-MERGE RATE = unwarranted-reverts / merged agent PRs, per
+  producer agent+model — the spurious-work analog of the security-catch rate. Also
+  the overall revert rate and the full reason breakdown (the `bug` slice is a
+  quality-escape signal complementing model-scorecard's `survived`).
+
+  Ledger: <root>/agent-runs/scorecard/warrant.jsonl (one row per detected
+  revert of an agent PR) + warrant-report.json (the rollup orient's /warrant reads).
+
+CLI: `--days N` (denominator window over merged agent PRs, default 90), `--no-write`,
+`--ledger PATH`, `--report`, `--json`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR
+RUNS_ROOT = BR.runs_root()
+SCORECARD_LEDGER = RUNS_ROOT / "scorecard" / "scorecard.jsonl"    # the merged agent-PR set (ARCH-107)
+LEDGER_PATH = RUNS_ROOT / "scorecard" / "warrant.jsonl"
+REPORT_PATH = RUNS_ROOT / "scorecard" / "warrant-report.json"
+
+REPORT_WINDOW_DAYS = 90        # reverts are rare — a wider default than the other scorecards
+REVERT_SCAN_LIMIT = 400        # recent PRs to scan per repo for revert markers
+
+# The revert's original-PR reference and its reason. Both the explicit convention
+# (`Reverts: #764`) and GitHub's native cross-ref (`Reverts #764`) match the first.
+_REVERTS_RE = re.compile(r"reverts:?\s*#(\d+)", re.IGNORECASE)
+_REASON_RE = re.compile(r"revert-reason:\s*([a-z-]+)", re.IGNORECASE)
+VALID_REASONS = {"unwarranted", "bug", "superseded", "other"}
+
+
+def _gh_json(args: list[str]) -> list | dict | None:
+    """Run a `gh` command returning JSON; None on any failure (read-only harvester
+    degrades, never crashes, on a gh/network hiccup)."""
+    try:
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        if cp.returncode != 0 or not cp.stdout.strip():
+            return None
+        return json.loads(cp.stdout)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def load_ledger(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def write_ledger(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
+
+
+def merged_agent_prs(days: int) -> dict[str, dict[int, dict]]:
+    """repo → pr_number → {producer_agent, producer_model, merged_at} for agent PRs
+    merged within the window, read from the cost/success scorecard (ARCH-107). These
+    are the denominator — the merged agent work whose warrant we're auditing."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    out: dict[str, dict[int, dict]] = defaultdict(dict)
+    for r in load_ledger(SCORECARD_LEDGER):
+        pr = r.get("pr_number")
+        repo = r.get("repo")
+        merged_at = r.get("merged_at") or ""
+        if not pr or not repo or not r.get("merged") or merged_at < cutoff:
+            continue
+        prev = out[repo].get(pr)
+        if prev is None or merged_at >= prev.get("merged_at", ""):
+            out[repo][pr] = {
+                "producer_agent": r.get("agent"),
+                "producer_model": r.get("model"),
+                "merged_at": merged_at,
+            }
+    return out
+
+
+def _parse_revert(title: str, body: str) -> tuple[int | None, str]:
+    """(original_pr, reason) from a PR's title+body, or (None, "") if not a revert.
+    A revert with no `Revert-reason:` line is 'unclassified' — detected but unlabelled."""
+    text = f"{title}\n{body}"
+    m = _REVERTS_RE.search(text)
+    if not m:
+        return None, ""
+    rmatch = _REASON_RE.search(text)
+    reason = rmatch.group(1).lower() if rmatch else "unclassified"
+    if reason not in VALID_REASONS and reason != "unclassified":
+        reason = "other"
+    return int(m.group(1)), reason
+
+
+def find_reverts(repo: str) -> list[dict]:
+    """Detected reverts in a repo: {revert_pr, original_pr, reason, reverted_at}."""
+    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+                     "--limit", str(REVERT_SCAN_LIMIT), "--json",
+                     "number,title,body,createdAt,state"]) or []
+    if len(data) >= REVERT_SCAN_LIMIT:
+        print(f"warrant-scorecard: WARNING: {repo} PR scan hit the "
+              f"{REVERT_SCAN_LIMIT}-PR limit — older reverts may be missed; "
+              f"raise REVERT_SCAN_LIMIT if this repo's PR volume has grown.",
+              file=sys.stderr)
+    out = []
+    for pr in data:
+        original, reason = _parse_revert(pr.get("title") or "", pr.get("body") or "")
+        if original is None or original == pr.get("number"):
+            continue
+        out.append({
+            "revert_pr": pr.get("number"),
+            "original_pr": original,
+            "reason": reason,
+            "reverted_at": pr.get("createdAt"),
+            "revert_state": pr.get("state"),
+        })
+    return out
+
+
+def harvest(days: int) -> list[dict]:
+    """One row per detected revert that targets a merged agent PR in the window."""
+    merged = merged_agent_prs(days)
+    rows = []
+    for repo, prmap in merged.items():
+        for rev in find_reverts(repo):
+            ctx = prmap.get(rev["original_pr"])
+            if ctx is None:
+                continue  # revert of a non-agent or out-of-window PR — not ours to score
+            rows.append({
+                "repo": repo,
+                "original_pr": rev["original_pr"],
+                "revert_pr": rev["revert_pr"],
+                "reason": rev["reason"],
+                "producer_agent": ctx.get("producer_agent"),
+                "producer_model": ctx.get("producer_model"),
+                "merged_at": ctx.get("merged_at"),
+                "reverted_at": rev["reverted_at"],
+                "revert_state": rev["revert_state"],
+                "harvested_at": datetime.now(timezone.utc).isoformat(),
+            })
+    return rows
+
+
+def upsert(ledger: list[dict], fresh: list[dict]) -> list[dict]:
+    """Upsert keyed (repo, original_pr, revert_pr): a re-harvest overwrites each
+    row from the live PR, so a revert re-derives its reason from the PR body every
+    run. To reclassify a prior 'unclassified', add a `Revert-reason:` line to the
+    revert PR's body on GitHub — the next harvest picks it up. A manual edit to the
+    ledger row itself would be overwritten, so the PR body is the source of truth."""
+    def key(r):
+        return (r.get("repo"), r.get("original_pr"), r.get("revert_pr"))
+    by_key = {key(r): r for r in ledger}
+    for r in fresh:
+        by_key[key(r)] = r
+    return list(by_key.values())
+
+
+def _pct(n: int, d: int) -> float:
+    return round(100.0 * n / d, 1) if d else 0.0
+
+
+def build_report(revert_rows: list[dict], days: int) -> dict:
+    """Join reverts to the merged-agent-PR denominator and roll up the warrant
+    metrics overall, by producer model, and by repo."""
+    merged = merged_agent_prs(days)
+    # reverts keyed by (repo, original_pr) — a merged PR is 'reverted' if any revert
+    # targets it; its reason is the most-severe (unwarranted > bug > other > else).
+    sev = {"unwarranted": 3, "bug": 2, "superseded": 1, "other": 1, "unclassified": 0}
+    rev_by_pr: dict[tuple, str] = {}
+    for r in revert_rows:
+        # Only a *merged* revert has actually undone the work. An open or
+        # closed-unmerged revert PR is a proposal, not a revert — counting it
+        # would inflate the unwarranted rate before anything was undone.
+        if r.get("revert_state") != "MERGED":
+            continue
+        k = (r["repo"], r["original_pr"])
+        cur = rev_by_pr.get(k)
+        if cur is None or sev.get(r["reason"], 0) > sev.get(cur, 0):
+            rev_by_pr[k] = r["reason"]
+
+    # one record per merged agent PR, tagged with its revert reason (or None)
+    prs = []
+    for repo, prmap in merged.items():
+        for pr, ctx in prmap.items():
+            reason = rev_by_pr.get((repo, pr))
+            prs.append({
+                "repo": repo,
+                "pr": pr,
+                "producer_model": ctx.get("producer_model") or "unknown",
+                "reverted": reason is not None,
+                "reason": reason,
+            })
+
+    def rollup(bucket: list[dict]) -> dict:
+        n = len(bucket)
+        reverted = [p for p in bucket if p["reverted"]]
+        unwarranted = [p for p in reverted if p["reason"] == "unwarranted"]
+        bug = [p for p in reverted if p["reason"] == "bug"]
+        by_reason: dict[str, int] = defaultdict(int)
+        for p in reverted:
+            by_reason[p["reason"]] += 1
+        return {
+            "merged_prs": n,
+            "reverted": len(reverted),
+            "revert_rate": _pct(len(reverted), n),
+            "unwarranted": len(unwarranted),
+            "unwarranted_rate": _pct(len(unwarranted), n),   # the headline: spurious-work rate
+            "bug_reverts": len(bug),
+            "bug_revert_rate": _pct(len(bug), n),
+            "by_reason": dict(by_reason),
+        }
+
+    by_model = {m: rollup([p for p in prs if p["producer_model"] == m])
+                for m in sorted({p["producer_model"] for p in prs})}
+    by_repo = {rp: rollup([p for p in prs if p["repo"] == rp])
+               for rp in sorted({p["repo"] for p in prs})}
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "window_days": days,
+        "overall": rollup(prs),
+        "by_model": by_model,
+        "by_repo": by_repo,
+    }
+
+
+def print_report(rep: dict) -> None:
+    o = rep["overall"]
+    print("warrant-scorecard — did agent-merged work deserve to exist?")
+    print(f"  merged agent PRs:        {o['merged_prs']}")
+    print(f"  reverted:                {o['reverted']}  ({o['revert_rate']}%)")
+    print(f"  UNWARRANTED (spurious):  {o['unwarranted']}  ({o['unwarranted_rate']}%)  <- headline")
+    print(f"  bug-reverts (quality):   {o['bug_reverts']}  ({o['bug_revert_rate']}%)")
+    print(f"  reason breakdown:        {o['by_reason'] or '{}'}")
+    print("\n  by producer model:")
+    for m, r in rep["by_model"].items():
+        print(f"    {m:28s}  {r['merged_prs']:4d} merged  {r['unwarranted_rate']:5.1f}% unwarranted  {r['revert_rate']:5.1f}% reverted")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Harvest the warrant / spurious-work rate of agent PRs.")
+    ap.add_argument("--days", type=int, default=REPORT_WINDOW_DAYS,
+                    help=f"denominator window over merged agent PRs (default {REPORT_WINDOW_DAYS})")
+    ap.add_argument("--no-write", action="store_true")
+    ap.add_argument("--ledger", type=Path, default=LEDGER_PATH)
+    ap.add_argument("--report", action="store_true")
+    ap.add_argument("--json", action="store_true", help="emit the report as JSON (for the orient builder)")
+    args = ap.parse_args()
+
+    fresh = harvest(args.days)
+    ledger = load_ledger(args.ledger)
+    merged = upsert(ledger, fresh) if fresh else ledger
+    report = build_report(merged, args.days)
+
+    if not args.no_write:
+        write_ledger(args.ledger, merged)
+        REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        REPORT_PATH.write_text(json.dumps(report, separators=(",", ":")) + "\n")
+
+    if args.json:
+        print(json.dumps(report, separators=(",", ":")))
+    elif args.report:
+        print_report(report)
+    else:
+        print(f"harvested {len(fresh)} revert rows; ledger now {len(merged)} rows"
+              f"{' (not written; --no-write)' if args.no_write else ''}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

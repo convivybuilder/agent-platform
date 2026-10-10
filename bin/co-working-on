@@ -1,0 +1,172 @@
+#!/usr/bin/env python3.11
+"""co-working-on — tell Deck's cockpit what this session is doing right now.
+
+Deck's cockpit lists "what we are working on now, populated by the co" as the
+one panel with no data source at all (deck/bead/deck §1, operator 2026-08-24). This
+is that source: one line a co runs by hand, whenever it wants to say what it is
+doing, so the fact that would otherwise live only in the terminal transcript
+also reaches Deck's frame.
+
+    co-working-on "chasing the pagination bug in the OwnerRez client"
+
+FOLLOWS `co-session-health`'s VITALS FILE, DELIBERATELY, NOT A NEW SCHEME. That
+script writes the terminal's status area to `~/.cache/co-session-health/
+vitals-<key>.json` so Deck's frame can show it without a second poll; this
+writes a SEPARATE file in the same directory, under the same sanitised-charset
+key. One cache directory, one key scheme, two files — because this is not
+per-turn status-line data, and forcing it through the vitals file would tie a
+sentence's lifetime to a status-line render this script has no part in.
+
+KEYED BY THE TMUX SESSION NAME, NOT a Claude Code session id. The status line
+gets its session id handed to it inside the session, in the payload Claude Code
+passes it every turn; a command run by hand has no such payload. The tmux name
+is what `session_state(name)` — Deck's own reader — already takes as its
+argument, so recording under that name is what makes the two sides agree
+without either needing to resolve anything about the other.
+
+WHY THIS LIVES HERE AND NOT THE LIBRARY, recorded once so nobody re-opens the
+question without a reason. Deck reads Chart House state from the Library for
+everything fleet-wide (courses, the corrections queue, crew stats); this fact
+is per-session and terminal-adjacent instead, wanted by whoever is watching
+THIS session's pane — exactly `vitals`'s shape, and exactly what rides free on
+the poll Deck already makes every two seconds. Building a second poll and a
+second client stack for one line of text would cost real complexity for a fact
+nothing outside this one session needs yet. That changes the day this needs to
+reach Orient or the team site, which show the fleet rather than one session —
+not before.
+
+FAILS LOUDLY, UNLIKE THE STATUS LINE. `co-session-health` must never break a
+render, so every failure there is silent. This is a command the co runs on
+purpose and reads the result of, so a failure to record says so on stderr
+rather than looking like it worked.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+# Not called directly below any more (crew_key.tmux_session_name makes the
+# call) — kept so a test that patches `cwo.subprocess.run` still reaches it,
+# since both names bind the one `subprocess` module object.
+import subprocess  # noqa: F401
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "signal_client.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+import crew_key as CK  # noqa: E402  (shared sanitiser + tmux lookup, agent-platform CQ-357)
+import signal_client as SC  # noqa: E402
+
+CACHE_DIR = Path.home() / ".cache" / "co-session-health"
+
+# The text is free-form, typed by whoever is driving this session, and reaches
+# a WKWebView pane in Deck as display content — bounded so a pasted paragraph
+# can't grow the cockpit line without limit. 200 characters is roughly two
+# short sentences: enough for "what am I doing", not enough for a essay.
+# `session_state.working_on` re-applies the same bound on the read side, as its
+# own constant — this script does not import that module, the same
+# self-containment `co-session-health` chose so a farm that has not been
+# re-linked yet cannot break this command either.
+MAX_LEN = 200
+
+# The charset and the tmux lookup are shared with `session_state.working_on`
+# (the reader) and the Slate (`crew_key.py`, agent-platform CQ-357) — one
+# implementation, imported here under this script's own names so existing
+# callers (including this file's tests) keep working unchanged.
+_session_key = CK.session_key
+_tmux_session_name = CK.tmux_session_name
+
+
+def _started_at(path, text: str, now: float) -> float:
+    """When THIS text was first recorded, so a consumer can say "since".
+
+    TWO TIMESTAMPS, NOT ONE, AND THEY ANSWER DIFFERENT QUESTIONS. `written_at`
+    is when the co last confirmed the line and is what staleness measures;
+    `started_at` is when the line's TEXT first appeared and is what "working on
+    X since 14:05" reads from. Stamping one time for both would make a co that
+    re-announces the same work appear to have just started it — the display
+    would say "since 15:30" for something begun at 14:05, which is worse than
+    showing no duration at all, because it reads as precise.
+
+    Preserved only while the text is UNCHANGED. New text is new work and starts
+    its own clock, which is the whole point: a co that re-announces refreshes
+    its liveness without lying about duration, and a co that says something new
+    resets the duration honestly.
+
+    Falls back to `now` whenever the previous recording cannot be read or
+    carries no usable stamp — the same fail-to-the-present posture every other
+    read here takes, since a missing history is not a reason to refuse a write.
+    """
+    try:
+        with open(path) as fh:
+            previous = json.load(fh)
+    except (OSError, ValueError):
+        return now
+    if not isinstance(previous, dict) or previous.get("text") != text:
+        return now
+    started = previous.get("started_at")
+    return started if isinstance(started, (int, float)) else now
+
+
+def _write(key: str, text: str) -> None:
+    """Atomic write, mirroring `co-session-health._cache_label`: a pid-unique
+    temp file plus `os.replace`, so a reader never sees a half-written file."""
+    CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = CACHE_DIR / f"working-{key}.json"
+    now = time.time()
+    started = _started_at(path, text, now)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}")
+    try:
+        tmp.unlink()          # a same-pid crash could have left one behind
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps({"text": text, "written_at": now,
+                             "started_at": started}))
+    os.replace(tmp, path)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="co-working-on",
+        description="Record what this session is working on, for Deck's cockpit.")
+    ap.add_argument("text", help="what this session is doing right now")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    text = args.text.strip()
+    if not text:
+        print("co-working-on: refusing to record an empty line", file=sys.stderr)
+        return 2
+
+    name = _tmux_session_name()
+    if not name:
+        print("co-working-on: not running inside a tmux session; nothing to key "
+              "this recording to", file=sys.stderr)
+        return 1
+
+    key = _session_key(name)
+    if not key:
+        print(f"co-working-on: tmux session name {name!r} has no usable "
+              f"characters", file=sys.stderr)
+        return 1
+
+    try:
+        _write(key, SC.sanitise(text, max_len=MAX_LEN))
+    except OSError as e:
+        print(f"co-working-on: could not write the record ({e})", file=sys.stderr)
+        return 1
+
+    print(f"co-working-on: recorded for session {name!r}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

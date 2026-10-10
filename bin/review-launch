@@ -1,0 +1,646 @@
+#!/opt/homebrew/bin/python3 -I
+"""review-launch — the root-owned launcher `agents` reaches through one sudo
+rule to request a review (platform/decisions/0090,
+platform/specs/builder-runs-as-two-accounts).
+
+    sudo /opt/builder/libexec/review-launch --repo <owner/name> --pr <N> \\
+        --role {reviewer,security-reviewer} --run-id <id>
+
+As root: mints a read-only installation token from the approver App's key
+(`etc/approver-app.pem`, owned by root, mode 600 — never read by `agents` or
+`reviewers`), fetches the PR and the diff pinned to its head, and writes
+both to the run directory as files. Builds the session's persona and task
+itself (`review_launch.build_prompt`) from what it just fetched — nothing
+here comes from this process's own argv, environment or inherited stdin —
+and runs it as the `reviewers` account (`ClaudeSession`, below) from a
+fresh, per-run `CLAUDE_CONFIG_DIR` with `--setting-sources user`, so a PR
+that ships a `SessionStart` hook cannot run it. Reads the session's verdict
+back from ITS OWN stdout (round 4 of #732, finding 2 — never a file under
+the run directory; see `review_launch.extract_verdict`'s docstring), only if
+that session itself exited 0, re-reads the PR's current base, mints a
+write-scoped token, posts the PR comment and (only when the base was `main`
+at both fetch and post) the `builder/review/<role>` check, and revokes both
+tokens.
+
+ALL ORCHESTRATION LOGIC IS IN `review_launch.py` (`lib/agent-platform/`).
+This file supplies the real GitHub calls, the real key path and a real
+`claude -p` subprocess; every test fakes all three, so no test here touches
+the approver key, runs `sudo`, or makes a network call.
+
+THE SHEBANG IS AN ABSOLUTE PATH, NOT `#!/usr/bin/env python3.11` (round 2 of
+#732, finding 5): `env` resolves `python3.11` by searching `PATH`, and this
+script is reached only through `sudo`, whose `env_reset` (kept — platform/
+specs/builder-runs-as-two-accounts Handoff) sets `PATH` from sudoers'
+`secure_path` if one is configured and otherwise falls back to a default
+that this script must not depend on either way — the resolution should not
+hinge on how that separate file ends up configured. `libexec/review-launch`
+installs byte-for-byte from agent-platform's `main` with no per-platform
+rewrite (contrast `libexec/update-privileged`, whose exec line IS rewritten
+per platform at install time), so the path committed here is the one that
+has to be correct on the install it actually runs on. `tests/
+test_bin_shebangs.py`'s `ALLOWED` carries this exemption next to
+`co-session-health`'s, for the same reason: neither file is ever symlinked
+into `~/.local/bin` across arbitrary machines the way an ordinary `bin/`
+command is.
+
+THE `-I` IS ROUND 3 OF #732's ADDITION TO THAT SAME SHEBANG (finding 2): it
+puts the interpreter in isolated mode — no `PYTHONPATH`, no user site
+directory, `sys.path` built from the script's own location only — which
+matters here specifically because this interpreter (`/opt/homebrew/bin/
+python3`) is owned by the OPERATOR's account, not root's (platform/decisions/
+0090's catch: "Root runs an interpreter the operator's account owns...the
+`admin` group can write its `bin`"). `-I` does not change who owns the
+binary itself, but it does stop a `PYTHONPATH` or a `~/.local/lib/python*/
+site-packages` entry — either one plantable by anything in `admin`, which
+`agents` is not, so this is belt-and-suspenders rather than this finding's
+main fix — from being consulted by a process that runs as root.
+
+THIS PROCESS'S ENTIRE ENVIRONMENT IS REPLACED BEFORE ANYTHING ELSE IMPORTS
+(round 3 of #732, finding 2; moved earlier in round 4, finding 5): `sudo`'s
+`env_reset` (kept) decides what survives from the caller only via
+`/etc/sudoers`, which this script must not have to trust either way — see
+the shebang note above for the same argument applied to `PATH`
+specifically. At round 3's head this replacement was `main()`'s first act,
+AFTER `import review_launch as RL` below — but that import's own chain
+(`review_protocol` -> `telemetry` -> `builder_root.runs_root()`) reads
+`BUILDER_ROOT` from `os.environ` at IMPORT time, before `main()` ever got a
+chance to replace it. `sudo`'s `env_reset` already drops that variable
+before this process even starts, so nothing was exploitable through it
+either way (confirmed: round 4's security review read the import chain and
+found no effect), but the read should not have to depend on that separate
+file's configuration any more than the shebang's absolute path does. The
+replacement now runs guarded by `if __name__ == "__main__":`, ahead of the
+`import review_launch` below, rather than unconditionally at module scope —
+this file is also loaded as an ordinary module by the test suite (`tests/
+conftest.py`'s `review_launch_bin` fixture), which must not have its OWN
+process environment wiped out as a side effect of importing a module under
+test; `__name__` there is the module's given name, never `"__main__"`.
+Clearing `os.environ` and replacing it with a fixed, minimal,
+root-owned-paths-only dict before anything else runs means every subprocess
+this process (or a module it imports) spawns without its own explicit
+`env=` — today, only `github_app.app_jwt`'s `openssl` call — inherits that
+fixed environment regardless of what `/etc/sudoers` does or does not keep.
+"""
+from __future__ import annotations
+
+import os
+import pwd
+import select
+import signal
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+# Root-owned directories only; `/opt/homebrew` (the OPERATOR-owned
+# interpreter's own tree) is deliberately not on it. Defined ahead of the
+# `import review_launch` below — see the module docstring's "THIS PROCESS'S
+# ENTIRE ENVIRONMENT IS REPLACED BEFORE ANYTHING ELSE IMPORTS".
+_ROOT_ENV = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/var/root"}
+
+if __name__ == "__main__":
+    os.environ.clear()
+    os.environ.update(_ROOT_ENV)
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import review_launch as RL  # noqa: E402
+
+OWNER = "convivy"
+
+# `/opt/builder` is root-owned and fixed (platform/specs/builder-runs-as-two-
+# accounts Handoff: "Root-owned tree /opt/builder"), never home-relative: this
+# script is reachable only through the one sudo rule
+# (`agents ALL=(root) NOPASSWD: /opt/builder/libexec/review-launch`), so it
+# always runs as root, and `builder_root.real_account_home()` on that path
+# would answer root's own home (`/var/root` on macOS) — a different, wrong
+# location every time, never the tree Shipwright's installer actually
+# populates. Contrast `bin/pr-state-capture`'s KEY_PATH, which is genuinely
+# home-relative because the `agents` account's own key lives under its home.
+KEY_PATH = Path("/opt/builder/etc/approver-app.pem")
+
+# The reviewers' own Claude token (platform/specs/builder-runs-as-two-accounts
+# Handoff: "root-owned, exported only into the session").
+CLAUDE_TOKEN_PATH = Path("/opt/builder/etc/reviewers-claude-token")
+
+# The account the reviewer session runs as (platform/decisions/0090's second
+# account). Round 2 of #732, finding 2: `ClaudeSession` below drops to this
+# account before `claude -p` ever starts — this script itself runs as root
+# (from `sudo`), but nothing a reviewer session does should.
+REVIEWERS_ACCOUNT = "reviewers"
+
+# How much of the session's stdout `ClaudeSession.run` asks the pipe for in
+# one `read()` call. Deliberately smaller than `RL.MAX_SESSION_STDOUT_BYTES`
+# so the bound below (`min(_READ_CHUNK, max_bytes + 1 - total)`) can shrink
+# the final request to just enough to detect an overflow by one byte,
+# rather than always asking for a full chunk past the cap.
+_READ_CHUNK = 65536
+
+
+def _readable(stream, timeout: float) -> bool:
+    """True once `stream` has data (or EOF) ready, or `timeout` seconds have
+    passed with nothing — the default `select_fn` `ClaudeSession.run` polls,
+    so its read loop never blocks longer than the time still left before
+    `RL.SESSION_TIMEOUT_S` (round 5 of #732) WAITING FOR READINESS. `select`
+    itself was never the gap round 6 of #732 closes — see `ClaudeSession.run`'s
+    docstring for the read call that followed it instead. Injected the same
+    way `getpwnam`/`popen` already are, so a test can fake session output
+    without a real pipe or process — see `tests/test_review_launch_bin.py`."""
+    ready, _, _ = select.select([stream], [], [], timeout)
+    return bool(ready)
+
+
+def _kill_process_group(proc) -> None:
+    """Kills `proc`'s entire process group, not just `proc`'s own pid (round
+    6 of #732). `run` starts every session with `start_new_session=True`
+    precisely so this is possible without also signalling THIS (root)
+    process's own group: a `claude -p` session can fork a grandchild that
+    inherits the stdout pipe and never leaves the leader's own process
+    group (no `setsid` of its own), and killing only the named child would
+    leave that grandchild running (and the pipe open) behind it.
+
+    ROUND 8 OF #732, THE SECURITY REVIEWER'S ROUND-7 FINDING CORRECTS A
+    FALSE CLAIM THIS DOCSTRING AND `ClaudeSession.run`'S BOTH USED TO MAKE:
+    this kill does NOT reach "a tool-call subprocess the session spawned".
+    On the reviewer's machine (Claude Code 2.1.287), the Bash tool starts
+    each command it runs in ITS OWN process group, distinct from `claude`'s
+    — `os.killpg(proc.pid, ...)` never reaches a Bash-tool command or
+    anything that command backgrounds, on any exit path. What this kill
+    actually reaches is the session leader and any descendant that stays in
+    the LEADER's group, such as a plain `os.fork()` child that never starts
+    a session of its own — the case the paragraph above describes.
+    Containment that also covered a Bash-tool command would have to hold by
+    uid (ending every process the `reviewers` account owns), which is a
+    design question for `platform/specs/builder-runs-as-two-accounts`, not
+    a round-8 code change — a uid-based kill would also end a concurrent
+    review sharing that account, which the spec currently accepts.
+
+    ROUND 7 OF #732, THE SECURITY REVIEWER'S ROUND-6 FINDING: at round 6's
+    head (e41fcdca) this called `os.killpg(os.getpgid(pid), SIGKILL)` —
+    looking up `pid`'s OWN pgid before signalling it, rather than using the
+    pgid this process already knows (`start_new_session=True` makes it
+    equal `proc.pid`, for the life of the group). On macOS, `os.getpgid(pid)`
+    raises `ProcessLookupError` once `pid` — the leader — has exited, EVEN
+    WHILE another member of the same group is still alive: the group's
+    existence does not depend on the one process whose pid happens to equal
+    its pgid still being around to answer a lookup about itself. The
+    reviewer reproduced this directly (`ps -g` showing the leader
+    `<defunct>` with a `sleep` still alive in the same group) and confirmed
+    `os.killpg(proc.pid, SIGKILL)` — skipping the lookup — killed it. This
+    now calls `killpg` on `proc.pid` directly; `ProcessLookupError` from
+    THAT call (never from a `getpgid` lookup, which no longer happens) means
+    the whole group, leader included, is already gone, which is simply
+    nothing left to signal.
+
+    Tolerates a fake `proc` with no real `pid` (the test doubles in `tests/
+    test_review_launch_bin.py`) via the `getattr` below. `proc.kill()`
+    still runs afterward — every test double implements it, and for a real
+    `proc` it is a harmless, redundant signal to a pid `killpg` above
+    already covers (the leader is always a member of its own group)."""
+    pid = getattr(proc, "pid", None)
+    if pid is not None:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+    proc.kill()
+
+
+class _Terminated(Exception):
+    """Raised by `_handle_terminate` so a `SIGTERM`, `SIGHUP` or `SIGINT`
+    this (root) process receives unwinds through the SAME `finally` blocks
+    an ordinary exception would, rather than ending the process immediately
+    with none of them run (round 7 of #732, finding 3). `ClaudeSession.run`'s
+    own `finally` already kills the session's process group and bounds the
+    closing `wait()` on any exception raised while it is blocked in
+    `self._select` or the read — this makes a signal one of those, instead
+    of a case neither `run` nor `RL.main`'s own token-revoking `finally`
+    blocks ever see. `agentctl kill` reaches this process by having `sudo`
+    forward the SIGTERM a plain `kill <pid>` sends; SIGHUP is handled the
+    same way since nothing here gives it a different disposition than the
+    default (terminate, no cleanup) that is exactly the gap this closes.
+
+    ROUND 8 OF #732, THE CODE REVIEWER'S ROUND-7 FINDING CORRECTS WHAT THIS
+    CLOSES FOR SIGINT SPECIFICALLY: CPython installs its own default SIGINT
+    handler at interpreter startup, which already raises `KeyboardInterrupt`
+    — itself unwinding through the same `try`/`finally` chains this handler
+    does. Installing `_handle_terminate` for SIGINT does not close a
+    cleanup gap SIGINT already had; it normalises SIGINT's exit code and
+    exception type to match SIGTERM and SIGHUP's, so all three leave this
+    process the same way."""
+
+
+def _handle_terminate(signum, frame):  # noqa: ARG001 — frame unused; signal.signal requires it
+    # Round 8 of #732, the security reviewer's round-7 finding 1 (the second
+    # window): set all three to their default ignored disposition BEFORE
+    # raising, so a second SIGTERM/SIGHUP/SIGINT that lands while `run`'s
+    # `finally` is still unwinding the first one — anywhere in it, `os.
+    # killpg` included — cannot re-enter this handler and replace the
+    # exception already propagating with a fresh one. Only the signal that
+    # gets here first ever unwinds anything; every later one is silently
+    # dropped, which is exactly what should happen to a session that is
+    # already on its way out.
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, signal.SIG_IGN)
+    raise _Terminated(signum)
+
+
+class ClaudeSession:
+    """The real reviewer session. Round 2 of #732, finding 2: constructed as
+    root, but `run` drops to `REVIEWERS_ACCOUNT` before `claude -p` ever
+    starts, and `home()` reads that account's OWN passwd entry rather than
+    this (root) process's `$HOME` or `os.path.expanduser("~")`, either of
+    which would answer root's home instead. `stdin=subprocess.DEVNULL`
+    (finding 1) is what stops the session from inheriting whatever is
+    sitting on the sudo caller's own stdin — `review_launch.build_prompt`
+    already supplies the session's entire task as the command's final
+    argument, so there is nothing for stdin to usefully carry anyway.
+
+    ROUND 3 OF #732, FINDING 1 CORRECTS A FALSE CLAIM THIS DOCSTRING USED TO
+    MAKE: `subprocess.run(user=..., group=...)` does NOT "perform its own
+    setgroups" — CPython only calls `setgroups()` when `extra_groups` is
+    ALSO given; `user=`/`group=` alone only call `setreuid`/`setregid`, and
+    the child keeps every supplementary group THIS (root) process belongs to.
+    Root is in `admin` (platform/decisions/0090's catch: "`admin` group can
+    write its `bin`" — this machine's `/opt/homebrew/bin`, this very
+    interpreter's own directory), so without `extra_groups` the dropped-
+    privilege reviewer session would still carry `admin` membership — able to
+    plant code a FUTURE root-run `review-launch` would execute, the same
+    class of escalation finding 2's `-I`/environment-lockdown closes from a
+    different angle. `run` below passes `extra_groups=` computed from the
+    `reviewers` account's OWN group list (`os.getgrouplist`, injected the
+    same way `getpwnam`/`popen` already are), which is what actually makes
+    `setgroups()` run — and run with THAT account's groups, not root's.
+
+    ROUND 4 OF #732, FINDING 1 REMOVES THE `chown` INJECTION ENTIRELY: at
+    round 3's head (09642bed) `run` itself chowned the run directory and
+    every pre-existing entry in it to `self._account` before starting the
+    subprocess — making the run directory WRITABLE by `reviewers` is the one
+    precondition every attack the round-4 security review found (hardlinking
+    a root-owned file into it, or renaming the whole directory away and
+    leaving a symlink at its old name) needed in the first place.
+    `review_launch.prepare_run_dir` now creates AND owns every entry the
+    session needs — `pr.json`, `diff.patch`, `worktree/`, `claude/` — itself,
+    by file descriptor, before `RL.main` ever calls this method, and leaves
+    the run directory itself root-owned and non-writable by anyone else (see
+    `prepare_run_dir`'s own docstring). `run` below creates nothing and
+    chowns nothing; it only drops privilege and starts the subprocess.
+
+    ROUND 5 OF #732, FINDING 2 REPLACES `subprocess.run(stdout=PIPE,
+    timeout=...)` WITH `subprocess.Popen` AND `run`'S OWN BOUNDED READ LOOP:
+    at round 4's head (309d2e38) `subprocess.run`'s `stdout=subprocess.PIPE`
+    captured the ENTIRE child stdout into memory before returning at all —
+    so `RL.MAX_SESSION_STDOUT_BYTES` only ever bounded what `RL.extract_verdict`
+    would later refuse to PARSE, after root had already read and held an
+    unbounded amount of a steered or runaway session's own output, which is
+    not what that constant's own docstring claims it bounds. `run` below
+    instead reads the child's stdout itself, a chunk at a time, enforcing
+    both `RL.MAX_SESSION_STDOUT_BYTES` and the `RL.SESSION_TIMEOUT_S`
+    deadline WHILE reading — the moment either is crossed, the session is
+    killed and nothing further is read. `popen`, `select_fn` and `monotonic`
+    are injected (defaulting to the real `subprocess.Popen`, `_readable`,
+    and `time.monotonic`) so a test can drive the read loop deterministically
+    — real session output and a real clock, without an actual pipe or
+    process, or a real multi-second wait for a timeout.
+
+    ROUND 6 OF #732, BOTH REVIEWS, SAME FINDING: round 5's read loop called
+    `proc.stdout.read(n)` after `self._select` reported the pipe ready, but
+    `Popen`'s default `bufsize=-1` makes `proc.stdout` an `io.BufferedReader`,
+    and `BufferedReader.read(n)` does NOT return once any data has arrived —
+    it keeps issuing raw reads until it has `n` bytes or hits EOF. A session
+    that writes a little output and then stalls (a hung API connection, a
+    steered child) left that one `.read()` call blocked past `remaining`,
+    with the deadline only re-checked after it returned — never, for a
+    session that never returns. Both reviews reproduced this against a real
+    pipe. `run` below now starts the child with `bufsize=0`, so `proc.stdout`
+    is a raw, unbuffered stream whose `.read(n)` is one `read(2)` syscall
+    that returns as soon as ANY data is available, exactly the semantics
+    `self._select` already assumed. The `finally` block also now kills
+    `proc`'s whole process group (`_kill_process_group`, via
+    `start_new_session=True` below), including an exception raised by
+    `self._select` or the read itself, and bounds the closing `proc.wait()`
+    by whatever of the deadline is left rather than waiting on it
+    unboundedly.
+
+    ROUND 7 OF #732 FIXES TWO THINGS BOTH REVIEWS' ROUND-6 FOLLOW-UP FOUND.
+
+    FIRST: at round 6's head (e41fcdca) the `finally` block above killed the
+    group only `if not clean_eof` — a session whose leader exits cleanly
+    (closing its own end of the pipe, so `run` sees ordinary EOF) while a
+    grandchild it spawned is still alive, and does not itself hold the pipe
+    open, got NO kill at all; the grandchild and anything it does next
+    (write into a LATER review's own run directory, say) simply keeps
+    running. The group is now killed on every exit from the loop, clean EOF
+    included — see `_kill_process_group`'s own docstring for the matching
+    fix to how it signals that group, which both reviews reproduced
+    together as one finding.
+
+    SECOND: the closing `proc.wait()`'s budget used to be `max(0.0,
+    remaining)`, where `remaining` is whatever the loop last computed —
+    at the TOP of whatever iteration last ran, before that iteration's own
+    `self._select` call (which can itself block for up to that same
+    `remaining` seconds). A session whose pipe closes late in that blocked
+    call reaches the `finally` block with `remaining` still holding close to
+    the FULL value it had before the block, even though almost none of it
+    is actually left — so the wait below could run for nearly another whole
+    `SESSION_TIMEOUT_S` past the real deadline. `wait_budget` is now
+    `max(0.0, deadline - self._monotonic())`, a FRESH read of the clock at
+    the point of waiting, never the loop's last snapshot of it — the
+    `max(0.0, ...)` clamp is exactly what makes a deadline already passed by
+    the time this runs wait for `0`, not "wait again" the way round 6's own
+    docstring wrongly argued a fresh clock read would.
+
+    ROUND 8 OF #732, THE SECURITY REVIEWER'S ROUND-7 FOLLOW-UP FINDING
+    CLOSES TWO SIGNAL WINDOWS ROUND 7 LEFT OPEN, BOTH ON THE PATH TO
+    `_kill_process_group` EVER RUNNING AT ALL.
+
+    FIRST, THE STARTUP WINDOW: at round 7's head (b9828a78) `self._popen(...)`
+    ran with SIGTERM/SIGHUP/SIGINT at their round-7 disposition (the
+    handler installed in `main`), and `proc` was not under any `try`/
+    `finally` of `run`'s own until several lines later. A signal landing
+    inside `Popen` itself (the reviewer measured ~1.2ms there) or in the
+    gap right after it returns raised `_Terminated` with no `finally` yet
+    able to see `proc`, leaving the session's whole process group running
+    with nothing left to end it. `run` below now blocks all three signals
+    with `signal.pthread_sigmask(SIG_BLOCK, ...)` before calling
+    `self._popen`, passes a `preexec_fn` that unblocks them again in the
+    CHILD before it execs (so the reviewer session is not left with these
+    three permanently blocked), and unblocks them again in THIS process as
+    the very FIRST statement inside the `try` whose `finally` kills
+    `proc`'s group — not right after `Popen` returns, which would just
+    reopen the same gap a few lines later. A signal that arrived while
+    blocked is delivered the moment it is unblocked, which is now always
+    already inside that `try`.
+
+    SECOND, A SIGNAL DURING CLEANUP ITSELF: the handler stayed installed
+    for the whole of `finally`'s own execution, so a second signal landing
+    after the first one had already started unwinding — before `os.killpg`
+    in `_kill_process_group` got to run — raised AGAIN from inside the
+    still-executing `finally`, replacing the exception already propagating
+    and abandoning the group kill it was in the middle of. `_handle_
+    terminate` now sets all three signals to `SIG_IGN` as its own first
+    act, before it raises — so only the signal that gets there first ever
+    unwinds anything, and nothing after it can interrupt the cleanup that
+    first signal's `_Terminated` is already running.
+
+    Both windows are exercised with real subprocesses and a deterministic
+    hook rather than a race against a timer: `after_popen=` and
+    `before_group_kill=` (both test-only, no-ops by default) let a test
+    fire a signal from exactly the point each finding names — see `tests/
+    test_review_launch_bin.py`.
+
+    `getpwnam` and `popen` are injected (defaulting to the real `pwd`/
+    `subprocess` calls) so a test can fake the account and the subprocess
+    without being root or having a `reviewers` account to look up — see
+    `tests/test_review_launch_bin.py`."""
+
+    def __init__(self, *, oauth_token_path: Path, account: str = REVIEWERS_ACCOUNT,
+                getpwnam=pwd.getpwnam, popen=subprocess.Popen, getgrouplist=os.getgrouplist,
+                select_fn=_readable, monotonic=time.monotonic,
+                after_popen=lambda proc: None, before_group_kill=lambda: None):
+        self._oauth_token_path = oauth_token_path
+        self._account = account
+        self._pwent = getpwnam(account)
+        self._popen = popen
+        self._getgrouplist = getgrouplist
+        self._select = select_fn
+        self._monotonic = monotonic
+        # Round 8 of #732: test-only, no-op-by-default hooks that let a
+        # test fire a signal from exactly the startup window or exactly the
+        # top of `finally`, rather than racing a timer against either one —
+        # see `run`'s own docstring and `tests/test_review_launch_bin.py`.
+        self._after_popen = after_popen
+        self._before_group_kill = before_group_kill
+
+    def home(self) -> Path:
+        return Path(self._pwent.pw_dir)
+
+    def owner(self) -> "tuple[int, int]":
+        """`(uid, gid)` for `self._account` — what `review_launch.main`
+        passes to `review_launch.prepare_run_dir` (round 4 of #732, finding
+        1) so root chowns the run's fixed children to the RIGHT account
+        without this module needing to look it up a second time."""
+        return (self._pwent.pw_uid, self._pwent.pw_gid)
+
+    def env(self, *, claude_config_dir: Path, home: Path) -> "dict[str, str]":
+        try:
+            token = self._oauth_token_path.read_text().strip()
+        except OSError:
+            token = ""
+        return RL.session_env(claude_config_dir=claude_config_dir, oauth_token=token, home=home)
+
+    def run(self, *, cmd: "list[str]", env: "dict[str, str]", cwd: Path) -> "tuple[int, str | None]":
+        """Runs `cmd` as `self._account` and reads the session's verdict
+        from its OWN stdout (round 4 of #732, finding 2) — never a file
+        under `cwd`'s run directory; see `review_launch.extract_verdict`'s
+        docstring for why. `review_launch.prepare_run_dir` has already
+        created and owned `cwd` and its siblings by the time this runs; this
+        method creates nothing and chowns nothing.
+
+        `extra_groups=` is what makes `setgroups()` actually run in the
+        child (see the class docstring's finding-1 correction) — without it
+        the child keeps every supplementary group THIS (root) process
+        belongs to, `admin` included.
+
+        ROUND 5 OF #732, FINDING 2: this no longer hands the whole run to
+        `subprocess.run(timeout=...)` and reads `.stdout` from the completed
+        result — that buffers every byte the child ever writes before this
+        method sees any of them. Instead, `self._popen` starts the child
+        with `stdout=subprocess.PIPE`, and the loop below reads it a chunk
+        (`_READ_CHUNK` bytes) at a time, tracking a running total and a
+        deadline (`self._monotonic() + RL.SESSION_TIMEOUT_S`, read once, up
+        front). Each read is capped at `max_bytes + 1 - total` — never more
+        than one byte past `RL.MAX_SESSION_STDOUT_BYTES` — so an oversized or
+        runaway session's output is detected, and the session killed, before
+        this process ever buffers meaningfully more than the cap.
+
+        ROUND 6 OF #732, BOTH REVIEWS: round 5's claim that "a session that
+        has gone quiet is caught by `self._select` returning false for the
+        time remaining" was false for a session that writes a LITTLE output
+        and then goes quiet — `self._select` correctly reports the pipe
+        ready, but the `proc.stdout.read(...)` call that followed it was a
+        `BufferedReader.read(n)` (the `Popen` default, `bufsize=-1`), which
+        keeps reading until it has `n` bytes or hits EOF, not until it has
+        ANY bytes. That one call could then block past `remaining` with no
+        way back to the top of the loop to notice. `self._popen` below is
+        now given `bufsize=0`, so `proc.stdout` is a raw, unbuffered stream:
+        once `self._select` reports it ready, `.read(n)` is one `read(2)`
+        syscall that returns with whatever is available (1 byte or more),
+        never waiting for a full chunk. `start_new_session=True` makes the
+        child its own process group leader, so the `finally` block below can
+        kill that whole group (`_kill_process_group`) — covering a forked
+        grandchild that never leaves the leader's group, not just the
+        session's own pid (see `_kill_process_group`'s own docstring, round
+        8 of #732, for what this reaches and does not) — including an
+        exception raised by `self._select` or the read itself
+        (the exception is not swallowed: `finally` just makes sure cleanup
+        happens before it keeps propagating). If the bounded wait below
+        itself times out, the group is killed again and the final
+        `proc.wait()` has no bound left to give, since the group is by then
+        dead or dying. Either bound crossed discards whatever was read: a
+        killed session reports exit code 124 (timeout) or 125 (output past
+        the cap) with no verdict, which `RL.main` already treats as "no
+        verdict trusted" the same way any other non-zero exit does.
+
+        ROUND 7 OF #732 CLOSES TWO GAPS BOTH REVIEWS' ROUND-6 FOLLOW-UP FOUND
+        — see `_kill_process_group`'s and this class's own docstring for the
+        full account of each. FIRST: the group kill below no longer runs
+        only `if not clean_eof` — a session whose own leader exits cleanly,
+        leaving a grandchild it spawned alive in the group, used to get no
+        kill at all; it now runs on every exit from the loop, clean EOF
+        included. SECOND: `wait_budget` is now computed from a fresh
+        `self._monotonic()` call at the point of waiting, `max(0.0, ...)`-
+        clamped, rather than reused from `remaining`'s last value from the
+        loop — which could be stale by nearly a full `self._select` call's
+        worth of time if the pipe closed late inside that call, making the
+        wait below run for close to another whole `RL.SESSION_TIMEOUT_S`
+        past the real deadline. A SIGTERM/SIGHUP/SIGINT this process
+        receives while blocked in `self._select` or the read raises
+        `_Terminated` (module-level, installed in `main` below) through the
+        exact same `finally` path — the signal is one more way an exception
+        can interrupt this loop, not a separate mechanism.
+
+        ROUND 8 OF #732 CLOSES TWO MORE SIGNAL WINDOWS — see `ClaudeSession`'s
+        own docstring for the full account of both. FIRST: all three signals
+        are now blocked (`signal.pthread_sigmask(SIG_BLOCK, ...)`) before
+        `self._popen` is even called, and unblocked again only as the first
+        statement inside the `try` below — never right after `self._popen`
+        returns, which is exactly the gap that used to leave `proc` started
+        but unprotected. The `preexec_fn` passed to `self._popen` unblocks
+        them again in the CHILD before it execs, so the reviewer session
+        itself does not inherit them blocked. SECOND: `_handle_terminate`
+        now disables all three signals (`SIG_IGN`) before it ever raises,
+        so a second signal arriving anywhere in the `finally` below —
+        including inside `_kill_process_group` or either `proc.wait()` —
+        cannot re-enter the handler and abandon the group kill partway
+        through."""
+        gid = self._pwent.pw_gid
+        extra_groups = self._getgrouplist(self._account, gid)
+        block_signals = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+        # Round 8 of #732, the security reviewer's round-7 finding 1 (the
+        # startup window): block these three around `Popen` itself, so a
+        # signal that lands during it, or between it returning and the
+        # `try:` below taking ownership of `proc`, is deferred rather than
+        # raised with no `finally` yet able to see `proc` at all.
+        signal.pthread_sigmask(signal.SIG_BLOCK, block_signals)
+        try:
+            proc = self._popen(cmd, env=env, cwd=str(cwd), stdin=subprocess.DEVNULL,
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               user=self._account, group=self._account,
+                               extra_groups=extra_groups, bufsize=0,
+                               start_new_session=True,
+                               preexec_fn=lambda: signal.pthread_sigmask(
+                                   signal.SIG_UNBLOCK, block_signals))
+        except BaseException:
+            # `self._popen` itself failed (never a signal — those are still
+            # blocked) — nothing was started, but THIS process must not be
+            # left with these three permanently blocked for the rest of its
+            # life, so restore them before the failure propagates.
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, block_signals)
+            raise
+        # Round 8 of #732: a test-only, no-op-by-default hook fired exactly
+        # here — `proc` exists, signals are still blocked, nothing protects
+        # it yet — so a test can demonstrate the startup window without
+        # racing a timer. See `ClaudeSession`'s own docstring.
+        self._after_popen(proc)
+        max_bytes = RL.MAX_SESSION_STDOUT_BYTES
+        deadline = self._monotonic() + RL.SESSION_TIMEOUT_S
+        chunks: "list[bytes]" = []
+        total = 0
+        timed_out = False
+        overflowed = False
+        try:
+            # Round 8 of #732: unblocked here, as the FIRST statement inside
+            # the try/finally that now owns `proc` — a signal still pending
+            # from the blocked window above, or one that lands the instant
+            # this call returns, is delivered at or after this point, which
+            # is to say already inside this `try`, where the `finally`
+            # below is already in effect.
+            signal.pthread_sigmask(signal.SIG_UNBLOCK, block_signals)
+            while True:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    break
+                if not self._select(proc.stdout, remaining):
+                    continue
+                data = proc.stdout.read(min(_READ_CHUNK, max_bytes + 1 - total))
+                if not data:
+                    break  # EOF: the session's own process closed stdout
+                total += len(data)
+                chunks.append(data)
+                if total > max_bytes:
+                    overflowed = True
+                    break
+        finally:
+            # Round 8 of #732: a test-only, no-op-by-default hook fired as
+            # the first statement of this `finally`, before the group kill
+            # — lets a test demonstrate a second signal landing during
+            # cleanup without racing a timer. See `ClaudeSession`'s own
+            # docstring.
+            self._before_group_kill()
+            # Round 7 of #732: killed on EVERY exit, clean EOF included —
+            # the leader closing its own stdout cleanly says nothing about
+            # whether a grandchild it spawned is still alive in the group.
+            _kill_process_group(proc)
+            # Round 7 of #732: a FRESH clock read, not the loop's last
+            # `remaining` snapshot — see this method's own docstring.
+            wait_budget = max(0.0, deadline - self._monotonic())
+            try:
+                proc.wait(timeout=wait_budget)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
+                proc.wait()
+            proc.stdout.close()
+
+        if timed_out:
+            return 124, None
+        if overflowed:
+            return 125, None
+        return proc.returncode, RL.extract_verdict(b"".join(chunks), max_bytes=max_bytes)
+
+
+def main(argv=None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    # Round 7 of #732, finding 3: `agentctl kill` reaches this process as a
+    # plain SIGTERM, which `sudo` forwards unchanged — with no handler
+    # installed, the default disposition ends this (root) process at once,
+    # running neither `ClaudeSession.run`'s process-group kill nor `RL.main`'s
+    # own token-revoking `finally` blocks, so the session it started keeps
+    # running, orphaned, with no deadline left to end it. Installing a
+    # handler that raises `_Terminated` turns the signal into an ordinary
+    # exception that unwinds through those SAME `finally` blocks instead.
+    # SIGHUP gets the same handler for the same reason: nothing here gives
+    # it a different, safer default than SIGTERM's. SIGINT also gets this
+    # handler, but round 8 of #732 (the code reviewer's round-7 finding)
+    # corrects what that closes: CPython's own default SIGINT handler
+    # already raises KeyboardInterrupt, which already unwinds through the
+    # same finally blocks — installing this handler for SIGINT normalises
+    # its exit code and exception type to match the other two, it does not
+    # close a cleanup gap SIGINT already had.
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(sig, _handle_terminate)
+    gate = RL.ProductionGate(key_path=KEY_PATH, app_id=RL.APPROVER_APP_ID, owner=OWNER,
+                             opener=urllib.request.urlopen)
+    session = ClaudeSession(oauth_token_path=CLAUDE_TOKEN_PATH)
+    # Run directories live under the `reviewers` account's OWN home
+    # (platform/specs/builder-runs-as-two-accounts Handoff: "Session start:
+    # CLAUDE_CONFIG_DIR=<REVIEWERS_ACCOUNT's home>/runs/<run-id>/claude"), never under
+    # the root-owned `/opt/builder` tree — `review_launch.prepare_run_dir`
+    # chowns `pr.json`/`diff.patch`/`worktree/`/`claude/` to that account
+    # (never the run directory itself — round 4 of #732, finding 1) once
+    # `ClaudeSession.owner()` tells it who to chown them to.
+    try:
+        return RL.main(argv, gate=gate, session=session,
+                       run_dir_for=lambda run_id: session.home() / "runs" / run_id)
+    except _Terminated as e:
+        # The process-group kill and any token revocation already ran, via
+        # the `finally` blocks the exception unwound through on its way
+        # here. The conventional 128+signum exit status is all that is
+        # left to report.
+        return 128 + int(e.args[0])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

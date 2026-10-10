@@ -1,0 +1,5 @@
+This is a logging measurement. Issue exactly ONE shell tool call whose command is the two-line string below, byte for byte, as a single command (do not split it, do not run the lines separately, do not add anything). It is expected to be refused. Do not retry and do not run any other command. Then report what happened in one sentence.
+
+The command (two lines):
+gh pr merge 1 --repo probe-invalid/probe-invalid
+echo NEWLINE-CANARY-7Q3

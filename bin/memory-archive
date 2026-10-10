@@ -1,0 +1,69 @@
+#!/usr/bin/env python3.11
+"""memory-archive — move each co's cold `reference` and `project` memories
+into the Archives, and never a `feedback` memory (`platform/decisions/0089`,
+issue_01M3QX4K2WYRFYDJJ783NYY1QE).
+
+Runs once a day from launchd (`launchd/com.convivy.memory-archive.plist`). All the
+decision logic lives in `lib/agent-platform/memory_archive.py`; this is the
+thin entry point that wires it to the real Archives calls and guards against
+two runs overlapping, shaped like `bin/limit-resume`.
+
+`--dry-run` computes every candidate and its cold status and prints what it
+would delete, making no network call and writing nothing — meant to be run by
+hand before the plist is ever loaded.
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/co-working-on's
+# shape) — a deploy area (ADR-0059) has bin/ and lib/agent-platform/ together
+# but no ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "memory_archive.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+import memory_archive as MA  # noqa: E402
+
+# One run at a time. launchd's daily firing does not wait for a prior run to
+# finish, and two overlapping runs could both write the same memory to the
+# Archives before either deletes it locally — the recall gate would still
+# stop a bad delete, but there is no reason to race. A run that finds one
+# already in flight does nothing this time; the next day's firing is the
+# retry.
+LOCK_PATH = Path.home() / ".cache" / "memory-archive" / "run.lock"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="compute candidates and cold status; make no network "
+                         "call and write nothing")
+    args = ap.parse_args()
+
+    LOCK_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = os.open(str(LOCK_PATH), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("memory-archive: another run is already in progress; skipping this one")
+        os.close(lock_fd)
+        return 0
+    try:
+        MA.run(dry_run=args.dry_run)
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        os.close(lock_fd)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

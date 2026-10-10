@@ -1,0 +1,37 @@
+# Tool config only — agent-platform is a scripts repo (bin/ + lib/), not a
+# packaged library, so there is no [build-system]. This file exists to give
+# pytest + ruff a home for the Phase A test foundation (substrate ARCH-098).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+[tool.coverage.run]
+# Measure the importable platform lib — the bin/ CLIs are exercised too but load
+# via importlib paths, so the lib is the clean testable core. CI runs
+# `pytest --cov --cov-report=json` and uploads coverage.json as the `coverage`
+# artifact → the substrate code-health dashboard's Cov% (ARCH-111).
+source = ["lib/agent-platform"]
+omit = ["tests/*"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# Ruff's default set (E4/E7/E9/F). CI now lints the whole tree (`ruff check .`),
+# so bug-classes (F: unused/undefined names, E9: syntax) are caught in the actual
+# platform source — not just tests/.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# The platform scripts (bin/ + lib/) deliberately use a compact one-liner style
+# (single-line try/except, `;`-joined statements, lambda-assigned helpers). That
+# predates linting and is intentional — ignore the *stylistic* E7 codes there
+# while still enforcing the bug-classes (F + E9). tests/ are held to the full set.
+"bin/*" = ["E701", "E702", "E731", "E741"]
+"lib/**" = ["E701", "E702", "E731", "E741"]
+# knowledge-watcher must put its lib dir on sys.path BEFORE importing from it, so
+# its imports cannot be at the top of the file. E402 is correct in general and
+# wrong here specifically.
+"bin/knowledge-watcher" = ["E701", "E702", "E731", "E741", "E402"]

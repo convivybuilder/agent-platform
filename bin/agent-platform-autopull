@@ -1,0 +1,602 @@
+#!/bin/zsh
+# agent-platform-autopull — keep the PRIMARY CHECKOUT current with
+# origin/main, AND drive the Bosun's shared deploy area off of it
+# (platform/decisions/0059; issue_01M19RRWSS9ETR09N9M2BJPA0Q). This is the
+# Bosun's continuous-deployment watcher: the operator chose full CD over an explicit
+# install step, so nothing here needs a human to notice main moved.
+#
+# Run by launchd (com.convivy.agent-platform-autopull, every 10min).
+#
+# WHY THIS EXISTS. `~/.local/bin` and `~/.local/lib/agent-platform` are symlinks
+# into this repo's WORKING TREE (ARCH-229) — correct for a person re-invoking a
+# CLI tool while working on it (ADR-0059 rule 5), but not for a launchd job
+# firing unattended, which is production USE of whatever code sits there at
+# that instant. The 28-ish scheduled jobs enumerated in
+# issue_01M19RRWSS9ETR09N9M2BJPA0Q now point their plists at a SEPARATE deploy
+# area instead (~/.local/deploy/agent-platform-shared/), and this job is what
+# keeps that area current — merging to origin/main would otherwise deploy
+# nothing, exactly the gap that motivated this file in the first place for the
+# primary checkout itself.
+#
+# Measured 2026-07-28: this checkout sat 21 commits behind origin/main with five
+# fixes merged that day inert, including one whose entire purpose was to make a
+# silent parser failure loud. It cannot make anything loud while it is not
+# running. That is the failure this job prevents.
+#
+# ARCH-229 recorded the opposite hazard — a feature branch checked out here makes
+# UNMERGED code live to cron. Both directions come from the same symlink
+# coupling. The stale direction is the quieter one: unmerged code eventually
+# surprises somebody, while a stale checkout just looks like the fix did not work.
+#
+# WHAT IT REFUSES TO DO, and why each guard is here rather than "probably fine":
+#
+#   * Pull onto a branch other than main, or over a dirty tree. Either means a
+#     human is mid-something in the checkout that IS production. Fast-forwarding
+#     out from under them is how you lose uncommitted work, so this exits
+#     LOUDLY rather than silently skipping — a silent skip here reads exactly
+#     like a healthy quiet cycle, which is the state this job exists to end.
+#   * Pull while a run holds the primary checkout. `planning-orchestrator` runs
+#     in the primary rather than a worktree, so a fast-forward underneath it
+#     changes files mid-run. That defers quietly and retries next cycle, because
+#     unlike the guards above it resolves on its own.
+#   * Run install.sh. Symlinks are already correct for existing files, but a pull
+#     that ADDS a bin or changes a plist needs `install.sh` and, for plists, a
+#     `launchctl bootout` + `bootstrap` (ARCH-104: kickstart reuses the old job
+#     definition). Doing that unattended would copy over live launchd config, so
+#     the job reports what needs doing and leaves it to a human. This is
+#     narrower than that: refresh_deploy_area() below calls
+#     install-agent-platform-shared, which only copies bin/ and
+#     lib/agent-platform/ into the deploy area and never loads, unloads, or
+#     touches any plist — a code-only refresh needs no launchd interaction at
+#     all, so doing THAT unattended is safe where running install.sh unattended
+#     is not.
+#
+# THE ONE CONSTRAINT THAT MAKES THIS SAFE: this watcher must never READ the
+# deploy area it writes. Every guard, every git operation, and the call to
+# refresh_deploy_area() below runs against $REPO (the working tree this file
+# itself lives in, reached through the interactive ~/.local/bin symlink) —
+# never against ~/.local/deploy/agent-platform-shared. A deployed installer
+# that broke could not deploy its own fix; the tree is the one place
+# "reflect current work" is genuinely correct, because it is what repairs
+# everything else.
+#
+# SELF-MODIFICATION. The pull can rewrite this very file while it executes,
+# because bin/ is symlinked to the tree. Every function body is therefore parsed
+# in full at its closing brace, before the single top-level call at the bottom
+# runs, and the pull happens well inside main().
+#
+# The variable assignments and function definitions above main() are fine: they
+# complete before any git operation. What must NOT move to the top level is
+# executable logic or I/O — a top-level `source`, command substitution, or
+# function call added below could be read from a file the pull has already
+# rewritten underneath us.
+#
+# Logs at ~/.local/state/agent-platform/autopull.log.
+
+set -u
+
+# The checkout lives under the machine's root (company/decisions/0008). It is
+# resolved at the start of main(), not here: resolving it runs builder-root, a
+# command substitution, and nothing above main() may run one (SELF-MODIFICATION,
+# above). The script's own directory is captured here instead, because it is a
+# parameter expansion, and because inside a function zsh's $0 names the function.
+REPO=""
+_AUTOPULL_BIN=${0:A:h}
+# The library this checkout ships, preferred over the installed farm for the
+# same reason bin/knowledge-watcher prefers it: this script and the library it
+# was written against move together, and a Builder deploy area has bin/ and
+# lib/agent-platform/ together but no ~/.local farm at all. Existence-gated on
+# signal_client.py, which every heredoc below imports, so a wrong guess falls
+# back to the farm instead of importing nothing. A parameter expansion plus a
+# file test, not a command substitution — safe above main() for the same
+# reason _AUTOPULL_BIN is (SELF-MODIFICATION, above). Threaded into each
+# heredoc via AP_LIB_DIR, since __file__ does not exist under `python3 -`.
+_LIB_DIR=${_AUTOPULL_BIN:h}/lib/agent-platform
+[[ -f $_LIB_DIR/signal_client.py ]] || _LIB_DIR=$HOME/.local/lib/agent-platform
+# Set by main() on failure, read by the exit wrapper to emit a signal.
+_FAILURE_REASON=""
+_FAILURE_BRANCH=""
+_FAILURE_BEHIND=""
+LOGDIR=$HOME/.local/state/agent-platform
+LOG=$LOGDIR/autopull.log
+# Absolute: launchd's PATH does not include ~/.local/bin (ARCH-086).
+AGENTCTL=$HOME/.local/bin/agentctl
+
+# Top level rather than nested in main(), so the helpers below can call it
+# without depending on zsh leaking a nested definition into global scope.
+log() {
+    local ts
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    print -r -- "[$ts] $*" >>$LOG
+}
+
+# Emit a signal to the operating plane when the autopull exits non-zero.
+# Best-effort: a failing signal write must not mask the original exit code.
+# Uses a dedup_key so a condition persisting across many 10-minute cycles
+# produces one signal, not one per cycle.
+signal_failure() {
+    local branch=$1 behind=$2 reason=$3
+    AP_LIB_DIR=$_LIB_DIR python3 - "$branch" "$behind" "$reason" "${REPO:-unresolved}" <<'PYEOF' 2>/dev/null || true
+import sys, os, json, datetime as _dt
+sys.path.insert(0, os.environ['AP_LIB_DIR'])
+import signal_client as sc
+branch = sys.argv[1]
+behind = sys.argv[2]
+reason = sys.argv[3]
+body = {
+    'branch': branch,
+    'reason': reason,
+    'repo': sys.argv[4],
+}
+if behind:
+    body['commits_behind'] = int(behind)
+sc.post_structured(
+    kind='alert',
+    stream='agent-platform-autopull',
+    product='agent-platform',
+    body=json.dumps(body),
+    dedup_key=f'agent-platform-autopull-failure-{reason}-{branch}-{_dt.date.today().isoformat()}',
+)
+PYEOF
+}
+
+# Post an operational alert when the farm has dead/wrong drift — code running
+# from a non-primary checkout. Best-effort like signal_failure: a failing write
+# must not break the cycle. Dedup per day so a persistent state alerts once, not
+# once per 10-minute cycle.
+alert_farm_drift() {
+    local detail=$1
+    AP_LIB_DIR=$_LIB_DIR python3 - "$detail" "$REPO" <<'PYEOF' 2>/dev/null || true
+import sys, os, datetime as _dt
+sys.path.insert(0, os.environ['AP_LIB_DIR'])
+import signal_client as sc
+# `detail` is farm_check.py's captured stdout+stderr — subprocess output the
+# platform did not author — and this body renders on a tiered-readership page, so
+# it takes the same treatment as the other external-output call sites (escapes and
+# C0 stripped, credentials redacted). The 16th call site, missed by the original
+# sweep and neither treated nor listed as exempt (reviewer, #331).
+#
+# Not exempted on "farm_check only emits structured diagnostic lines today", which
+# is true and is a claim about a program that can change. Sanitising costs nothing
+# and does not have to be revisited when it does.
+# PER LINE, so the structure survives the treatment. `sanitise` collapses
+# newlines, and this is the one alert whose whole job is ENUMERATING what needs
+# manual repair — collapsed, three findings read as
+# "DEAD LINK: foo WRONG TARGET: bar DEAD LINK: baz" instead of three lines a
+# reader can scan. Each line is treated just as fully; only the joins survive
+# (reviewer, #331).
+detail = "\n".join(sc.sanitise(line) for line in sys.argv[1].splitlines() if line.strip())
+body = (
+    "agent-platform-autopull found the deployed lib farm out of sync with the primary checkout. "
+    "Every launchd job imports the platform from ~/.local/lib/agent-platform/, so links that point "
+    "at dead or wrong targets mean the machine is running library code from somewhere other than the "
+    "primary checkout — the state that served a feature-branch worktree's code to the whole overnight "
+    "wave on 2026-07-30. Details:\n" + detail +
+    "\nFix: run install.sh from " + sys.argv[2] + " (the primary checkout) to rebuild the farm, "
+    "or inspect and repair the listed links by hand."
+)
+sc.post_alert(
+    stream='agent-platform-autopull',
+    product='agent-platform',
+    body=body,
+    dedup_key=f'agent-platform-autopull-farm-drift-{_dt.date.today().isoformat()}',
+)
+PYEOF
+}
+
+main() {
+    mkdir -p $LOGDIR 2>/dev/null
+
+    # The machine's root, printed by the builder-root beside this script; HOME does
+    # not move it. FOR TESTS ONLY, `--root-config FILE` names the root through a
+    # session-agent.env, the one way a test moves it; launchd passes nothing, and
+    # builder-root refuses a config that names no root rather than printing the
+    # real one. An unresolvable root keeps nothing current, so it fails loudly.
+    local -a root_args=(--root)
+    if [[ ${1:-} == --root-config ]]; then
+        if [[ -z ${2:-} ]]; then
+            log "ERROR: --root-config needs a file"
+            _FAILURE_REASON="bad-args"
+            return 1
+        fi
+        root_args+=(--config "$2")
+    fi
+    local root
+    root=$("$_AUTOPULL_BIN/builder-root" "${root_args[@]}") && [[ -n $root ]] || {
+        log "ERROR: cannot resolve the machine's root ($_AUTOPULL_BIN/builder-root --root)"
+        _FAILURE_REASON="no-root"
+        return 1
+    }
+    REPO=$root/agent-platform
+
+    if [[ ! -d $REPO/.git ]]; then
+        log "ERROR: $REPO is not a git checkout; nothing to keep current"
+        _FAILURE_REASON="not-a-git-checkout"
+        return 1
+    fi
+
+    cd $REPO || { log "ERROR: cannot cd to $REPO"; _FAILURE_REASON="cannot-cd"; return 1 }
+
+    # Offline or a transient GitHub failure is a no-op that retries next cycle — but a
+    # LOCAL git error (this checkout's own object store or refs are broken, not the
+    # network) is a different failure and must not read the same way. Measured
+    # 2026-10-07: a dispatched run's still-unimported commit left this checkout's
+    # refs/heads/<branch> pointing at an object the run's own private store held
+    # exclusively; `git fetch` failed with "bad object"/"did not send all necessary
+    # objects"; and the blanket quiet-on-any-failure below treated that exactly like a
+    # sleeping laptop — silent for 3.5 hours while origin moved 21 commits ahead with
+    # nobody told, because the one thing that could have said so read "offline" instead.
+    local fetch_err fetch_rc
+    fetch_err=$(git fetch origin --quiet 2>&1)
+    fetch_rc=$?
+    if (( fetch_rc != 0 )); then
+        if print -r -- "$fetch_err" | grep -Eq \
+                'bad object|does not point to a valid object|did not send all necessary objects|fatal: loose object'; then
+            log "ERROR: git fetch failed on a LOCAL git error (not offline — not a quiet no-op):"
+            print -r -- "$fetch_err" | while read -r line; do
+                log "    $line"
+            done
+            _FAILURE_REASON="fetch-local-error"
+            _FAILURE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+            return 1
+        fi
+        # Deliberately quiet otherwise. A laptop that is asleep or off-network would
+        # otherwise write a line every 10 minutes and bury the real events.
+        return 0
+    fi
+
+    local head remote behind branch
+    head=$(git rev-parse HEAD 2>/dev/null)
+    # show-ref --verify matches this one ref name and applies none of git's search
+    # rules. rev-parse, even on the fully qualified name, falls through to
+    # refs/tags/refs/remotes/origin/main once the real ref is gone (the remote
+    # renamed its default branch and fetch --prune deleted it), and a tag pushed
+    # to the remote with that name would then be fast-forwarded into the live tree.
+    # Everything below acts on this sha, never on a ref name.
+    remote=$(git show-ref --verify --hash refs/remotes/origin/main 2>/dev/null)
+
+    if [[ -z $remote ]]; then
+        log "ERROR: refs/remotes/origin/main does not exist; not merging anything"
+        _FAILURE_REASON="no-origin-main"
+        _FAILURE_BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")
+        return 1
+    fi
+
+    # The common case, and it stays silent so the log is all signal.
+    if [[ $head == $remote ]]; then
+        # The farm check must not depend on a pull happening. The 2026-07-30
+        # incident (38 of 40 farm links pointed at a feature-branch worktree)
+        # sat for days because nothing watched the farm; it surfaced only when
+        # a merged PR needed a brand-new function and hit AttributeError. The
+        # check is silent when clean and cheap, so running it on the quiet
+        # path costs nothing.
+        check_and_fix_farm
+        refresh_deploy_area
+        return 0
+    fi
+
+    # commits behind origin/main — computed once for all refusal paths
+    behind=$(git rev-list --count HEAD..$remote 2>/dev/null)
+    branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+    # Already ahead of or diverged from origin/main is not a fast-forward.
+    if ! git merge-base --is-ancestor HEAD $remote 2>/dev/null; then
+        log "REFUSING: HEAD is not an ancestor of origin/main — the checkout has diverged."
+        log "  HEAD=$(git rev-parse --short HEAD)  origin/main=${remote:0:7}"
+        log "  This checkout is what ~/.local/bin runs. Resolve by hand; not fast-forwarding."
+        _FAILURE_REASON="diverged"
+        _FAILURE_BRANCH=$branch
+        # _FAILURE_BEHIND omitted: the count is semantically ambiguous for
+        # diverged history (commits exist on both sides of the fork).
+        return 1
+    fi
+
+    if [[ $branch != main ]]; then
+        log "REFUSING: on branch '$branch', not main."
+        log "  ARCH-229: a feature branch checked out here makes UNMERGED code live to cron."
+        log "  Someone is working in the checkout that is production. Leaving it alone."
+        _FAILURE_REASON="not-on-main"
+        _FAILURE_BRANCH=$branch
+        _FAILURE_BEHIND=$behind
+        return 1
+    fi
+
+    if [[ -n $(git status --porcelain 2>/dev/null) ]]; then
+        log "REFUSING: working tree is dirty; a fast-forward could clobber uncommitted work."
+        git status --porcelain 2>/dev/null | head -20 | while read -r line; do
+            log "    $line"
+        done
+        _FAILURE_REASON="dirty"
+        _FAILURE_BRANCH=$branch
+        _FAILURE_BEHIND=$behind
+        return 1
+    fi
+
+    if run_holds_checkout; then
+        # Quiet-ish: this resolves without help, unlike the guards above.
+        log "deferring: a live run holds $REPO (planning-orchestrator runs in the primary checkout); retrying next cycle"
+        return 0
+    fi
+
+    local out rc
+    out=$(git merge --ff-only $remote 2>&1)
+    rc=$?
+
+    if (( rc != 0 )); then
+        log "FAILED: fast-forward to origin/main failed (exit $rc)"
+        [[ -n $out ]] && log "  $out"
+        _FAILURE_REASON="ff-failed"
+        _FAILURE_BRANCH=$branch
+        _FAILURE_BEHIND=$behind
+        return 1
+    fi
+
+    log "pulled $behind commit(s): $(git rev-parse --short $head) -> $(git rev-parse --short HEAD) — now live"
+    git log --oneline --no-merges ${head}..HEAD 2>/dev/null | head -20 | while read -r line; do
+        log "    $line"
+    done
+
+    report_manual_steps $head HEAD
+    check_and_fix_farm
+    refresh_deploy_area
+
+    return 0
+}
+
+# True when any live run's worktree is the primary checkout. `agentctl list`
+# reports live runs but not their worktree, so each is resolved individually.
+#
+# EVERY UNCERTAIN ANSWER IS "HELD". Deferring a cycle costs ten minutes;
+# fast-forwarding under a running planning-orchestrator can corrupt its work. So
+# a failed `list`, or a listed run whose worktree cannot be read, both mean HELD
+# rather than "probably nobody is there".
+#
+# But a silent fail-HELD would be its own bug: a permanently broken agentctl
+# would freeze deploys forever while every cycle looked like a normal quiet
+# deferral, which is the exact failure this whole job exists to end. So the
+# uncertain paths LOG, and the caller's deferral line names them.
+#
+# The one case that stays NOT-HELD is agentctl missing entirely. Nothing can be
+# running without it, so there is no orchestrator to protect.
+run_holds_checkout() {
+    [[ -x $AGENTCTL ]] || return 1
+
+    local raw ids id wt rc
+    raw=$($AGENTCTL list 2>/dev/null)
+    rc=$?
+    if (( rc != 0 )); then
+        log "  cannot enumerate runs: '$AGENTCTL list' exited $rc — treating the checkout as HELD"
+        return 0
+    fi
+
+    # "$raw" is quoted deliberately. Unquoted, this would depend on zsh leaving
+    # SH_WORD_SPLIT off — which it does by default, so the newlines survive and
+    # every run is seen. But under `setopt shwordsplit` the output would collapse
+    # to one line and the `^` anchor would match only the FIRST run, silently
+    # dropping the rest. If the run holding the primary checkout were not first,
+    # this would report NOT-HELD and pull under a live orchestrator. One option
+    # away from a corruption bug is too close for a free pair of quotes.
+    ids=$(print -r -- "$raw" | grep -oE '^run-[a-z0-9]+')
+    # Exit 0 with no run lines is a real answer: nothing is running.
+    [[ -z $ids ]] && return 1
+
+    for id in ${(f)ids}; do
+        wt=$($AGENTCTL status $id 2>/dev/null | awk '/^worktree:/{print $2}')
+        if [[ -z $wt ]]; then
+            log "  cannot resolve a worktree for $id — treating the checkout as HELD"
+            return 0
+        fi
+        [[ $wt == $REPO ]] && return 0
+    done
+    return 1
+}
+
+# A pull can land things a symlink cannot deploy on its own. Name them rather
+# than acting: install.sh copies over live launchd config, which is not a thing
+# to do unattended.
+report_manual_steps() {
+    local from=$1 to=$2
+    local changed
+    changed=$(git diff --name-only $from $to 2>/dev/null)
+    [[ -z $changed ]] && return 0
+
+    local new_bins
+    new_bins=$(git diff --name-only --diff-filter=A $from $to -- bin/ lib/ 2>/dev/null)
+    if [[ -n $new_bins ]]; then
+        log "  ACTION NEEDED: new bin/lib files are not symlinked yet — run install.sh"
+        print -r -- "$new_bins" | while read -r line; do log "      $line"; done
+    fi
+
+    local plists
+    plists=$(print -r -- "$changed" | grep '^launchd/.*\.plist$')
+    if [[ -n $plists ]]; then
+        log "  ACTION NEEDED: launchd plists changed — plists are COPIES (ARCH-116), so run"
+        log "                 install.sh then bootout+bootstrap each label (ARCH-104:"
+        log "                 kickstart reuses the old job definition)."
+        print -r -- "$plists" | while read -r line; do log "      $line"; done
+    fi
+
+    local gw
+    gw=$(print -r -- "$changed" | grep '^gateway/')
+    if [[ -n $gw ]]; then
+        log "  ACTION NEEDED: gateway files changed — the gateway runs from a PINNED COPY"
+        log "                 (ARCH-116), so run install.sh and restart the gateway job."
+    fi
+}
+
+# Keep the deployed lib farm aligned with the primary checkout. Runs after a
+# pull AND on cycles where nothing is pulled, because the farm is what every
+# launchd job imports and drift that cannot auto-fix must surface even when the
+# checkout never moved.
+#
+# A pull can add a new lib module, leaving it unlinked in the symlink farm.
+# When the ONLY drift is new modules (no dead links, no wrong targets), it is
+# safe to link them automatically by calling link-farm.sh, which shares its
+# logic with install.sh phase 2. This is only reached when the checkout is on
+# current main (either the quiet path or just after a fast-forward), so the
+# auto-linked module content is main's.
+#
+# Other drift (dead links, wrong targets) cannot auto-fix and is the dangerous
+# state — the farm serving code from a checkout other than the primary. It is
+# logged as ACTION NEEDED AND raised as an operational alert (one per day via
+# dedup), instead of being left to surface as a downstream failure.
+#
+# Silent when the farm matches the checkout (the common case).
+check_and_fix_farm() {
+    local fp=$REPO/lib/agent-platform/farm_check.py
+    [[ -f $fp ]] || return 0
+
+    local farm_out farm_rc
+    farm_out=$(python3 "$fp" 2>&1)
+    farm_rc=$?
+
+    if (( farm_rc == 0 )); then
+        return 0
+    fi
+
+    # Classify the drift by scanning the output.
+    # Require a POSITIVE match on NEW MODULE before auto-linking (ARCH-030).
+    # A traceback or unexpected output matches neither NEW MODULE nor the
+    # known-bad strings, so the all-negative gate would silently link against
+    # unknown farm state. Positive match closes that hole.
+    local has_new has_dead has_wrong
+    print -r -- "$farm_out" | grep -q 'NEW MODULE' && has_new=1
+    print -r -- "$farm_out" | grep -q 'DEAD LINK' && has_dead=1
+    print -r -- "$farm_out" | grep -q 'WRONG TARGET' && has_wrong=1
+
+    # A DEAD LINK NO LONGER BLOCKS THE AUTO-LINK; only a WRONG TARGET does.
+    # The two are different risks. A wrong target means the farm resolves into
+    # another checkout, so its provenance is in doubt and adding links from this
+    # one mixes two — refuse everything, as before. A dead link is inert: it
+    # resolves to nothing and an import through it raises ModuleNotFoundError.
+    #
+    # Coupling them wedged this for three days. techdebt.py was deleted from
+    # lib/ on 2026-09-15, its farm symlink stayed, and from that moment
+    # crew_doctor.py, github_app.py and shell_families.py could not link. This
+    # function logged ACTION NEEDED 1,645 times naming the same four files.
+    # A correct alert nobody can close is one that gets ignored.
+    #
+    # Clearing a dead link is not part of the AUTOMATED job (operator, 2026-09-17,
+    # restated 2026-09-21): the unattended tick must not start DELETING from
+    # the machine's own deployed library, where today it only ever adds. That
+    # is a constraint on THIS CRON JOB, not on who may clear a link — install.sh
+    # now does exactly that (lib/link-farm.sh --prune, operator-run), which is
+    # why the ACTION NEEDED line below names it as the fix.
+    #
+    # THE EARLIER "human action" WORDING MATTERED, AND IT WAS WRONG. It got
+    # quoted into a work-item comment, then into a session handoff, and read
+    # there as a fence on AGENTS. A session told the operator twice that it could not
+    # clear a link that was alerting about 143 times a day, while the cron job
+    # this rule actually governs went untouched the whole time. A constraint on
+    # a MACHINE, restated as a constraint on AGENTS, forbids the one actor who
+    # could fix the thing.
+    if [[ -n $has_new && -z $has_wrong ]]; then
+        bash "$REPO/lib/link-farm.sh" "$REPO"
+        log "  auto-linked new lib module(s):"
+        print -r -- "$farm_out" | grep 'NEW MODULE' | while read -r line; do
+            log "      $line"
+        done
+        # A dead link alongside them is still drift and still needs attention.
+        # Reported and alerted here rather than swallowed by the success path —
+        # auto-linking the new modules must not make the remaining drift quiet.
+        if [[ -n $has_dead ]]; then
+            log "  ACTION NEEDED: dead farm link(s) remain — run install.sh from the primary checkout to clear them."
+            print -r -- "$farm_out" | grep 'DEAD LINK' | while read -r line; do
+                log "      $line"
+            done
+            alert_farm_drift "$farm_out"
+        fi
+    else
+        log "  ACTION NEEDED: farm drift detected — dead/wrong links cannot auto-fix."
+        print -r -- "$farm_out" | while read -r line; do
+            log "      $line"
+        done
+        # Alert only on a POSITIVE dead/wrong match. A traceback (farm_check
+        # itself broken) matches none of the patterns; that gets logged as
+        # ACTION NEEDED above but is not labeled farm drift.
+        if [[ -n $has_dead || -n $has_wrong ]]; then
+            alert_farm_drift "$farm_out"
+        fi
+    fi
+}
+
+# Refresh the Bosun's shared deploy area (platform/decisions/0059;
+# issue_01M19RRWSS9ETR09N9M2BJPA0Q) — the copy of bin/ and lib/agent-platform/
+# that every scheduled job's plist now points at, instead of the ~/.local/bin
+# symlink into this checkout. Called on BOTH the quiet path and just after a
+# pull, same as check_and_fix_farm: cheap when nothing moved, because
+# install-agent-platform-shared skips the copy entirely once its own
+# DEPLOYED_COMMIT already matches, so paying the cost every cycle is fine.
+#
+# READS ONLY $REPO — the working tree this file itself lives in, reached
+# through the interactive ~/.local/bin symlink — and NEVER the deploy area it
+# writes. That is the whole safety property this job exists to hold: a broken
+# deploy area cannot break its own repair, because nothing here depends on it.
+# Invoked with $REPO passed explicitly rather than by name through
+# ~/.local/bin/install-agent-platform-shared, so this does not even
+# transitively depend on that symlink existing or pointing anywhere sane.
+#
+# Best-effort like the farm check above: a failure here must not mask the
+# pull's own exit code, since the guard this job exists to enforce (don't pull
+# onto a dirty/wrong-branch/held checkout) already succeeded by the time this
+# runs. Logged and alerted instead, the same shape as alert_farm_drift.
+refresh_deploy_area() {
+    local installer=$REPO/bin/install-agent-platform-shared
+    [[ -x $installer ]] || return 0
+
+    local out rc
+    # `--repo=` with the equals sign. The space form now works too, but this
+    # call is what proved the installer only took `=`: it exited 2 every cycle
+    # for a day and the deploy area never refreshed once.
+    out=$("$installer" --repo="$REPO" 2>&1)
+    rc=$?
+
+    if (( rc != 0 )); then
+        log "  ACTION NEEDED: shared deploy area refresh failed (exit $rc) — scheduled jobs may be serving stale code:"
+        print -r -- "$out" | while read -r line; do
+            log "      $line"
+        done
+        alert_deploy_refresh_failure "$out" "$rc"
+    elif [[ $out == *"Deployed:"* ]]; then
+        log "  deploy area refreshed:"
+        print -r -- "$out" | while read -r line; do
+            log "      $line"
+        done
+    fi
+    # Silent when already up to date (the installer's own idempotent fast path).
+}
+
+# Best-effort alert, same idiom as alert_farm_drift: a failing write must not
+# break the cycle, and dedup per day so a persistent failure alerts once.
+alert_deploy_refresh_failure() {
+    local detail=$1 rc=$2
+    AP_LIB_DIR=$_LIB_DIR python3 - "$detail" "$rc" <<'PYEOF' 2>/dev/null || true
+import sys, os, datetime as _dt
+sys.path.insert(0, os.environ['AP_LIB_DIR'])
+import signal_client as sc
+detail = "\n".join(sc.sanitise(line) for line in sys.argv[1].splitlines() if line.strip())
+rc = sys.argv[2]
+body = (
+    "agent-platform-autopull could not refresh the shared deploy area "
+    "(~/.local/deploy/agent-platform-shared), exit " + rc + ". Every one of the "
+    "Bosun's scheduled jobs (platform/decisions/0059) reads its code from "
+    "there, so this means they may be running code older than what's on main. "
+    "Details:\n" + detail +
+    "\nFix: run bin/install-agent-platform-shared by hand from the primary "
+    "checkout and read what it says."
+)
+sc.post_alert(
+    stream='agent-platform-autopull',
+    product='agent-platform',
+    body=body,
+    dedup_key=f'agent-platform-autopull-deploy-refresh-failure-{_dt.date.today().isoformat()}',
+)
+PYEOF
+}
+
+main "$@"
+_exit_code=$?
+if (( _exit_code != 0 )); then
+    signal_failure "$_FAILURE_BRANCH" "$_FAILURE_BEHIND" "$_FAILURE_REASON"
+fi
+exit $_exit_code

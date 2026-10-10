@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Prune the Claude Code hook-event spool. Run by launchd, daily.
+
+The hook spool captures full user prompts and tool inputs. This deletes lines the
+reducer has already consumed, and deletes whole days past a 14-day backstop
+regardless of index state. Policy and rationale live in
+`lib/agent-platform/hook_log_retention.py` and the KB doc
+`shared/contracts/hook-log-retention`.
+
+Absolute interpreter path (ARCH-086): launchd gives this no useful PATH.
+
+Usage:
+  hook-log-prune              # prune
+  hook-log-prune --dry-run    # report what would go, touch nothing
+  hook-log-prune --days N     # override the backstop (testing)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, prefer_venv=True)
+
+import hook_log_retention as R  # noqa: E402
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Prune the hook-event spool.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="report BACKSTOP deletions only; does not count indexed lines")
+    ap.add_argument("--days", type=int, default=R.BACKSTOP_DAYS,
+                    help=f"backstop in days (default {R.BACKSTOP_DAYS})")
+    ap.add_argument("--root", type=Path, default=R.LOG_ROOT,
+                    help="spool root (default the live hook-log tree)")
+    args = ap.parse_args()
+
+    if args.days < 1:
+        print("hook-log-prune: --days must be at least 1", file=sys.stderr)
+        return 2
+
+    today = R.utc_today()
+
+    if args.dry_run:
+        # Report only. Deliberately does not compute the purge-after-index half:
+        # counting it would mean reading every line to no purpose, and the number
+        # that matters for a dry run is which whole days are about to vanish.
+        cutoff = today - datetime.timedelta(days=args.days)
+        doomed = [d.name for day, d in R.day_dirs(args.root)
+                  if day < today and day <= cutoff]
+        print(f"hook-log-prune: dry run, backstop {args.days}d, cutoff {cutoff}")
+        print(f"  day dirs present: {len(R.day_dirs(args.root))}")
+        print(f"  would delete: {doomed or 'nothing'}")
+        return 0
+
+    stats = R.run(args.root, today, days=args.days)
+    p, b = stats["purged"], stats["backstop"]
+    # One line when there is nothing to say, so a daily job does not fill a log
+    # with noise, but always something — silence is indistinguishable from a job
+    # that never ran.
+    print(f"hook-log-prune: purged {p['lines_dropped']} line(s) from {p['files']} "
+          f"file(s) across {p['days']} closed day(s); "
+          f"backstop deleted {b['days_deleted']} day dir(s) "
+          f"{b['deleted'] if b['deleted'] else ''}".rstrip())
+
+    # A file that keeps failing to prune must not look like a clean run. The
+    # backstop still bounds the worst case to 14 days, but for a pruner over
+    # prompt text the operator needs to hear that the line-level pass is broken —
+    # and under launchd, stdout is the quiet channel and a non-zero exit is what
+    # gets noticed.
+    if p["errors"]:
+        print(f"hook-log-prune: {p['errors']} file(s) could not be pruned; "
+              f"the 14-day backstop still applies", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

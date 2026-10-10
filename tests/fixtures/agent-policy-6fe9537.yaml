@@ -1,0 +1,110 @@
+policy: platform/agent-policy
+schema_version: 1
+
+# The agent policy: which pull requests an agent may merge, how many review
+# rounds run before you decide whether another happens, and how many agents run
+# at once. This file is yours to edit, through a pull request you merge.
+#
+# HOW A READER READS IT. Every tool that enforces this file reads it from the
+# knowledge repository at origin/main, never at a pull request's head, so no
+# pull request can widen the permission that gates its own merge. It is read as
+# lines, not as general YAML:
+# - a line that is blank or starts with # is ignored;
+# - every other line is exactly `key: value`, starting at the first column,
+#   with nothing after the value: no quotes and no trailing comment;
+# - a boolean is exactly `true` or `false`;
+# - a number is a whole number from 1 to 1000, written in digits with no
+#   leading zero;
+# - `policy` is exactly `platform/agent-policy`, and `schema_version` is exactly
+#   1, since a reader built for version 1 cannot know what another version means;
+# - every key below appears exactly once, and no other key appears.
+#
+# IF THE FILE IS MISSING, UNREADABLE OR BREAKS ANY RULE ABOVE, the reader
+# permits no agent merge and uses the numbers shipped here: 5 review rounds per
+# role, and 16, 4 and 4 for the concurrency limits. It says on stderr that it
+# fell back, and why. A blank never means "nobody" or "unlimited".
+
+# MERGING. By default a person merges every pull request. Set a kind to true to
+# let an agent merge a pull request of that kind once its review has passed. A
+# pull request an agent may merge must fit a kind below in every file it
+# changes. Anything that fits no kind is merged by a person, and so is any file
+# a reader cannot classify. There is no setting for code.
+#
+# NO AGENT EVER MERGES A PULL REQUEST THAT ADDS, CHANGES, DELETES OR RENAMES
+# ANYTHING UNDER projects/platform/policy/ IN THE KNOWLEDGE REPOSITORY, with the
+# path compared in any letter case, whatever the settings below say, so an
+# agent cannot widen its own permission.
+#
+# Every test below applies to both sides of every file a pull request touches:
+# the path and content before the change and after it, for an addition, an
+# edit, a deletion or a rename alike.
+#
+# Names are compared in any letter case, since a checkout on a case-insensitive
+# disk loads docs/claude.md as docs/CLAUDE.md.
+#
+# FRONT MATTER is read by the same rule as this file. A file has front matter
+# when its first line starts with `---`, and the front matter runs to the next
+# line that starts with `---`. Both of those lines must be exactly `---`, and
+# each line between them exactly `key: value` from the first column, with each
+# key once. A key is lowercase letters, digits, hyphens and underscores,
+# followed at once by a colon and exactly one space, and a value neither starts
+# nor ends with a space, so `kind : agent` and `kind:  agent` are lines this
+# rule cannot read. The two keys that decide what a file is are held to an
+# exact value: a `kind` value is lowercase letters, digits and hyphens, and an
+# `audience` value is `[` and `]` around such names separated by a comma and a
+# space. Any other `kind` or `audience` value, such as a quoted one, a tagged
+# one, an alias, an anchor or one followed by a comment, is one this rule
+# cannot read. So is any line between the two delimiters that contains `---`
+# anywhere in it, since some tools end front matter at the first `---`
+# mid-line and would read `kind: agent---` as `kind: agent`. Any character anywhere in the file that is not printable, a
+# space, a tab or a line feed makes the file an instruction, where printable
+# means what Python's str.isprintable() accepts. That covers a byte-order
+# mark, a carriage return, and every other character some tool treats as a line
+# break, such as a vertical tab, a form feed or a Unicode line separator. So do
+# an opening or closing line with anything after `---`, a duplicate key, a key
+# in another case or in quotes, a value spread over several lines, and front
+# matter with no closing line. Each is a place another tool may read front
+# matter that this rule does not. An `audience`
+# counts as only `team` when its line is exactly `audience: [team]`.
+#
+# An INSTRUCTION is a file an agent is told to act on. A file is an instruction
+# when either side:
+# - sits under an agents/, instruction-blocks/, runbooks/, skills/ or
+#   profiles/ directory;
+# - has a front-matter `kind` of agent, skill, runbook or instruction-block;
+# - is a `decision` whose `audience` is not exactly `[team]`;
+# - is not a regular file ending in .md, or is named CLAUDE.md,
+#   CLAUDE.local.md or AGENTS.md;
+# - has front matter this rule cannot read.
+#
+# knowledge: a pull request the Library opened through `kb propose`, where
+#   every file is a document under projects/ in the knowledge repository and
+#   none is an instruction. What shows the Library opened it is the pull
+#   request's author as the code host reports it, compared with the account the
+#   Library signs in as, which the reader takes from the Library's own
+#   configuration and never from the pull request. A branch name, a title or
+#   body, a label or a log on this machine does not count, since an agent can
+#   write each of those.
+agents_may_merge_knowledge: false
+# knowledge_instructions: the same, where some of the files are instructions.
+#   Turning this on lets an agent merge a change to what agents are told to do,
+#   once review passes.
+agents_may_merge_knowledge_instructions: false
+# documents: a pull request in any repository where every file sits inside a
+#   docs/ directory at the top of that repository, has no front matter at all,
+#   and is not an instruction.
+agents_may_merge_documents: false
+
+# REVIEW. How many rounds each reviewer role (reviewer, security-reviewer) runs
+# on one pull request. When that many rounds of a role have run and the last
+# still returned a finding, the agent stops and brings you the findings with a
+# recommendation, and you decide whether another round happens.
+review_rounds_per_role: 5
+
+# CONCURRENCY. How many agents run at once on this machine.
+# max_concurrent: runs of any kind, machine-wide.
+# max_workers_per_team: workers dispatched by one orchestrating session.
+# max_live_supervisors: supervisors running at once.
+max_concurrent: 16
+max_workers_per_team: 4
+max_live_supervisors: 4

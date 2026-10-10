@@ -1,0 +1,3 @@
+Reading additional input from stdin...
+2026-09-25T03:36:40.256343Z ERROR codex_core::tools::router: error=Command blocked by PreToolUse hook: Blocked by the Codex hook bridge: BLOCKED by ARCH-020 (hard hook): agents never merge PRs. 'ship it' / 'merge it' is NOT authorization to run the merge yourself — surface the PR as ready (post the URL) and let the operator merge it in the GitHub UI. Then run the post-merge cycle once they have.. Command: gh pr merge 1 --repo probe-invalid/probe-invalid
+echo NEWLINE-CANARY-7Q3

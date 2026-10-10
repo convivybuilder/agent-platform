@@ -1,0 +1,408 @@
+#!/usr/bin/env python3.11
+"""Cross-repo CLI-contract check.
+
+For each shared bin/ tool with known product callers, assert that every
+long flag any caller passes still parses. Runs on the mini where all
+sibling checkouts exist; agent-platform CI has no sibling checkouts, so
+this cannot run there — scheduled as a launchd job instead. Same structural
+constraint as the explainer drift guard (issue_01KYQAMMF34DP3C1XHPZ69SMR4).
+
+SAFETY. Only ever runs `--help` on the tool, never with real arguments. No
+changelog entry is written.
+
+BEHAVIOUR. A pass is silent. A breach logs an alert signal against the affected
+product (with dedup_key scoped to the UTC day: a break logs once a day while it persists,
+and again after it clears and returns on a later day). A break that clears and returns
+within the same UTC day logs nothing after that day's first signal, unless its key differs:
+the key carries the set of unknown flags, so a return with a different set logs again.
+It never creates a work item: only a co session does (platform/decisions/0073).
+A missing sibling checkout degrades gracefully — the product is simply not checked.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import json
+import pathlib
+import re
+import subprocess
+import sys
+from typing import Any
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR  # noqa: E402
+
+# The map of shared bin/ tools to the products that call them from their
+# scripts/ directories. Declared (not discovered) so a missing checkout
+# reads as absent rather than "no problems found". When adding or removing
+# a flag from one of these tools, update this map and sweep the callers.
+# convivy-app-kit belongs here even though its --no-slack breach is already fixed.
+# So is every other entry: all five callers had that same breach repaired. Being
+# fixed is not the same as ceasing to call the tool, and this map exists to catch
+# the NEXT contract change, not the one that prompted it. Leaving it out shipped
+# the check with a blind spot the incident table itself names.
+_TOOL_CALLERS: dict[str, list[str]] = {
+    "post-changelog": ["vivy", "constance", "selector", "selector-backend",
+                       "convivy-app-kit"],
+    "post-release-note": ["vivy"],
+}
+
+CONVIVY_ROOT = BR.root()
+AGENT_PLATFORM_DIR = CONVIVY_ROOT / "agent-platform"
+BIN_DIR = AGENT_PLATFORM_DIR / "bin"
+
+# Flags argparse adds automatically, never part of a tool's own contract.
+_IMPLICIT_FLAGS = frozenset({"-h", "--help"})
+
+# Track how many report attempts failed. Reset each run. Used to distinguish
+# "breaches logged OK" (exit 2) from "breaches but reporting failed" (exit 3).
+_report_failures: int = 0
+
+
+def parse_accepted_flags(help_text: str) -> frozenset[str]:
+    """Extract --long-option flags from argparse --help output.
+
+    Only scans indented option-definition lines within the
+    ``options:`` (or ``optional arguments:``) section, so usage
+    examples and non-option prose do not introduce phantom
+    accepted flags. Filters out ``--help`` which argparse adds
+    to every parser.
+    """
+    flags: set[str] = set()
+    in_options = False
+    for line in help_text.splitlines():
+        if line.rstrip() in ("options:", "optional arguments:"):
+            in_options = True
+            continue
+        if in_options and re.match(r"  -", line):
+            flags.update(re.findall(r"(--[\w-]+)", line))
+    flags -= _IMPLICIT_FLAGS
+    return frozenset(flags)
+
+
+def _get_accepted_flags(tool_name: str, bin_dir: pathlib.Path) -> frozenset[str] | None:
+    """Run <tool> --help and return its accepted long flags.
+
+    Returns None if the tool cannot be executed (missing, import error, etc.).
+    SAFETY: only invokes with --help, never with real arguments.
+    """
+    tool_path = bin_dir / tool_name
+    try:
+        result = subprocess.run(
+            [str(tool_path), "--help"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        return parse_accepted_flags(result.stdout)
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _is_comment_line(line: str) -> bool:
+    """True when the line is a whole-line comment (first non-space is #)."""
+    return line.lstrip().startswith("#")
+
+
+def _strip_inline_comment(line: str) -> str:
+    """Remove inline comment content (# ...) from a line.
+
+    Tracks single/double quotes to avoid matching # inside a string.
+    """
+    in_single = in_double = False
+    out: list[str] = []
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c in ("'", '"') and (i == 0 or line[i - 1] != "\\"):
+            if c == "'" and not in_double:
+                in_single = not in_single
+            elif c == '"' and not in_single:
+                in_double = not in_double
+            out.append(c)
+        elif c == "#" and not in_single and not in_double:
+            break
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out).rstrip()
+
+
+def _line_references_tool(code: str, tool_name: str) -> bool:
+    """True when a code line references tool_name or a `tool` variable.
+
+    Python callers assign the tool path to a variable named ``tool`` and
+    build flags on the same line (``cmd = [tool, \"--flag\", ...]``).
+    Shell callers use the literal tool path (``post-release-note --flag``).
+    Checking for both catches all known caller patterns.
+
+    Uses word-boundary matching on ``tool`` so plain prose like
+    ``tool`` is matched as a variable reference, while compound names
+    like ``tool_path`` (where ``_`` is a word character that prevents
+    a word boundary between ``l`` and ``_``) are not matched — they
+    name separate variables, not references to the caller's ``tool``.
+    """
+    if tool_name in code:
+        return True
+    if re.search(r"\btool\b", code):
+        return True
+    return False
+
+
+def find_caller_invocations(
+    product_dir: pathlib.Path, tool_name: str,
+) -> list[dict[str, Any]]:
+    """Scan product/scripts/ for lines that invoke tool_name.
+
+    Callers use variables (``tool = shutil.which(\"post-changelog\")``) or
+    the literal tool path (``~/.local/bin/post-release-note --flag``).
+    Only extracts flags from lines that reference the tool — either by name
+    or via the ``tool`` variable — so unrelated commands (git, gh, etc.)
+    in the same file do not produce false positives.
+
+    Skips whole-line comments and strips inline comments before extracting
+    flags.
+
+    Returns a list of dicts with keys: file (relative path), lineno
+    (1-indexed), line (original text), flags (set of --flags on that line).
+    Multiple lines per file are possible when a command is built across
+    several lines.
+
+    A missing product dir returns empty — the checkout is absent and we
+    degrade gracefully rather than crashing.
+    """
+    results: list[dict[str, Any]] = []
+    scripts_dir = product_dir / "scripts"
+    if not scripts_dir.is_dir():
+        return results
+
+    _SKIP_DIRS = frozenset({"__pycache__", ".git", ".hg", ".svn", "node_modules"})
+    for path in sorted(scripts_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        # Skip compiled/cache directories to avoid bytecode false positives.
+        if any(part in _SKIP_DIRS for part in path.parts):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        # File-level presence check: only process files that mention the
+        # tool name somewhere (docstring, variable assignment, etc.).
+        if tool_name not in text:
+            continue
+
+        for lineno, raw_line in enumerate(text.splitlines(), 1):
+            if _is_comment_line(raw_line):
+                continue
+            code = _strip_inline_comment(raw_line)
+            if not _line_references_tool(code, tool_name):
+                continue
+            flags = set(re.findall(r"--[\w-]+", code))
+            flags -= _IMPLICIT_FLAGS
+            if not flags:
+                continue
+
+            rel = path.relative_to(product_dir)
+            results.append({
+                "file": str(rel),
+                "lineno": lineno,
+                "line": raw_line.strip(),
+                "flags": flags,
+            })
+
+    return results
+
+
+_LIB_DIR = pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"
+
+
+def _ensure_lib_on_path() -> None:
+    """Put the installed platform lib on sys.path exactly once.
+
+    The insert used to sit inside `_post_signal`, which runs per breach. After the
+    first call `issue_client` is already in `sys.modules`, so every later insert
+    added a duplicate entry and imported nothing — a sys.path that grows with the
+    number of problems found. Idempotent here, and the intent ("find this module
+    once") is stated rather than implied.
+
+    Resolved relative to this file, not ~/.local/lib/agent-platform: that farm
+    symlinks into whichever branch the agent-platform checkout is on
+    (platform/decisions/0059 rule 1), which is exactly the hazard a
+    deploy-pinned copy of this script must not reach back into. A deployed
+    copy resolves this to its own deploy area's lib/; the interactive symlink
+    at ~/.local/bin resolves it to the checkout, same as before.
+    """
+    entry = str(_LIB_DIR)
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+
+def _utc_today() -> str:
+    """Today's UTC date, ISO format: the day scope of this monitor's dedup_key.
+
+    A named seam so a test can pin the day. main() reads it once per run and
+    passes that one value to every key the run writes."""
+    return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _names_digest(names: list[str]) -> str:
+    """The identity of a set of names in a dedup_key. Joining them with `_` let `["x_y"]` and
+    `["x", "y"]` produce one key, so the second distinct breach answered `duplicate`. A hash of the
+    JSON list cannot collide that way (review of PR #788, rounds 1 and 2)."""
+    return hashlib.sha256(json.dumps(list(names)).encode("utf-8")).hexdigest()[:16]
+
+
+def _post_signal(product: str, title: str, body: str, dedup_key: str,
+                 *, dry_run: bool = False, severity: str = "medium") -> dict[str, Any]:
+    """Log an alert signal for a breach. Best-effort. A signal, never a work item.
+
+    The title leads the body, since a signal has no title field. With dry_run=True
+    returns {"status": "dry-run"}.
+    """
+    global _report_failures
+    if dry_run:
+        return {"status": "dry-run"}
+    try:
+        _ensure_lib_on_path()
+        import signal_client  # noqa: E402
+        status = signal_client.post_alert(
+            "cli-contract", signal_client.sanitise_body(f"{title}\n\n{body}"),
+            product=product, dedup_key=dedup_key, meta={"severity": severity})
+        return {"status": status}
+    except Exception as exc:
+        _report_failures += 1
+        print(f"[REPORT-ERROR] {product}: {exc}", file=sys.stderr)
+        return {"status": f"error:{type(exc).__name__}"}
+
+
+def check_tool(tool_name: str, products: list[str],
+               convivy_root: pathlib.Path, bin_dir: pathlib.Path,
+               verbose: bool, *, day: str, dry_run: bool = False) -> int:
+    """Check one tool's CLI contract against its callers.
+
+    Returns the number of products with breaches (0 = clean).
+    Logs one alert signal for each product+tool with a breach.
+    """
+    accepted = _get_accepted_flags(tool_name, bin_dir)
+    if accepted is None:
+        print(f"[SKIP] {tool_name}: could not execute --help (tool missing or broken)",
+              file=sys.stderr)
+        return 0
+
+    if verbose:
+        print(f"[OK] {tool_name}: {len(accepted)} option(s): {sorted(accepted)}")
+
+    products_with_breaches = 0
+
+    for product in products:
+        product_dir = convivy_root / product
+        if not product_dir.is_dir():
+            print(f"[SKIP] {product}: checkout not found under convivy_root",
+                  file=sys.stderr)
+            continue
+
+        invocations = find_caller_invocations(product_dir, tool_name)
+
+        # Group breaches by the set of unknown flags (same breach across
+        # multiple call sites → one signal).
+        breached_sites: dict[frozenset[str], list[dict[str, Any]]] = {}
+        for inv in invocations:
+            unknown = inv["flags"] - accepted
+            if unknown:
+                key = frozenset(unknown)
+                breached_sites.setdefault(key, []).append(inv)
+
+        if not breached_sites:
+            continue
+
+        products_with_breaches += 1
+
+        for unknown_set, sites in breached_sites.items():
+            unknown_sorted = sorted(unknown_set)
+            site_lines = "\n".join(
+                f"- `{s['file']}:{s['lineno']}`: `{s['line']}`"
+                for s in sites
+            )
+
+            title = (
+                f"[cli-contract] {product}/{tool_name}: flags "
+                f"{unknown_sorted} no longer accepted"
+            )
+            body = (
+                f"**CLI-contract breach.** `{tool_name}` no longer accepts "
+                f"`{'`, `'.join(unknown_sorted)}`, but callers still pass them.\n\n"
+                f"Sites:\n{site_lines}\n\n"
+                f"Fix: remove the flag(s) from each caller, or re-add the flag "
+                f"to the tool."
+            )
+            dedup_key = (
+                f"cli-contract:{product}:{tool_name}:"
+                f"{_names_digest(unknown_sorted)}:{day}"
+            )
+
+            res = _post_signal(product, title, body, dedup_key, dry_run=dry_run)
+            print(
+                f"[BREACH] {product}/{tool_name}: {unknown_sorted} "
+                f"→ {res.get('status', '?')}",
+                file=sys.stderr,
+            )
+
+    return products_with_breaches
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="check-cli-contracts",
+        description=__doc__,
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="print per-tool details even when passing",
+    )
+    parser.add_argument(
+        "--convivy-root", default=str(CONVIVY_ROOT),
+        help="override the machine's root (for testing)",
+    )
+    parser.add_argument(
+        "--bin-dir", default=str(BIN_DIR),
+        help="override agent-platform bin/ dir (for testing)",
+    )
+    parser.add_argument(
+        "--no-report", action="store_true",
+        help="detect breaches but do not log signals (dry run)",
+    )
+    opts = parser.parse_args(argv)
+
+    global _report_failures
+    _report_failures = 0
+
+    convivy_root = pathlib.Path(opts.convivy_root)
+    bin_dir = pathlib.Path(opts.bin_dir)
+
+    day = _utc_today()
+    total_breaches = 0
+    for tool_name in sorted(_TOOL_CALLERS):
+        products = _TOOL_CALLERS[tool_name]
+        count = check_tool(
+            tool_name, products, convivy_root, bin_dir, opts.verbose,
+            day=day, dry_run=opts.no_report,
+        )
+        total_breaches += count
+
+    if total_breaches == 0:
+        if opts.verbose:
+            print("[OK] no CLI-contract breaches found")
+        return 0
+
+    print(f"[DONE] {total_breaches} product(s) with breaches", file=sys.stderr)
+    if _report_failures > 0:
+        print(f"[REPORT-FAIL] {_report_failures} report(s) failed — "
+              "breaches not all logged", file=sys.stderr)
+        return 3
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

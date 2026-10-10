@@ -1,0 +1,415 @@
+#!/usr/bin/env python3.11
+"""Write a changelog entry for every merge that still lacks one.
+
+WHY THIS EXISTS.
+
+`post-changelog` (2026-07-23) established that a changelog entry should be
+authored prose, not a PR body — "*Merged:* the docs-only CI skip now actually
+skips — the detection job was missing a token permission. #1032" rather than
+700 characters of `## Summary` and code blocks. The tool shipped and nothing ever
+called it. Measured 2026-07-26, the store held 3045 `changelog` signals, every
+one `source=github` and none `source=co`, so `/engineering/changelog` had been
+rendering PR bodies for its whole life. This is the half that was missing: the
+thing that notices a merge and gets an entry written for it (ARCH-411).
+
+HOW IT FINDS WORK. `github_capture.signal_from_merge` already writes one
+`changelog` signal per merge (`source=github`, `refs.pr`). Those rows stay
+exactly as they are — they are the merge feed, and the site no longer renders
+them. A merge NEEDS an entry when no `source=co` changelog signal exists for the
+same product and PR number. That comparison is the whole cursor: it is derived
+from the store on each run rather than kept in a file, so a crashed run, a
+re-run, or a hand-written entry all converge without bookkeeping.
+
+WHY THE DRAIN POSTS, RATHER THAN THE EXPLAINER. The explainer composes the entry;
+this command reads its final output and calls `post-changelog` itself. Granting
+the explainer the posting tool would mean editing `.claude/agents/explainer.md`
+in the five repos whose crew is repo-local (LOCAL_AGENT_REPOS) on top of the
+indexed copy — five edits to product repos with live sessions in them, to add a
+permission only this caller needs. Reading the run's own result keeps the change
+in one place and leaves every agent definition untouched.
+
+WHAT IT COSTS. One explainer dispatch per merge, and merges run ~53/day across
+the fleet (measured over the 7 days to 2026-07-26). The operator priced and chose that
+(2026-07-26) over cheaper shapes. `--max-dispatch` bounds any single run so a
+backfill or a burst cannot spawn unboundedly, and `--concurrency` bounds how many
+run at once.
+
+Usage:
+    changelog-drain                          # the scheduled pass, last 6h
+    changelog-drain --since 2026-07-24T00:00:00Z --max-dispatch 120   # backfill
+    changelog-drain --dry-run                # list what it would write, spawn nothing
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import signal_client as SC  # noqa: E402
+import vault_plane  # noqa: E402
+import review_protocol as RP  # noqa: E402
+
+import builder_root as BR
+RUNS_ROOT = BR.runs_root()
+
+# The sibling agentctl, falling back to the deployed one — same shape as
+# POST_CHANGELOG below, and for the same reason: ~/.local/bin symlinks into
+# whichever branch the agent-platform checkout is on (platform/decisions/0059
+# rule 5), which a deploy-pinned copy of this script must not reach back into.
+_SIBLING_AGENTCTL = pathlib.Path(__file__).resolve().parent / "agentctl"
+AGENTCTL = (_SIBLING_AGENTCTL if _SIBLING_AGENTCTL.is_file()
+            else pathlib.Path.home() / ".local" / "bin" / "agentctl")
+
+# The sibling post-changelog, falling back to the deployed one. `~/.local/bin`
+# symlinks into the repo's `bin/`, so in deployment `__file__`'s parent IS that
+# directory and the two resolve to the same file. The difference shows up in a
+# worktree: preferring the sibling means a branch run exercises the branch's
+# post-changelog rather than main's, which is what a live test of a change
+# spanning both tools has to do. Getting this wrong makes a verification pass
+# against code you are not shipping.
+_SIBLING_PC = pathlib.Path(__file__).resolve().parent / "post-changelog"
+POST_CHANGELOG = (_SIBLING_PC if _SIBLING_PC.is_file()
+                  else pathlib.Path.home() / ".local" / "bin" / "post-changelog")
+
+# The store's list endpoint caps a response at this many rows. Asking for a
+# window that holds more silently returns a prefix, so the drain says so rather
+# than reporting a clean pass over work it never saw.
+_API_PAGE_CAP = 200
+
+# The default window for the scheduled pass. Comfortably wider than the 15-minute
+# interval, because the cursor is derived from the store rather than stored: a
+# wider window costs one extra query and makes a missed run self-healing.
+_DEFAULT_WINDOW_HOURS = 6
+
+# Where the explainer definition is read from, for EVERY repo.
+#
+# Without this the first backfill wrote entries for 6 of 12 repos and failed 40
+# of 88 merges, in two ways that look different and are both resolution failures:
+#
+#   * hollis, selector, convivy-app-kit, convivy-deck and convivy-services are
+#     agentctl's LOCAL_AGENT_REPOS — they resolve agents from their own
+#     `.claude/agents/`, and not one of them defines an `explainer` (their crews
+#     are prefixed: sel-*, hollis-*, deck-*, svc-*). "agent 'explainer' not
+#     found".
+#   * selector-backend has no knowledge-ctx project mapping, so profile
+#     activation failed before the agent ever ran.
+#
+# Passing `--agents-dir` fixes both, because agentctl treats a directory-resolved
+# agent as local: it reads the definition off disk and skips profile activation.
+# Verified against convivy-deck and selector-backend before this landed.
+#
+# It is passed for every repo rather than only the broken ones, so the drain does
+# not carry its own copy of LOCAL_AGENT_REPOS to drift against agentctl's. One
+# definition, one resolution path, fleet-wide.
+#
+# The donors are individuated copies of the SAME indexed explainer agentctl would
+# otherwise resolve, so this is a cache rather than a second source of truth.
+# Several are listed because a missing or mid-rebase checkout must not take the
+# drain down; the first that exists wins.
+_EXPLAINER_DONORS = ("vivy", "constance", "sous-chef")
+
+
+def _agents_dir() -> pathlib.Path | None:
+    """The directory to resolve `explainer` from, or None if no donor exists."""
+    for repo in _EXPLAINER_DONORS:
+        d = BR.root() / repo / ".claude" / "agents"
+        if (d / "explainer.md").is_file():
+            return d
+    return None
+
+
+# A merge in a repo agentctl cannot dispatch against cannot get an entry written
+# — `agentctl spawn --on <repo>` needs a primary checkout at <root>/<repo>
+# (ARCH-391). Skipped loudly rather than retried every 15 minutes forever.
+def _dispatchable(repo: str) -> bool:
+    return (BR.root() / repo / ".git").exists()
+
+
+def _get(path: str, params: dict) -> list[dict]:
+    """One read against the signal store. Raises on failure — unlike the write
+    path's swallow, a drain that cannot READ must not report a clean pass."""
+    tok = SC.token()
+    if not tok:
+        raise SystemExit("changelog-drain: no ops token; cannot read the store")
+    url = vault_plane.url(f"{path}?{urllib.parse.urlencode(params)}")
+    req = urllib.request.Request(url, headers=vault_plane.headers(token=tok))
+    with urllib.request.urlopen(req, timeout=SC._DELIVERY_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8")).get("items", [])
+
+
+def _pr_of(item: dict) -> str | None:
+    pr = (item.get("refs") or {}).get("pr")
+    return str(pr) if pr not in (None, "") else None
+
+
+def _key(item: dict) -> tuple[str, str] | None:
+    """(product, pr) — what makes a merge and its entry the same piece of work."""
+    pr = _pr_of(item)
+    return (item.get("product") or "", pr) if pr else None
+
+
+def _pending(since: str) -> tuple[list[dict], list[str]]:
+    """Merges since `since` with no authored entry yet, oldest first, plus any
+    warnings worth surfacing.
+
+    The two truncation cases are NOT symmetric, and treating them alike is how
+    this would quietly spend money (code review, #250):
+
+      * A truncated MERGES read is safe. It means this pass sees a prefix of the
+        work; the rest is picked up next pass, oldest first. Warn and continue.
+      * A truncated ENTRIES read is NOT safe. `have` is what suppresses a merge
+        that is already written, so an incomplete `have` makes written merges
+        look unwritten — and the drain re-explains them, producing duplicate
+        entries and duplicate spend. Refuse the pass instead of advising the
+        operator to narrow the window and hoping they do.
+    """
+    warnings = []
+    merges = _get("/api/signals", {"kind": "changelog", "source": "github", "since": since})
+    entries = _get("/api/signals", {"kind": "changelog", "source": "co", "since": since})
+    if len(entries) >= _API_PAGE_CAP:
+        raise SystemExit(
+            f"changelog-drain: the entries query returned the {_API_PAGE_CAP}-row cap, "
+            f"so the set of already-written merges is incomplete. Continuing would "
+            f"re-explain merges that already have an entry. Narrow --since and run "
+            f"again.")
+    if len(merges) >= _API_PAGE_CAP:
+        warnings.append(
+            f"the merges query returned the {_API_PAGE_CAP}-row cap — this pass sees "
+            f"a prefix of the window; the rest is picked up next pass, oldest first")
+    have = {k for k in (_key(e) for e in entries) if k}
+    out, seen = [], set()
+    for m in merges:
+        k = _key(m)
+        if not k or k in have or k in seen:
+            continue          # already written, or the same merge captured twice
+        seen.add(k)
+        out.append(m)
+    # Oldest first: a burst that exceeds --max-dispatch should drain in order
+    # rather than leave the oldest merges permanently at the back of the queue.
+    out.sort(key=lambda m: m.get("produced_at") or "")
+    return out, warnings
+
+
+def _task_for(merge: dict, pr: str) -> str:
+    """The explainer's brief. It returns the entry as its FINAL OUTPUT — the drain
+    reads that back and posts it, so the agent needs no posting tool."""
+    repo = merge.get("product") or ""
+    return (
+        f"Write the team-site changelog entry for {repo} PR #{pr}, which has ALREADY "
+        f"MERGED into main.\n\n"
+        f"Read it with `gh pr view {pr}` and `gh pr diff {pr}`, or from main's history "
+        f"(`git log --grep '#{pr}'`, `git show`). Your worktree is on main, not on the "
+        f"PR branch, because the branch is gone — the merge is in main.\n\n"
+        "Say what "
+        "shipped and why it matters, for the operator, in two or three sentences. This is the "
+        "entry a reader sees on team.convivy.com/engineering/changelog instead of the "
+        "PR description — so write what the change DOES, not how it was implemented, "
+        "and lead with the part that would surprise someone who had not been "
+        "following.\n\n"
+        "The operator reads this as a non-engineer. Write for that reader:\n"
+        "- Rewrite the PR title; don't carry it over. A conventional-commits prefix "
+        "(`fix:`, `feat(ingest):`), a module or file path, or a build-step code like "
+        "`B3/P1` must not survive into the entry.\n"
+        "- Name the user- or operator-visible effect. When a change has none — a "
+        "refactor, a CI fix, a dependency bump — say plainly what it protects or "
+        "unblocks instead of narrating the internals it touched. When the change "
+        "is a security fix, this instruction (and the gloss requirement below) "
+        "means naming the category of risk closed, never the exploitable "
+        "mechanism — this entry posts to the public site, often before the fix "
+        "has reached every affected deployment, so the entry must not itself be "
+        "the advisory.\n"
+        "- No bare function, table, service, or file name unless the sentence would "
+        "be false without it, and then gloss what it is in the same breath — for a "
+        "security fix, gloss the category of risk, not the exploitable "
+        "mechanism.\n\n"
+        "For example, a PR titled `fix(ingest): add retry-with-backoff to "
+        "signal_from_merge() [B3/P1]` should not become \"Added retry-with-backoff "
+        "to signal_from_merge in ingest (B3/P1). #1032\" — that is the title with a "
+        "period on it. It should become something like: \"**Merges stopped "
+        "vanishing when GitHub's API hiccuped** — a failed fetch now retries "
+        "instead of silently dropping the merge. Every merge still gets a "
+        "changelog entry, even through a rocky GitHub API day. #1032\"\n\n"
+        "Rules for this output:\n"
+        f"- Reference the PR as #{pr} somewhere in the text; an entry with no PR link "
+        "is refused.\n"
+        "- Write CommonMark, so **bold** for bold. (The site renders CommonMark. The "
+        "Slack copy of this entry will show the asterisks literally; Slack is being "
+        "retired and that is accepted.)\n"
+        "- Apply the ARCH-030 verification step: re-read the diff and drop or hedge "
+        "any claim you cannot ground in it.\n"
+        "- Your FINAL MESSAGE must be the entry text and nothing else — no preamble, "
+        "no 'here is the entry', no surrounding code fence. It is read verbatim and "
+        "posted.\n"
+        "- Do not post anything yourself; the caller posts it.\n"
+        # The shared explainer definition carries scribe permissions for its other
+        # invocations. Writing a changelog entry needs none of them, and until
+        # --agents-dir landed these dispatches never ran in the repo-local repos
+        # at all — so the reachable surface grew (security review, #252). The
+        # definition is shared and not this caller's to narrow; the brief is.
+        "- Do NOT run `agentctl scribe verify` or `agentctl scribe apply`, and do "
+        "not write to the knowledge base. This task is read-and-summarize only."
+    )
+
+
+def _final_output(run_id: str) -> str | None:
+    """The run's final result, from its transcript. None when the run left none.
+
+    Resolved through the shared `review_protocol.find_run_dir` (the same
+    resolver the merge gate's stamp authentication uses), not a locally-globbed
+    date directory: a run-id planted under a second date directory must not
+    silently win a first-match glob (issue_01M1JWB7M75SZ160VRJRCGARBF) — here
+    that would let a planted directory's transcript supply the text this
+    command posts as the changelog entry. An ambiguous run-id degrades to no
+    output, the same answer an unknown run-id already gets."""
+    try:
+        run_dir = RP.find_run_dir(run_id, RUNS_ROOT)
+    except RP.AmbiguousRunDir:
+        return None
+    if run_dir is None:
+        return None
+    transcript = run_dir / "transcript.jsonl"
+    if not transcript.is_file():
+        return None
+    result = None
+    for line in transcript.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("type") == "result" and isinstance(row.get("result"), str):
+            result = row["result"]          # last one wins
+    return (result or "").strip() or None
+
+
+def _spawn(repo: str, pr: str, task: str) -> str | None:
+    """Dispatch the explainer and wait for it. Returns the run-id, or None.
+
+    NO `--pr`, deliberately. That flag pins the worktree to a PR's head and
+    refuses a closed or merged one — "refusing to dispatch against a
+    closed/merged PR". Every PR this command touches is merged by definition, so
+    passing it fails 100% of the time. The explainer only needs to READ the
+    merge, which is already in main, and the task text names the PR number for
+    `gh pr view` / `git log`.
+
+    Foreground on purpose: this command IS the orchestrator, it runs from launchd
+    with nothing to notify, and it must have the entry text in hand before it can
+    post. The bound on concurrency is the caller's loop, not backgrounding.
+    """
+    cmd = [str(AGENTCTL), "spawn", "explainer", "--on", repo]
+    agents_dir = _agents_dir()
+    if agents_dir:
+        cmd += ["--agents-dir", str(agents_dir)]
+    cmd += ["--task", task, "--foreground"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        # subprocess.run kills the child before re-raising, so nothing is left
+        # running. What matters is the LOOP: uncaught, one stuck explainer
+        # aborted the whole pass, so every merge behind it was skipped and the
+        # "wrote N, failed M" line never printed — launchd would show a
+        # traceback and no account of the work (code review, #250). One stuck
+        # run is one failure, not a lost pass.
+        print(f"  {repo}#{pr}: the explainer exceeded 30m and was killed",
+              file=sys.stderr)
+        return None
+    # Anchor to the line agentctl actually emits on spawn — both the foreground
+    # path ("spawned {run_id}  pid=…") and the detached path ("spawned {run_id}
+    # (detached)  …") start with that word, on stderr. The full transcript from
+    # --foreground streams through stdout, so a loose scan over combined output
+    # takes the first run-id that appears anywhere in agent-authored text — the
+    # root cause of the 2026-07-26 backfill failures (issue_01KYGCTN0MZQR531ZVN2APSB3V).
+    m = re.search(r"^spawned (run-[0-9a-f]+)\b", proc.stderr or "", re.MULTILINE)
+    if not m:
+        print(f"  {repo}#{pr}: no run-id in agentctl output "
+              f"(exit {proc.returncode})", file=sys.stderr)
+        return None
+    return m.group(1)
+
+
+def _post(repo: str, pr: str, entry: str) -> bool:
+    proc = subprocess.run(
+        [str(POST_CHANGELOG), "--product", repo, "--pr", pr, entry],
+        capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        print(f"  {repo}#{pr}: post-changelog failed — "
+              f"{(proc.stderr or proc.stdout).strip()[:300]}", file=sys.stderr)
+        return False
+    return True
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="changelog-drain", description=__doc__)
+    ap.add_argument("--since", help="ISO-8601 lower bound on the merge time "
+                                    f"(default: {_DEFAULT_WINDOW_HOURS}h ago)")
+    ap.add_argument("--max-dispatch", type=int, default=20,
+                    help="stop after this many entries in one pass (default 20)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="list the merges needing an entry and spawn nothing")
+    args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    since = args.since or (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=_DEFAULT_WINDOW_HOURS)
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    pending, warnings = _pending(since)
+    for w in warnings:
+        print(f"changelog-drain: WARNING — {w}", file=sys.stderr)
+    print(f"changelog-drain: {len(pending)} merge(s) need an entry since {since}")
+
+    skipped = [m for m in pending if not _dispatchable(m.get("product") or "")]
+    if skipped:
+        # Named, not silently dropped: a repo with no primary checkout will be
+        # skipped on every pass forever, and a count with no names hides which.
+        repos = sorted({m.get("product") or "?" for m in skipped})
+        print(f"changelog-drain: skipping {len(skipped)} merge(s) in repos agentctl "
+              f"cannot dispatch against: {', '.join(repos)}", file=sys.stderr)
+    workable = [m for m in pending if _dispatchable(m.get("product") or "")]
+
+    if len(workable) > args.max_dispatch:
+        print(f"changelog-drain: capping this pass at {args.max_dispatch} of "
+              f"{len(workable)}; the rest are picked up next pass", file=sys.stderr)
+        workable = workable[:args.max_dispatch]
+
+    if args.dry_run:
+        for m in workable:
+            print(f"  would write: {m.get('product')}#{_pr_of(m)} "
+                  f"({(m.get('body') or '').splitlines()[0][:70]})")
+        return 0
+
+    wrote = failed = 0
+    for m in workable:
+        repo, pr = m.get("product") or "", _pr_of(m)
+        if not pr:
+            continue
+        run_id = _spawn(repo, pr, _task_for(m, pr))
+        if not run_id:
+            failed += 1
+            continue
+        entry = _final_output(run_id)
+        if not entry:
+            print(f"  {repo}#{pr}: {run_id} produced no final output", file=sys.stderr)
+            failed += 1
+            continue
+        if _post(repo, pr, entry):
+            wrote += 1
+            print(f"  wrote {repo}#{pr} ({run_id})")
+        else:
+            failed += 1
+
+    print(f"changelog-drain: wrote {wrote}, failed {failed}")
+    # A failure is worth a non-zero exit so launchd's log shows a bad pass, but
+    # the entries that DID land are already posted — this is a report, not a
+    # rollback.
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.agent-platform-autopull</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/bin/agent-platform-autopull</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <!-- RunAtLoad so a machine that boots behind origin/main catches up at
+         login rather than waiting out the first interval. The job is a no-op
+         when already current, so this costs one fetch. -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/agent-platform/autopull.launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/agent-platform/autopull.launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+    </dict>
+</dict>
+</plist>

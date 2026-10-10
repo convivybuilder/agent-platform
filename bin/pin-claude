@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""pin-claude — record Anthropic's published sha256 for a Claude Code release
+(platform/decisions/0090).
+
+root installs the reviewers' Claude binary only if its sha256 equals the pin
+this command writes to etc/claude-pin.yaml. The pin must come from Anthropic's
+own published checksums, never a value typed by hand, so this command is the
+only writer of that file: it downloads Anthropic's manifest and all three
+platform binaries, hashes the bytes it received, and writes the pin only when
+every platform's hash matches the manifest's checksum for it.
+
+It never executes, chmods +x, or opens-for-exec anything it downloads — a
+downloaded binary is read as bytes, hashed, and discarded. The scratch files
+it writes while hashing are deleted whether verification passes or fails.
+
+Usage:
+  pin-claude <version>      # e.g. pin-claude 2.1.286
+
+Exit 0 and a pin written only if all three platforms verify. Exit 1, with no
+pin written and any existing pin left untouched, on a bad version string, a
+fetch failure, or a checksum mismatch on any platform.
+
+Reads straight from Anthropic's own installer (https://claude.ai/install.sh)
+for where the manifest and binaries live — DOWNLOAD_ROOT below — but never
+executes that script. A fetch or a redirect to any host other than the two
+that installer uses (ALLOWED_HOSTS below) is refused, checked at every hop;
+the fetch ignores any proxy configured in the caller's environment, and
+verifies HTTPS against a CA bundle pinned to a fixed, platform-specific
+path rather than one the environment (SSL_CERT_FILE/SSL_CERT_DIR) can swap.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import ssl
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO / "lib" / "agent-platform"))
+import venv_bootstrap  # noqa: E402
+if __name__ == "__main__":
+    venv_bootstrap.ensure(__file__, requires=("yaml",))
+import yaml  # noqa: E402
+
+DOWNLOAD_ROOT = "https://downloads.claude.ai/claude-code-releases"
+PIN_PATH = REPO / "etc" / "claude-pin.yaml"
+PLATFORMS = ("darwin-arm64", "linux-x64", "linux-arm64")
+_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+\Z")
+_CHECKSUM_RE = re.compile(r"^[a-f0-9]{64}$")
+_TIMEOUT = 60
+
+# The hosts https://claude.ai/install.sh and the bootstrap.sh it 302s to
+# (https://downloads.claude.ai/claude-code-releases/bootstrap.sh) use for the
+# install flow today: claude.ai is the published entry point, downloads.claude.ai
+# is where the manifest and binaries actually live. A redirect or final URL to
+# any other host is refused — see _check_url and _fetch.
+ALLOWED_HOSTS = frozenset({"claude.ai", "downloads.claude.ai"})
+_REDIRECT_CODES = (301, 302, 303, 307, 308)
+_MAX_REDIRECTS = 5
+
+
+class PinError(Exception):
+    """A version could not be verified against Anthropic's published manifest."""
+
+
+class _NoFollowRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Stops urllib from silently auto-following a redirect to an unchecked
+    host. With `redirect_request` returning None, a 3xx response surfaces to
+    the caller as a `urllib.error.HTTPError` (with the `Location` header
+    still readable) instead of being followed — `_fetch` then validates and
+    follows it itself, one hop at a time."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+# The CA bundle this process trusts for the fetch, keyed by `sys.platform` —
+# never `ssl.SSLContext.load_default_certs()` or `set_default_verify_paths()`,
+# both of which read SSL_CERT_FILE/SSL_CERT_DIR from the caller's environment
+# and would let a caller swap in a different trust root for a fake manifest
+# to pass (security review on #734, point 1). macOS keeps its system trust
+# store exported here automatically (`/etc/ssl/cert.pem`, kept current by
+# `certsync` since Big Sur); Ubuntu — this repo's CI runner and the planned
+# Linux host — keeps `update-ca-certificates`'s output at the other path.
+# Neither path is configurable by an environment variable.
+_CA_BUNDLE_BY_PLATFORM = {
+    "darwin": Path("/etc/ssl/cert.pem"),
+    "linux": Path("/etc/ssl/certs/ca-certificates.crt"),
+}
+
+
+def _ca_bundle_path() -> Path:
+    path = _CA_BUNDLE_BY_PLATFORM.get(sys.platform)
+    if path is None or not path.is_file():
+        raise PinError(
+            f"no fixed CA bundle known for this platform ({sys.platform!r}); "
+            "refusing to fall back to the caller's environment "
+            "(SSL_CERT_FILE/SSL_CERT_DIR)")
+    return path
+
+
+def _build_ssl_context() -> ssl.SSLContext:
+    """One SSLContext, with certificate and hostname verification on and CAs
+    loaded only from `_ca_bundle_path()`'s fixed, platform-specific path."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = True
+    ctx.load_verify_locations(cafile=str(_ca_bundle_path()))
+    return ctx
+
+
+def _build_opener() -> urllib.request.OpenerDirector:
+    """No proxy from the caller's environment — `ProxyHandler({})` is an
+    explicit empty mapping, so it never calls `getproxies()` — a redirect is
+    never auto-followed past an unchecked host (`_NoFollowRedirectHandler`),
+    and HTTPS verifies against `_SSL_CONTEXT`'s pinned CA bundle rather than
+    whatever `SSL_CERT_FILE`/`SSL_CERT_DIR` the caller's environment sets."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoFollowRedirectHandler(),
+        urllib.request.HTTPSHandler(context=_SSL_CONTEXT))
+
+
+# The SSLContext only, built once at import time — NOT the opener itself.
+# `install_opener` replaces the process-wide default every
+# `urllib.request.urlopen` call in this process uses, and this module is
+# loaded in-process by the test suite's session-scoped `pin_claude` fixture
+# (and anything else that imports it), not only when the CLI actually runs.
+# Installing at import time clobbered whatever opener the importing process
+# already had installed — lib/agent-platform/vault_plane.py installs its own
+# process-wide redirect guard at its import time, and loading this module
+# afterward silently replaced it, failing test_vault_plane.py's
+# test_the_guard_is_the_process_default whenever test collection happened to
+# load pin-claude first (round 5 of #734; CI run 36864054315, job
+# 110375125484). `main()` installs the opener instead, right before the one
+# fetch this one-shot CLI makes — see there.
+#
+# An unknown platform or a missing CA bundle makes `_build_ssl_context()`
+# raise here, before `main()`'s own try/except exists to catch anything —
+# caught and held in `_INIT_ERROR` instead of propagating out of the import
+# as a bare traceback, so `main()` can still report it the same way it
+# reports every other PinError (code review on #734, point 2).
+_SSL_CONTEXT: ssl.SSLContext | None = None
+_INIT_ERROR: PinError | None = None
+try:
+    _SSL_CONTEXT = _build_ssl_context()
+except PinError as e:
+    _INIT_ERROR = e
+
+
+def _check_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
+        raise PinError(
+            f"refusing to fetch from disallowed host {parsed.hostname!r}: {url}")
+
+
+def _fetch(url: str) -> bytes:
+    """GET `url`, following only a redirect whose target host `_check_url`
+    allows — checked before every hop is followed, not only on the final
+    response's URL."""
+    for _ in range(_MAX_REDIRECTS + 1):
+        _check_url(url)
+        try:
+            with urllib.request.urlopen(url, timeout=_TIMEOUT) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code not in _REDIRECT_CODES:
+                raise
+            location = e.headers.get("Location")
+            if not location:
+                raise PinError(
+                    f"redirect ({e.code}) from {url} has no Location header") from e
+            url = urllib.parse.urljoin(url, location)
+    raise PinError(f"too many redirects fetching {url}")
+
+
+def validate_version(version: str) -> str:
+    """Reject anything that isn't a concrete release — in particular the
+    installer's own moving targets ('latest', 'stable'), which would make the
+    pin mean something different on every future run."""
+    if not _VERSION_RE.match(version):
+        raise PinError(
+            f"not a pinnable version: {version!r} (need X.Y.Z, e.g. 2.1.286 — "
+            "not 'latest' or 'stable')")
+    return version
+
+
+def fetch_manifest(version: str) -> dict:
+    url = f"{DOWNLOAD_ROOT}/{version}/manifest.json"
+    return json.loads(_fetch(url).decode("utf-8"))
+
+
+def fetch_binary(version: str, platform: str) -> bytes:
+    url = f"{DOWNLOAD_ROOT}/{version}/{platform}/claude"
+    return _fetch(url)
+
+
+def verify_platform(version: str, platform: str, manifest: dict) -> dict:
+    """Download <platform>'s binary, hash it, and compare against the
+    manifest's checksum for that platform. The download lands in a scratch
+    file created with no execute bit (tempfile.mkstemp's default mode), which
+    is deleted before this returns whether or not the hash matched — the file
+    is read for its bytes and never opened for exec.
+
+    Returns {"ok": bool, "sha256": <downloaded>, "expected": <manifest's>}.
+    """
+    expected = manifest.get("platforms", {}).get(platform, {}).get("checksum")
+    if not expected or not _CHECKSUM_RE.match(expected):
+        raise PinError(f"manifest has no valid checksum for platform {platform!r}")
+
+    data = fetch_binary(version, platform)
+    fd, scratch = tempfile.mkstemp(prefix="pin-claude-", suffix=f"-{platform}")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        digest = hashlib.sha256(data).hexdigest()
+    finally:
+        try:
+            os.unlink(scratch)
+        except OSError:
+            pass
+    return {"ok": digest == expected, "sha256": digest, "expected": expected}
+
+
+def write_pin(version: str, hashes: dict) -> None:
+    """Atomically replace the pin file. Only called once every platform in
+    `hashes` has verified — see `pin()`."""
+    doc = {"claude": {"version": version,
+                      "sha256": {platform: hashes[platform] for platform in PLATFORMS}}}
+    PIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(PIN_PATH.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(doc, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp, PIN_PATH)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def pin(version: str) -> dict:
+    """Validate, fetch the manifest, verify all three platforms, and write the
+    pin iff every platform's hash matched. Raises PinError and writes nothing
+    on a bad version, an unusable manifest, or any mismatch.
+
+    Returns {"version": version, "results": {platform: {"ok", "sha256", "expected"}}}.
+    """
+    validate_version(version)
+    manifest = fetch_manifest(version)
+    results = {platform: verify_platform(version, platform, manifest) for platform in PLATFORMS}
+    bad = [platform for platform, r in results.items() if not r["ok"]]
+    if bad:
+        raise PinError(f"checksum mismatch for {', '.join(bad)}; no pin written")
+    write_pin(version, {platform: results[platform]["sha256"] for platform in PLATFORMS})
+    return {"version": version, "results": results}
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if len(argv) != 1:
+        print("usage: pin-claude <version>", file=sys.stderr)
+        return 2
+    if _INIT_ERROR is not None:
+        print(f"pin-claude: {_INIT_ERROR}", file=sys.stderr)
+        return 1
+    # Installed here, not at import time — see the comment above
+    # `_SSL_CONTEXT`. `_SSL_CONTEXT` is already built (the `_INIT_ERROR`
+    # check above), so this cannot fail the way `_build_ssl_context()` can.
+    urllib.request.install_opener(_build_opener())
+    try:
+        outcome = pin(argv[0])
+    except PinError as e:
+        print(f"pin-claude: {e}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError) as e:
+        print(f"pin-claude: fetch failed: {e}", file=sys.stderr)
+        return 1
+    for platform in PLATFORMS:
+        print(f"{platform}: {outcome['results'][platform]['sha256']}")
+    print(f"pinned claude {outcome['version']} -> {PIN_PATH}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

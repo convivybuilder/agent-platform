@@ -1,0 +1,306 @@
+#!/usr/bin/env python3.11
+"""session-follow-watchdog — notices leaked `session-agent state --follow` processes.
+
+WHAT HAPPENED, measured 2026-08-12. `session-agent state <name> --follow` never
+exited when its reader (a Deck pane) went away — `BrokenPipeError` only raises on
+a write, so a follower watching a stable session sat forever. 101 followers were
+live on the mini against roughly 8 legitimate ones: `svc` had 28, `constance` 25,
+`sous-chef` 24, `ask` 21, all orphaned (`ppid == 1`), the oldest running 2 days 23
+hours. Load average hit 209 on ten cores, the self-hosted CI runner starved into
+failing three unrelated PRs, and the ops control plane took 9.5s to answer a
+health check. It ran undetected for at least three days because nothing was
+watching the process list — a Swift build timing out was what surfaced it.
+
+THREE LAYERS. PR #392 fixed the two root causes: an orphan check every tick in
+the follow loop (catches a reader that's gone when the session is otherwise
+quiet, which was almost every orphan here) and clean `BrokenPipeError` handling
+at the write (catches a reader that closes while the loop is live). This is the
+third layer — detecting a recurrence neither of those anticipated, or a leak from
+a caller PR #392 doesn't cover (Deck itself not tearing down a follower on pane
+close, tracked separately). Report only; a watchdog does not kill.
+
+THE SIGNAL IS DUPLICATES, NOT A COUNT. One tmux session should have exactly one
+live follower. More than one for the same session name is the leak, regardless
+of how many panes happen to be open or what the legitimate baseline is on a given
+day — a fixed threshold goes stale the moment usage changes, and this would have
+fired on day one of the actual incident. `ppid == 1` (reparented to launchd, so
+whatever session started it is long gone) is reported as supporting detail, never
+as the trigger.
+
+REPORTING DEGRADES WITH THE THING IT WATCHES. This posts through
+`signal_client.post_alert`, the same loopback ops-plane signal every other
+platform watchdog uses (`overnight-healthcheck`, `metric-alerts`,
+`budget-watchdog`) — no new channel. That store was itself a casualty of this
+exact incident (9.5s health checks under the load the leak caused), and
+`post_alert` is best-effort: on a store that's slow or down it logs the failure
+to stderr (this job's launchd log) and returns, same as every other platform
+alert. This watchdog does not special-case that — a degraded store degrades this
+alert the same way it degrades every other one, which is an accepted gap, not a
+silent one: the finding still lands in the launchd log even when the store
+doesn't take it.
+
+  session-follow-watchdog             # check once; post on a breach
+  session-follow-watchdog --dry-run   # print what would be posted; post nothing
+  session-follow-watchdog --verbose   # also print OK on a clean run
+
+Exit 0 clean, 1 a leak found, 2 the check could not run. 2 is its own code
+because "no duplicates" and "could not look" are different answers, and a
+watchdog that returns the first when it means the second is worse than no
+watchdog.
+
+Cheap by design — one `ps` call and a group-by — so it can run on a short
+interval (`launchd/com.convivy.session-follow-watchdog.plist`, every 15 minutes).
+"""
+from __future__ import annotations
+
+import argparse
+import subprocess
+import sys
+from collections import defaultdict
+from datetime import date
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import signal_client  # noqa: E402
+
+PS_CMD = ["ps", "-ax", "-o", "pid=,ppid=,command="]
+ALERT_STREAM = "session-follow-leak"
+
+_FOLLOWER_BASENAMES = ("session-agent", "session-agent.py")
+
+
+# --- pure: ps text -> structured procs -> followers -> verdict --------------
+
+
+def parse_ps_output(text: str) -> list[dict]:
+    """[{"pid": int, "ppid": int, "command": str}, ...] from `ps -ax -o
+    pid=,ppid=,command=` text (no header, `=` suffix). A line whose pid/ppid
+    don't parse as integers — a truncated read, a stray blank line — is skipped
+    rather than raising; this only ever reduces what gets checked, never crashes
+    the watchdog."""
+    procs = []
+    for line in text.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_s, ppid_s, command = parts
+        try:
+            pid, ppid = int(pid_s), int(ppid_s)
+        except ValueError:
+            continue
+        procs.append({"pid": pid, "ppid": ppid, "command": command})
+    return procs
+
+
+def follower_session(command: str) -> str | None:
+    """The session name if `command` is a `session-agent state <name> --follow`
+    invocation, else None. Scans every token rather than assuming a fixed argv[0]
+    shape, so it matches whether the process was exec'd directly, through an
+    interpreter prefix (`python3.11 /path/session-agent …`), or via a bare PATH
+    lookup vs. a full path — `ps` reports whatever argv the caller actually used,
+    and this doesn't assume which one Deck picks.
+
+    The name is sanitised here, at the one place it enters this process, because
+    it is argv read out of `ps` — subprocess output the platform did not author,
+    which `signal_client` requires be sanitised before it reaches an alert body
+    or meta. Doing it here rather than at each report site covers both exits at
+    once and keeps the grouping key identical to what gets displayed. 64 is
+    generous for a tmux session name and bounds a pathological one."""
+    tokens = command.split()
+    for i, tok in enumerate(tokens):
+        basename = tok.rsplit("/", 1)[-1]
+        if basename not in _FOLLOWER_BASENAMES:
+            continue
+        rest = tokens[i + 1:]
+        if not rest or rest[0] != "state" or "--follow" not in rest:
+            continue
+        return _positional_name(rest[1:])
+    return None
+
+
+# Flags on `session-agent state` that CONSUME THE NEXT TOKEN. `--follow` is a
+# store_true and takes none; `--interval` takes a float. The distinction has to
+# be made, because "the first token that does not start with a dash" reads the
+# 5 in `state --interval 5 sous-chef --follow` as the session name.
+#
+# This duplicates the CLI's own spec, which is how it would rot. Pinned by
+# `test_the_value_taking_flag_list_matches_session_agent`, which reads the real
+# subparser out of `bin/session-agent`, so adding a value-taking flag there
+# fails CI here rather than silently misreading a name.
+_STATE_VALUE_FLAGS = frozenset({"--interval"})
+
+
+def _positional_name(args: list[str]) -> str | None:
+    """The session name out of the arguments following `state`.
+
+    WALKS THE ARGV THE WAY ARGPARSE DOES rather than guessing at dashes, which
+    is where two earlier versions of this went wrong. `--follow` is a
+    store_true, so argparse accepts it on either side of the positional and
+    `rest[1]` is not reliably the name. Skipping every dash-prefixed token
+    instead is not enough either: it swallows the flag but keeps the flag's
+    VALUE, and it drops a name that legitimately begins with a dash, which
+    argparse allows behind a `--` separator. The second failure is the worse
+    one, because it hides the process entirely instead of merely misfiling it.
+    """
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        # Everything after `--` is positional, dashes and all — the only way to
+        # pass a name starting with one.
+        if tok == "--":
+            if i + 1 < len(args):
+                return signal_client.sanitise(args[i + 1], max_len=64) or "(unnamed)"
+            return None
+        if tok.startswith("-"):
+            # `--interval=5` carries its value in the same token, so it is one
+            # step; `--interval 5` is two.
+            i += 2 if tok in _STATE_VALUE_FLAGS else 1
+            continue
+        return signal_client.sanitise(tok, max_len=64) or "(unnamed)"
+    return None
+
+
+def followers(procs: list[dict]) -> list[dict]:
+    """Every `session-agent state <name> --follow` process in `procs`, as
+    `{"pid", "ppid", "session"}`."""
+    out = []
+    for p in procs:
+        name = follower_session(p["command"])
+        if name is not None:
+            out.append({"pid": p["pid"], "ppid": p["ppid"], "session": name})
+    return out
+
+
+def duplicate_sessions(followed: list[dict]) -> dict[str, list[dict]]:
+    """{session: [followers]} for every session with MORE THAN ONE live
+    follower — the threshold-free signal. A healthy session has exactly one, so
+    this is empty whenever nothing has leaked, however many sessions or panes are
+    open."""
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for f in followed:
+        grouped[f["session"]].append(f)
+    return {name: procs for name, procs in grouped.items() if len(procs) > 1}
+
+
+def orphan_count(followed: list[dict]) -> int:
+    """How many followers have `ppid == 1` (reparented to launchd — whatever
+    started them is long gone). Supporting detail only; never the trigger, since
+    the legitimate count moves with however many panes happen to be open."""
+    return sum(1 for f in followed if f["ppid"] == 1)
+
+
+# --- I/O + reporting ----------------------------------------------------------
+
+
+def run_ps(cmd: list[str] = PS_CMD) -> str | None:
+    """Raw `ps` output, or None when the look itself failed.
+
+    NONE AND "" ARE DIFFERENT ANSWERS and collapsing them is how a watchdog
+    reports all-clear at the moment it has gone blind. `ps` on a working host
+    always lists at least `launchd`, so an empty result is never a legitimate
+    "nothing to see" — it is evidence the check could not run. The caller says
+    so out loud rather than counting zero followers.
+
+    This is not hypothetical for this particular watchdog. The incident it
+    exists to catch ran load average 209 with a 9.5s stall on a health check,
+    which is inside this function's own 10s timeout — so a recurrence is a
+    plausible way for `ps` itself to time out, and silence would arrive exactly
+    when the signal matters most.
+
+    It still never raises: a watchdog must not crash the host it is watching."""
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0 or not out.stdout:
+        # The empty-but-successful case is enforced rather than assumed. `ps
+        # -ax` cannot exit 0 with no output on a live host, so treating it as a
+        # failed look costs nothing and keeps the docstring above true of the
+        # code rather than only of the platform.
+        return None
+    return out.stdout
+
+
+def format_report(dups: dict[str, list[dict]], followed: list[dict]) -> str:
+    total_orphans = orphan_count(followed)
+    lines = [
+        f"{len(dups)} tmux session(s) have more than one `session-agent state "
+        f"<name> --follow` process live — a session should have exactly one.",
+    ]
+    for name in sorted(dups):
+        procs = sorted(dups[name], key=lambda p: p["pid"])
+        orphans = sum(1 for p in procs if p["ppid"] == 1)
+        pids = ", ".join(str(p["pid"]) for p in procs)
+        lines.append(
+            f"• `{name}`: {len(procs)} followers ({orphans} orphaned, "
+            f"ppid=1) — pids {pids}"
+        )
+    lines.append(
+        f"{total_orphans}/{len(followed)} followers total are orphaned (ppid=1) "
+        f"across every session, duplicated or not — supporting detail, not "
+        f"what triggered this."
+    )
+    lines.append(
+        "This watchdog reports only; it does not kill anything (a reaper could "
+        "take a live follower during a race and leave a pane blind). Investigate "
+        "and clear the excess PIDs by hand."
+    )
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--dry-run", action="store_true",
+                     help="print what would be posted; post nothing")
+    ap.add_argument("--verbose", "-v", action="store_true",
+                     help="print OK even on a clean run")
+    args = ap.parse_args(argv)
+
+    text = run_ps()
+    if text is None:
+        # DEGRADE LOUDLY. Reporting "no duplicates" here would be a lie about
+        # a check that never ran, and this watchdog's whole value is being
+        # believed when it says nothing is wrong.
+        blind = ("could not read the process list — `ps` failed or timed out, "
+                 "so NOTHING was checked. This is not an all-clear.")
+        print(f"session-follow-watchdog: {blind}", file=sys.stderr)
+        if not args.dry_run:
+            signal_client.post_alert(
+                ALERT_STREAM, blind,
+                meta={"alert": "session-follow-watchdog-blind"},
+                dedup_key=f"{ALERT_STREAM}-blind-{date.today().isoformat()}",
+            )
+        return 2
+
+    procs = parse_ps_output(text)
+    followed = followers(procs)
+    dups = duplicate_sessions(followed)
+
+    if not dups:
+        if args.verbose:
+            print(f"session-follow-watchdog: OK — {len(followed)} "
+                  f"follower(s), at most one per session.")
+        return 0
+
+    msg = format_report(dups, followed)
+    print(f"session-follow-watchdog: {msg}", file=sys.stderr)
+
+    if args.dry_run:
+        print("[dry-run] would raise a session-follow-leak alert", file=sys.stderr)
+        return 1
+
+    signal_client.post_alert(
+        ALERT_STREAM, msg,
+        meta={
+            "alert": "session-follow-leak",
+            "duplicate_sessions": {name: len(procs) for name, procs in dups.items()},
+            "orphan_count": orphan_count(followed),
+            "follower_count": len(followed),
+        },
+        dedup_key=f"{ALERT_STREAM}-{date.today().isoformat()}",
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

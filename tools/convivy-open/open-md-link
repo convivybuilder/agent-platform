@@ -1,0 +1,154 @@
+#!/bin/zsh
+# iTerm2 Semantic History handler.
+# Invoked on cmd-click of a path inside an SSH session to the mac mini.
+# Translates mini-side paths to the laptop's SMB mount and opens markdown
+# files in Typora (which writes saves back through SMB to the mini).
+#
+# For .md files with a line number, drives Typora's Find to scroll to a
+# snippet of that line. Requires Accessibility permission for iTerm2 (or
+# whatever launches this script) to control System Events / Typora.
+#
+# Args:
+#   $1 — path as printed in the terminal (mini's perspective)
+#   $2 — optional line number
+
+emulate -L zsh
+set -u
+
+remote_path="${1:-}"
+line="${2:-}"
+[[ -z "$remote_path" ]] && exit 0
+
+# A URL — open it in the default browser and stop. Must come BEFORE the path
+# machinery below: a GitHub/web link isn't a mini file, and the ":<port>" /
+# line-number stripping would mangle it (e.g. localhost:8765 -> localhost). This
+# covers http(s) links cmd-clicked in the terminal — github PRs, dashboards, and
+# the localhost:8765 convivy-open Slack links (the browser hits that server,
+# which opens the file). Anything non-URL falls through to the file handling.
+case "$remote_path" in
+  http://*|https://*)
+    /usr/bin/open "$remote_path"
+    exit 0
+    ;;
+esac
+
+# iTerm2 sometimes packs the line into $1 as "file.md:42" or "file.md:42:7".
+if [[ -z "$line" && "$remote_path" == *:[0-9]* ]]; then
+  line="${remote_path##*:}"
+  line="${line%%:*}"
+fi
+remote_path="${remote_path%:[0-9]*}"
+remote_path="${remote_path%:[0-9]*}"
+
+# This script always runs on the laptop, but $remote_path names an account on
+# the MINI, which the two-account design (platform/decisions/0090) can be a
+# different one from this laptop account — so the account to map is read out
+# of $remote_path itself, never out of $HOME. <home-root> is this laptop
+# account's home directory's parent (/Users on macOS) as the directory
+# service reports it, the same resolution resolve-open-base.sh's sibling fix
+# uses: the SMB share exposes the mini's account home as /Volumes/<user>, so
+# <home-root>/<user>/<rest> on the mini reads as /Volumes/<user>/<rest> here,
+# whichever <user> the mini actually named.
+_this_home="$(/usr/bin/dscacheutil -q user -a name "$(/usr/bin/whoami)" 2>/dev/null | /usr/bin/awk '/^dir: / {print $2}')"
+_home_root="${_this_home:h}"
+[[ -z "$_home_root" ]] && _home_root="${HOME:h}"
+case "$remote_path" in
+  "$_home_root"/*/*)
+    _user="$(printf '%s\n' "$remote_path" | /usr/bin/cut -d/ -f3)"
+    _rest="$(printf '%s\n' "$remote_path" | /usr/bin/cut -d/ -f4-)"
+    local_path="/Volumes/$_user/$_rest"
+    ;;
+  *)
+    local_path="$remote_path"
+    ;;
+esac
+
+# iTerm's cmd-click path detection can grab trailing sentence punctuation — a
+# path ending a line ("…now-plane-build-pass-1.md.") arrives with a trailing
+# dot, so the mapped path won't exist. If local_path isn't found, peel
+# trailing . , ; : ) one char at a time and keep a peeled candidate only if it
+# actually exists, so a legitimate trailing char is never dropped.
+if [[ ! -e "$local_path" ]]; then
+  cand="$local_path"
+  while [[ ! -e "$cand" && "$cand" == *[.,\;:\)] ]]; do
+    cand="${cand%[.,\;:\)]}"
+  done
+  [[ -e "$cand" ]] && local_path="$cand"
+fi
+
+notify() {
+  /usr/bin/osascript -e "display notification \"$1\" with title \"open-md-link\""
+}
+
+if [[ ! -e "$local_path" ]]; then
+  notify "Not found: $local_path"
+  exit 1
+fi
+
+is_markdown=false
+case "${local_path:l}" in
+  *.md|*.markdown|*.mdown|*.mkd|*.mkdn) is_markdown=true ;;
+esac
+
+if ! $is_markdown; then
+  /usr/bin/open "$local_path"
+  exit 0
+fi
+
+typora_running=$(/usr/bin/osascript -e 'application "Typora" is running' 2>/dev/null)
+/usr/bin/open -a Typora "$local_path"
+
+# No line number → done.
+if [[ -z "$line" || "$line" == "0" ]] || ! [[ "$line" =~ ^[0-9]+$ ]]; then
+  exit 0
+fi
+
+# Pull a search snippet from $line (or a nearby non-empty line).
+# Strip leading whitespace and common markdown markers so the text matches
+# what Typora renders, not the raw source.
+clean_line() {
+  /usr/bin/sed -n "${1}p" "$local_path" \
+    | /usr/bin/sed -E 's/^[[:space:]]*//; s/^#+[[:space:]]+//; s/^[-*+][[:space:]]+//; s/^[0-9]+\.[[:space:]]+//; s/^>[[:space:]]*//' \
+    | /usr/bin/awk '{ sub(/[[:space:]]+$/, ""); print }' \
+    | /usr/bin/cut -c1-60
+}
+
+snippet=""
+for offset in 0 1 -1 2 -2 3 -3; do
+  cand_line=$((line + offset))
+  (( cand_line < 1 )) && continue
+  cand=$(clean_line "$cand_line")
+  if [[ -n "$cand" && "${#cand}" -ge 8 ]]; then
+    snippet="$cand"
+    break
+  fi
+done
+
+[[ -z "$snippet" ]] && exit 0
+
+# Escape for AppleScript string literal: backslash and double-quote.
+as_snippet="${snippet//\\/\\\\}"
+as_snippet="${as_snippet//\"/\\\"}"
+
+# Wait longer if Typora had to cold-start.
+if [[ "$typora_running" == "true" ]]; then
+  open_delay="0.4"
+else
+  open_delay="1.5"
+fi
+
+/usr/bin/osascript <<APPLESCRIPT
+  tell application "Typora" to activate
+  delay $open_delay
+  tell application "System Events"
+    tell process "Typora"
+      keystroke "f" using command down
+      delay 0.15
+      keystroke "$as_snippet"
+      delay 0.05
+      key code 36
+      delay 0.2
+      key code 53
+    end tell
+  end tell
+APPLESCRIPT

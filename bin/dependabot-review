@@ -1,0 +1,618 @@
+#!/usr/bin/env python3
+"""dependabot-review — review the weekly dependency PRs overnight, so the
+morning decision is one paragraph rather than a dozen tabs.
+
+WHY THIS EXISTS.
+
+Measured 2026-07-30: 73 dependabot PRs merged across vivy, constance and
+sous-chef in 30 days. The operator's account of the cost was that dependabot plus nightly
+bugs plus issues consumed roughly the first ten hours of his day, leaving a thin
+window for product work.
+
+Two changes attack that. Grouping (the dependabot.yml rewrites merged the same
+day) cuts how OFTEN the question is asked: routine minor and patch updates now
+arrive as one PR per ecosystem per week instead of one per bump. This command
+cuts what ANSWERING it costs, by doing the reading before the operator wakes up.
+
+WHAT IT DOES NOT DO, and why.
+
+It does NOT merge. Auto-merge was considered and dropped: the required-status-
+check sets on these repos are far thinner than the checks that actually run
+(constance requires none at all), so "merge when required CI is green" would
+have merged on almost nothing. Fixing that means restructuring branch protection,
+which the operator declined for products with no users. See signal
+branch-protection-required-checks-thin-2026-07-30. So the human merge click
+stays the gate, and this command's job is to make that click well-informed.
+
+It does NOT combine PRs. Combining N dependabot branches means resolving the
+same lockfile N times by hand, which is the resolver's job and which dependabot
+already does correctly when it groups. Grouping is where batching belongs.
+
+WHAT IT DISPATCHES.
+
+Every PR gets a `reviewer`. The routing is decided HERE rather than by the agent,
+so the choice is deterministic, testable, and its cost is predictable.
+
+TWO AXES, because a bump can go wrong in two unrelated ways:
+
+    security   the package can be EXPLOITED — request path, auth, crypto,
+               deserialization, a database driver, or a published advisory.
+               Adds a `security-reviewer`.
+    breaking   the package can STOP WORKING — a major version jump. The
+               reviewer is told to hunt breaking changes and check call sites.
+
+Collapsing these was the first version's mistake, and running it against the
+live fleet is what exposed it: "any major, whatever the package" sent a
+security-reviewer at a major bump of an icon library and classified 8 of 10 open
+PRs as needing a security review. Split, it is 4, and the 4 touch something.
+
+Everything tripping neither axis gets a changelog read, which is the whole
+review a routine bump deserves.
+
+For each PR it dispatches, the tool prints the `agentctl review-status` command
+that gates its merge, with `--required` naming exactly the reviewers it
+dispatched. The command's default (both reviewers) reads FAIL on a changelog-
+or breaking-tier PR that never got a security-reviewer, so the printed command
+is the one that answers the question the tier actually asked.
+
+A PR already reviewed at its current head is skipped, because this runs nightly
+and a weekly PR would otherwise be re-reviewed six times for nothing.
+
+Usage:
+    dependabot-review                  # every dispatchable repo
+    dependabot-review --repo vivy      # one repo
+    dependabot-review --dry-run        # classify and print, dispatch nothing
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent
+                       / "lib" / "agent-platform"))
+
+import registry as R  # noqa: E402
+from worktrees import is_dispatch_target  # noqa: E402
+import builder_root as BR  # noqa: E402
+
+# The sibling agentctl, falling back to the deployed one: ~/.local/bin
+# symlinks into whichever branch the agent-platform checkout is on
+# (platform/decisions/0059 rule 5), which a deploy-pinned copy of this script
+# must not reach back into.
+_SIBLING_AGENTCTL = pathlib.Path(__file__).resolve().parent / "agentctl"
+AGENTCTL = (_SIBLING_AGENTCTL if _SIBLING_AGENTCTL.is_file()
+            else pathlib.Path.home() / ".local" / "bin" / "agentctl")
+
+# How long to wait for a registry slot before giving up on one dispatch. A fleet
+# pass can want a dozen agents at once and the global ceiling is 16, so on a busy
+# night this WILL block rather than being theoretical. Waiting beats the
+# alternative: agentctl refuses the spawn, and the PR is silently skipped until
+# tomorrow with nothing in the log saying why.
+_SLOT_WAIT_SECONDS = 900
+_SLOT_POLL_SECONDS = 20
+CONVIVY = BR.root()
+DEPENDABOT = "app/dependabot"
+
+# The categories the machine-global rule states, as a CLOSED set.
+#
+# Adding a member here is a CHANGE TO THE RULE, not a change to this file. Amend
+# "Tier a dependency-bump review by what the package touches" in
+# machine-global-CLAUDE.md first, then add it here.
+#
+# It is a closed set because the previous guard matched reasons by SUBSTRING
+# against a hand-maintained list inside the test. Widening that list was easier
+# than amending the rule, so it happened: five categories sat in the test that
+# the rule never named, and the guard ratified the drift it existed to catch.
+# A closed set makes widening a visible one-line diff in the tool rather than a
+# substring quietly appended to a tuple in a test file.
+RULE_CATEGORIES = (
+    "request-path",         # HTTP server, ASGI/WSGI, router, proxy, headers
+    "auth-crypto-tokens",   # signing, verification, key and password handling
+    "deserialization",      # untrusted YAML/XML, templates, image decoding
+    "db-driver",            # driver or ORM on a user-input query path
+    "outbound-tls",         # outbound requests, certificate trust, redirects
+    "webhook-signature",    # verifying inbound callback signatures
+)
+
+# Packages whose bump earns a security review, each with its category and the
+# reason. The reason travels into the reviewer's task string, because a reviewer
+# told which surface to examine produces a materially better review than one
+# told "review this bump".
+#
+# Matching is on the package name as dependabot reports it, case-folded and
+# exact, so `starlette` does not match `starlette-extras` and `Jinja2` does match
+# `jinja2`. Deliberately a LIST rather than a pattern: a package earns its place
+# by argument, and an unfamiliar name should fall to the changelog tier rather
+# than be caught by a clever regex nobody can audit.
+SENSITIVE: dict[str, tuple[str, str]] = {
+    # Request path — terminates HTTP or parses untrusted bytes off the wire.
+    "uvicorn": ("request-path", "terminates HTTP on the request path"),
+    "gunicorn": ("request-path", "terminates HTTP on the request path"),
+    "hypercorn": ("request-path", "terminates HTTP on the request path"),
+    "starlette": ("request-path", "routes and parses requests on the request path"),
+    "fastapi": ("request-path", "routes and parses requests on the request path"),
+    "flask": ("request-path", "routes and parses requests on the request path"),
+    "django": ("request-path", "routes and parses requests on the request path"),
+    "werkzeug": ("request-path", "parses requests and handles headers on the request path"),
+    "aiohttp": ("request-path", "is both an HTTP client and server, so it parses untrusted bytes"),
+    "python-multipart": ("request-path", "parses multipart form bodies and file uploads, "
+                                         "which is untrusted input with a CVE history"),
+    # Outbound requests and the TLS trust root.
+    "httpx": ("outbound-tls", "issues outbound requests and handles TLS"),
+    "requests": ("outbound-tls", "issues outbound requests and handles TLS"),
+    "urllib3": ("outbound-tls", "issues outbound requests and handles TLS"),
+    "certifi": ("outbound-tls", "is the trust root for outbound TLS"),
+    # Auth, crypto, tokens.
+    "cryptography": ("auth-crypto-tokens", "implements the crypto primitives"),
+    "pyjwt": ("auth-crypto-tokens", "signs and verifies auth tokens"),
+    "python-jose": ("auth-crypto-tokens", "signs and verifies auth tokens"),
+    "passlib": ("auth-crypto-tokens", "hashes and verifies passwords"),
+    "bcrypt": ("auth-crypto-tokens", "hashes and verifies passwords"),
+    "authlib": ("auth-crypto-tokens", "implements the auth flows"),
+    "oauthlib": ("auth-crypto-tokens", "implements the auth flows"),
+    "itsdangerous": ("auth-crypto-tokens", "signs session data"),
+    # Webhook signature verification — who can forge a callback.
+    "stripe": ("webhook-signature", "verifies payment webhook signatures and handles payment data"),
+    "twilio": ("webhook-signature", "verifies webhook signatures on inbound callbacks"),
+    # Deserialization of untrusted input.
+    "pyyaml": ("deserialization", "deserializes untrusted input"),
+    "lxml": ("deserialization", "deserializes untrusted XML"),
+    "defusedxml": ("deserialization", "deserializes untrusted XML"),
+    "jinja2": ("deserialization", "renders templates, which is a server-side injection surface"),
+    "markupsafe": ("deserialization", "is the escaping layer templates depend on"),
+    "pillow": ("deserialization", "decodes untrusted image bytes"),
+    # Database drivers and ORMs on a user-input query path.
+    "sqlalchemy": ("db-driver", "builds queries from user input"),
+    "psycopg": ("db-driver", "is the database driver on the query path"),
+    "psycopg2": ("db-driver", "is the database driver on the query path"),
+    "psycopg2-binary": ("db-driver", "is the database driver on the query path"),
+    "asyncpg": ("db-driver", "is the database driver on the query path"),
+    "pymysql": ("db-driver", "is the database driver on the query path"),
+}
+# alembic was here and was removed. It applies developer-authored migration
+# scripts, so no untrusted input reaches it and it matches none of the four
+# categories the rule states: request path, auth/crypto, deserialization, or a
+# driver on a user-input query path. Keeping it made the tool and the rule
+# disagree about the same package, which is worse than either answer alone.
+#
+# Its real risk is not exploitability but data integrity: a migration-engine
+# defect corrupts data on deploy, and a MINOR bump can do that, so the breaking
+# axis does not catch it either. That gap is filed rather than papered over by
+# filing alembic under a heading it does not belong to.
+
+# "Updates `pkg` from 1.2.3 to 1.3.0" — dependabot writes this for single and
+# grouped PRs alike, which is why the body is parsed rather than the title.
+_UPDATE_RE = re.compile(
+    r'Updates?\s+`?([A-Za-z0-9._@/-]+)`?\s+from\s+([0-9][^\s]*)\s+to\s+([0-9][^\s]*)',
+    re.I)
+# The single-bump title, as a fallback when the body says nothing parseable.
+_TITLE_RE = re.compile(
+    r'bump\s+`?([A-Za-z0-9._@/-]+)`?\s+from\s+([0-9][^\s]*)\s+to\s+([0-9][^\s]*)',
+    re.I)
+
+
+def _gh(args: list[str], repo: str) -> str | None:
+    """Run gh. Returns stdout, or None when the call FAILED.
+
+    None and "" are deliberately different answers, and conflating them is what
+    made the first version fail open: `gh pr list` erroring on an expired token
+    produced an empty PR list, which printed as "0 open dependabot PR(s)" and was
+    indistinguishable in the log from a genuinely empty queue. A persistent auth
+    failure could then suppress every security review across the fleet for days
+    while the log looked clean. Callers must treat None as "I do not know".
+    """
+    try:
+        p = subprocess.run(["gh", *args, "--repo", f"convivy/{repo}"],
+                           capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        print(f"  ! gh {args[0]} {args[1] if len(args) > 1 else ''} on {repo} "
+              f"failed: {type(exc).__name__}", file=sys.stderr)
+        return None
+    if p.returncode != 0:
+        print(f"  ! gh {args[0]} on {repo} exited {p.returncode}: "
+              f"{p.stderr.strip()[:160]}", file=sys.stderr)
+        return None
+    return p.stdout
+
+
+def repos() -> list[str]:
+    """Dispatchable repos that dependabot is actually configured for."""
+    out = []
+    for d in sorted(CONVIVY.iterdir()):
+        if not d.is_dir() or not (d / ".github" / "dependabot.yml").is_file():
+            continue
+        if is_dispatch_target(d.name):
+            out.append(d.name)
+    return out
+
+
+def parse_updates(title: str, body: str) -> list[tuple[str, str, str]]:
+    """Every (package, from, to) the PR claims to change."""
+    seen: dict[str, tuple[str, str, str]] = {}
+    for pkg, lo, hi in _UPDATE_RE.findall(body or ""):
+        seen.setdefault(pkg.lower(), (pkg, lo, hi))
+    if not seen:
+        for pkg, lo, hi in _TITLE_RE.findall(title or ""):
+            seen.setdefault(pkg.lower(), (pkg, lo, hi))
+    return list(seen.values())
+
+
+def _major_jump(lo: str, hi: str) -> bool:
+    """True when the leading version component increases.
+
+    A version dependabot writes that does not start with a number is treated as
+    NOT a major jump, and the package still reaches a reviewer through the
+    changelog tier. Guessing 'major' off an unparseable string would spend a
+    security review on noise; guessing 'not major' loses nothing, because
+    nothing here decides whether a human sees the PR.
+    """
+    def head(v: str) -> int | None:
+        m = re.match(r'\s*v?(\d+)', v or "")
+        return int(m.group(1)) if m else None
+
+    a, b = head(lo), head(hi)
+    return a is not None and b is not None and b > a
+
+
+def classify(title: str, body: str, labels: list[str]) -> tuple[list[str], list[str]]:
+    """Return (security_reasons, breaking_reasons). Deterministic and testable.
+
+    TWO AXES, not one, and they dispatch different agents.
+
+    A SECURITY reason means the package can be exploited: it is on the request
+    path, handles auth or crypto, deserializes untrusted input, drives the
+    database, or the bump is a published advisory. That earns a security-reviewer.
+
+    A BREAKING reason means the package can stop working: a major version jump.
+    That earns a reviewer told to look for breaking changes, and nothing more.
+
+    Collapsing these was the first version's mistake. "Any major, whatever the
+    package" sent a security-reviewer at a major bump of an icon library, which
+    spends a security review on a class of risk that is not a security risk.
+    Measured against the live fleet on 2026-07-30, that rule classified 8 of 10
+    open PRs as needing a security review; splitting the axes puts it at 4, and
+    the 4 are the ones that actually touch something.
+    """
+    security: list[str] = []
+    breaking: list[str] = []
+
+    low = {label.lower() for label in labels}
+    if "security" in low or "security update" in (body or "").lower():
+        security.append("carries a security advisory")
+
+    updates = parse_updates(title, body)
+
+    # FAIL CLOSED when the PR cannot be read. If the parse yields nothing, the
+    # loop below runs zero times, no sensitive package is ever matched, and a
+    # uvicorn bump would be reviewed as though it were a test runner — a silent
+    # security bypass triggered by nothing more adversarial than dependabot
+    # changing its body format. So an unreadable PR earns the FULL review: the
+    # honest reading of "I cannot tell what this changes" is not "it is routine".
+    # Cheap, because it only fires when the format actually breaks.
+    if not updates and (title or body):
+        security.append("the packages in this PR could not be parsed, so what it "
+                        "changes is unknown; treat it as unreviewed")
+
+    for pkg, lo, hi in updates:
+        key = pkg.lower()
+        if key in SENSITIVE:
+            security.append(f"{pkg} {SENSITIVE[key][1]}")
+        if _major_jump(lo, hi):
+            breaking.append(f"{pkg} is a MAJOR bump ({lo} to {hi})")
+
+    return security, breaking
+
+
+def open_prs(repo: str) -> list[dict] | None:
+    """Open dependabot PRs, or None when the listing itself failed."""
+    raw = _gh(["pr", "list", "--author", DEPENDABOT, "--state", "open",
+               "--limit", "50", "--json",
+               "number,title,body,headRefOid,labels,isDraft"], repo)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw) if raw.strip() else []
+    except json.JSONDecodeError:
+        print(f"  ! could not parse the PR list for {repo}", file=sys.stderr)
+        return None
+
+
+def ci_state(repo: str, number: int) -> str:
+    """"pending" | "red" | "green" | "unknown" for the PR's checks.
+
+    PENDING IS THE ONE THAT MUST NOT BE REVIEWED. A reviewer dispatched against
+    unfinished CI is required by the machine-global rule to return
+    REQUEST_CHANGES citing only "CI still in progress", so the round is spent
+    learning nothing. Observed the first night this ran: 3 of 4 vivy PRs came
+    back REQUEST_CHANGES with no substantive finding, purely because vivy's
+    serial gate had not landed. They are skipped and picked up on the next pass,
+    which is at most three hours away.
+
+    RED IS REVIEWED, deliberately, and this is not a concession. On that same
+    night the one genuinely red PR produced the most valuable review of the lot:
+    lucide-react 1.x adds aria-hidden to SVG icons, which broke a test asserting
+    exactly one such element in the nav. Diagnosing a red dependency PR is the
+    single thing here worth most of the operator's time, so red earns a review and the
+    reviewer is told the failure is the subject.
+    """
+    raw = _gh(["pr", "view", str(number), "--json", "statusCheckRollup"], repo)
+    if not raw:
+        return "unknown"  # includes the None case: unknown is not green
+    try:
+        rollup = json.loads(raw).get("statusCheckRollup") or []
+    except json.JSONDecodeError:
+        return "unknown"
+    if not rollup:
+        return "unknown"
+    red = False
+    for c in rollup:
+        # A rollup mixes two shapes. A CheckRun carries status + conclusion and
+        # leaves `state` null; a StatusContext (an external CI service, a deploy
+        # status) carries `state` and leaves the other two null. Reading only the
+        # CheckRun fields treats a PENDING StatusContext as green, which is the
+        # wasted-round bug again by a different route. Convivy's repos use
+        # CheckRun today, so this is latent rather than live.
+        status = (c.get("status") or "").upper()
+        concl = (c.get("conclusion") or "").upper()
+        state = (c.get("state") or "").upper()
+        if status in ("QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED"):
+            return "pending"
+        if state in ("PENDING", "EXPECTED"):
+            return "pending"
+        if concl in ("FAILURE", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+            red = True
+        if state in ("FAILURE", "ERROR"):
+            red = True
+    return "red" if red else "green"
+
+
+def reviewed_at_head(repo: str, number: int, sha: str) -> bool:
+    """Has a reviewer already stamped this exact head?
+
+    Read from the PR's own comments rather than from any local state, so a
+    review posted by a different session, or by a human, still counts. Nightly
+    re-review of an unchanged weekly PR is the failure this prevents.
+    """
+    raw = _gh(["pr", "view", str(number), "--json", "comments"], repo)
+    if not raw:
+        return False  # includes the None case: unknown means review it again
+    try:
+        comments = json.loads(raw).get("comments", [])
+    except json.JSONDecodeError:
+        return False
+    for c in comments:
+        text = c.get("body", "")
+        if "agentctl-review" in text and sha in text and "agent: reviewer" in text:
+            return True
+    return False
+
+
+def _task(repo: str, pr: dict, security_reasons: list[str],
+          breaking_reasons: list[str],
+          updates: list[tuple[str, str, str]], security: bool,
+          ci: str = "green") -> str:
+    listing = "\n".join(f"  - {p}: {lo} -> {hi}" for p, lo, hi in updates) or "  (none parsed)"
+    red = (
+        "CI IS RED on this PR, and diagnosing that is the main job. Find which "
+        "check fails and why, and say whether the cause is a behavioural change "
+        "in the new version, a test that encoded an assumption the new version "
+        "breaks, or a genuine defect. Name the fix concretely. Do not simply "
+        "report that CI is red; that is already visible.\n\n"
+        if ci == "red" else "")
+
+    head = (f"{'Security review' if security else 'Review'} of dependabot PR "
+            f"#{pr['number']} on convivy/{repo}, at head {pr['headRefOid'][:9]}.\n\n"
+            f"Packages this PR moves:\n{listing}\n\n")
+
+    if security:
+        return head + red + (
+            "This PR was routed to a security review because:\n"
+            + "\n".join(f"  - {r}" for r in security_reasons) + "\n\n"
+            "Review the named surfaces specifically rather than the diff "
+            "generally. For a request-path package, that means request parsing, "
+            "header handling, HTTP protocol edge cases, request smuggling, TLS "
+            "and forwarded-header trust. For auth or crypto, it means what "
+            "changed in signing, verification or key handling, and whether any "
+            "default moved. For deserialization, it means whether the new "
+            "version changes what untrusted input can reach. Check whether the "
+            "new version carries a CVE fix, and whether it changes any default "
+            "the app relies on.\n\n"
+            "Do NOT fast-bail on the grounds that this is a routine dependency "
+            "bump. It was routed here because the surface is real.\n\n"
+            "Post your verdict with agentctl review-post. The operator merges; do not merge.")
+
+    if breaking_reasons:
+        return head + red + (
+            "This PR contains a major version bump:\n"
+            + "\n".join(f"  - {r}" for r in breaking_reasons) + "\n\n"
+            "Review it for BREAKING CHANGES, which is why it was routed to you "
+            "rather than treated as routine. Read the upgrade or migration notes "
+            "between the two versions and say plainly whether this repo uses any "
+            "API that changed, was deprecated, or was removed. Check the call "
+            "sites; a major bump that CI passes can still change behaviour at "
+            "runtime in a path the tests do not cover.\n\n"
+            "No package here trips a security trigger, so this is not a security "
+            "review and no security-reviewer was dispatched. If you find one "
+            "that should have been, say so.\n\n"
+            "Also do the routine pass: confirm the lockfile delta contains "
+            "nothing beyond these packages and their transitive requirements, "
+            "and that everything resolves from the expected index.\n\n"
+            "Post your verdict with agentctl review-post. The operator merges; do not merge.")
+
+    return head + red + (
+        "Nothing in this PR sits on the request path, handles auth, crypto or "
+        "tokens, deserializes untrusted input, or drives a database, and nothing "
+        "here is a major bump or a security advisory. So this is a CHANGELOG "
+        "PASS, not a deep review.\n\n"
+        "Do exactly this and then stop: read what changed between the versions "
+        "for each package above; confirm the lockfile or requirements delta "
+        "contains nothing beyond those packages and their transitive "
+        "requirements; confirm everything resolves from the expected index with "
+        "no substitution. Then write a SHORT summary, a few sentences, saying "
+        "what moved and whether anything in the changelogs looks behavioural "
+        "rather than routine.\n\n"
+        "Do not pad this. A correct review of a routine bump is brief, and "
+        "brevity is the point of the tier. If something in the changelogs "
+        "genuinely warrants a closer look, say so plainly and say why.\n\n"
+        "Post your verdict with agentctl review-post. The operator merges; do not merge.")
+
+
+def _wait_for_slot(agent: str, budget: int = _SLOT_WAIT_SECONDS) -> bool:
+    """Block until the registry can admit one more run, or the budget runs out."""
+    waited = 0
+    while True:
+        try:
+            ok, current, reason = R.can_spawn(None, agent)
+        except Exception:
+            return True  # registry unreadable: let agentctl make the call
+        if ok:
+            return True
+        if waited >= budget:
+            print(f"    {agent}: no slot after {waited}s ({reason}); skipping",
+                  file=sys.stderr)
+            return False
+        if waited == 0:
+            print(f"    waiting for a slot ({reason}, {len(current)} live)")
+        time.sleep(_SLOT_POLL_SECONDS)
+        waited += _SLOT_POLL_SECONDS
+
+
+def dispatch(repo: str, agent: str, pr: dict, task: str, dry: bool) -> bool:
+    cmd = [str(AGENTCTL), "spawn", agent, "--on", repo,
+           "--pr", str(pr["number"]), "--task", task]
+    if dry:
+        print(f"    would dispatch {agent}")
+        return True
+    if not _wait_for_slot(agent):
+        return False
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        print(f"    {agent}: dispatch timed out", file=sys.stderr)
+        return False
+    if p.returncode != 0:
+        print(f"    {agent}: dispatch failed — {p.stderr.strip()[:200]}",
+              file=sys.stderr)
+        return False
+    print(f"    dispatched {agent}")
+    return True
+
+
+def _gate_command(repo: str, number: int, agents: list[str]) -> str:
+    """The review-status command whose PASS gates this PR's merge.
+
+    review-status defaults to requiring BOTH reviewers, so a changelog- or
+    breaking-tier PR, which only ever gets a reviewer, reads FAIL on the merge
+    gate while carrying a clean APPROVE. The printed command passes --required
+    for exactly the agents this run actually dispatched, so the operator checks
+    the gate the tier asked for rather than the default one. Building the set
+    from the dispatch results rather than from the tier keeps the hint true to
+    what the tool did, even when one dispatch failed.
+    """
+    flags = " ".join(f"--required {agent}" for agent in agents)
+    return (f"agentctl review-status --pr {number} --repo convivy/{repo}"
+            + (f" {flags}" if flags else ""))
+
+
+def _signal_listing_failure(failed: int, targets: list[str]) -> None:
+    """Put a listing failure where a human will see it.
+
+    stderr goes to a launchd log nobody reads, so a fleet-wide auth failure would
+    be invisible for days while every pass reported a clean run. The operating
+    plane is the channel that is actually watched.
+    """
+    try:
+        import signal_client as SC
+        SC.post_alert(
+            "engineering",
+            f"dependabot-review could not list PRs for {failed} of "
+            f"{len(targets)} repo(s). Those repos' dependency PRs are "
+            f"UNREVIEWED and the pass cannot say which. Usually an expired gh "
+            f"credential. Checked repos: {', '.join(targets)}.")
+    except Exception as exc:  # never let reporting failure mask the run
+        print(f"  ! could not signal the listing failure: {exc}", file=sys.stderr)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--repo", help="only this repo")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="classify and print; dispatch nothing")
+    ap.add_argument("--ignore-ci", action="store_true",
+                    help="review even when CI is still running (wastes rounds)")
+    ap.add_argument("--force", action="store_true",
+                    help="re-review even if a stamp already exists at this head")
+    args = ap.parse_args(argv)
+
+    targets = [args.repo] if args.repo else repos()
+    if args.repo and not is_dispatch_target(args.repo):
+        print(f"dependabot-review: {args.repo} is not a dispatch target",
+              file=sys.stderr)
+        return 1
+    if not targets:
+        print("dependabot-review: no dependabot-configured dispatch targets")
+        return 0
+
+    total = skipped = waiting = failed = 0
+    for repo in targets:
+        prs = open_prs(repo)
+        if prs is None:
+            # NOT "0 PRs". The listing failed, so this repo's PRs are unreviewed
+            # and nobody knows which. Counted, shouted, and reflected in the exit
+            # code, because launchd's only visible signal is that status.
+            print(f"{repo}: COULD NOT LIST PRs — repo skipped, PRs left unreviewed",
+                  file=sys.stderr)
+            failed += 1
+            continue
+        print(f"{repo}: {len(prs)} open dependabot PR(s)")
+        for pr in prs:
+            if pr.get("isDraft"):
+                continue
+            labels = [lbl.get("name", "") for lbl in pr.get("labels", [])]
+            updates = parse_updates(pr.get("title", ""), pr.get("body", ""))
+            sec, brk = classify(pr.get("title", ""), pr.get("body", ""), labels)
+            head = pr["headRefOid"]
+            tier = "security" if sec else ("breaking" if brk else "changelog")
+            note = (sec or brk or [""])[0]
+            print(f"  #{pr['number']} [{tier}] {len(updates)} package(s)"
+                  + (f" — {note}" if note else ""))
+            if not args.force and reviewed_at_head(repo, pr["number"], head):
+                print("    already reviewed at this head; skipping")
+                skipped += 1
+                continue
+            ci = ci_state(repo, pr["number"])
+            if ci == "pending" and not args.ignore_ci:
+                print("    CI still running; leaving it for the next pass")
+                waiting += 1
+                continue
+            dispatched: set[str] = set()
+            if dispatch(repo, "reviewer", pr,
+                        _task(repo, pr, sec, brk, updates, security=False, ci=ci),
+                        args.dry_run):
+                dispatched.add("reviewer")
+            if sec and dispatch(repo, "security-reviewer", pr,
+                                _task(repo, pr, sec, brk, updates, security=True, ci=ci),
+                                args.dry_run):
+                dispatched.add("security-reviewer")
+            if dispatched:
+                label = "would-be gate" if args.dry_run else "gate"
+                print(f"    {label}: {_gate_command(repo, pr['number'], sorted(dispatched))}")
+            total += 1
+
+    summary = (f"dependabot-review: {total} PR(s) dispatched, "
+               f"{skipped} already current, {waiting} waiting on CI")
+    if failed:
+        summary += f", {failed} repo(s) COULD NOT BE LISTED"
+    print(summary)
+    if failed:
+        _signal_listing_failure(failed, targets)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

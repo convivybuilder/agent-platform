@@ -1,0 +1,467 @@
+#!/usr/bin/env python3.11
+"""metric-alerts — threshold alerts on the cost/quality + code-health metrics (ARCH-112).
+
+Reads the same data the two convivy-orient dashboards surface — the scorecard
+ledgers (cost/quality) and the code-health snapshot (`health.json`) — evaluates a
+small set of thresholds, and posts breaches to Slack. **Edge-triggered**: a breach
+posts once when it starts (and a brief "recovered" when it clears), tracked in a
+state file, so a sustained problem doesn't re-alert every day. Alert-on-change, not
+a daily digest (the digests already exist).
+
+Routing:
+  code-health breaches  → #alerts-code-health
+  cost/quality breaches → #alerts-agent-cost-perf
+
+CLI: `--dry-run` (print, don't post or update state), `--report` (print the
+current breaches without touching state). Runs daily after the harvests; Slack
+`send()` no-ops gracefully until the two webhooks are provisioned.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import signal_client
+
+import builder_root as BR
+SCORECARD_DIR = BR.runs_root() / "scorecard"
+HEALTH_SNAPSHOT = SCORECARD_DIR / "health.json"
+SCORECARD = SCORECARD_DIR / "scorecard.jsonl"
+PA_LEDGER = SCORECARD_DIR / "hollis.jsonl"
+KB_EVAL = SCORECARD_DIR / "kb-eval.json"
+STATE = SCORECARD_DIR / "alert-state.json"
+
+CH_HEALTH = "alerts-code-health"
+CH_COST = "alerts-agent-cost-perf"
+
+# Thresholds (tunable). Kept conservative to stay low-noise.
+CI_PASS_FLOOR = 0.70        # CI pass-rate below this → alert
+REVERTS_MAX = 2             # reverts in the window at/above this → alert
+STALE_PR_DAYS = 14          # oldest open PR older than this → alert
+SURVIVAL_FLOOR = 0.70       # merged-and-survived% below this → alert
+SURVIVAL_MIN_N = 3          # ...only once this many PRs have been scored (noise floor)
+GATE_BAND = 5.0             # cheaper model >this many merge-% points below premium → alert
+GATE_MIN_N = 20             # ...and only when BOTH models have >this many resolved PRs.
+# A merge-rate off a handful of runs is noise, not signal: a retired model frozen
+# at 3/3 = 100% would otherwise anchor a permanent, un-closeable gap and re-fire the
+# alert daily (operator 2026-07-06, ARCH-323). Gate BOTH sides on sample size:
+# the cheaper model needs enough runs to prove it lags, and the baseline needs
+# enough to be a trustworthy premium. A model below the floor drops out of the
+# comparison entirely rather than anchoring or tripping it.
+CQ_WINDOW_DAYS = 7
+
+# Model-override monitor (ARCH-188): the roster model is the deterministic, cheaper
+# default; a co leaning on `agentctl spawn --model` defeats it, so alert on a run of
+# overrides in the trailing window.
+MODEL_OVERRIDES_LOG = BR.runs_root() / "model-overrides.jsonl"
+MODEL_OVERRIDE_WINDOW_H = 24
+MODEL_OVERRIDE_MAX = 3      # > this many interactive overrides in the window → alert
+KB_RECALL_FLOOR = 0.85      # kb-eval recall@k below this → alert (baseline ~0.98, ARCH-149)
+KB_MRR_FLOOR = 0.70         # kb-eval MRR below this → alert (baseline ~0.81, ARCH-149)
+
+# Switch-aware model gating (ARCH-173). The model-gate compares an agent's
+# CURRENT cheap model against the premium baseline. When an agent's model is
+# changed mid-window (refactorer deepseek → kimi-code, 2026-06-15), the trailing
+# 7d window straddles both, so the retired model keeps producing a gate row that
+# fires — and later "recovers" — on stale runs. That surfaces as a misleading
+# "✅ recovered: gate:refactorer:deepseek" which only means "we stopped running
+# deepseek there," while the model we actually switched to goes ungated. Resolve
+# each agent's configured model from its frontmatter and gate only that one; let
+# a retired model age out of the window silently.
+#
+# THIS IS A KB PATH, so a re-file moves it and this constant does not follow.
+# It read `projects/shared/agents/` until Phase 0 step 5 moved the roster to
+# `projects/agent-platform/agents/` (ARCH-426), and the break was SILENT and
+# fail-open: `configured_models()` returns {} for an empty directory by design,
+# so every model gate quietly reverted to the pre-ARCH-173 behaviour this whole
+# block exists to replace, and no alert said so. Found by PR G's reader sweep,
+# which the plan had scoped to three readers; this was the fourth.
+# `test_configured_models_reads_the_live_roster` pins it against the real
+# checkout, and the daily `check-kb-guards` run is what makes that pin fire.
+AGENTS_DIR = BR.root() / "knowledge" / "projects" / "agent-platform" / "agents"
+MODEL_ALIASES = {  # frontmatter alias → resolved id (mirrors agentctl.MODEL_ALIASES; ids match scorecard rows)
+    "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5",
+    "gpt5": "openai/gpt-5", "deepseek": "deepseek/deepseek-v4-flash",
+    "kimi": "moonshot/kimi-k2.6", "kimi-code": "moonshot/kimi-k2.7-code",
+}
+
+
+# --- pure: threshold evaluation ----------------------------------------------
+
+
+def configured_models(agents_dir: Path = AGENTS_DIR) -> dict[str, str]:
+    """{agent-name: resolved current model id} from each agent def's frontmatter
+    `model:` alias. Agents with no `model:` field (they run the harness default)
+    are omitted, so the gate keeps its fail-open behavior for them. An unreadable
+    agents dir returns {} — gating then falls back to its pre-ARCH-173 behavior."""
+    out: dict[str, str] = {}
+    try:
+        paths = sorted(agents_dir.glob("*.md"))
+    except OSError:
+        return out
+    for path in paths:
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        if not text.startswith("---"):
+            continue
+        fm = text.split("---", 2)[1]
+        for line in fm.splitlines():
+            if line.startswith("model:"):
+                # tolerate a quoted scalar — an unmatched alias would resolve to a
+                # bogus id and silently suppress every gate for this agent (fail
+                # closed), the opposite of this module's fail-open intent.
+                alias = line.split(":", 1)[1].strip().strip("\"'")
+                if alias:
+                    out[path.stem] = MODEL_ALIASES.get(alias, alias)
+                break
+    return out
+
+
+def _pct(n, d):
+    return (100.0 * n / d) if d else None
+
+
+def code_health_alerts(repos: list[dict]) -> list[dict]:
+    """Per-repo code-health breaches → alert dicts {key, text, severity}.
+
+    The CI alerts gate on the **main-only** fields (`ci_last_main` /
+    `ci_pass_rate_main`, ARCH-179), not the all-branch dashboard rate. A
+    pre-merge red on an agent PR branch is CI working — it caught the problem
+    before merge — so a busy night of fail→fix→merge PRs must not read as a
+    health breach; only *merged* code on main does. Both are None for a repo
+    with no push-to-main ci.yml runs, which leaves its CI alerts silent
+    (fail-open — an unmeasurable repo isn't provably unhealthy)."""
+    out = []
+    for r in repos:
+        repo = r.get("repo", "?")
+        if r.get("ci_last_main") == "failure":
+            out.append({"key": f"ci-red:{repo}", "severity": "high",
+                        "text": f"🔴 *{repo}* — the latest CI run on `main` failed, so merged "
+                                f"code on main is currently red (this tracks main only, not "
+                                f"pre-merge branch failures). Check the failing run in the repo's "
+                                f"Actions tab and fix-forward or revert."})
+        pr = r.get("ci_pass_rate_main")
+        if pr is not None and pr < CI_PASS_FLOOR:
+            out.append({"key": f"ci-low:{repo}", "severity": "warn",
+                        "text": f"⚠️ *{repo}* — CI on `main` is passing only {pr*100:.0f}% of "
+                                f"recent runs, below the {CI_PASS_FLOOR*100:.0f}% floor. Main is "
+                                f"breaking repeatedly, not on a one-off; look for a flaky or "
+                                f"genuinely broken test."})
+        rev = r.get("reverts_recent")
+        if rev is not None and rev >= REVERTS_MAX:
+            out.append({"key": f"reverts:{repo}", "severity": "warn",
+                        "text": f"⚠️ *{repo}* — {rev} reverts landed in the last 30 days "
+                                f"({REVERTS_MAX}+ trips this). A cluster of reverts usually means "
+                                f"changes are shipping under-tested; worth checking what's being "
+                                f"pulled back and why."})
+        old = r.get("oldest_open_days")
+        if old is not None and old > STALE_PR_DAYS:
+            out.append({"key": f"stale-pr:{repo}", "severity": "warn",
+                        "text": f"⚠️ *{repo}* — the oldest open PR has sat {old} days "
+                                f"(>{STALE_PR_DAYS} trips this). It's either waiting on a "
+                                f"decision/merge or should be closed — a PR open this long is "
+                                f"usually blocked on something."})
+    return out
+
+
+def _parse_iso(s):
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def aggregate_cq(rows: list[dict], now: datetime, window_days: int = CQ_WINDOW_DAYS) -> dict:
+    """Per (agent, model) over the trailing window: resolved / merged / scored /
+    survived / usd. Mirrors the scorecard's summarize, computed inline to keep the
+    alerter self-contained."""
+    start = (now - timedelta(days=window_days)).date().isoformat()
+    agg: dict = defaultdict(lambda: {"resolved": 0, "merged": 0, "scored": 0,
+                                     "survived": 0, "usd": 0.0})
+    for r in rows:
+        if (r.get("date") or "") < start:
+            continue
+        a = agg[(r.get("agent"), r.get("model"))]
+        if r.get("pr_state") not in (None, "unresolved"):
+            a["resolved"] += 1
+        if r.get("merged"):
+            a["merged"] += 1
+        if r.get("survived") is not None:
+            a["scored"] += 1
+            if r["survived"]:
+                a["survived"] += 1
+        a["usd"] += float(r.get("cost_usd") or 0.0)
+    return dict(agg)
+
+
+def cost_quality_alerts(rows: list[dict], now: datetime,
+                        configured: dict[str, str] | None = None) -> list[dict]:
+    """Survival-floor + model-gate-band breaches from the scorecard rows.
+
+    `configured` maps each agent to its current resolved model id (ARCH-173): a
+    model-gate then fires only for the model an agent is configured to run now,
+    so a retired model still inside the trailing window can't raise a stale gate.
+    None disables switch-awareness and gates every priced model — the fail-open
+    default (never hides a breach); the live callers pass `configured_models()`."""
+    agg = aggregate_cq(rows, now)
+    out = []
+    for (agent, model), a in agg.items():
+        if a["scored"] >= SURVIVAL_MIN_N:
+            sp = _pct(a["survived"], a["scored"])
+            if sp is not None and sp < SURVIVAL_FLOOR * 100:
+                out.append({"key": f"survival:{agent}:{model}", "severity": "high",
+                            "text": f"🔴 *{agent}* on `{model}` — only {sp:.0f}% of its merged "
+                                    f"PRs ({a['survived']}/{a['scored']}) survived 7 days without "
+                                    f"being reverted, below the {SURVIVAL_FLOOR*100:.0f}% floor. "
+                                    f"This agent+model is shipping work that gets pulled back; "
+                                    f"review its recent merges before relying on it further."})
+    # model-gate: for an agent on ≥2 priced models, the cheaper one's merge% > band
+    # below the premium. Only models with a trustworthy sample (> GATE_MIN_N resolved
+    # PRs) can anchor OR trip the gate — below the floor a merge-rate is noise (a
+    # 3/3 = 100% retired model would otherwise anchor a permanent false gap), so it
+    # drops out of the comparison entirely (operator 2026-07-06).
+    by_agent: dict = defaultdict(list)
+    for (agent, model), a in agg.items():
+        if a["merged"] and a["resolved"] > GATE_MIN_N:
+            by_agent[agent].append((model, a, a["usd"] / a["merged"]))
+    for agent, entries in by_agent.items():
+        if len(entries) < 2:
+            continue
+        base_model, base, base_cpm = max(entries, key=lambda e: e[2])  # priciest well-sampled = premium
+        current = (configured or {}).get(agent)
+        for model, a, cpm in entries:
+            if model == base_model:
+                continue
+            if current is not None and model != current:
+                continue  # retired model aging out of the window, not the agent's current one (ARCH-173)
+            # Both _pct denominators (resolved) are > GATE_MIN_N > 0 by the filter
+            # above, so neither is None here.
+            mp, bp = _pct(a["merged"], a["resolved"]), _pct(base["merged"], base["resolved"])
+            if mp < bp - GATE_BAND:
+                # Quantify "cheaper" with the observed $/merged the ranking uses —
+                # the label is empirical (this model cost less per merged PR here),
+                # not a list-price claim (two models can share a list price and
+                # still differ in observed $/merged) (operator 2026-07-06).
+                out.append({"key": f"gate:{agent}:{model}", "severity": "warn",
+                            "text": f"⚠️ *{agent}* — the cheaper model `{model}` "
+                                    f"(${cpm:.2f}/merged vs `{base_model}` at ${base_cpm:.2f}/merged) "
+                                    f"is merging {mp:.0f}% of its PRs ({a['merged']}/{a['resolved']}) "
+                                    f"versus {bp:.0f}% ({base['merged']}/{base['resolved']}), more than "
+                                    f"the {GATE_BAND:.0f}-point gap we flag. Both models have a "
+                                    f"meaningful sample (>{GATE_MIN_N} resolved PRs), so this gap is "
+                                    f"real, not small-sample noise — consider switching {agent} back to "
+                                    f"`{base_model}`. Breakdown: run model-scorecard."})
+    return out
+
+
+def kb_eval_alerts(summary: dict) -> list[dict]:
+    """KB retrieval regression: recall@k or MRR below floor (ARCH-149).
+
+    Reads the daily kb-eval summary (the same kb-eval.json the /kb dashboard
+    shows). The eval re-runs the golden set through the real kb_search each
+    morning at 07:48, just before this alerter at 07:50, so a retrieval defect
+    or a doc-rename that breaks lookup pages within a day instead of waiting for
+    an agent to hit it. Silent when the summary is missing (no eval yet)."""
+    overall = (summary or {}).get("overall") or {}
+    if not overall:
+        return []
+    out = []
+    k = (summary or {}).get("k", 10)
+    recall = overall.get(f"recall@{k}")
+    if recall is not None and recall < KB_RECALL_FLOOR:
+        out.append({"key": "kb-recall", "severity": "high",
+                    "text": f"🔴 KB retrieval — recall@{k} dropped to {recall*100:.0f}%, below the "
+                            f"{KB_RECALL_FLOOR*100:.0f}% floor. Agents searching the knowledge base "
+                            f"are missing docs that should match, so they may act on absent or stale "
+                            f"context. A doc rename or an index problem is the usual cause; check "
+                            f"the /kb dashboard."})
+    mrr = overall.get("mrr")
+    if mrr is not None and mrr < KB_MRR_FLOOR:
+        out.append({"key": "kb-mrr", "severity": "warn",
+                    "text": f"⚠️ KB retrieval — mean reciprocal rank is {mrr:.2f}, below the "
+                            f"{KB_MRR_FLOOR:.2f} floor. The right doc is still found but ranked "
+                            f"lower, so an agent may read the wrong hit first. Check the /kb dashboard."})
+    return out
+
+
+def model_override_alerts(now: datetime, path: Path = MODEL_OVERRIDES_LOG) -> list[dict]:
+    """Alert when interactive `--model` overrides exceed the budget in the trailing
+    window (ARCH-188). The roster model is the deterministic, cheaper default; a co
+    repeatedly overriding it defeats the design, so surface a run of overrides for a
+    look. Counts interactive origins only (a scheduled override is a deliberate
+    config, not co drift). Silent when the log is missing.
+
+    Quotes each override's `reason` (model-lane epic issue_01KZH2GYGTVHFXZ055GEZVH2ZJ)
+    rather than only the model breakdown, so the alert reads as "here's why" instead
+    of leaving that to a timestamp-matching reconstruction — which is exactly the
+    gap that prompted the epic (a 2026-08-08 alert reported six overrides and
+    couldn't say why any of them happened). A row with no `reason` (written before
+    the field existed, or a best-effort log write that lost the field) quotes as
+    "(no reason recorded)" rather than being dropped, so the alert still counts it.
+    `reason` is free text typed at the CLI, not platform-authored, but it's safe to
+    interpolate straight into this alert's text: agentctl's `_log_model_override`
+    already runs it through `signal_client.sanitise` before it ever reaches this
+    log, so credential-shaped text is redacted at the point it's captured rather
+    than here at the point it's read."""
+    cutoff = now - timedelta(hours=MODEL_OVERRIDE_WINDOW_H)
+    # Drop rows with an unparseable/missing ts — we can't confirm they're in-window,
+    # so they must not inflate the count (would fire the alert early).
+    recent = [r for r in _load_jsonl(path)
+              if r.get("origin") == "interactive"
+              and (ts := _parse_iso(r.get("ts"))) is not None and ts >= cutoff]
+    if len(recent) <= MODEL_OVERRIDE_MAX:
+        return []
+    breakdown = ", ".join(f"`{m}`×{c}" for m, c in Counter(r.get("model", "?") for r in recent).most_common())
+    quotes = "; ".join(f'`{r.get("model", "?")}` — "{r.get("reason") or "no reason recorded"}"'
+                        for r in recent)
+    return [{"key": "model-override:interactive", "severity": "warn",
+             "text": f"⚠️ {len(recent)} interactive `--model` overrides in the last "
+                     f"{MODEL_OVERRIDE_WINDOW_H}h (>{MODEL_OVERRIDE_MAX} trips this). The roster pins "
+                     f"each agent to a deterministic, cheaper model on purpose; a co repeatedly "
+                     f"overriding it defeats that and can quietly raise cost. Which models: "
+                     f"{breakdown}. Reasons given: {quotes}. If the overrides are justified, no "
+                     f"action; if it's drift, steer the co back to the roster default."}]
+
+
+def edge_trigger(alerts: list[dict], active: list[str]) -> tuple[list[dict], list[str], list[str]]:
+    """Compare this run's firing alerts to the previously-active keys. Returns
+    (new_breaches, recovered_keys, now_active). New = started firing this run;
+    recovered = was firing, no longer is."""
+    prev = set(active)
+    now_keys = {a["key"] for a in alerts}
+    new = [a for a in alerts if a["key"] not in prev]
+    recovered = sorted(prev - now_keys)
+    return new, recovered, sorted(now_keys)
+
+
+# --- impure: IO + post -------------------------------------------------------
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def load_health(path: Path = HEALTH_SNAPSHOT) -> list[dict]:
+    try:
+        return json.loads(path.read_text()).get("repos", [])
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def load_kb_eval(path: Path = KB_EVAL) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def load_state(path: Path = STATE) -> dict:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"active": []}
+
+
+def save_state(active: list[str], now: datetime, path: Path = STATE) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"active": active, "updated": now.strftime("%Y-%m-%dT%H:%M:%SZ")},
+                               indent=2))
+
+
+def _post(channel: str, header: str, new_: list[dict], recovered: list[str]) -> None:
+    lines = [header]
+    lines += [f"• {a['text']}" for a in new_]
+    if recovered:
+        lines += [f"• ✅ recovered: {k}" for k in recovered]
+    text = "\n".join(lines)
+    signal_client.post_alert(
+        channel, text,
+        meta={"alert": channel, "new": [a["text"] for a in new_],
+              "recovered": list(recovered)})
+
+
+def run(*, dry_run: bool) -> int:
+    now = datetime.now(timezone.utc)
+    health = load_health()
+    cq_rows = _load_jsonl(SCORECARD) + _load_jsonl(PA_LEDGER)
+
+    ch_alerts = code_health_alerts(health)
+    # KB retrieval-quality breaches ride the cost/perf channel (an agent-performance
+    # signal, no new webhook needed); _channel_of routes their kb- keys there.
+    cq_alerts = (cost_quality_alerts(cq_rows, now, configured_models())
+                 + kb_eval_alerts(load_kb_eval())
+                 + model_override_alerts(now))
+    state = load_state()
+    active = state.get("active", [])
+
+    posted_active = list(active)
+    for channel, header, alerts in (
+        (CH_HEALTH, "*Code-health alerts*\n_The daily metric-alerts check on each repo's CI and "
+                    "PR health. It posts only when a threshold is freshly crossed — silence means "
+                    "all clear. Each line below is a new breach; ✅ lines have recovered._",
+         ch_alerts),
+        (CH_COST, "*Agent cost/perf alerts*\n_The daily metric-alerts check on agent merge and "
+                  "survival rates, model gates, KB retrieval quality, and model overrides. It posts "
+                  "only a fresh threshold crossing — silence means all clear. Each line is a new "
+                  "breach; ✅ lines have recovered._",
+         cq_alerts),
+    ):
+        # edge-trigger per channel against that channel's slice of the state
+        ch_prefix_keys = [k for k in active if _channel_of(k) == channel]
+        new, recovered, now_keys = edge_trigger(alerts, ch_prefix_keys)
+        if new or recovered:
+            print(f"[{channel}] {len(new)} new, {len(recovered)} recovered", file=sys.stderr)
+            for a in new:
+                print(f"  NEW  {a['text']}", file=sys.stderr)
+            for k in recovered:
+                print(f"  CLR  {k}", file=sys.stderr)
+            if not dry_run:
+                _post(channel, header, new, recovered)
+        # replace this channel's keys in the active set
+        posted_active = [k for k in posted_active if _channel_of(k) != channel] + now_keys
+
+    if not dry_run:
+        save_state(sorted(set(posted_active)), now)
+    return 0
+
+
+def _channel_of(key: str) -> str:
+    """Which channel an alert key belongs to (by its prefix)."""
+    health_prefixes = ("ci-red:", "ci-low:", "reverts:", "stale-pr:")
+    return CH_HEALTH if key.startswith(health_prefixes) else CH_COST
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Threshold alerts on cost/quality + code-health (ARCH-112).")
+    p.add_argument("--dry-run", action="store_true", help="print breaches; don't post or update state")
+    p.add_argument("--report", action="store_true", help="print current breaches, don't touch state")
+    args = p.parse_args(argv)
+    if args.report:
+        now = datetime.now(timezone.utc)
+        for a in (code_health_alerts(load_health())
+                  + cost_quality_alerts(_load_jsonl(SCORECARD) + _load_jsonl(PA_LEDGER), now, configured_models())
+                  + kb_eval_alerts(load_kb_eval())):
+            print(f"{a['severity']:<5} {a['key']:<32} {a['text']}")
+        return 0
+    return run(dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

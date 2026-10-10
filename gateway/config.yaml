@@ -1,0 +1,243 @@
+# LiteLLM proxy config for the Convivy agent-platform gateway (Phase C, ARCH-102).
+#
+# MODEL STRINGS (coder notes for the operator's review):
+#   deepseek/deepseek-v4-flash  — DeepSeek's current fast model, explicit id (ARCH-280).
+#       Repointed from the legacy `deepseek-chat` alias, which DeepSeek sunsets
+#       2026-07-24; deepseek-chat had already become V4 Flash's non-thinking mode at
+#       the same price, so this is the same model under its durable name. Pricing is
+#       pinned in model_info below (LiteLLM's map has no v4-flash entry). Keep this,
+#       MODEL_ALIASES, GATEWAY_MODEL_GROUPS, and the model_group_alias in bin/agentctl
+#       (+ bin/metric-alerts' alias map and the test fixtures) in sync —
+#       test_gateway_routing enforces the alias↔deployment match.
+#
+#   moonshot/kimi-k2.6  — Moonshot AI direct (256k context window).
+#       Confirmed available on the existing MOONSHOT_API_KEY (GET /v1/models,
+#       2026-06-11) — no OpenRouter key needed, contrary to the original note.
+#       Replaced moonshot-v1-32k (ARCH-130): as the deepseek fallback it must
+#       absorb deepseek-sized contexts (50k+ tokens), which 32k cannot, and it
+#       must accept response_format json_schema (verified 2026-06-11; emits a
+#       whitespace run before the JSON body, which JSON parsers tolerate).
+#       Keep this and MODEL_ALIASES in bin/agentctl in sync.
+#
+#   moonshot/kimi-k2.7-code  — Moonshot's coding-specialized model (released
+#       2026-06-12, 256k context). Wired as the `kimi-code` group for the
+#       refactorer experiment (replacing deepseek there; "watch it" via the
+#       scorecard). Distinct from the `kimi` (k2.6) generalist that backs the
+#       deepseek fallback — k2.7-code is coding-tuned, so it stays scoped to
+#       coding agents, not the general fallback. New enough that it is absent
+#       from LiteLLM's pricing map, so pricing is pinned below. Falls back to
+#       `kimi` (k2.6) on failure since k2.7-code is unproven on our json_schema
+#       adapter path. Keep this and MODEL_ALIASES/GATEWAY_MODEL_GROUPS in
+#       bin/agentctl in sync.
+#
+# SECRETS: every api_key field references an env var — no literal key material here.
+# This file is safe to track in git. The live plist (gitignored) carries the secrets.
+#
+# CALLBACK: spend_callback.spend_callback_instance requires PYTHONPATH to include the
+# directory holding spend_callback.py. The plist's EnvironmentVariables sets
+# PYTHONPATH=$HOME/.local/lib/llm-gateway — the PINNED copy install.sh
+# makes from this repo's gateway/, NOT the live working tree (ARCH-116), so a daemon
+# restart can never silently deploy a feature branch. This config.yaml is copied to
+# the same pinned dir; edit it here, then re-run install.sh + restart to deploy.
+#
+# VIRTUAL KEYS (E17·1). bin/gateway-mint-keys calls /key/generate once per consumer
+# declared in gateway/consumers.json, tagged metadata.consumer, and writes each key to
+# the {account, key} entry that the declaration names, in litellm-keys.json inside
+# LLM_GATEWAY_CONFIG_DIR (mode 0600). This deployment declares agentctl, co and opencode.
+# Minting needs the proxy up with its database connected: DATABASE_URL in llm-gateway.env,
+# and /health/readiness reports the database connected. Then run the mint:
+#   bin/gateway-mint-keys
+# Re-running mints a new key per consumer and does not revoke the ones already issued.
+# The mint refuses any key equal to the master key or to another entry, and stores
+# nothing when it refuses. See gateway/README.md for the procedure.
+
+model_list:
+  - model_name: gpt5
+    litellm_params:
+      model: openai/gpt-5
+      api_key: "os.environ/OPENAI_API_KEY"
+
+  - model_name: deepseek
+    litellm_params:
+      model: deepseek/deepseek-v4-flash
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+    # Repointed from the legacy `deepseek-chat` alias to the explicit
+    # `deepseek-v4-flash` id (ARCH-280): DeepSeek sunsets the `deepseek-chat` /
+    # `deepseek-reasoner` aliases on 2026-07-24 15:59 UTC. deepseek-chat already
+    # routed to V4 Flash (non-thinking) at the same price, so this is the same
+    # model under its durable name — V4 Flash ($0.14/$0.0028/$0.28 per M, 1M
+    # context) is the mechanical-tier model. Pin pricing on the deployment so
+    # cost is correct regardless of what the API echoes: LiteLLM 1.86.2's map
+    # has no v4-flash entry → completion_cost() would error → usd:0 in the spend
+    # log. These model_info costs feed the cache-aware map path
+    # (cache_read_input_token_cost is honored there, unlike the flat
+    # custom_cost_per_token path). Source: api-docs.deepseek.com/quick_start/pricing
+    # (2026-06): input cache-miss $0.14/M, cache-hit $0.0028/M, output $0.28/M.
+    model_info:
+      input_cost_per_token: 0.00000014
+      cache_read_input_token_cost: 0.0000000028
+      output_cost_per_token: 0.00000028
+
+  - model_name: kimi
+    litellm_params:
+      model: moonshot/kimi-k2.6
+      api_key: "os.environ/MOONSHOT_API_KEY"
+    # Pin pricing for the same reason as deepseek above: if Moonshot's API
+    # echoes a model name absent from the installed LiteLLM map (the
+    # deepseek-v4-flash failure mode), completion_cost() errors → usd:0 in the
+    # spend log. Source: litellm upstream map 2026-06-11 (matches Azure's
+    # kimi-k2.6 listing): input cache-miss $0.95/M, cache-hit $0.16/M,
+    # output $4.00/M.
+    model_info:
+      input_cost_per_token: 0.00000095
+      cache_read_input_token_cost: 0.00000016
+      output_cost_per_token: 0.000004
+
+  - model_name: kimi-code
+    litellm_params:
+      model: moonshot/kimi-k2.7-code
+      api_key: "os.environ/MOONSHOT_API_KEY"
+    # Pin pricing — k2.7-code (released 2026-06-12) is too new for the installed
+    # LiteLLM map, so completion_cost() would error → usd:0 (the deepseek-v4-flash
+    # failure mode). Source: Moonshot's published k2.7-code rates (platform.kimi.ai,
+    # 2026-06): input cache-miss $0.95/M, cache-hit $0.19/M, output $4.00/M. The
+    # cache-read tier (added ARCH-181) matters: agent loops are cache-read-dominated
+    # (system prompt + tools + history re-sent each turn). With NO cache_read tier
+    # set, LiteLLM's completion_cost billed cache-read tokens at $0 (verified on the
+    # 5 past kimi-k2.7-code runs: logged usd == cache_miss*$0.95 + out*$4 exactly),
+    # which UNDER-counted cost and biased the refactorer experiment in kimi's favor —
+    # NOT an overcharge. Pinning $0.19/M (up from k2.6's $0.16/M) bills cache reads
+    # at the real rate; past run costs were retroactively corrected (+~15%) too.
+    model_info:
+      input_cost_per_token: 0.00000095
+      cache_read_input_token_cost: 0.00000019
+      output_cost_per_token: 0.000004
+
+  - model_name: mimo
+    # Xiaomi MiMo-V2.5-Pro (released 2026-04-22, flagship, software-engineering
+    # tuned, 1M context). Trial model for the `refactorer` agent (ARCH-201,
+    # replacing deepseek there; watch via the scorecard, same as the kimi-code
+    # refactorer experiment). LiteLLM 1.86.2 has a `xiaomi_mimo` provider ENUM but
+    # no transformation module, so we route via the OpenAI-compatible path with an
+    # explicit api_base (Xiaomi's API is OpenAI- and Anthropic-compatible). The
+    # provider string stays `openai/mimo-v2.5-pro` — distinct from gpt5's
+    # `openai/gpt-5`, so per-model cost attribution is unambiguous (billing_source
+    # labels it provider_api:openai, the litellm handler, not xiaomi — cosmetic).
+    litellm_params:
+      model: openai/mimo-v2.5-pro
+      api_base: "https://api.xiaomimimo.com/v1"
+      api_key: "os.environ/XIAOMI_MIMO_API_KEY"
+      # NOTE: agents reach this via the /v1/messages anthropic bridge (claude -p).
+      # By default that bridge routes the `openai` provider to the OpenAI Responses
+      # API (/v1/responses), which Xiaomi doesn't serve → 404. The litellm_settings
+      # flag `use_chat_completions_url_for_anthropic_messages: true` (below) forces
+      # /chat/completions instead, which Xiaomi serves (ARCH-210 Fix 1). openai_like
+      # is NOT an option here — it's unmapped on the anthropic bridge.
+    # Pin pricing — mimo-v2.5-pro is absent from the installed LiteLLM map
+    # (completion_cost() → usd:0, the deepseek-v4-flash failure mode). Source:
+    # Xiaomi MiMo open platform pricing (mimo.mi.com, June 2026, after the
+    # 2026-05-26 permanent reduction): input cache-miss $0.435/M, output $0.87/M,
+    # cache-hit $0.0036/M (a 99% cache-read cut). Cache-read tier pinned for the
+    # same reason as kimi-code: agent loops are cache-read-dominated, and an unset
+    # tier bills cache reads at $0 and biases the trial in mimo's favor. The
+    # $0.0036/M figure is strikingly low — verify against the first real invoice.
+    model_info:
+      input_cost_per_token: 0.000000435
+      cache_read_input_token_cost: 0.0000000036
+      output_cost_per_token: 0.00000087
+
+  - model_name: glm
+    # Z.ai GLM-5.2 (coding-optimized, 1M context, MoE). Trial model for the
+    # `bug-fixer` agent (ARCH-201, replacing deepseek there; watch via the
+    # scorecard). LiteLLM 1.86.2 has a native `zai/` provider (base
+    # https://api.z.ai/api/paas/v4, env ZAI_API_KEY) that preserves cache_control,
+    # so prompt caching works on the adapter path.
+    litellm_params:
+      model: zai/glm-5.2
+      api_key: "os.environ/ZAI_API_KEY"
+    # Pin pricing — glm-5.2 is absent from the installed LiteLLM map (only glm-5 /
+    # glm-4.7 are mapped) → completion_cost() → usd:0. Source: Z.ai published
+    # GLM-5.2 rates (z.ai, June 2026): input cache-miss $1.40/M, cache-hit $0.26/M,
+    # output $4.40/M. Cache-read tier pinned (cache-read-dominated agent loops).
+    model_info:
+      input_cost_per_token: 0.0000014
+      cache_read_input_token_cost: 0.00000026
+      output_cost_per_token: 0.0000044
+
+general_settings:
+  master_key: "os.environ/LITELLM_MASTER_KEY"
+  # Virtual keys live in this database; the URL comes from llm-gateway.env (E17·1).
+  database_url: "os.environ/DATABASE_URL"
+
+router_settings:
+  # Fallbacks only fire for requests that name a model GROUP ("deepseek").
+  # A raw provider string ("deepseek/deepseek-v4-flash") routes fine, but LiteLLM
+  # 1.86.2 treats it as an ad-hoc group where neither the fallbacks lookup nor
+  # the fallback hop can resolve ("No deployments available. Passed
+  # model=kimi") — and model_group_alias does NOT bridge it: the alias fixes
+  # routing only, the fallback lookup still keys on the original string (both
+  # verified empirically 2026-06-11). agentctl therefore passes the GROUP name
+  # to `claude --model` (GATEWAY_MODEL_GROUPS in bin/agentctl — keep in sync).
+  # The alias stays as a routing safety net for any straggler caller still
+  # sending the provider string; such calls get no fallback.
+  model_group_alias:
+    "deepseek/deepseek-v4-flash": "deepseek"
+  # Fallbacks removed (ARCH-186) — kimi is cut. The `deepseek → kimi` net was
+  # added (ARCH-130) for DeepSeek's 2026-06-11 json_schema 400-storm (it disabled
+  # response_format json_schema, the shape every Claude-CLI structured-output
+  # request takes on the adapter path, and deepseek workers died in 400-retry
+  # storms). That issue has passed — deepseek is healthy again (91% merge over 146
+  # recent runs) — so the net is dormant, and kimi is being fully removed. The
+  # `kimi-code → kimi` net is dead now that nothing routes to kimi-code (refactorer
+  # moved to deepseek). If DeepSeek's json_schema regresses, re-add a NON-kimi
+  # rescue (e.g. `deepseek → gpt5`); it'll show in the overnight digest. The
+  # kimi/kimi-code deployments below are left dormant + unreachable (trivially
+  # re-enableable), not yet deleted.
+  fallbacks: []
+
+  # Gateway 429/overload backpressure (ARCH-303, task #9 audit). Before this, a
+  # DeepSeek/Kimi 429 (or a transient 5xx / timeout) passed straight through to the
+  # worker as a plain death: there are NO fallbacks (above), and ARCH-131 harness
+  # fail-over is Anthropic-direct ONLY (fallback_model_for short-circuits to None
+  # for gateway models), so a gateway worker had ZERO recovery on a rate-limit burst
+  # — worst case a Sunday multi-product drain hitting DeepSeek concurrently. Now the
+  # gateway retries the request itself with LiteLLM's built-in exponential backoff
+  # (honoring the provider's Retry-After header); retry_after floors the wait. On
+  # exhaustion the failure still raises to the agent (where auto-cycle, not ARCH-131,
+  # is the only remaining recovery for a gateway worker). retry_policy scopes retries
+  # to rate-limit / timeout / 5xx ONLY: BadRequestErrorRetries stays 0 so a 400 does
+  # NOT retry — ARCH-130's DeepSeek json_schema 400-storm must fail fast, not
+  # multiply. Single deployment per group + empty fallbacks means allowed_fails /
+  # cooldown_time are deliberately UNSET: cooling down the sole deployment would just
+  # fail-fast requests during the window, the opposite of what we want here.
+  # NOTE: this LiteLLM's get_num_retries_from_retry_policy has NO InternalServerError
+  # case, so a 5xx is NOT policy-tunable — it's covered by the global num_retries
+  # (should_retry_this_error retries 500/503), i.e. 5xx retries twice here. Listing an
+  # InternalServerErrorRetries key would be a dead, misleading knob, so it's omitted.
+  num_retries: 2
+  retry_after: 5
+  retry_policy:
+    RateLimitErrorRetries: 2
+    TimeoutErrorRetries: 2
+    BadRequestErrorRetries: 0
+    AuthenticationErrorRetries: 0
+    ContentPolicyViolationErrorRetries: 0
+
+litellm_settings:
+  set_verbose: false  # suppress LiteLLM debug/prompt logging to llm-gateway.out.log
+  # Route OpenAI-provider models through /chat/completions (not the Responses API,
+  # /v1/responses) on the /v1/messages anthropic bridge that `claude -p` uses.
+  # The default Responses-API path 404s against OpenAI-COMPATIBLE servers that only
+  # serve chat/completions (Xiaomi MiMo — ARCH-210 Fix 1). Real OpenAI (gpt-5)
+  # serves both, so this is safe for it too.
+  use_chat_completions_url_for_anthropic_messages: true
+  # claude -p sends Anthropic-specific params (context_management, thinking,
+  # cache_control, ...) on every request. Routed to a non-Anthropic provider,
+  # LiteLLM raises UnsupportedParamsError unless told to drop them. Only affects
+  # gateway-served (non-Anthropic) calls — Anthropic models bypass the proxy.
+  drop_params: true
+  callbacks:
+    - spend_callback.spend_callback_instance
+
+host: "127.0.0.1"
+port: 4000

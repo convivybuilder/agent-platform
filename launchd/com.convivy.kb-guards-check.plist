@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.kb-guards-check</string>
+
+    <!-- Cross-repo KB-agreement check (substrate ARCH-436). Runs each repo's
+         `pytest -m needs_kb` — the guards asserting that a constant in that repo
+         still agrees with the knowledge repo. Those guards skip in CI, which has
+         no KB checkout, so every repo's main reads green because the check did
+         not run while the same assertion fails on any machine that has the KB.
+         This runs them where the checkouts are. Logs an alert signal on breach; silent
+         on pass. Same structural constraint, and the same answer, as
+         com.convivy.cli-contract-check. -->
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of check-kb-guards, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes check-kb-guards interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/check-kb-guards</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- 09:52 local time, daily — during the workday so the operator sees any alert
+         promptly, and five minutes before cli-contract-check rather than beside
+         it, so two suites do not compete for the machine. Off-minute to avoid
+         the :00 crowd. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>52</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/kb-guards-check.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/kb-guards-check.err.log</string>
+
+    <!-- launchd jobs get a thin PATH without ~/.local/bin (ARCH-086), and this
+         one shells out to `python3.11` by name for the agent-platform suite.
+         Homebrew's bin is what provides it. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

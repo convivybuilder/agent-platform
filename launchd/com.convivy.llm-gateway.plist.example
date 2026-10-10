@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  PINNED PATHS (ARCH-116): config + PYTHONPATH point at ~/.local/lib/llm-gateway,
+  a copy install.sh makes from the repo's gateway/ — NOT the live repo working
+  tree. The gateway is a long-running KeepAlive daemon: if it read code straight
+  from the checkout, whatever branch happened to be checked out would become
+  production on the next (or crash-triggered) restart. Pinning decouples the
+  daemon from branch state, so only installed-from-main code is ever live.
+  Deploy = checkout main, pull, `bash install.sh` (refreshes the pinned copy),
+  then restart. Copy this file to launchd/com.convivy.llm-gateway.plist (the
+  gitignored live plist) and bootstrap it.
+
+  NO API KEYS HERE (ARCH-342). The six provider keys used to sit in
+  EnvironmentVariables below. A plist is the wrong home for a secret: it is
+  world-readable by default, install.sh copies it over the live one, and
+  `launchctl print` renders every value to anyone who can run it. They now live
+  in ~/.config/convivy/llm-gateway.env, mode 0600, which llm-gateway-run.sh
+  sources before exec'ing litellm. The launcher refuses to start if that file is
+  missing or looser than 0600. See gateway/README.md.
+-->
+<dict>
+  <key>Label</key>
+  <string>com.convivy.llm-gateway</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/lib/llm-gateway/llm-gateway-run.sh</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>WorkingDirectory</key>
+  <string>__HOME__/.local/lib/llm-gateway</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONPATH</key>
+    <string>__HOME__/.local/lib/llm-gateway</string>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Convivy/agent-runs/llm-gateway.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Convivy/agent-runs/llm-gateway.err.log</string>
+</dict>
+</plist>

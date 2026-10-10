@@ -1,0 +1,17 @@
+# Repositories whose workflows use `runs-on: convivy-linux`, one owner/repo per line, whether
+# or not the repository has been added to the convivy-linux runner group yet. A job queued
+# because its repository was never added to the group is exactly what bin/ci1-heartbeat must
+# report, so missing group membership is never a reason to leave a repository out of this file.
+#
+# The convivy-bosun App is refused GET /orgs/convivy/actions/runner-groups/6/repositories
+# (403 "Resource not accessible by integration", 2026-10-05), so this file stands in for the
+# runner group's repository list for every other purpose. Add a repository here in the same
+# change that moves its workflows to runs-on: convivy-linux, or its queued jobs go unwatched.
+convivy/vivy
+convivy/library
+convivy/agent-platform
+convivy/shipwright
+convivy/selector
+convivy/selector-backend
+convivy/knowledge
+convivy/ci1-runner-scratch

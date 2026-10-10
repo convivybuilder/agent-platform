@@ -1,0 +1,43 @@
+{
+  "_meta": {
+    "doc": "The project registry an adopter instance starts with. Each top-level key is a project: a unit of work with a home directory, the repos that serve it, and a dev crew. `_products` holds commercial products a project may build, linked by a project's own `products` list; `_scopes` holds the scopes that span more than one project or belong to none. The loader enforces the schema each field must satisfy. This seed ships with the one project the engine itself needs: the Library, which owns the knowledge repo. An adopter registers its own projects here as it grows."
+  },
+  "_products": {},
+  "_scopes": {
+    "_doc": "Non-project scopes: work or documents that span more than one project, or belong to none. Nothing is built AT these, so they carry no home directory and no crew.",
+    "company": {
+      "display": "Company",
+      "note": "The company altitude: brand, legal, marketing, company-wide communication. No Workshop issue is filed at this scope."
+    },
+    "platform": {
+      "display": "Platform",
+      "note": "Cross-cutting operations with no single owning project: cost, alerts, health checks, dependency scanning, release process."
+    },
+    "commercial": {
+      "display": "Commercial",
+      "note": "Commercial facts that are not about one project. A commercial fact about a specific project is scoped to that project instead."
+    },
+    "engineering-practice": {
+      "display": "Engineering Practice",
+      "note": "How the platform is built, binding every product and owned by none: coding conventions, testing discipline, CI conventions."
+    },
+    "keel": {
+      "display": "Keel",
+      "note": "The platform as a whole: the Library and the service that dispatches and coordinates the crews working against it, and the wire between them. Work spanning both sides is scoped here rather than to either project alone."
+    }
+  },
+  "library": {
+    "class": "project",
+    "display": "Library",
+    "owner": "tbd",
+    "home_dir": "<root>/library",
+    "dirs": [],
+    "repos": ["knowledge"],
+    "aliases": [],
+    "crew": "library",
+    "lifecycle": "active",
+    "products": [],
+    "kb": "central",
+    "kb_project": "library"
+  }
+}

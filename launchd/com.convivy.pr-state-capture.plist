@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.pr-state-capture</string>
+
+    <!-- Per-repository pull-request state for Deck's PR-ladder panel
+         (issue_01M2KV16ZRG3N49GRER8Q7545H), authenticating as the convivy-bosun
+         GitHub App rather than `gh` under the operator's personal account.
+
+         900s (15 min), matching the cadence `com.convivy.changelog-drain` already
+         notes for orient-github-capture's own GitHub-capture job on this
+         machine — a panel is fine lagging one capture interval (see the
+         script's module docstring), and a tighter cadence buys nothing a
+         reader needs while multiplying calls against every covered repo for
+         no visible gain. Deliberately NOT tied to the gates' live GitHub read,
+         which stays synchronous at merge time — see the module docstring for
+         why the two sources must not merge. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of pr-state-capture, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes pr-state-capture interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH.
+
+         NOT INSTALLED BY THIS CHANGE: this plist is committed so its shape and
+         interval are reviewable; the orchestrator loads it after merge
+         (`launchctl load`/`kickstart`) rather than this PR touching
+         ~/Library/LaunchAgents or ~/.local. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/pr-state-capture</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/pr-state-capture.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/pr-state-capture.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ~/.local/bin is not load-bearing here (the script shells out to
+             `openssl` alone, at its normal system path) but is kept for
+             parity with this repo's other deploy-pinned jobs and so a future
+             change to this script that adds a subprocess call does not
+             silently lose PATH the way ARCH-086 describes. -->
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

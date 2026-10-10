@@ -1,0 +1,1042 @@
+#!/usr/bin/env python3.11
+"""velocity-report — Convivy engineering velocity, total + by product/bucket.
+
+A read-only harvester that rolls up throughput / volume / stability / decisions
+metrics per repo, maps each repo to a product or engineering bucket, and writes a
+windowed JSON the convivy-orient `/velocity` dashboard reads. Companion to
+model-scorecard (which owns per-(agent,model) quality); this is the human-readable
+"how much shipped, how safely" view across the whole org.
+
+Metrics (per 7/30/90-day window, per bucket + a grand total):
+  • Throughput — commits, PRs merged, features shipped (feat-typed merges).
+  • Volume     — net lines changed (added − removed), generated/lockfiles excluded.
+  • Stability  — reverts → change-failure rate (reverts ÷ merges); plus CI-first-pass%
+                 and 7-day survival% read from the model-scorecard ledgers where they
+                 exist (dev-crew repos + PA).
+  • Decisions  — ADRs minted (knowledge, attributed to the ADR's project) + ARCH
+                 entries (substrate decisions.md).
+
+Sources, by what each repo has:
+  • local git clone → commits, net LOC, reverts (all cloned repos).
+  • GitHub (gh)     → PRs merged + features (best-effort; skipped if the repo doesn't
+                      resolve, e.g. the local-only *-commercial sites).
+  • The three NYH projects live under the <root>/nyh-architecture/ umbrella (mapped by
+    REPO_SUBPATH): nyh-arch-tools at the operator's personal GitHub account (PRs via gh + local commits/LOC),
+    nyh-etc + nyh-park-villa local-only (commits/LOC, no PRs). One bucket each.
+
+LOC is a deliberately weak signal kept as one input among several — never read alone.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+class FetchError(Exception):
+    """A GitHub fetch failed after retries — distinct from 'the repo has no GitHub
+    remote.' The caller carries forward the last-known-good value instead of writing
+    a false zero, so a transient gh blip never pollutes the metrics or the history."""
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR  # noqa: E402
+import operator_config  # noqa: E402
+# The repos root, where every bucket's checkout lives (builder_root.root(),
+# company/decisions/0008); run records come from data_root() below.
+CONVIVY = BR.root()
+RUNS_ROOT = BR.runs_root()
+OUT_PATH = RUNS_ROOT / "velocity" / "velocity.json"
+HISTORY_PATH = RUNS_ROOT / "velocity" / "velocity-history.jsonl"
+BASELINE_PATH = RUNS_ROOT / "velocity" / "velocity-baseline.json"
+SCORECARD_DIR = RUNS_ROOT / "scorecard"
+WINDOWS = (7, 30, 90)
+
+# bucket → repos. Order is display order. (operator 2026-06-15.)
+BUCKETS: dict[str, list[str]] = {
+    "Vivy": ["vivy", "vivy-ownerrez-sandbox-tools", "vivy-commercial", "vivy-landing"],
+    "Constance": ["constance", "constance-landing", "constance-commercial", "constance-updates"],
+    "Sous Chef": ["sous-chef"],
+    "Hollis": ["hollis"],
+    # placard (2026-09-05): property instruction pages reached by a QR code at
+    # the property. Added in the same change as its config/projects.json entry,
+    # because tests/test_projects.py::test_repos_match_velocity_buckets fails red
+    # when the two disagree — the one drift check in this project's registration
+    # chain, and the reason this site did not become a sixth forgotten copy.
+    "Placard": ["placard"],
+    # shipwright (2026-09-06): the crew working the company bead. Same rule as
+    # placard: added with its registry entry, because test_repos_match_velocity_buckets
+    # goes red when the two disagree. Its ADRs file under the `company` KB slice,
+    # which is unmapped below and counts in the Engineering-internal fallback.
+    "Shipwright": ["shipwright"],
+    # Signals (2026-09-16), the internal product crew writing derived signal to the
+    # Archives. tests/test_projects.py holds this table to the registry.
+    "Signals": ["signals"],
+    # Selector spans two repos — one product over a frontend and a backend, which
+    # issue_api's own comment already assumed ("the 'selector' product covers both
+    # convivy/selector and convivy/selector-backend").
+    "Selector": ["selector", "selector-backend"],
+    # App Kit is ONE project over two tightly-coupled repos: the on-device kit and
+    # the backend commercial server (ARCH-426 amendment). Repo count says nothing
+    # about project count.
+    "App Kit": ["convivy-app-kit", "convivy-services"],
+    "Orient": ["convivy-orient", "www"],
+    # NYH Studio (Now You're Here) is THREE PROJECTS, one per bucket (ARCH-426
+    # amendment) — shared tooling on GitHub, plus two per-property projects on
+    # local-only clones. They were one bucket while the umbrella directory was the
+    # only thing holding them together; per-property velocity is the useful view.
+    # All three live one level down under the umbrella, so repo_path maps them via
+    # REPO_SUBPATH. NYH Studio survives as the PRODUCT all three build.
+    "NYH Arch Tools": ["nyh-arch-tools"],
+    "East Texas Circle": ["nyh-etc"],
+    "Park Villa": ["nyh-park-villa"],
+    "Convivy general": ["convivy-commercial"],
+    # Archy (2026-10-02): the small-business agentic ops product. Added with its
+    # config/projects.json entry — test_repos_match_velocity_buckets holds this
+    # table to the registry.
+    "Archy": ["archy"],
+    # The Keel, split out of the old "Engineering-internal" lump (ARCH-426) and
+    # then RE-MERGED on 2026-08-06 when the steward was retired and the Keel became
+    # one project. ARCH-426 split it into four buckets on the reasoning that they
+    # were four projects sharing the steward co; the correction is that they were
+    # never four projects — one co, one crew, one thing being built, which is the
+    # same work test that split NYH Studio three ways below. Orient keeps its own
+    # bucket above because it IS a separate project: it becomes a client of the
+    # Library rather than the place Library functions live.
+    # The Keel's two halves, each with its own crew since 2026-08-17 (the operator), so
+    # they can move in parallel rather than queueing behind one co. The Library
+    # holds the vaults and serves them; the Bosun dispatches, coordinates and
+    # measures the crews. `knowledge` rides with the Library because the KB is a
+    # vault. The Keel itself is a SCOPE now, not a bucket — nothing is built at
+    # it, so nothing rolls up to it.
+    "Library": ["library", "knowledge"],
+    "Bosun": ["agent-platform"],
+    # The steward's cockpit: charter, build plan, backlog, handoffs, and the ARCH
+    # log. It ships no product code, so its velocity is deliberately thin; it
+    # keeps a bucket because `decisions.md` lives here and the ARCH count has to
+    # land somewhere real.
+    "Steward": ["substrate"],
+    "Deck": ["convivy-deck"],
+    "Write Better": ["write-better"],
+    # Kept with NO repos, deliberately. It is no longer a PR bucket — every repo it
+    # held is now named above, and the two it also held (multitenant-registry,
+    # multi-agent-slack-bot-kit) were sunsetted and archived out of <root>/
+    # entirely (ARCH-427). It survives ONLY as the ADR fallback below, for a KB
+    # project slug that maps to no bucket (`shared`, `engineering`, `convivy`,
+    # `utility`). Deleting it would silently drop those ADRs from the report.
+    "Engineering-internal": [],
+}
+# repo → GitHub owner (default "convivy"). nyh is the org-move exception. The
+# owner login comes from the operator config file's `github_login` key, never
+# a hardcoded default; a report that can't read it falls back to "convivy"
+# for this one mapping rather than refusing the whole run.
+try:
+    GH_OWNER = {"nyh-arch-tools": operator_config.get("github_login")}
+except operator_config.OperatorConfigError:
+    GH_OWNER = {}
+# ADR project slug → bucket, so a constance ADR counts for Constance, not for the
+# knowledge repo's bucket. Unmapped slugs fall through to "Engineering-internal".
+ADR_PROJECT_BUCKET = {
+    "vivy": "Vivy", "constance": "Constance", "sous-chef": "Sous Chef",
+    "hollis": "Hollis", "convivy-orient": "Orient",
+    "selector": "Selector",
+    # placard (2026-09-05). THE THIRD velocity list this one project needed, and
+    # the only one with no test behind it: BUCKETS and the bucket-name set are
+    # both held by tests/test_projects.py and tests/test_velocity_report.py, but
+    # nothing asserts this map's keys cover the registered projects. An ADR under
+    # knowledge/projects/placard/decisions/ would have fallen through the
+    # "Engineering-internal" default below and miscounted silently — a wrong
+    # number rather than an error, which is the shape that survives longest.
+    "placard": "Placard",
+    # The three NYH projects share ONE KB slice (`nyh-studio`), so an ADR written
+    # there cannot be attributed to a single property. It counts for the
+    # studio-wide project. Splitting the slice belongs with the KB re-filing pass
+    # (Phase 0 step 5), where the scope vocabulary is being reworked anyway.
+    "nyh-studio": "NYH Arch Tools",
+    # the Keel and the interfaces onto it, so their ADRs count for themselves
+    # rather than landing in the fallback (ARCH-426). These are VALUES that must be
+    # live BUCKETS keys, and leaving a stale display name here makes every ADR under
+    # that slug count zero in the per-bucket breakdown while the grand total stays
+    # right — which is why the 2026-08-17 split re-points all of them rather than
+    # only the slugs whose names changed.
+    "substrate": "Steward", "agent-platform": "Bosun",
+    "knowledge": "Library", "library": "Library",
+    # `keel` is a scope now, and the documents already written under the slug stay
+    # where they are. They count for the Bosun, which inherits the Keel's platform
+    # work; the same reasoning puts the `keel` cost alias there.
+    "keel": "Bosun",
+    # `platform` is deliberately UNMAPPED, so it falls through to
+    # Engineering-internal with the other no-owner scopes. The steward's own future
+    # documents land there, which is why mapping it to Steward was tempting and
+    # wrong: the scope already holds 41 ADRs written by whichever crew was doing
+    # that cross-cutting work at the time, and it exists precisely because the work
+    # belongs to no single crew. Mapping it would credit every one of those to a
+    # crew that ships no product code and did not write them (reviewer, PR #402).
+    "deck": "Deck", "svc": "App Kit",
+    "convivy-app-kit": "App Kit", "convivy-services": "App Kit",
+}
+# net-LOC excludes: generated / vendored / lockfiles / built artifacts / PROSE.
+#
+# MARKDOWN IS NOT A LINE OF CODE (the operator, 2026-09-05): "LOC is rough anyway, but
+# adding *.md distorts it even more." The exclusion is deliberately blanket
+# rather than scoped to the canonical KB — a README or a runbook in a code repo
+# goes too, and the wider reach is the point rather than a side effect.
+#
+# WHAT MADE IT VISIBLE. `knowledge` reported 935,175 net lines over 30 days
+# against a working tree of 141,785. Its first commit is 2026-08-23 and 928,787
+# lines landed on a SINGLE DAY, 2026-08-24 — 99.1% across the repo's first two
+# days, because it was MIGRATED rather than written. That is one import event
+# wearing the shape of velocity, and the whole of it still sat inside the 30-day
+# window: on 2026-09-23 those two days would have aged out and the figure fallen
+# by ~99%, reading as a productivity crash rather than as an import leaving the
+# window. A number about to be dramatically wrong in both directions inside one
+# month is worse than no number.
+#
+# THE SHARE OF ADDED LINES THIS REMOVES, measured per repo on 2026-09-05 through
+# this file's own pathspec, is the check that it takes prose and leaves code:
+# knowledge 93%, substrate 91%, selector 16%, vivy 4%, convivy-orient 3%,
+# convivy-deck 2%, agent-platform 1%, library 0%. `substrate` nearly vanishing is
+# correct — it is a cockpit holding documents, not a codebase. The service repos
+# barely moving is the signal that the exclusion is landing where it should.
+#
+# Those shares are lower against a bare `git log --numstat`, which reports
+# 1,069,442 added for `knowledge` where this file sees 937,280. The `-- .`
+# pathspec below turns on git's history simplification, so the two disagree by
+# design. The figures above use the pathspec this file actually runs.
+#
+# THIS BREAKS COMPARABILITY WITH ANY FIGURE COMPUTED BEFORE IT. Every historical
+# number moves, so a stored or cached series spanning this change has a step in
+# it that is this commit and not a change in output.
+LOC_EXCLUDES = [
+    "*.lock", "*-lock.json", "*-lock.yaml", "package-lock.json", "poetry.lock",
+    "*.min.js", "*.min.css", "*.map",
+    "node_modules/*", "dist/*", "build/*", "vendor/*", "site/*", ".venv/*",
+    "*.svg", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.ico", "*.woff*",
+    "*.md",
+]
+_FEAT_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)?feat(?:\([^)]*\))?\s*[:!]", re.IGNORECASE)
+# Anchored: a genuine revert commit's subject starts with "Revert" (git's default
+# `Revert "..."`, and squash titles like `Revert: …`). A bare \brevert\b would
+# wrongly flag "feat: add revert button" and inflate change-failure rate.
+_REVERT_RE = re.compile(r"^Revert\b", re.IGNORECASE)
+
+
+# Repos that don't live flat under <root>/ — the NYH Studio projects are cloned
+# one level down under the <root>/nyh-architecture/ umbrella. Without this the harvest
+# looks in <root>/nyh-arch-tools (nonexistent) and reads 0 commits/LOC.
+REPO_SUBPATH = {
+    "nyh-arch-tools": "nyh-architecture/nyh-arch-tools",
+    "nyh-etc": "nyh-architecture/nyh-etc",
+    "nyh-park-villa": "nyh-architecture/nyh-park-villa",
+}
+
+
+def repo_path(repo: str) -> Path:
+    return CONVIVY / REPO_SUBPATH.get(repo, repo)
+
+
+def gh_full(repo: str) -> str:
+    return f"{GH_OWNER.get(repo, 'convivy')}/{repo}"
+
+
+def _git(repo: str, args: list[str]) -> str | None:
+    p = repo_path(repo)
+    if not (p / ".git").exists():
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(p), *args],
+                           capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def git_fetch(repo: str) -> None:
+    """Refresh origin/* so commit/LOC counts reflect the pushed branch, not a
+    possibly-stale local clone (best-effort; offline/no-remote repos just skip)."""
+    _git(repo, ["fetch", "--quiet", "origin"])
+
+
+def main_ref(repo: str) -> str:
+    """Count against origin/main when the clone tracks a remote (authoritative,
+    post-fetch), else the local main/HEAD."""
+    # Counts run against the sha the exact remote-tracking ref holds. `show-ref
+    # --verify` applies none of git's search rules, so a tag named `origin/main`, or
+    # one standing in for the ref after `fetch --prune` removed it, is never counted.
+    sha = (_git(repo, ["show-ref", "--verify", "--hash", "refs/remotes/origin/main"]) or "").strip()
+    return sha if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) else "HEAD"
+
+
+def is_shallow(repo: str) -> bool:
+    """True when the clone's history is grafted, so every window-bounded count
+    against it is silently truncated at the graft.
+
+    WHY THIS IS REPORTED RATHER THAN INFERRED FROM THE NUMBERS: a shallow checkout
+    and a genuinely young repo produce identical output. <root>/knowledge was
+    shallow at 337 commits until 2026-09-06 and nothing said so — the Library
+    bucket's 30-day and 90-day figures were identical because no window could
+    reach past the graft, and that was read off /velocity as a real measurement.
+
+    It ran in BOTH directions, which is why "the numbers are merely conservative"
+    was the wrong correction. The graft boundary carries the whole prior repo as
+    one commit (+131,120 insertions dated 2026-08-23), so commits were
+    under-counted while net LOC inside any window containing that date was
+    over-counted.
+
+    A missing or non-git path is not shallow — `_git` returns None and the repo
+    contributes nothing to the counts either way."""
+    return (_git(repo, ["rev-parse", "--is-shallow-repository"]) or "").strip() == "true"
+
+
+def shallow_repos() -> list[str]:
+    """Every measured repo whose history is truncated, checked once per run."""
+    return sorted({r for repos in BUCKETS.values() for r in repos if is_shallow(r)})
+
+
+def _gh_json(args: list[str], tries: int = 3):
+    """Run a gh command and return parsed JSON, or None after all retries fail.
+
+    Retries a transient failure (network blip, rate-limit, timeout, a non-zero exit)
+    with backoff, so one bad moment at generation time doesn't poison the daily
+    snapshot — the concrete bug that showed Vivy 0 merged for a whole day. A 0-exit
+    with unparseable output is NOT transient, so it returns immediately."""
+    for attempt in range(tries):
+        try:
+            r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            r = None
+        if r is not None and r.returncode == 0:
+            try:
+                return json.loads(r.stdout)
+            except json.JSONDecodeError:
+                return None
+        if attempt < tries - 1:
+            time.sleep(2 * (attempt + 1))  # 2s, then 4s
+    return None
+
+
+def _is_on_github(repo: str) -> bool:
+    """Whether the repo resolves on GitHub — the authoritative, offline no-GitHub
+    signal, kept separate from 'the query failed.' A cloned repo is on GitHub iff its
+    origin remote is github.com (so the local-only *-commercial sites read false); a
+    repo not cloned locally (nyh, gh-only by design) is assumed on GitHub, so a failed
+    query for it is treated as a transient error to carry forward, not a false 'no
+    remote' that would zero its count."""
+    p = repo_path(repo)
+    if not (p / ".git").exists():
+        return True
+    url = (_git(repo, ["remote", "get-url", "origin"]) or "").strip()
+    # Match github.com only as the URL host — scp form (git@github.com:owner/repo),
+    # url form (https://github.com/…, ssh://git@github.com/…), or the gh alias
+    # (github:owner/repo). Anchoring to a host boundary avoids a false positive on a
+    # look-alike host like github.com.evil.example (security review, PR #94).
+    return bool(re.search(r"(^|@|//)github\.com[:/]", url)) or url.startswith("github:")
+
+
+# --- per-repo harvest (IO) --------------------------------------------------
+
+def git_metrics(repo: str, since_iso: str, until_iso: str | None = None) -> dict:
+    """commits, net LOC, and revert count from the local clone (or zeros/None).
+
+    `until_iso` upper-bounds the window (for as-of history reconstruction); omit it for
+    the live 'since now' harvest."""
+    out = {"commits": 0, "loc_added": 0, "loc_removed": 0, "reverts": 0,
+           "has_local": (repo_path(repo) / ".git").exists()}
+    if not out["has_local"]:
+        return out
+    ref = main_ref(repo)
+    rng = [f"--since={since_iso}"] + ([f"--until={until_iso}"] if until_iso else [])
+
+    n = _git(repo, ["rev-list", "--count", *rng, ref])
+    out["commits"] = int(n.strip()) if n and n.strip().isdigit() else 0
+
+    subjects = _git(repo, ["log", *rng, "--pretty=format:%s", ref])
+    if subjects:
+        out["reverts"] = sum(1 for ln in subjects.splitlines() if _REVERT_RE.search(ln))
+
+    # `--first-parent` COUNTS EACH MERGE'S NET EFFECT ON MAIN, EXACTLY ONCE, and
+    # summing every commit instead does not. Net lines, measured 2026-09-05
+    # through THIS FILE'S OWN `-- .` PATHSPEC rather than a bare `git log`:
+    #
+    #     repo             all-commits   first-parent   loc_now
+    #     convivy-orient        67,635         67,672         -
+    #     library               47,361         47,379    47,378
+    #     knowledge            935,175        141,790   141,785
+    #
+    # Two repos agree inside 40 lines; `knowledge` is overstated by a factor of
+    # 6.6. The first-parent figure is the true one — it lands within 5 lines of
+    # `loc_now`, which counts the working tree and shares none of this method.
+    #
+    # THE PATHSPEC HAS TO BE HELD CONSTANT WHEN QUOTING THAT RATIO, and this is
+    # the trap the numbers themselves set. A bare `git log` reports 1,069,442
+    # added for `knowledge` where `-- .` reports 937,280, because a pathspec turns
+    # on git's history simplification, so the same overstatement reads as 7.5x or
+    # 6.6x depending on a flag the caller never thinks about. 6.6 is the one this
+    # file earns.
+    #
+    # `--first-parent` is IDENTICAL under both — 142,606 added either way, in every
+    # repo. So history simplification distorts only the broken method, which is
+    # also why two independent measurements of the same repo agreed on every
+    # `*.md` numerator while disagreeing on every share.
+    #
+    # THE CAUSE IS STALE BRANCH BASES STRADDLING A BULK IMPORT. Eight or more
+    # non-merge commits dated 2026-08-23/24 each show ~132,000 lines added — the
+    # whole migrated corpus — including commits whose real content is trivial
+    # ("two colons become commas" shows 131,120). Those branches were cut from a
+    # pre-migration base, so each commit's diff against its own parent contains
+    # the entire corpus, and an all-commits sum counts the migration once per
+    # branch. The method is not wrong in general; it is wrong wherever stale-base
+    # branches straddle a bulk import, which is why the service repos never
+    # showed it.
+    #
+    # WHAT EACH FLAG DOES HERE, measured on one fixture rather than reasoned
+    # about — a 102-line tree whose stale branch contributed 100 lines that the
+    # merge discarded:
+    #
+    #     git log                      202   counts the discarded copy: the bug
+    #     git log -m                   303   adds a diff per parent on top of it
+    #     git log --first-parent       102   correct, and equals the tree
+    #     git log --first-parent -m    102   `-m` is a no-op once constrained
+    #
+    # So `-m` inflates on its own and changes nothing alongside `--first-parent`.
+    # It is worth neither adding nor fearing here, and `--no-merges` is the one
+    # that actually breaks this: it drops whatever arrived only through a merge,
+    # which under `--first-parent` is most of the history.
+    #
+    # An earlier revision of this branch asserted that `--first-parent` itself
+    # "would silently double every figure". It deflates and corrects. That claim
+    # reached the file as an aside in an otherwise-measured message and was
+    # written down without being run — hence the table above.
+    #
+    # `out["commits"]` above deliberately does NOT move with this. A first-parent
+    # commit count counts merges rather than commits, which is a different measure
+    # of activity than the one the dashboard asks for, and no ruling asked to
+    # change it. Only the LOC arithmetic was wrong.
+    numstat = _git(repo, ["log", *rng, "--first-parent", "--numstat",
+                          "--pretty=tformat:", ref, "--", ".",
+                          *[f":(exclude){p}" for p in LOC_EXCLUDES]])
+    if numstat:
+        add = rem = 0
+        for ln in numstat.splitlines():
+            parts = ln.split("\t")
+            if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+                add += int(parts[0]); rem += int(parts[1])
+        out["loc_added"], out["loc_removed"] = add, rem
+    return out
+
+
+def gh_pr_metrics(repo: str, since_date: str, until_date: str | None = None) -> dict | None:
+    """merged-PR count + feat-typed (features shipped) in the window, via gh.
+
+    Returns None when the repo genuinely has no GitHub remote (the local-only
+    *-commercial sites), which the caller records as no_gh. Raises FetchError when the
+    repo IS on GitHub but the query failed after retries — the caller then carries the
+    last-known-good value forward rather than writing a false 0 (the bug that showed
+    Vivy 0 merged in the 30-day window while 7d/90d were fine). `until_date` upper-bounds
+    the merged range for as-of history reconstruction; omit it for the live window."""
+    if not _is_on_github(repo):
+        return None
+    search = f"merged:{since_date}..{until_date}" if until_date else f"merged:>={since_date}"
+    rows = _gh_json(["pr", "list", "--repo", gh_full(repo), "--state", "merged",
+                     "--search", search, "--limit", "500",
+                     "--json", "number,title,mergedAt"])
+    if rows is None:
+        raise FetchError(f"gh pr list failed for {gh_full(repo)} after retries")
+    merged = len(rows)
+    features = sum(1 for r in rows if _FEAT_RE.search(r.get("title") or ""))
+    return {"prs_merged": merged, "features": features}
+
+
+# --- all-time totals (cumulative, not windowed) -----------------------------
+
+def loc_now(repo: str) -> int:
+    """Current tracked lines of code — the codebase's size *now*, noise excluded.
+    Distinct from windowed net-LOC (added−removed). 0 if not cloned locally."""
+    listing = _git(repo, ["ls-files", "--", ".",
+                          *[f":(exclude){p}" for p in LOC_EXCLUDES]])
+    if not listing:
+        return 0
+    base, total = repo_path(repo), 0
+    for rel in listing.splitlines():
+        f = base / rel
+        try:
+            if f.stat().st_size > 2_000_000:  # skip a stray large/binary blob
+                continue
+            total += f.read_bytes().count(b"\n")
+        except OSError:
+            continue
+    return total
+
+
+def commits_total(repo: str) -> int:
+    n = _git(repo, ["rev-list", "--count", main_ref(repo)])
+    return int(n.strip()) if n and n.strip().isdigit() else 0
+
+
+def prs_total(repo: str) -> int | None:
+    """All-time merged-PR count via GraphQL totalCount (one cheap call).
+
+    None when the repo has no GitHub remote; raises FetchError when it's on GitHub but
+    the query failed after retries, so the caller carries forward instead of flipping
+    the repo to no_gh / 0 on a transient blip."""
+    if not _is_on_github(repo):
+        return None
+    owner, _, name = gh_full(repo).partition("/")
+    q = ('{repository(owner:"%s",name:"%s"){pullRequests(states:MERGED){totalCount}}}'
+         % (owner, name))
+    data = _gh_json(["api", "graphql", "-f", f"query={q}"])
+    try:
+        return data["data"]["repository"]["pullRequests"]["totalCount"]
+    except (TypeError, KeyError):
+        raise FetchError(f"gh graphql prs_total failed for {gh_full(repo)} after retries")
+
+
+def _prev_alltime_repo(prev: dict, bucket: str, repo: str) -> dict:
+    """The prior snapshot's all-time row for one repo, or {} — the last-known-good
+    value carried forward when this run's GitHub fetch fails."""
+    for r in (((prev.get("alltime") or {}).get("buckets") or {}).get(bucket) or {}).get("repos", []):
+        if r.get("repo") == repo:
+            return r
+    return {}
+
+
+def build_alltime(prev: dict | None = None) -> dict:
+    """Cumulative per-repo + per-bucket + grand-total: codebase LOC now, all-time
+    commits, all-time merged PRs. Answers 'how big / how much shipped, ever.'"""
+    prev = prev or {}
+    buckets_out: dict[str, dict] = {}
+    grand = {"loc_now": 0, "commits_total": 0, "prs_total": 0}
+    grand_stale = False
+    for bucket, repos in BUCKETS.items():
+        bt = {"loc_now": 0, "commits_total": 0, "prs_total": 0}
+        rows = []
+        for repo in repos:
+            loc, commits = loc_now(repo), commits_total(repo)
+            stale = False
+            try:
+                prs = prs_total(repo)          # None = no GitHub remote, int = ok
+                no_gh = prs is None
+            except FetchError:
+                # On GitHub but the fetch failed — carry the last-known-good total
+                # forward instead of flipping the repo to no_gh / 0.
+                prs = _prev_alltime_repo(prev, bucket, repo).get("prs_total")
+                no_gh, stale = False, True
+            rows.append({"repo": repo, "loc_now": loc, "commits_total": commits,
+                         "prs_total": prs or 0,
+                         "no_local": not (repo_path(repo) / ".git").exists(),
+                         "no_gh": no_gh, "pr_stale": stale})
+            bt["loc_now"] += loc
+            bt["commits_total"] += commits
+            bt["prs_total"] += prs or 0
+        # Propagate stale to the bucket + grand total (symmetric with build_window), so
+        # the dashboard can flag a held all-time value, not just the per-repo row.
+        bucket_stale = any(r["pr_stale"] for r in rows)
+        grand_stale = grand_stale or bucket_stale
+        buckets_out[bucket] = {**bt, "repos": rows, "pr_stale": bucket_stale}
+        for k in grand:
+            grand[k] += bt[k]
+    return {"buckets": buckets_out, "total": {**grand, "pr_stale": grand_stale}}
+
+
+# --- ledger-sourced quality (CI-first-pass / survival) ----------------------
+
+def _load_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    out = []
+    for ln in path.read_text().splitlines():
+        ln = ln.strip()
+        if ln:
+            try:
+                out.append(json.loads(ln))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def scorecard_quality(since_date: str, until_date: str | None = None) -> dict[str, dict]:
+    """Per-repo CI-first-pass and 7d-survival, read from the model-scorecard
+    ledgers (it already harvests these daily for dev-crew repos + PA). Keyed by
+    repo; repos without ledger rows in-window simply get no quality figures.
+    `until_date` upper-bounds the window for as-of history reconstruction."""
+    rows: list[dict] = []
+    rows += _load_jsonl(SCORECARD_DIR / "scorecard.jsonl")
+    for f in SCORECARD_DIR.glob("*.jsonl"):
+        if f.name != "scorecard.jsonl":
+            rows += _load_jsonl(f)
+    agg: dict[str, dict] = {}
+    for r in rows:
+        repo = r.get("repo")
+        d = r.get("date") or ""
+        if not repo or d < since_date or (until_date and d > until_date):
+            continue
+        a = agg.setdefault(repo, {"ci_runs": 0, "ci_first_pass": 0, "scored": 0, "survived": 0})
+        if r.get("ci_first_pass") is not None:
+            a["ci_runs"] += 1
+            a["ci_first_pass"] += 1 if r.get("ci_first_pass") else 0
+        s = r.get("survived")
+        if s in (True, False, "survived", "reverted", "follow_up"):
+            a["scored"] += 1
+            a["survived"] += 1 if s in (True, "survived") else 0
+    return agg
+
+
+# --- decisions: ADRs (knowledge, by project) + ARCH (substrate) -------------
+
+def adrs_minted(since_iso: str, until_iso: str | None = None) -> dict[str, int]:
+    """Count ADR files added under knowledge projects/*/decisions/ in the window,
+    attributed to the ADR project's bucket. `until_iso` upper-bounds the window for
+    as-of history reconstruction.
+
+    COUNTS AGAINST `main_ref`, like every other counting path in this file. It did
+    not until 2026-09-07: the `git log` here carried no ref and so followed the
+    checkout's HEAD, which made branch work in the shared <root>/knowledge
+    checkout count as minted history. That checkout is the one every agent on this
+    machine reads, branch work in it is a known hazard with a written rescue
+    procedure, and this number lands on Orient's /velocity page with nothing
+    marking it degraded."""
+    added = _git("knowledge", ["log", main_ref("knowledge"), f"--since={since_iso}",
+                               *([f"--until={until_iso}"] if until_iso else []),
+                               "--diff-filter=A",
+                               "--name-only", "--pretty=format:", "--",
+                               "projects/*/decisions/*.md"])
+    out: dict[str, int] = {}
+    if not added:
+        return out
+    seen = set()
+    for ln in added.splitlines():
+        ln = ln.strip()
+        if not ln or ln in seen:
+            continue
+        seen.add(ln)
+        parts = ln.split("/")
+        if len(parts) >= 4 and parts[0] == "projects" and parts[2] == "decisions":
+            bucket = ADR_PROJECT_BUCKET.get(parts[1], "Engineering-internal")
+            out[bucket] = out.get(bucket, 0) + 1
+    return out
+
+
+def arch_entries(since_iso: str, until_iso: str | None = None) -> int:
+    """New ## ARCH-NNN headings added to substrate/decisions.md in the window.
+    `until_iso` upper-bounds the window for as-of history reconstruction.
+
+    COUNTS AGAINST `main_ref`, for the same reason as `adrs_minted` above:
+    <root>/substrate is a working checkout committed in directly, and this
+    `git log` followed its HEAD until 2026-09-07."""
+    diff = _git("substrate", ["log", main_ref("substrate"), f"--since={since_iso}",
+                              *([f"--until={until_iso}"] if until_iso else []),
+                              "-p", "--unified=0",
+                              "--pretty=format:", "--", "decisions.md"])
+    if not diff:
+        return 0
+    ids = set()
+    for ln in diff.splitlines():
+        if ln.startswith("+## ARCH-"):
+            m = re.match(r"\+## (ARCH-\d+)", ln)
+            if m:
+                ids.add(m.group(1))
+    return len(ids)
+
+
+# --- aggregation (pure) -----------------------------------------------------
+
+def _blank_metrics() -> dict:
+    return {"commits": 0, "prs_merged": 0, "features": 0, "loc_added": 0,
+            "loc_removed": 0, "reverts": 0, "adrs": 0, "arch": 0,
+            "ci_runs": 0, "ci_first_pass": 0, "scored": 0, "survived": 0,
+            "no_gh_repos": [], "no_local_repos": []}
+
+
+def _add(dst: dict, src: dict) -> None:
+    for k, v in src.items():
+        if isinstance(v, int):
+            dst[k] = dst.get(k, 0) + v
+        elif isinstance(v, list):
+            dst[k] = dst.get(k, []) + v
+
+
+def derived(m: dict) -> dict:
+    """Attach rates so the dashboard doesn't recompute them."""
+    net = m["loc_added"] - m["loc_removed"]
+    merges = m["prs_merged"]
+    return {
+        **m,
+        "loc_net": net,
+        "change_failure_rate": round(m["reverts"] / merges, 3) if merges else None,
+        "ci_first_pass_pct": round(100 * m["ci_first_pass"] / m["ci_runs"], 1) if m["ci_runs"] else None,
+        "survival_pct": round(100 * m["survived"] / m["scored"], 1) if m["scored"] else None,
+    }
+
+
+# --- velocity index (weighted 0–100, tracked over time) ---------------------
+
+# The operator's weighting (2026-06-29): throughput leads, then the quality of what ships,
+# with features + stability as smaller signals. A component with no data (a bucket
+# with no scored runs, say) drops out and the remaining weights renormalize, so a
+# missing signal neither zeros the score nor silently pads it.
+INDEX_WEIGHTS = {
+    "throughput": 0.35, "survival": 0.25, "ci_first_pass": 0.20,
+    "features": 0.10, "stability": 0.10,
+}
+INDEX_WINDOW = 30  # the headline window whose score the over-time trend records
+
+
+def _norm_rate(rate: float, baseline_rate: float) -> float | None:
+    """A per-week count → 0–100 against a frozen baseline: at baseline → 50, at 2×
+    baseline → 100, linear and capped. The baseline is frozen (not the concurrent
+    90-day window) so the trend shows real change over time instead of chasing its own
+    tail — if the whole org slows down, the score falls rather than the baseline sliding
+    down to meet it and pinning the index at 50.
+
+    A bucket with a real baseline that fell to zero this window scores 0 (a genuine
+    stall). But with no frozen baseline *and* no activity there's no basis to score, so
+    this returns None (the component drops out) rather than a misleading 0 — that's the
+    local-only bucket with no GitHub PRs to measure, not a slow one."""
+    if baseline_rate > 0:
+        return max(0.0, min(100.0, 50.0 * rate / baseline_rate))
+    return 50.0 if rate > 0 else None
+
+
+def velocity_index(m: dict, days: int, base_per_week: dict | None) -> dict:
+    """The weighted 0–100 velocity index for one window's metrics, plus the component
+    breakdown the dashboard renders. `base_per_week` is the frozen per-week baseline for
+    this bucket (throughput + features rates); the three percentage components
+    (survival, CI first-pass, 1−change-failure) are already absolute 0–100."""
+    base = base_per_week or {}
+    wk = days / 7 or 1
+    thr = _norm_rate(m.get("prs_merged", 0) / wk, base.get("prs_merged", 0.0))
+    feat = _norm_rate(m.get("features", 0) / wk, base.get("features", 0.0))
+    cfr = m.get("change_failure_rate")
+    raw = {
+        "throughput": thr,
+        "survival": m.get("survival_pct"),
+        "ci_first_pass": m.get("ci_first_pass_pct"),
+        "features": feat,
+        "stability": (1 - cfr) * 100 if cfr is not None else None,
+    }
+    present = {k: v for k, v in raw.items() if v is not None}
+    tw = sum(INDEX_WEIGHTS[k] for k in present)
+    score = round(sum(v * INDEX_WEIGHTS[k] for k, v in present.items()) / tw, 1) if tw else None
+    return {
+        "score": score,
+        "components": {k: {"value": round(v, 1),
+                           "weight": round(INDEX_WEIGHTS[k] / tw, 3)}
+                       for k, v in present.items()},
+    }
+
+
+def attach_index(windows: dict, baseline: dict | None) -> None:
+    """Add velocity_index (score + breakdown) to every bucket and total in every
+    window, in place, using the frozen per-bucket baseline for the rate components."""
+    per = (baseline or {}).get("per_week", {})
+    for days_str, w in windows.items():
+        days = int(days_str)
+        for bucket, m in w["buckets"].items():
+            m["velocity_index"] = velocity_index(m, days, per.get(bucket))
+        w["total"]["velocity_index"] = velocity_index(w["total"], days, per.get("TOTAL"))
+
+
+# --- frozen baseline + weekly history ---------------------------------------
+
+def _per_week(m: dict, days: int) -> dict:
+    wk = days / 7 or 1
+    return {"prs_merged": round(m.get("prs_merged", 0) / wk, 3),
+            "features": round(m.get("features", 0) / wk, 3)}
+
+
+def compute_baseline(now: datetime, days: int = 90) -> dict:
+    """Freeze a per-bucket per-week throughput/features baseline from the current
+    `days`-day window. Frozen once (auto on first run) so the index stays comparable
+    across time; re-mint deliberately with --rebaseline when steady-state shifts."""
+    w = build_window(days, now)
+    per = {b: _per_week(m, days) for b, m in w["buckets"].items()}
+    per["TOTAL"] = _per_week(w["total"], days)
+    return {"created": now.date().isoformat(), "window_days": days, "per_week": per}
+
+
+def _load_baseline(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_json(obj: dict, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2))
+    tmp.replace(path)
+
+
+def _write_jsonl(rows: list[dict], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")  # .jsonl → .jsonl.tmp (matches _write_json)
+    tmp.write_text("".join(json.dumps(r) + "\n" for r in rows))
+    tmp.replace(path)
+
+
+def _iso_week_start(d) -> str:
+    """The Monday of d's ISO week — the anchor a weekly trend point is keyed on."""
+    return (d - timedelta(days=d.weekday())).isoformat()
+
+
+def _history_point(window: dict, week: str, date_iso: str) -> dict:
+    """One weekly trend point from the headline window: the total score, per-bucket
+    scores, and whether the window was carrying a stale (held) PR count."""
+    return {
+        "week": week,
+        "date": date_iso,
+        "total": window["total"].get("velocity_index", {}).get("score"),
+        "buckets": {b: m.get("velocity_index", {}).get("score")
+                    for b, m in window["buckets"].items()},
+        "pr_stale": bool(window["total"].get("pr_stale")),
+    }
+
+
+def upsert_history(point: dict, path: Path) -> None:
+    """Append `point`, replacing any existing row for the same ISO week — daily runs
+    keep refining the current week's value; once the week rolls it freezes."""
+    rows = [r for r in _load_jsonl(path) if r.get("week") != point["week"]]
+    rows.append(point)
+    rows.sort(key=lambda r: r.get("week", ""))
+    _write_jsonl(rows, path)
+
+
+def backfill_history(weeks: int, now: datetime, baseline: dict, path: Path) -> int:
+    """Reconstruct up to `weeks` past weekly points by recomputing the headline window
+    as-of each week's Monday — the same code path as the live snapshot, just date-
+    bounded — so the chart has history the day it ships instead of filling in one week
+    at a time. Best-effort: an existing (live-recorded) week is never clobbered, and a
+    week whose GitHub fetch failed (pr_stale) is skipped rather than recorded low."""
+    existing = {r.get("week"): r for r in _load_jsonl(path)}
+    this_monday = now - timedelta(days=now.weekday())
+    added = 0
+    for i in range(weeks, 0, -1):
+        asof = (this_monday - timedelta(weeks=i)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        week = asof.date().isoformat()
+        if week in existing:
+            continue
+        wins = {str(INDEX_WINDOW): build_window(INDEX_WINDOW, asof, until=asof)}
+        attach_index(wins, baseline)
+        point = _history_point(wins[str(INDEX_WINDOW)], week, week)
+        if point["pr_stale"]:
+            continue  # a failed fetch would understate the week — leave it for a re-run
+        existing[week] = point
+        added += 1
+    rows = sorted(existing.values(), key=lambda r: r.get("week", ""))
+    _write_jsonl(rows, path)
+    return added  # newly reconstructed points, not the file's total
+
+
+# --- driver -----------------------------------------------------------------
+
+def build_window(days: int, now: datetime, prev: dict | None = None,
+                 until: datetime | None = None) -> dict:
+    since = now - timedelta(days=days)
+    since_iso = since.isoformat()
+    since_date = since.date().isoformat()
+    # `until` upper-bounds the window (as-of history reconstruction); the live daily
+    # harvest leaves it None, so the window runs since→now exactly as before.
+    until_iso = until.isoformat() if until else None
+    until_date = until.date().isoformat() if until else None
+    prev_buckets = ((((prev or {}).get("windows") or {}).get(str(days)) or {}).get("buckets") or {})
+
+    pr_quality = scorecard_quality(since_date, until_date)
+    adr_by_bucket = adrs_minted(since_iso, until_iso)
+    arch_n = arch_entries(since_iso, until_iso)
+
+    buckets_out: dict[str, dict] = {}
+    total = _blank_metrics()
+    any_stale = False
+    for bucket, repos in BUCKETS.items():
+        bm = _blank_metrics()
+        pr_error = False
+        for repo in repos:
+            g = git_metrics(repo, since_iso, until_iso)
+            if not g["has_local"]:
+                bm["no_local_repos"].append(repo)
+            _add(bm, {k: g[k] for k in ("commits", "loc_added", "loc_removed", "reverts")})
+            try:
+                pr = gh_pr_metrics(repo, since_date, until_date)
+            except FetchError:
+                pr_error = True          # carried forward below, not written as 0
+            else:
+                if pr is None:
+                    bm["no_gh_repos"].append(repo)
+                else:
+                    _add(bm, pr)
+            q = pr_quality.get(repo)
+            if q:
+                _add(bm, q)
+        if pr_error:
+            # A GitHub fetch failed for a repo that IS on GitHub. Carry the bucket's
+            # last-known-good merged/features forward — never a false 0 — and flag it
+            # stale so the dashboard shows the number is held, not freshly measured.
+            pb = prev_buckets.get(bucket) or {}
+            if pb.get("prs_merged") is not None:
+                bm["prs_merged"] = pb["prs_merged"]
+                bm["features"] = pb.get("features", bm["features"])
+            bm["pr_stale"] = True
+            any_stale = True
+        bm["adrs"] = adr_by_bucket.get(bucket, 0)
+        # The ARCH log is substrate/decisions.md, so it counts for whichever bucket
+        # holds substrate. That was "Engineering-internal" until ARCH-426, "Substrate"
+        # until 2026-08-06, "Keel" until the 2026-08-17 crew split, and the steward's
+        # own bucket from then on — substrate is the steward's cockpit and the log
+        # has never moved out of it.
+        if bucket == "Steward":
+            bm["arch"] = arch_n
+        buckets_out[bucket] = derived(bm)
+        _add(total, bm)
+    total["adrs"] = sum(adr_by_bucket.values())
+    total["arch"] = arch_n
+    if any_stale:
+        total["pr_stale"] = True
+    return {"buckets": buckets_out, "total": derived(total)}
+
+
+# Caveats the dashboard renders as footnotes (decided with the operator 2026-06-15).
+NOTES = [
+    "LOC is a weak signal kept as one input among several — read it alongside the rest.",
+    "The substrate + knowledge repos began 2026-05-16/21, so their 30/90-day windows "
+    "still include the doc-migration genesis (inflating ADRs/ARCH + engineering-internal "
+    "counts); the 7-day window is already clean and the longer windows normalize as the "
+    "repos age.",
+    "The NYH Studio product is built by three projects, each reporting for itself: NYH "
+    "Arch Tools (shared tooling, on GitHub → PRs counted), East Texas Circle and Park "
+    "Villa (per-property, local-only clones → commits/LOC counted, no PRs). They were one "
+    "bucket until 2026-07-31, so a window reaching back past that date reads as three "
+    "rows where the archive holds one.",
+    "The velocity index scores throughput/features against a frozen per-bucket baseline "
+    "(the 90-day pace at launch); a young bucket ramping fast can pin at 100 (≥2× its "
+    "baseline pace) with no quality ledger to temper it — that reads as real high "
+    "velocity, and the score gains resolution as the baseline fills. The TOTAL is the "
+    "balanced headline; re-baseline deliberately when steady-state shifts.",
+]
+
+
+def _load_previous(path: Path) -> dict:
+    """The last snapshot, or {} — the source of last-known-good values carried forward
+    when a GitHub fetch fails this run, so a transient blip never writes a false 0."""
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def build(now: datetime, prev: dict | None = None, baseline: dict | None = None) -> dict:
+    prev = prev or {}
+    windows = {str(d): build_window(d, now, prev) for d in WINDOWS}
+    attach_index(windows, baseline)
+    # `degraded` is always present and always the same shape, so a consumer reads
+    # one field rather than inferring truncation from the numbers — which is
+    # impossible, since a shallow repo and a young one count alike. Empty lists
+    # are the healthy state and say the check ran; a missing key would say only
+    # that the producer is old.
+    shallow = shallow_repos()
+    return {
+        "generated_at": now.astimezone().strftime("%Y-%m-%dT%H:%M:%S"),
+        "degraded": {
+            "shallow_repos": shallow,
+            "shallow_buckets": sorted(b for b, repos in BUCKETS.items()
+                                      if any(r in shallow for r in repos)),
+        },
+        "windows": windows,
+        "alltime": build_alltime(prev),
+        "bucket_order": list(BUCKETS.keys()),
+        "index_weights": INDEX_WEIGHTS,
+        "index_window": INDEX_WINDOW,
+        "baseline": {"created": (baseline or {}).get("created"),
+                     "window_days": (baseline or {}).get("window_days")},
+        "notes": NOTES,
+    }
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(description="Convivy engineering velocity rollup.")
+    p.add_argument("--out", default=str(OUT_PATH), help="output JSON path")
+    p.add_argument("--print", action="store_true", help="print a terminal summary too")
+    p.add_argument("--no-write", action="store_true", help="compute but don't write the JSON")
+    p.add_argument("--fetch", action="store_true",
+                   help="git fetch each clone first so counts reflect origin/main (the daily job uses this)")
+    p.add_argument("--rebaseline", action="store_true",
+                   help="re-freeze the velocity-index baseline from the current 90-day window")
+    p.add_argument("--backfill", type=int, metavar="WEEKS", default=0,
+                   help="reconstruct up to WEEKS past weekly index history points (run once to seed the trend)")
+    args = p.parse_args(argv)
+
+    if args.fetch:
+        for repos in BUCKETS.values():
+            for repo in repos:
+                git_fetch(repo)
+
+    now = datetime.now(timezone.utc)
+    out = Path(args.out)
+
+    # `--out` REDIRECTS THE WHOLE OUTPUT SET, not just the snapshot. The history
+    # and baseline sit beside the snapshot, so they follow it: pointing `--out` at
+    # a scratch path leaves the live trend series untouched. Until 2026-09-07 they
+    # were module constants read directly here, so the obvious way to test a
+    # change to this producer — run it to a temp file and diff — appended to the
+    # real velocity-history.jsonl and could re-freeze the real baseline.
+    history_path = out.parent / HISTORY_PATH.name
+    baseline_path = out.parent / BASELINE_PATH.name
+
+    # The frozen baseline anchors the index's rate components; auto-mint it on first run
+    # (or on --rebaseline) so the index is comparable across every later snapshot.
+    baseline = _load_baseline(baseline_path)
+    if baseline is None or args.rebaseline:
+        baseline = compute_baseline(now)
+        if not args.no_write:
+            _write_json(baseline, baseline_path)
+        print(f"froze velocity baseline ({baseline['created']}, {baseline['window_days']}d window)",
+              file=sys.stderr)
+
+    data = build(now, _load_previous(out), baseline)
+
+    # Say it on stderr as well as in the JSON. The field serves a renderer; this
+    # serves whoever runs the report by hand and would otherwise read truncated
+    # counts as measurements, which is exactly how the shallow `knowledge`
+    # checkout went unnoticed from 2026-08-23 to 2026-09-06.
+    deg = data["degraded"]
+    if deg["shallow_repos"]:
+        print(f"WARNING: shallow clone(s) {', '.join(deg['shallow_repos'])} — history is "
+              f"truncated at the graft, so commit counts under-report and net LOC "
+              f"over-reports inside any window holding the graft date. Affected bucket(s): "
+              f"{', '.join(deg['shallow_buckets'])}. Repair with `git fetch --unshallow`.",
+              file=sys.stderr)
+
+    if not args.no_write:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        tmp.replace(out)  # atomic swap so a reader (or a crash) never sees a partial file
+        print(f"wrote {out}", file=sys.stderr)
+        # Record this week's trend point (upsert — a daily run refines the current week
+        # until it rolls over and freezes).
+        w30 = data["windows"][str(INDEX_WINDOW)]
+        upsert_history(_history_point(w30, _iso_week_start(now.date()),
+                                      now.date().isoformat()), history_path)
+        if args.backfill:
+            n = backfill_history(args.backfill, now, baseline, history_path)
+            print(f"backfilled velocity history → {n} new weekly point(s)", file=sys.stderr)
+    if args.print or args.no_write:
+        w = data["windows"]["30"]
+        print("\nVelocity — last 30 days (commits / merged / netLOC / reverts):")
+        for b in data["bucket_order"]:
+            m = w["buckets"][b]
+            print(f"  {b:22s} {m['commits']:>5} commits  {m['prs_merged']:>4} merged  "
+                  f"{m['loc_net']:>+8} net  {m['reverts']:>3} rev")
+        t = w["total"]
+        print(f"  {'— TOTAL —':22s} {t['commits']:>5} commits  {t['prs_merged']:>4} merged  "
+              f"{t['loc_net']:>+8} net  {t['reverts']:>3} rev  | {t['adrs']} ADRs, {t['arch']} ARCH")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

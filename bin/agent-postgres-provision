@@ -1,0 +1,291 @@
+#!/bin/bash
+# agent-postgres-provision — a dedicated Postgres cluster for dispatched runs,
+# separate from the operator's own (round-1 revise, PR #817).
+#
+# WHY A SECOND CLUSTER. Round 1 opened a vivy dispatch's sandbox to
+# /tmp/.s.PGSQL.5432 — the operator's main cluster's socket. The co then checked that
+# cluster directly: pg_hba trusts every role on the local socket, the role a
+# dispatch connects as (the operator's own unix user) is a superuser there, and a superuser can
+# run `COPY ... TO PROGRAM`, which runs a shell command in the server
+# process — outside every run's sandbox. Granting that socket to a dispatch
+# was command execution on the host, not a database-scope question. This
+# script builds a cluster a dispatch can be pointed at instead: its own data
+# directory and socket directory, no TCP listener, and one role (`agent`)
+# that holds LOGIN and CREATEDB and nothing else — no SUPERUSER, CREATEROLE,
+# REPLICATION or BYPASSRLS, and no grant of pg_execute_server_program,
+# pg_read_server_files or pg_write_server_files. pg_hba trusts `agent` on this
+# cluster's socket and nothing else: every other role, the bootstrap
+# superuser (`agent_admin`) included, needs a password pg_hba does not hand
+# out for free.
+#
+# WHERE. Both the data and socket directories sit under
+# ~/.local/state/agent-platform/postgres/, beside agent-platform-autopull's
+# own state. The socket directory in particular was chosen so that no
+# component of its path is a symlink (checked by hand on this machine:
+# ~/.local, ~/.local/state and the rest all resolve to themselves) — round 1's
+# reviewers both flagged that nothing here shows whether Seatbelt's
+# `(remote unix-socket (subpath ...))` predicate resolves a symlink the same
+# way the filesystem predicates do (that is why SCRATCH_ROOTS in
+# lib/agent-platform/run_sandbox.py lists both /tmp and /private/tmp). Putting
+# the socket under a path with no symlink in it at all removes the question
+# rather than answering it.
+#
+# MAINTENANCE PATH. `agent_admin`'s password lives in
+# ~/.orient-control/agent-postgres-superuser-password, mode 0600 — a
+# directory lib/agent-platform/run_sandbox.py's DENIED_DIRS already denies to
+# every dispatched run's Read and Edit tools. A dispatch cannot read the file
+# a human maintaining this cluster uses to connect as its superuser.
+#
+# NO BOOTSTRAP WINDOW (round-2 revise, PR #817). A fresh initdb is handed
+# --auth-local=scram-sha-256 and --pwfile pointing at that same password
+# file, so `agent_admin` already has its password set, and nothing is
+# trusted, from the cluster's very first start — never initdb's own
+# all-trust default waiting on this script to overwrite it later. The
+# password reaches initdb only as file content; it is never an argv value,
+# so it never appears in a process listing, `provision.log`, or the plist.
+#
+# IDEMPOTENT. Safe to re-run: initdb runs only when the data directory is not
+# yet one (no PG_VERSION file), and every other step re-applies the same
+# config, role attributes and password-file content whether this is the
+# first run or the hundredth. Each run briefly starts the cluster to apply
+# the role/password SQL, then stops it again — the plist installed alongside
+# this script (launchd/com.convivy.agent-postgres.plist) is what keeps it running
+# day to day; this script does not touch that plist, install it, or load it.
+#
+# NEVER RUN BY THIS REPO'S OWN TESTS OR BY ANY SANDBOXED SESSION. This exists
+# so an OPERATOR runs it, by hand, outside any dispatch's sandbox.
+#
+# Must stay bash-3.2-safe: tests/bash/lint.sh parses every bin/ script with a
+# bash shebang under /bin/bash -n on macOS 3.2.57.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'EOF'
+usage: agent-postgres-provision [--verify]
+
+  (no args)   Idempotent: initializes the agent Postgres cluster if it does
+              not exist yet, and re-applies its config, role and password
+              either way. Starts and stops the cluster briefly to do so.
+
+  --verify    Checks that the `agent` role is not a superuser, does not hold
+              CREATEROLE, REPLICATION or BYPASSRLS, does not hold — directly
+              or by inheritance — pg_execute_server_program,
+              pg_read_server_files or pg_write_server_files, and (the
+              behavioral check the first three make redundant, kept as a
+              second layer) cannot run COPY ... TO PROGRAM. Needs the
+              cluster already running (bootstrap the launchd job first).
+              Exits 0 if every check passed, 1 if any one of them failed
+              (meaning: do not point any sandbox grant at this cluster), 2
+              if the cluster could not be reached at all.
+EOF
+}
+
+# The ONE source for the Postgres version this cluster runs: the same
+# postgresql@15 Cellar prefix launchd/com.convivy.agent-postgres.plist execs its
+# `postgres` binary from. _initdb and _pg_ctl default into this prefix's
+# bin/, so a fresh initdb and the server the plist starts can never disagree
+# on major version the way `command -v initdb` (PATH's newest postgresql@N,
+# PostgreSQL 18 on the machine this was first provisioned on) and the
+# plist's pinned postgresql@15 did. A version change touches this one line
+# plus the plist's ProgramArguments[0] — tests/test_agent_postgres_version.py
+# asserts the two agree.
+AGENT_POSTGRES_PREFIX="/opt/homebrew/opt/postgresql@15"
+
+# Resolved once per run, so a stub on PATH (tests) or an explicit override
+# (also tests) both work the same way `gateway/llm-gateway-run.sh` resolves
+# its own psql, via LLM_GATEWAY_PSQL.
+_initdb() { [ -n "${AGENT_POSTGRES_INITDB:-}" ] && { echo "$AGENT_POSTGRES_INITDB"; return 0; }; echo "$AGENT_POSTGRES_PREFIX/bin/initdb"; }
+_pg_ctl() { [ -n "${AGENT_POSTGRES_PG_CTL:-}" ] && { echo "$AGENT_POSTGRES_PG_CTL"; return 0; }; echo "$AGENT_POSTGRES_PREFIX/bin/pg_ctl"; }
+_psql()   { [ -n "${AGENT_POSTGRES_PSQL:-}" ]   && { echo "$AGENT_POSTGRES_PSQL"; return 0; }; command -v psql; }
+
+STATE_ROOT="$HOME/.local/state/agent-platform/postgres"
+DATA_DIR="$STATE_ROOT/data"
+SOCK_DIR="$STATE_ROOT/sockets"
+PWFILE="$HOME/.orient-control/agent-postgres-superuser-password"
+PORT=5433
+AGENT_ROLE="agent"
+ADMIN_ROLE="agent_admin"
+
+say() { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
+
+# A fresh 48-hex-character secret, the same shape `gateway/llm-gateway-run.sh`
+# generates its own role passwords with (`_gateway_new_password`) — no new
+# dependency beyond /dev/urandom.
+_new_password() {
+  od -An -N24 -tx1 /dev/urandom | tr -d ' \n'
+}
+
+# The postgresql.conf this cluster runs with, every run — a full replace, not
+# a patch, because this is a cluster this script owns outright. No TCP at
+# all (`listen_addresses = ''`): the sandbox grant this cluster exists for
+# never opens `allowLocalBinding`, so a TCP listener here would just be an
+# unused, unguarded extra surface.
+_write_postgresql_conf() {
+  cat > "$DATA_DIR/postgresql.conf" <<EOF
+# Managed by bin/agent-postgres-provision — hand edits are overwritten on the
+# next run.
+listen_addresses = ''
+unix_socket_directories = '$SOCK_DIR'
+unix_socket_permissions = '0700'
+port = $PORT
+EOF
+}
+
+# pg_hba.conf, every run — a full replace. Only $AGENT_ROLE gets `trust`.
+# $ADMIN_ROLE (the bootstrap superuser) needs the password in $PWFILE. Every
+# other role, named or not, is rejected outright on this socket.
+_write_pg_hba_conf() {
+  cat > "$DATA_DIR/pg_hba.conf" <<EOF
+# Managed by bin/agent-postgres-provision — hand edits are overwritten on the
+# next run. Only $AGENT_ROLE is trusted; $ADMIN_ROLE (the operator's
+# maintenance role) needs its password from $PWFILE; everything else is
+# rejected.
+local   all             $AGENT_ROLE                             trust
+local   all             $ADMIN_ROLE                             scram-sha-256
+local   all             all                                     reject
+EOF
+}
+
+# The idempotent role/password SQL, run as $ADMIN_ROLE against the briefly-
+# started cluster. Written as a DO block rather than psql's client-side
+# \gexec, kept conditional-only because the ALTER and REVOKE lines below it
+# are themselves idempotent (they converge to the same state whether $AGENT_ROLE
+# already existed or not). Never grants SUPERUSER, CREATEROLE, REPLICATION,
+# BYPASSRLS, or the three server-program/file predefined roles — every
+# "SUPERUSER" that appears below is part of "NOSUPERUSER".
+_role_sql() {
+  cat <<SQL
+DO \$do\$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$AGENT_ROLE') THEN
+    CREATE ROLE $AGENT_ROLE LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  ELSE
+    ALTER ROLE $AGENT_ROLE WITH LOGIN CREATEDB NOSUPERUSER NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+  END IF;
+END
+\$do\$;
+REVOKE pg_execute_server_program FROM $AGENT_ROLE;
+REVOKE pg_read_server_files FROM $AGENT_ROLE;
+REVOKE pg_write_server_files FROM $AGENT_ROLE;
+ALTER ROLE $ADMIN_ROLE WITH PASSWORD '$1';
+SQL
+}
+
+provision() {
+  mkdir -p "$SOCK_DIR"
+  chmod 700 "$SOCK_DIR"
+
+  # The password is written before initdb ever runs, and initdb is handed
+  # --auth-local=scram-sha-256 with --pwfile pointing at it, so the bootstrap
+  # superuser is never reachable with no password: there is no window
+  # between a fresh initdb and _write_pg_hba_conf's final rules where
+  # anything is trusted. $ADMIN_ROLE's password is the one already on disk
+  # from a prior run, not a fresh one, so a wiped-and-reinitialized data
+  # directory keeps whichever password this cluster's maintenance path
+  # already uses.
+  mkdir -p "$(dirname "$PWFILE")"
+  if [ -f "$PWFILE" ]; then
+    pw=$(cat "$PWFILE")
+  else
+    pw=$(_new_password)
+    ( umask 077; printf '%s' "$pw" > "$PWFILE" )
+  fi
+
+  if [ ! -f "$DATA_DIR/PG_VERSION" ]; then
+    say "Initializing the agent Postgres cluster at $DATA_DIR"
+    mkdir -p "$(dirname "$DATA_DIR")"
+    "$(_initdb)" -D "$DATA_DIR" -U "$ADMIN_ROLE" --auth-local=scram-sha-256 \
+      --auth-host=reject --pwfile="$PWFILE"
+  else
+    say "Agent Postgres cluster already initialized at $DATA_DIR"
+  fi
+
+  _write_postgresql_conf
+
+  say "Starting the cluster to apply its role and password"
+  "$(_pg_ctl)" start -D "$DATA_DIR" -w -l "$DATA_DIR/provision.log"
+  _role_sql "$pw" | PGPASSWORD="$pw" "$(_psql)" -h "$SOCK_DIR" -p "$PORT" -U "$ADMIN_ROLE" \
+    -d postgres -X -q -v ON_ERROR_STOP=1 -f -
+  "$(_pg_ctl)" stop -D "$DATA_DIR" -m fast -w
+
+  _write_pg_hba_conf
+
+  say "Provisioned. Bootstrap launchd/com.convivy.agent-postgres.plist to keep it running:"
+  say "  launchctl bootstrap \"gui/\$(id -u)\" ~/Library/LaunchAgents/com.convivy.agent-postgres.plist"
+  say "Then run '$0 --verify'."
+}
+
+# One query covering every attribute and membership --verify must reject:
+# the four role attributes as pg_roles columns, and the three predefined
+# server-program/file roles checked with pg_has_role(..., 'USAGE') — true
+# whether $AGENT_ROLE was granted one directly or inherits it through
+# another role it is a member of.
+_role_attrs_query() {
+  cat <<SQL
+SELECT rolsuper, rolcreaterole, rolreplication, rolbypassrls,
+  pg_has_role(rolname, 'pg_execute_server_program', 'USAGE'),
+  pg_has_role(rolname, 'pg_read_server_files', 'USAGE'),
+  pg_has_role(rolname, 'pg_write_server_files', 'USAGE')
+FROM pg_roles WHERE rolname = '$AGENT_ROLE';
+SQL
+}
+
+verify() {
+  local attrs out rc=0
+  attrs=$(PGPASSWORD= "$(_psql)" -h "$SOCK_DIR" -p "$PORT" -U "$AGENT_ROLE" -d postgres -At -F '|' \
+    -c "$(_role_attrs_query)" 2>&1) || rc=$?
+  case "$attrs" in
+    *"could not connect"*)
+      echo "agent-postgres-provision --verify: could not connect to $SOCK_DIR:$PORT as $AGENT_ROLE — bootstrap the launchd job first." >&2
+      echo "$attrs" >&2
+      return 2
+      ;;
+  esac
+  if [ "$rc" -ne 0 ] || [ -z "$attrs" ]; then
+    echo "agent-postgres-provision --verify: FAIL — could not read $AGENT_ROLE's role attributes (role missing, or the query failed):" >&2
+    echo "$attrs" >&2
+    return 1
+  fi
+
+  local rolsuper rolcreaterole rolreplication rolbypassrls has_exec has_read has_write bad
+  IFS='|' read -r rolsuper rolcreaterole rolreplication rolbypassrls has_exec has_read has_write <<EOF
+$attrs
+EOF
+  bad=""
+  [ "$rolsuper" = "t" ]       && bad="$bad SUPERUSER"
+  [ "$rolcreaterole" = "t" ]  && bad="$bad CREATEROLE"
+  [ "$rolreplication" = "t" ] && bad="$bad REPLICATION"
+  [ "$rolbypassrls" = "t" ]   && bad="$bad BYPASSRLS"
+  [ "$has_exec" = "t" ]       && bad="$bad pg_execute_server_program"
+  [ "$has_read" = "t" ]       && bad="$bad pg_read_server_files"
+  [ "$has_write" = "t" ]      && bad="$bad pg_write_server_files"
+  if [ -n "$bad" ]; then
+    echo "agent-postgres-provision --verify: FAIL —$bad. $AGENT_ROLE holds this directly or by inheritance; any one of these is enough to read or write arbitrary files, or run arbitrary commands, as the Postgres server's OS user. Do not grant any sandbox the socket at $SOCK_DIR." >&2
+    return 1
+  fi
+
+  rc=0
+  out=$(PGPASSWORD= "$(_psql)" -h "$SOCK_DIR" -p "$PORT" -U "$AGENT_ROLE" -d postgres -At \
+    -c "COPY (SELECT 1) TO PROGRAM 'id'" 2>&1) || rc=$?
+  case "$out" in
+    *"could not connect"*)
+      echo "agent-postgres-provision --verify: could not connect to $SOCK_DIR:$PORT as $AGENT_ROLE — bootstrap the launchd job first." >&2
+      echo "$out" >&2
+      return 2
+      ;;
+  esac
+  if [ "$rc" -eq 0 ]; then
+    echo "agent-postgres-provision --verify: FAIL — COPY ... TO PROGRAM succeeded as $AGENT_ROLE. This role can run arbitrary commands on the Postgres server; do not grant any sandbox the socket at $SOCK_DIR." >&2
+    return 1
+  fi
+  echo "agent-postgres-provision --verify: PASS — $AGENT_ROLE holds none of SUPERUSER, CREATEROLE, REPLICATION, BYPASSRLS, pg_execute_server_program, pg_read_server_files or pg_write_server_files, and COPY ... TO PROGRAM was refused:"
+  echo "$out"
+  return 0
+}
+
+case "${1:-}" in
+  --verify) verify ;;
+  -h|--help) usage ;;
+  "") provision ;;
+  *) echo "agent-postgres-provision: unknown option: $1" >&2; usage; exit 2 ;;
+esac

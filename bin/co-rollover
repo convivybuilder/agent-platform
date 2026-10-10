@@ -1,0 +1,500 @@
+#!/usr/bin/env python3.11
+"""co-rollover — hand this tmux session to a successor (ADR-0069 Slice 5).
+
+Replaces the `/rollover` skill's inline bash. The skill still writes
+`handoff.md` (unchanged) and still tells the operator what happened; this script owns
+everything from "spawn the successor" through "the predecessor is fenced and
+will close once the successor confirms pickup."
+
+Two invocations, run from two different Claude Code sessions:
+
+  co-rollover [--product NAME]
+      Run by the PREDECESSOR, right after it has written handoff.md. Spawns
+      the successor in a new window of the SAME tmux session, verifies it
+      came up, `select-window`s to it, and sets this session's rollover state
+      to `rolling` — which `tools/rollover-trigger.py`'s PreToolUse fence then
+      denies every further tool call in, unconditionally.
+
+  co-rollover --picked-up <handoff-path>
+      Run by the SUCCESSOR, once `/handoff-pickup` has read the handoff at
+      that exact path. Forwards, SYNCHRONOUSLY, any message that landed in
+      the predecessor's held queue after the handoff was written (Slice 7,
+      epic issue_01M1S2X8ENKYEGSDE3H0REFD3G — `co_rollover.
+      forward_late_messages`), THEN records pickup and starts a DETACHED
+      close-out (kill the predecessor's pane, then renumber so the
+      successor becomes window 1) — detached so this command returns
+      immediately rather than blocking the successor's own turn on it. The
+      close-out never fires without a recorded pickup: that ordering is
+      what keeps a failed spawn from stranding the operator with zero
+      sessions (the skill's original safety rule, carried forward rather
+      than re-derived).
+
+      Forwarding runs BEFORE the side channel's `picked_up` gate flips
+      (round 2, PR #588), on purpose: the gate is what a retried
+      `--picked-up` reads to skip a second close-out, and if it also gated
+      forwarding, a crash between the two would leave `picked_up` true with
+      the queue never read — a held message dropped with no record it ever
+      existed, forever, since nothing after that point ever calls
+      `forward_late_messages` again. Reading the not-yet-flipped side
+      channel instead means a crash-then-retry re-forwards the queue
+      exactly as it stood — a possible duplicate of a message an earlier,
+      interrupted call already delivered. A visible duplicate beats a
+      silent loss. The close-out gate itself is untouched: it still flips
+      exactly once, so a retry — crash-driven or a plain duplicate
+      dispatch — never starts a second one.
+
+THE HANDOFF DIRECTORY comes from `agentctl session-dir --product <product>`,
+called by THIS process. With `CLAUDE_CODE_SESSION_ID` set, that returns the
+directory the session recorded on its first call, so this script reads the same
+`handoff.md` the handoff was written to. The skill's step 1 also exports
+`CONVIVY_SESSION_DIR` to that directory, which `session-dir` returns unchanged
+(see `bin/agentctl`'s `cmd_session_dir`). With neither variable set, every call
+mints a fresh, numbered directory.
+
+FAILS LOUD, NOT OPEN — unlike `tools/rollover-trigger.py`. That hook fires on
+every tool call in every session and a stuck failure there wedges the
+machine; this is a foreground command run once, by intent, and its caller
+(the model, following the rollover skill) needs to know plainly whether the
+handoff actually happened. A failed spawn prints the successor pane's last
+lines and exits non-zero WITHOUT marking anything `rolling` — the predecessor
+stays live and unfenced, for the model to report and keep working in (the
+skill's "never strand the operator" rule, Slice 6's territory for anything
+past reporting it).
+
+ITS `.claude/` MAY NOT BE UNTOUCHED, THOUGH. When a predecessor pid was found
+to exempt, the successor's forced re-individuate starts running inside the
+detached window the instant `spawn_successor` creates it — well before
+`verify_up` can detect a failure. A spawn that fails after that rewrite has
+started can report failure with the predecessor's own `.claude/agents/` and
+`.claude/skills/` already replaced by the successor's profile
+(`co_rollover.spawn_successor`'s docstring has the full timing and the
+unguarded gap this leaves).
+
+A FAILURE MUST LEAN TOWARD "UNFENCED", NEVER "STUCK ROLLING WITH NO WAY BACK".
+`_cmd_spawn` writes the side channel BEFORE calling `mark_rolling`, on
+purpose: those are the only two steps left once the successor is verified
+up, and only the side-channel write can raise (a removed handoff directory,
+a full disk). Marking rolling first and writing the side channel second
+would let that failure leave the predecessor permanently fenced with no
+side channel for any successor to ever find — the fence has no built-in way
+out (see `rollover_policy.mark_rolling`'s docstring; `session-agent rollover
+<name> clear` is the operator's manual escape hatch).
+
+A FAILED SPAWN PARKS RATHER THAN JUST REPORTING (Slice 6, ADR-0069/epic
+comment 2402 ruling (b)). There is no automatic retry: `spawn_successor`
+raising `CoRolloverError`, or `verify_up` timing out or matching a known
+failure signature, both now log one alert signal for the operator
+and write a `parked` rollover state before returning non-zero — see
+`_park_and_file`, and `rollover_policy.mark_parked`'s own docstring for why
+`parked`, unlike `rolling`, is not a fence: the predecessor stays fully
+usable while it waits for the operator.
+
+THE CLOSE-OUT VERIFIES THE PANE IT IS ABOUT TO KILL. `mark_rolling` records
+the predecessor pane's own PID and the tmux server's `#{session_id}`
+alongside its `pane_id` — tmux reassigns both pane ids and session ids from
+zero on every server restart, so a `pane_id` recorded before a restart can
+otherwise name a live pane in an unrelated session by the time
+`--picked-up` runs (2026-09-13, %3 after the 15:46 MST restart named live
+panes elsewhere). `co_rollover.close_out` checks the live pane's identity
+against what was recorded before it ever calls `kill-pane`.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+_SELF = Path(__file__).resolve()
+_LIB_DIR = _SELF.parent.parent / "lib" / "agent-platform"
+sys.path.insert(0, str(_LIB_DIR))
+import co_rollover as CR  # noqa: E402
+import signal_client as SC  # noqa: E402
+import rollover_policy as RP  # noqa: E402
+from private_crew import private_home_for  # noqa: E402
+
+# Resolved beside THIS file (ARCH-229), not `~/.local/bin/agentctl` — a
+# worktree's own copy of this script must call ITS OWN worktree's agentctl,
+# not whatever primary has checked out.
+_AGENTCTL = _SELF.parent / "agentctl"
+
+
+def _handoff_dir(product: str) -> Path:
+    try:
+        done = subprocess.run([str(_AGENTCTL), "session-dir", "--product", product],
+                              capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"co-rollover: could not run agentctl session-dir: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if done.returncode != 0 or not done.stdout.strip():
+        print(f"co-rollover: agentctl session-dir failed: {done.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    return Path(done.stdout.strip())
+
+
+def _require_session_id() -> str:
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not session_id:
+        print("co-rollover: CLAUDE_CODE_SESSION_ID is unset — this must run inside a co session",
+              file=sys.stderr)
+        sys.exit(1)
+    return session_id
+
+
+# --- Slice 6: a failed spawn parks and logs one operator signal ------------
+#
+# `reason` values `mark_parked` records and `_park_and_file`'s signal title
+# names — one per failure branch in `_cmd_spawn`, so an operator reading the
+# state file or the signal can tell which without reading this script.
+_REASON_SPAWN_ERROR = "spawn_error"
+_REASON_VERIFY_UP_FAILED = "verify_up_failed"
+
+
+# A park is written whatever the signal returns, and it runs on the rollover path, so the signal
+# gets a 5s timeout per socket operation rather than the delivery budget (30s per attempt).
+# post_structured makes up to three attempts with backoff, so a store that stops answering costs
+# about 19.5 seconds. A store that trickles bytes can exceed that, since urllib applies the timeout
+# to each read.
+_PARK_SIGNAL_TIMEOUT = 5
+# `medium`, matching the spawn-failure park's severity on its item: a parked session is recoverable
+# and stays fully usable, so the operator needs to know, but nothing is getting worse.
+_PARK_SEVERITY = "medium"
+
+
+def _park_and_file(predecessor_session_id: str, *, session_name: str,
+                   predecessor_pane_id: str, handoff_path: Path, product: str,
+                   cwd: str, reason: str, detail: str | None, pane_text: str | None,
+                   successor_window: int | None,
+                   successor_pane: str | None) -> tuple[str | None, str]:
+    """Log one alert signal for the operator, then write the `parked` rollover state
+— always, regardless of whether logging succeeded. Returns the signal status:
+`created`, `duplicate`, `skip` (no token), `black-box` or an `error:`-prefixed string.
+A session inside a private crew logs no signal (ADR-0043); the state records `black-box`.
+
+THE STATUS IS RETURNED AND RECORDED BECAUSE IT IS THE ONLY RECORD OF WHY LOGGING
+FAILED. `post_alert` never raises, so a wire error comes back as `error:<code>`
+and a missing token as `skip`. Taking only a yes or no here would discard the
+reason at the one point anything held it, and a failed log and a clean park would
+leave identical evidence.
+
+LOGGING RUNS FIRST so `mark_parked` records the status in its one state write.
+`post_alert` never raises, so the park always still runs. "A parked session with
+no signal is recoverable; a lost park is not" (the build's own words).
+
+`dedup_key` is the predecessor's session id plus the handoff path (not just its
+filename, which is always literally `handoff.md` — `_handoff_dir`'s directory is
+what makes the path unique per rollover attempt): stable across a retried
+`co-rollover` against the SAME predecessor session and the SAME unmodified
+handoff, so a retry that fails again answers `duplicate` instead of logging twice.
+"""
+    predecessor_window = CR.pane_window_index(predecessor_pane_id)
+    lines = [
+        "An automatic rollover's successor spawn failed; there is no "
+        "automatic retry, and the predecessor has parked.",
+        "",
+        f"- failure path: {reason}",
+        f"- predecessor session id: {predecessor_session_id}",
+        f"- tmux session: {session_name}"
+        + (f", window {predecessor_window}" if predecessor_window is not None else ""),
+        f"- predecessor pane: {predecessor_pane_id}",
+        f"- handoff: {handoff_path}",
+    ]
+    if detail:
+        lines.append(f"- error: {detail}")
+    if successor_window is not None:
+        lines.append(
+            f"- successor window: {successor_window}"
+            + (f" (pane {successor_pane})" if successor_pane else ""))
+    if pane_text:
+        lines += ["", "Last lines of the successor's pane:", "```"]
+        lines += pane_text.splitlines()[-30:]
+        lines.append("```")
+    lines += [
+        "",
+        "The predecessor session stays live and usable — nothing is fenced "
+        "— but it will not seek or roll over again on its own. Once this is "
+        "resolved, run `session-agent rollover <name> clear` to un-park it.",
+    ]
+
+    # ADR-0043: the gate is before any of the session's text is sent. `lines` quotes the handoff and
+    # the successor's pane, and `cwd` is the only thing that places the session in a crew.
+    # `private_home_for` answers UNKNOWN when it cannot tell, and UNKNOWN is not None, so it fails
+    # closed.
+    if private_home_for(cwd) is not None:
+        status = "black-box"
+    else:
+        status = SC.post_alert(
+            "co-rollover-park",
+            SC.sanitise_body(
+                f"co-rollover: successor spawn failed ({reason}), session parked\n\n"
+                + "\n".join(lines)),
+            product=product,
+            dedup_key=f"co-rollover-park:{predecessor_session_id}:{handoff_path}",
+            timeout=_PARK_SIGNAL_TIMEOUT, meta={"severity": _PARK_SEVERITY})
+
+    RP.mark_parked(predecessor_session_id, reason=reason, handoff_path=str(handoff_path),
+                   issue_id=None, issue_status=status, issue_product=product)
+    return status
+
+
+def _report_parked(issue_status: str = "unknown") -> None:
+    """Name the signal status rather than pointing at the scrollback. A failed log
+    prints its status here, so a park whose signal did not land reads as incomplete
+    instead of as complete."""
+    if issue_status in ("created", "duplicate"):
+        print(f"co-rollover: logged a signal for the operator ({issue_status}); "
+              "this session has parked.", file=sys.stderr)
+    elif issue_status == "black-box":
+        print("co-rollover: this session is inside a black-box crew, which logs no signal "
+              "(ADR-0043); this session has parked.", file=sys.stderr)
+    else:
+        print(f"co-rollover: could not log a signal for this failure "
+              f"(logging returned {issue_status}); this session has parked anyway "
+              "— tell the operator directly.", file=sys.stderr)
+
+
+def _cmd_spawn(args) -> int:
+    predecessor_session_id = _require_session_id()
+
+    try:
+        session_name, predecessor_pane_id = CR.current_session_and_pane()
+    except CR.CoRolloverError as exc:
+        print(f"co-rollover: {exc}", file=sys.stderr)
+        return 1
+
+    # Captured now, not at close-out time: `close_out` verifies this against
+    # what tmux reports for `predecessor_pane_id` right before it kills
+    # anything, since a tmux server restart reassigns both pane ids and
+    # session ids from zero and can otherwise make an old `pane_id` name an
+    # unrelated live pane (2026-09-13, %3 after the 15:46 MST restart).
+    predecessor_identity = CR.pane_identity(predecessor_pane_id)
+    if predecessor_identity is None:
+        print(f"co-rollover: could not resolve this pane's own identity "
+              f"({predecessor_pane_id!r}) — refusing to roll over", file=sys.stderr)
+        return 1
+
+    cwd = CR.git_toplevel()
+    product = args.product or os.path.basename(cwd)
+
+    handoff_dir = _handoff_dir(product)
+    handoff_path = handoff_dir / "handoff.md"
+    if not handoff_path.is_file():
+        print(f"co-rollover: no handoff.md at {handoff_path} — write it (as /handoff-leave "
+              "does) before running co-rollover", file=sys.stderr)
+        return 1
+
+    # The predecessor's own `claude` pids, if any can be found beneath its
+    # pane (issue_01M2FDBJS8GMA16DX4XNBVH2K6) — passed to `spawn_successor` so
+    # the successor's forced re-individuate can exempt exactly these pids
+    # from knowledge-ctx's live-process guard instead of skipping the
+    # re-individuate outright. Every pid at the pane, not just one:
+    # `tmux_transcript.claude_pids_under` can legitimately return more than
+    # one (its own docstring's 2026-07-22 computer-use-fork case), and
+    # exempting only the first would leave a second, equally-legitimate pid
+    # tripping the guard. Empty when no claude process resolves (the pane's
+    # shell already exited, or the tree is deeper than
+    # `claude_pids_for_pane`'s bounded walk) — `spawn_successor` falls back to
+    # today's skip in that case, exactly as before this pid lookup existed.
+    predecessor_claude_pids = CR.predecessor_claude_pids(predecessor_identity["pane_pid"])
+
+    # ADR-0069, the operator's 2026-09-16 ruling: the successor keeps the predecessor's
+    # permission mode. `rollover_policy.evaluate` (fired from `Stop`/
+    # `UserPromptSubmit`) already tracks this field, but that reading can be
+    # stale by the time a rollover actually runs — a Shift+Tab mode change
+    # fires no hook at all. `tools/rollover-trigger.py`'s `PreToolUse` branch
+    # records the CURRENT mode on every firing that isn't itself the `rolling`
+    # fence, and the PreToolUse firing for THIS invocation (the Bash tool call
+    # running `co-rollover` itself) is what makes this read fresh as of right
+    # now rather than as of the predecessor's last Stop/UserPromptSubmit.
+    predecessor_permission_mode = RP.read_state(predecessor_session_id).get("permission_mode")
+
+    try:
+        spawned = CR.spawn_successor(session_name, cwd, product, str(handoff_path),
+                                      exempt_pids=predecessor_claude_pids,
+                                      permission_mode=predecessor_permission_mode)
+    except CR.CoRolloverError as exc:
+        print(f"co-rollover: {exc}", file=sys.stderr)
+        issue_status = _park_and_file(
+            predecessor_session_id, session_name=session_name,
+            predecessor_pane_id=predecessor_pane_id, handoff_path=handoff_path,
+            product=product, cwd=cwd, reason=_REASON_SPAWN_ERROR, detail=str(exc),
+            pane_text=None, successor_window=None, successor_pane=None)
+        _report_parked(issue_status)
+        return 1
+
+    ok, pane_text = CR.verify_up(session_name, spawned["window_index"])
+    if not ok:
+        print("co-rollover: the successor did not come up. Do NOT switch — this session is "
+              "unfenced and live, but if a predecessor pid was exempted its .claude/ profile "
+              "may already have been rewritten by the failed successor's re-individuate. "
+              "Last lines of its pane:", file=sys.stderr)
+        for line in pane_text.splitlines()[-30:]:
+            print(f"    {line}", file=sys.stderr)
+        issue_status = _park_and_file(
+            predecessor_session_id, session_name=session_name,
+            predecessor_pane_id=predecessor_pane_id, handoff_path=handoff_path,
+            product=product, cwd=cwd, reason=_REASON_VERIFY_UP_FAILED, detail=None,
+            pane_text=pane_text, successor_window=spawned["window_index"],
+            successor_pane=spawned["pane_id"])
+        _report_parked(issue_status)
+        return 1
+
+    CR.select_window(session_name, spawned["window_index"])
+
+    # Turn `remain-on-exit` back off now that the successor is confirmed up
+    # (`spawn_successor` turned it on only so a failed spawn stayed
+    # diagnosable — see its own comment and `clear_remain_on_exit`'s
+    # docstring). Best-effort: a failure here must not fail the rollover,
+    # since the successor is already live and selected by this point; it only
+    # means this window won't auto-close when its session later ends.
+    if not CR.clear_remain_on_exit(session_name, spawned["window_index"]):
+        print(f"co-rollover: could not turn off remain-on-exit on window "
+              f"{spawned['window_index']} — it will not auto-close once this "
+              "session ends", file=sys.stderr)
+
+    predecessor = {"session_id": predecessor_session_id, "pane_id": predecessor_pane_id,
+                   "pane_pid": predecessor_identity["pane_pid"],
+                   "tmux_session_id": predecessor_identity["tmux_session_id"]}
+    successor = {"session_id": None, "pane_id": spawned["pane_id"]}
+    # The side channel is written BEFORE `mark_rolling`: a failure in either
+    # step must leave the session unfenced (never rolling with no side
+    # channel for a successor to ever find), so whichever one can fail is the
+    # one that must run first. `write_side_channel` can raise (no handoff
+    # directory, a full disk); `mark_rolling` cannot (`_atomic_write` swallows
+    # its own OSError) — see each function's own docstring.
+    CR.write_side_channel(handoff_path, {
+        "tmux_session": session_name,
+        "predecessor": predecessor,
+        "successor": successor,
+        "successor_window": spawned["window_index"],
+        "picked_up": False,
+        "picked_up_at": None,
+    })
+    RP.mark_rolling(predecessor_session_id, predecessor=predecessor, successor=successor,
+                    successor_window=spawned["window_index"])
+
+    print(f"co-rollover: successor is up in window {spawned['window_index']} "
+          f"(pane {spawned['pane_id']}); handoff at {handoff_path}. "
+          "This session has rolled over — end your turn.")
+    return 0
+
+
+def _cmd_picked_up(args) -> int:
+    successor_session_id = _require_session_id()
+    handoff_path = Path(args.picked_up)
+
+    data = CR.read_side_channel(handoff_path)
+    if data is None:
+        print(f"co-rollover: no co-rollover state found beside {handoff_path!r}", file=sys.stderr)
+        return 1
+
+    if data.get("picked_up"):
+        # A retried `--picked-up` (the successor re-running it, or a
+        # duplicate dispatch) that reached an earlier, completed call's
+        # gate flip: that call already forwarded any late message this
+        # handoff gets and already started the one close-out it gets. Do
+        # neither again.
+        print("co-rollover: pickup already recorded; not starting another close-out.")
+        return 0
+
+    predecessor = data.get("predecessor") or {}
+    predecessor_pane_id = predecessor.get("pane_id")
+    predecessor_session_id = predecessor.get("session_id")
+    successor_pane_id = (data.get("successor") or {}).get("pane_id")
+    tmux_session = data.get("tmux_session")
+
+    # Slice 7 (epic issue_01M1S2X8ENKYEGSDE3H0REFD3G): forward anything that
+    # landed in the predecessor's held queue AFTER the handoff was written —
+    # SYNCHRONOUS, not part of the detached close-out below, because the
+    # close-out's own stdout/stderr are `DEVNULL` (see the `Popen` call
+    # further down) and a forwarding failure must reach somewhere an
+    # operator or this turn's own transcript can see it. Never wedges the
+    # pickup itself: `forward_late_messages` never raises, it returns
+    # per-message failures instead.
+    #
+    # Deliberately reads `picked_up` above rather than going through
+    # `mark_picked_up` first (round 2, PR #588) — see the module docstring
+    # for why forwarding must run before that gate flips, and which failure
+    # (a possible duplicate, never a silent loss) this ordering accepts.
+    if predecessor_session_id and successor_pane_id and tmux_session:
+        sent, failures = CR.forward_late_messages(
+            handoff_path, predecessor_session_id, successor_pane_id, tmux_session)
+        if sent:
+            print(f"co-rollover: forwarded {sent} held message(s) from the predecessor.")
+        for failure in failures:
+            print(f"co-rollover: {failure}", file=sys.stderr)
+    else:
+        missing = [name for name, val in (
+            ("predecessor session id", predecessor_session_id),
+            ("successor pane id", successor_pane_id),
+            ("tmux session", tmux_session),
+        ) if not val]
+        print(f"co-rollover: skipping message forwarding — missing {', '.join(missing)} on "
+              "record", file=sys.stderr)
+        CR.log_forwarding_skipped(missing)
+
+    try:
+        picked_up = CR.mark_picked_up(handoff_path, successor_session_id)
+    except CR.CoRolloverError as exc:
+        print(f"co-rollover: {exc}", file=sys.stderr)
+        return 1
+
+    if not picked_up.get("picked_up_this_call"):
+        # A concurrent `--picked-up` call for the same handoff reached the
+        # gate first: the forwarding pass above may have just re-sent
+        # messages that call is about to deliver too (the same accepted
+        # duplicate-over-loss trade the crash-retry case takes), but only
+        # ONE call ever starts the close-out.
+        print("co-rollover: pickup already recorded; not starting another close-out.")
+        return 0
+
+    if predecessor_pane_id and tmux_session:
+        # DETACHED: the close-out (kill the predecessor's pane, then
+        # renumber) runs independently so this command returns immediately
+        # rather than the successor's own turn blocking on it. The
+        # predecessor's own pane_pid/tmux_session_id (recorded at
+        # `mark_rolling` time) travel along so `close_out` can verify the
+        # named pane is still the one it was told to close before touching
+        # it — see `co_rollover.close_out`'s docstring.
+        subprocess.Popen(
+            [sys.executable, str(_SELF), "--close-out", tmux_session, predecessor_pane_id,
+             str(predecessor.get("pane_pid")), str(predecessor.get("tmux_session_id"))],
+            start_new_session=True, stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print("co-rollover: pickup recorded; closing out the predecessor.")
+    else:
+        print("co-rollover: pickup recorded (no predecessor pane on record — nothing to close out).")
+    return 0
+
+
+def _cmd_close_out(args) -> int:
+    session_name, predecessor_pane_id, pane_pid, tmux_session_id = args.close_out
+    CR.close_out(session_name, predecessor_pane_id,
+                expected_pane_pid=pane_pid, expected_tmux_session_id=tmux_session_id)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--product", default=None,
+                    help="override the product slug (default: basename of the git toplevel)")
+    ap.add_argument("--picked-up", metavar="HANDOFF_PATH", default=None,
+                    help="record pickup for the handoff at HANDOFF_PATH, then close out "
+                         "the predecessor")
+    ap.add_argument("--close-out", nargs=4,
+                    metavar=("TMUX_SESSION", "PANE_ID", "PANE_PID", "TMUX_SESSION_ID"),
+                    default=None,
+                    help=argparse.SUPPRESS)  # internal: the detached close-out step
+    args = ap.parse_args()
+
+    if args.close_out:
+        return _cmd_close_out(args)
+    if args.picked_up:
+        return _cmd_picked_up(args)
+    return _cmd_spawn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

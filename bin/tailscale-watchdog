@@ -1,0 +1,298 @@
+#!/bin/sh
+# Bring Tailscale back if it goes down, because it is the only way into this
+# machine and the operator is usually two thousand miles away.
+#
+# WHY THIS EXISTS. The mini is reachable only over Tailscale: it sits on
+# 172.16.0.59 behind a gateway that advertises no subnet route, so if the local
+# Tailscale stops, nothing reaches it until somebody stands in front of it. On
+# 2026-08-13 the machine had been up 51 days with a Tailscale system extension
+# queued to uninstall on the next reboot, an untested transition on exactly that
+# component. This is the net under that.
+#
+# WHAT IT WILL NOT DO. It never changes Tailscale's configuration. Recovery is
+# "start the thing again", never `--reset`, never a flag that could re-point the
+# node or drop its auth. A watchdog that repairs connectivity by reconfiguring
+# the network is a watchdog that can lock you out faster than the fault it
+# treats. It also refuses to act more than once per COOLDOWN, so a persistent
+# fault produces a log to read rather than a restart loop.
+#
+# WHAT IT MUST SURVIVE. Every failure mode below was found in review, and they
+# share one shape: the watchdog breaking in a way that only shows up while
+# Tailscale is DOWN, which is the one moment it has to work.
+#
+#   - A state file holding something that is not a number. Its contents used to
+#     go straight into an arithmetic expansion, where the shell stops the script
+#     dead — and two of the three malformed shapes exit 0 while doing it, so
+#     launchd and anybody reading the log see a clean run. Nothing repaired the
+#     file except the healthy branch, so every later tick died at the same line
+#     and no recovery was ever attempted again.
+#   - An unbounded call to the Tailscale CLI. A wedged `tailscaled` that does not
+#     answer its own CLI is a plausible way for this machine to go dark, and
+#     under `StartInterval` launchd will not start a second copy while the first
+#     is still running. One hang therefore disables the watchdog permanently.
+#   - Two invocations overlapping. A single run can take about as long as the
+#     interval, and the cooldown is a plain read-then-write with nothing holding
+#     the two together.
+set -u
+
+# Both overridable, so the lock and the state machine can be exercised against a
+# scratch directory and a stubbed CLI instead of against the real ones. launchd
+# passes a clean environment, so the deployed job always takes the defaults. This
+# is the only reason the lock below has any test at all: it runs at the top of
+# the script rather than inside a function, so nothing can lift it out the way
+# the tests lift read_int and healthy.
+TS="${TAILSCALE_WATCHDOG_CLI:-/Applications/Tailscale.app/Contents/MacOS/Tailscale}"
+STATE="${TAILSCALE_WATCHDOG_STATE:-$HOME/.local/state/tailscale-watchdog}"
+LOG=$STATE/watchdog.log
+FAILS=$STATE/consecutive-failures
+LAST=$STATE/last-action
+LOCK=$STATE/lock
+
+# Three consecutive failures before acting: one bad sample is a hiccup during a
+# network change, and acting on it would restart Tailscale every time the wifi
+# blinked. At a 60s interval this is a ~3 minute outage before intervention.
+THRESHOLD=3
+COOLDOWN=600          # seconds between recovery attempts
+HEALTH_TIMEOUT=20     # seconds any single health probe may take
+UP_TIMEOUT=60         # outer bound on `tailscale up`, over the CLI's own 30s
+LOCK_STALE=300        # seconds after which a held lock is assumed abandoned
+
+mkdir -p "$STATE" 2>/dev/null
+
+log() { echo "$(date '+%Y-%m-%dT%H:%M:%S') $*" >> "$LOG"; }
+
+# --- one runner at a time --------------------------------------------------------
+#
+# `mkdir` is the lock because it is atomic and needs no `flock`, which macOS does
+# not ship. A lock older than LOCK_STALE is assumed abandoned by a run that was
+# killed, since a watchdog that can be disabled forever by its own leftovers is
+# the failure this whole file exists to avoid.
+if ! mkdir "$LOCK" 2>/dev/null; then
+    # PORTABLE MTIME, same BSD-vs-GNU trap as the gateway's mode read. On GNU
+    # coreutils `-f` is `--file-system`, so `stat -f '%m' FILE` prints a
+    # filesystem dump to stdout, an error to stderr, and exits 1 — so a naive
+    # `$(stat -f '%m' "$LOCK" 2>/dev/null || echo 0)` DOES run the `|| echo 0`
+    # fallback, but too late: the dump is already inside the command
+    # substitution's stdout before `||` is evaluated, so the fallback's "0" is
+    # appended after the dump rather than replacing it.
+    # `_held` then held that dump-plus-0, `[ "$_held" -gt 0 ]` errored on a
+    # non-integer and read false, and the staleness test below fell through to
+    # the takeover path — so on Linux A LIVE LOCK READ AS STALE ON EVERY TICK,
+    # which is the opposite of what the comment above says this lock is for.
+    #
+    # The output is validated rather than the exit code, because a wrong answer
+    # and an error look the same to `||`. Falling back to 0 keeps the original
+    # behaviour on an unreadable lock: 0 means "treat as stale and take over",
+    # deliberately, since a watchdog disabled forever by its own leftovers is
+    # the failure this whole file exists to avoid.
+    # Spelled out rather than looped over a format variable: a loop would rely
+    # on the shell splitting "-c %Y" into two arguments, which this `sh` does
+    # and zsh does not, so the same code would read a leading space into the
+    # format elsewhere. Two calls need no splitting.
+    _held=0
+    _stat_out=$(stat -c '%Y' "$LOCK" 2>/dev/null) || true
+    case "$_stat_out" in
+        ''|*[!0-9]*) ;;
+        *) _held="$_stat_out" ;;
+    esac
+    if [ "$_held" -eq 0 ]; then
+        _stat_out=$(stat -f '%m' "$LOCK" 2>/dev/null) || true
+        case "$_stat_out" in
+            ''|*[!0-9]*) ;;
+            *) _held="$_stat_out" ;;
+        esac
+    fi
+    _now=$(date +%s)
+    if [ "$_held" -gt 0 ] && [ $(( _now - _held )) -lt "$LOCK_STALE" ]; then
+        exit 0        # a previous tick is still working; say nothing, it logs
+    fi
+    # THE TAKEOVER IS ONE ATOMIC STEP, because two ticks can see the same stale
+    # lock at the same moment. `rm -rf` then `mkdir` lets both of them succeed:
+    # each removes and recreates in turn, each writes its own pid, and both go on
+    # believing they hold it alone — two watchdogs running at once, duplicating
+    # every recovery action. `mv` is a rename, so exactly one caller can move a
+    # given directory; whoever loses finds it already gone and steps aside.
+    if ! mv "$LOCK" "$LOCK.stale.$$" 2>/dev/null; then
+        exit 0        # another tick won the takeover
+    fi
+    log "lock at $LOCK is over ${LOCK_STALE}s old — assuming an abandoned run and taking it"
+    rm -rf "$LOCK.stale.$$" 2>/dev/null
+    mkdir "$LOCK" 2>/dev/null || exit 0
+fi
+echo $$ > "$LOCK/pid" 2>/dev/null
+
+# THE TRAP CHECKS WHETHER IT STILL OWNS THE LOCK. A run that outlives
+# LOCK_STALE has already had the lock taken from it by a later tick, and an
+# unconditional `rm -rf` on the way out would then delete a lock somebody else
+# is holding — handing the overlap back at exactly the moment two runs are
+# genuinely in flight, which is the one case the lock is for.
+trap '[ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+
+# --- state that cannot stop the script -------------------------------------------
+
+# Read a non-negative integer from $1, treating anything else as 0 and repairing
+# the file. NOTHING from disk reaches an arithmetic expansion without passing
+# through here.
+read_int() {
+    _f="$1"
+    _v=""
+    [ -f "$_f" ] && _v=$(head -n 1 "$_f" 2>/dev/null)
+
+    # Digits only, and short enough that no arithmetic below can overflow. An
+    # empty file is the ordinary first-boot case and is not worth a log line;
+    # anything else means the file was damaged and the operator should know.
+    case "$_v" in
+        '') _v=0 ;;
+        0) ;;
+        0*)
+            # DIGITS ARE NOT ENOUGH. Shell arithmetic reads a leading zero as
+            # octal, so a stored "089" is not a number at all — `$(( 089 + 1 ))`
+            # aborts with "value too great for base" and takes the script with
+            # it, which is the very wedge this function exists to prevent, just
+            # through a narrower door. "017" is worse than a crash: it evaluates
+            # quietly to 15, so the counter would be wrong with nothing logged.
+            # Nothing here ever writes a leading zero, so one means the file was
+            # damaged.
+            log "state file $_f held '$_v', which shell arithmetic would read as octal — reset to 0"
+            _v=0 ;;
+        *[!0-9]*)
+            log "state file $_f held something that is not a number — reset to 0"
+            _v=0 ;;
+        *)
+            if [ ${#_v} -gt 18 ]; then
+                log "state file $_f held a ${#_v}-digit value — reset to 0"
+                _v=0
+            fi ;;
+    esac
+
+    echo "$_v" > "$_f" 2>/dev/null
+    printf '%s\n' "$_v"
+}
+
+# HEALTHY = the backend is running AND this node believes it is online. Both,
+# because BackendState alone stays "Running" while a node sits unable to reach
+# the control plane, which is the failure that matters here.
+#
+# BOUNDED, and bounded by python rather than by `timeout`, which macOS does not
+# ship and which exists here only under Homebrew — a launchd job runs with a thin
+# PATH and this script must not depend on Homebrew being installed to be able to
+# tell whether the network is up. `subprocess.run` kills the child when the
+# timeout expires, so a wedged CLI costs one probe rather than the watchdog.
+# Every failure — missing binary, hang, non-JSON output — resolves to unhealthy,
+# never to a crash.
+healthy() {
+    /usr/bin/python3 - "$TS" "$HEALTH_TIMEOUT" <<'PY' 2>/dev/null
+import json
+import subprocess
+import sys
+
+# The whole thing inside the try, the reading of the answer as well as the
+# fetching of it. Valid JSON that is not an object — a bare null, list or
+# number — would otherwise raise past the handler on `.get`. It happens to exit
+# non-zero today, so it reports unhealthy by accident rather than by design, and
+# "never crashes" is a claim this file makes out loud.
+try:
+    completed = subprocess.run(
+        [sys.argv[1], "status", "--json"],
+        capture_output=True,
+        timeout=float(sys.argv[2]),
+    )
+    d = json.loads(completed.stdout)
+    ok = d.get("BackendState") == "Running" and (d.get("Self") or {}).get("Online") is True
+except Exception:
+    sys.exit(1)
+
+sys.exit(0 if ok else 1)
+PY
+}
+
+# --- Safari has no business on a machine with no monitor -------------------------
+#
+# Claude Code's OAuth flow calls its openBrowser path, macOS had no http handler
+# set, and the fallback is Safari. One launch on 2026-07-17 became 29 processes
+# holding 5.7GB of compressed memory by 2026-08-13 — which exhausted swap and got
+# tmux shells SIGKILLed. The default handler is now a stub that logs the URL, so
+# this should never fire; it fires anyway, because "should never" is what the
+# last three months of this machine were made of.
+if /usr/bin/pgrep -f "Safari.app/Contents/MacOS/Safari$" >/dev/null 2>&1; then
+    n=$(/usr/bin/pgrep -cf "com.apple.WebKit" 2>/dev/null || echo "?")
+    log "SAFARI RUNNING on a headless box (${n} WebKit procs) — killing it"
+    /usr/bin/killall -TERM Safari 2>/dev/null
+    sleep 5
+    /usr/bin/pgrep -f "Safari.app/Contents/MacOS/Safari$" >/dev/null 2>&1 && \
+        /usr/bin/killall -9 Safari 2>/dev/null
+    log "  -> Safari stopped; check ~/.local/state/headless-browser/urls.log for what asked for a browser"
+fi
+
+if healthy; then
+    # Only log the recovery edge, not every healthy minute — this runs 1440
+    # times a day and a log nobody can skim is a log nobody reads.
+    count=$(read_int "$FAILS")
+    if [ "$count" != "0" ]; then
+        log "RECOVERED — healthy again after $count failed check(s)"
+    fi
+    echo 0 > "$FAILS"
+    exit 0
+fi
+
+count=$(( $(read_int "$FAILS") + 1 ))
+echo "$count" > "$FAILS"
+log "DOWN — check $count/$THRESHOLD failed"
+
+[ "$count" -lt "$THRESHOLD" ] && exit 0
+
+now=$(date +%s)
+last=$(read_int "$LAST")
+if [ $(( now - last )) -lt "$COOLDOWN" ]; then
+    log "still down, but within the ${COOLDOWN}s cooldown — not acting again"
+    exit 0
+fi
+echo "$now" > "$LAST"
+
+# Step 1: start the app. On the macsys build this is what owns the tunnel, and
+# a stopped app is the likeliest reason the node is offline while the machine
+# is otherwise fine.
+if ! /usr/bin/pgrep -f "Tailscale.app/Contents/MacOS/Tailscale$" >/dev/null 2>&1; then
+    log "ACTION: app not running — open -a Tailscale"
+    /usr/bin/open -a Tailscale 2>>"$LOG"
+    sleep 20
+    if healthy; then log "RECOVERED — app relaunch was enough"; echo 0 > "$FAILS"; exit 0; fi
+fi
+
+# Step 2: ask the backend to connect. No other flags: `up` with the node's
+# existing prefs, nothing that rewrites them.
+#
+# BOUNDED FROM OUTSIDE AS WELL AS IN. `--timeout=30s` is the CLI bounding
+# itself, and the reason the health probe stopped trusting that same CLI is that
+# a wedged daemon may never let its timeout logic run at all. This call talks to
+# the same daemon over the same socket, so it gets the same treatment: an outer
+# bound that does not depend on the thing being diagnosed.
+log "ACTION: tailscale up --timeout=30s"
+out=$(/usr/bin/python3 - "$TS" "$UP_TIMEOUT" <<'PY' 2>&1
+import subprocess
+import sys
+
+try:
+    done = subprocess.run(
+        [sys.argv[1], "up", "--timeout=30s"],
+        capture_output=True,
+        text=True,
+        timeout=float(sys.argv[2]),
+    )
+    sys.stdout.write((done.stdout or "") + (done.stderr or ""))
+except subprocess.TimeoutExpired:
+    sys.stdout.write("no answer within %ss — killed, the daemon is not talking" % sys.argv[2])
+except Exception as exc:
+    sys.stdout.write("could not run it: %s" % exc)
+PY
+)
+log "  -> ${out:-(no output)}"
+
+sleep 10
+if healthy; then
+    log "RECOVERED after tailscale up"
+    echo 0 > "$FAILS"
+else
+    log "STILL DOWN after recovery attempt — needs a human"
+fi
+exit 0

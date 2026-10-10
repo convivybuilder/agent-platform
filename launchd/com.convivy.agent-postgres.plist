@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.agent-postgres</string>
+
+    <!-- A dedicated Postgres cluster for dispatched runs, separate from
+         the operator's own (round-1 revise, PR #817 — see
+         bin/agent-postgres-provision for the full why). The data directory
+         carries its own postgresql.conf (listen_addresses='', no TCP) and
+         pg_hba.conf (only the `agent` role is trusted on its socket); this
+         plist only starts the same `postgres` binary Homebrew's own
+         postgresql 15 plist (label sh.brew.postgresql, version 15) starts,
+         pointed at a different -D.
+
+         Run bin/agent-postgres-provision once before bootstrapping this —
+         it creates the data directory, the socket directory, the `agent`
+         role and the `agent_admin` maintenance role's password. This plist
+         does not provision anything; it only keeps an already-provisioned
+         cluster running. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/opt/postgresql@15/bin/postgres</string>
+        <string>-D</string>
+        <string>__HOME__/.local/state/agent-platform/postgres/data</string>
+    </array>
+
+    <!-- Matches Homebrew's own postgresql 15 plist (label sh.brew.postgresql,
+         version 15). Without it the server dies at startup: "FATAL:
+         postmaster became multithreaded during startup. HINT: Set the
+         LC_ALL environment variable to a valid locale." launchd jobs start
+         with no locale set at all. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/agent-platform/postgres/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/agent-platform/postgres/launchd.err.log</string>
+</dict>
+</plist>

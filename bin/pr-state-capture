@@ -1,0 +1,614 @@
+#!/usr/bin/env python3.11
+"""pr-state-capture — per-repository pull-request state, captured as signals.
+
+Deck's PR-ladder panel needs a per-product pull-request inventory (number,
+title, author, draft flag, head sha, state), including recently-closed PRs, and
+its done-when requires the derivation spawn no `gh` process in Deck
+(issue_01M0NWVW4YS8E04A657JD04QQD). This reads that inventory and emits one
+signal per (repo, pr, head sha, state, draft flag, title) transition.
+
+AUTHENTICATES AS THE `convivy-bosun` GITHUB APP (app id 4666673), never `gh`.
+`gh` on this machine rides the operator's personal token, which carries
+`repo` and `workflow` WRITE scopes org-wide — reading PR state for a dashboard
+does not need that reach, and platform/decisions/0051 already commits to every
+`gh` call moving off it. The Bosun's own gates (draft/mergeability/CI checks at
+merge time) still use `gh` today; this script does not touch that path.
+
+WHY THIS IS A SEPARATE READ FROM THE GATES' LIVE GITHUB READ, AND MUST STAY
+SEPARATE: a merge gate needs GitHub's answer AT THE MOMENT it decides, because
+a stale answer there admits or blocks the wrong PR. A dashboard panel is fine
+lagging one capture interval — nobody is blocked on it being current to the
+second. Collapsing the two into one source would either slow the gate down to
+a capture cadence or speed the capture up to gate cost for no reader who needs
+it; a later change that "consolidates" them for being 'the same read' would be
+making exactly that mistake. See `lib/agent-platform/github_app.py`'s docstring
+for the shared authentication code both paths could in principle use — sharing
+the JWT/token plumbing is fine; sharing the READ is not.
+
+READ-ONLY. The `convivy-bosun` App holds `pull_requests:write` and
+`contents:write` for other reasons (its own merge/gate duties elsewhere); this
+script mints its OWN installation token scoped to `pull_requests: read` and
+`metadata: read` (`_READ_ONLY_PERMISSIONS`), so a bug here that tried to write
+would be refused by GitHub itself, not merely by review. The only non-GET HTTP
+call anywhere in this file is the installation-token mint
+(`github_app.installation_token`, a POST to `/access_tokens`) — a GitHub App
+authentication handshake, not a write to any repository's content. Nothing
+here issues a POST, PATCH, PUT or DELETE against a `/repos/...` endpoint.
+
+THE SIGNAL'S OWN IDENTITY IS STILL THE CORRECTNESS BACKSTOP; A LOCAL
+SEND-STATE RECORD IS WHAT KEEPS A PASS FROM RE-POSTING EVERYTHING
+(issue_01M3WQQ1STSGNZ6SKSMFGSBS4X). Each signal's `dedup_key` is still built
+from (repo, pr number, head sha, state, draft flag, title hash) —
+`dedup_key_for` — and `signal_client.post_structured` still passes it
+straight through to the store, which still treats a repeated `dedup_key` as
+a no-op duplicate (the same mechanism `agentctl`'s per-run model-resolution
+record and `post-changelog`'s idempotent re-post both use); that is why a
+missing or wiped local record is safe to fall back to "emit everything" from
+— the store's own dedup still collapses anything it has already seen back
+down to a no-op.
+
+This script used to rely on that alone: every pass re-listed every covered
+repo's PRs in full (`state=all`) and re-emitted every row, leaving the store
+to turn an unchanged row into "no second row". At this platform's scale
+that meant posting thousands of mostly-unchanged rows every 900 seconds
+against the Library's 120-signals-a-minute-per-submitter ceiling
+(library#176) — see `_RUN_DEADLINE_SECONDS` for what that did to a real run.
+`load_delivered`/`save_delivered` now keep, per repo under `STATE_DIR`, the
+last identity (`head_sha`, `state`, `draft`, `title_hash`) actually
+delivered for each PR number, and a pass emits a row only when the
+freshly-read identity differs from that record (`_changed_rows`). Losing
+that record (missing, corrupt, a wiped `STATE_DIR`) means "nothing
+delivered yet" for the affected repo and the next pass emits every row for
+it — the same self-heals-on-a-missed-run property the old all-rows design
+had; what changed is that the common case (nothing changed) no longer costs
+a POST at all.
+
+THE KEY'S TITLE COMPONENT IS A HASH OF THE FULL TITLE'S IDENTITY FORM, NOT THE
+200-CHAR DISPLAY VALUE (security-reviewer, #595 round 3). `row["title"]` is
+capped at 200 characters for display, so two GitHub titles differing only
+after character 200 would sanitise to the same displayed string — keying
+dedup on that value would collapse them into one row and silently drop the
+second title's transition. `rows_from_pulls` hashes the uncapped
+`_identity_title(raw_title)` into `row["title_hash"]`
+(`hashlib.sha256(...).hexdigest()[:16]`, the same short-hash convention
+`agentctl` and `session_view.py` already use for a composite key); a hash
+rather than the raw text because GitHub-authored free text has no length bound
+this script controls, and a dedup key is not the place to carry an unbounded
+string.
+
+DISPLAY AND IDENTITY ARE TWO SEPARATE DERIVATIONS OF THE SAME RAW TITLE
+(security-reviewer, #595 round 4; split further in round 5), because they
+answer different questions. `row["title"]` (display) is
+`SC.sanitise(raw_title, max_len=200)`: NFC-normalised, ANSI/control
+characters stripped, credentials redacted, and only the DISPLAY-safe subset
+of Default_Ignorable Unicode codepoints stripped (see `signal_client.
+_DISPLAY_KEEP_CODEPOINTS`) — round 4 stripped the full property here and
+broke real rendering (a ZWJ-joined family emoji split into four separate
+people; a gitmoji recycle symbol lost its forced emoji presentation), so
+round 5 narrowed this to codepoints whose removal cannot change what a
+reader sees. `title_hash` (identity) additionally NFKC-normalises
+`SC.sanitise`'s output — see `_identity_title` below — because two titles a
+human reads as the SAME text must hash the same, and NFC alone leaves
+compatibility-equivalent forms distinct (a fullwidth "Ａ" from an ASCII "A",
+the "ﬁ" ligature from "fi", a circled "①" from "1" — round-3's own
+non-blocking finding); NFKC is not applied for display, since it changes
+what the text actually SAYS. Identity then removes every REMAINING
+Default_Ignorable codepoint via `signal_client.is_default_ignorable`
+directly, with no keep list — including the ones display now keeps (ZWJ,
+the variation selectors, ZWNJ, soft hyphen) — because identity's contract is
+narrower than display's: two titles a reader cannot visually distinguish
+must hash the same, and none of those four codepoints changes what a title
+SAYS the way NFKC's compatibility folding would if applied to display. Both
+extra folds live here, in this script's own identity derivation, rather than
+in `signal_client.sanitise`, where every other caller displays its output
+unmodified (see that module's docstring for the full caller audit).
+
+The draft and title fields are in the key too, not just the row, because each
+can move on its own with no new commit and no state transition — a
+draft-to-ready flip and a title edit both leave `head_sha` and `state`
+unchanged. Leaving either out of the key would make that change invisible:
+the dedup key would repeat, the store would call it a duplicate, and Deck
+would keep rendering the stale badge or the stale title until some unrelated
+transition (a push, a close) happened to fire a new row. This widens the
+signal's grain from "the PR's (sha, state) changed" to "any field Deck's
+panel renders changed" — deliberately, since a stale render is the failure
+this capture exists to prevent. `author` and `number` are not in the key:
+GitHub does not let either change after a PR is opened, so there is no
+transition on them to miss. A reopened PR is already covered — reopening
+moves `state` (CLOSED back to OPEN), which was already in the key. A PR's
+base branch is not in the key because it is not in the row at all: Deck's
+panel does not render it (see the field list two paragraphs up), so this
+script does not capture it and there is nothing to go stale.
+
+REPOSITORY LIST is derived from `config/projects.json` (`lib/agent-platform/
+projects.py`) — every repo belonging to a registered, non-private project —
+rather than hardcoded here. A project's repos change as the registry changes,
+and a hardcoded list would silently drift from it. Repos of `private: true`
+(black-box) projects are excluded, the same wall ADR-0043 draws for their other
+output: none of their content reaches a shared store.
+
+NOT IN SCOPE, AND NOT ABSORBED HERE: Orient's existing capture of PR reviews,
+comments and the changelog feed, which still authenticates as the operator's personal account.
+That is a separate, larger migration (platform/decisions/0051) and a different
+item; this script covers pull-request STATE alone.
+
+SIGNAL POSTING USES ITS OWN CREDENTIAL, SEPARATE FROM THE GITHUB APP TOKEN
+ABOVE (issue_01M3VY56TWPFFHQ50QTFM5P07K). `POST /signals` rate-limits each
+authenticated actor to 120/minute (library#176); this job alone peaked at
+1,878 signals/minute, which would otherwise hold the whole shared
+agent-platform bucket for minutes and starve every other sender's signals.
+`signal_token()` resolves `PR_STATE_CAPTURE_TOKEN` or the 0600 file
+`~/.orient-control/pr-state-capture-token`, the same resolution order
+`signal_client.token()` uses for the shared credential. Until the Library
+mints and installs that credential, `main()` falls back to the shared token
+(via `post_signal`'s own `tok or token()`) and warns once to stderr.
+
+Usage:
+    pr-state-capture
+"""
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import io
+import json
+import os
+import sys
+import time
+import unicodedata
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import builder_root as BR  # noqa: E402
+import github_app as GA  # noqa: E402
+import projects  # noqa: E402
+import signal_client as SC  # noqa: E402
+
+# The convivy-bosun GitHub App, installed org-wide (issue_01M2KV16ZRG3N49GRER8Q7545H,
+# verified 2026-09-15: GET /app returned slug convivy-bosun as app id 4666673). Its
+# installation is derived and checked on every run, never stored — the same posture
+# kb_merge.knowledge_installation takes for convivy-library.
+APP_ID = "4666673"
+OWNER = "convivy"
+
+# Read from the passwd home, never $HOME, as every trust anchor is
+# (company/decisions/0008) — see builder_root.real_account_home.
+KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
+
+# The token this script mints can only ever read, whatever the App itself holds
+# — see the module docstring's READ-ONLY section.
+_READ_ONLY_PERMISSIONS = {"pull_requests": "read", "metadata": "read"}
+
+_KIND = "pr_state"
+_STREAM = "pr-state"
+
+# This job's OWN POST /signals credential (library#176 — 120 signals/minute is
+# per authenticated actor, and this job alone peaked at 1,878/minute, so it
+# needs its own actor and its own bucket rather than sharing the
+# agent-platform token every other sender presents). Resolved the same way
+# signal_client.token() resolves the shared one. Unrelated to KEY_PATH above,
+# which is the convivy-bosun GitHub App's key for reading GitHub, not for
+# posting signals.
+SIGNAL_TOKEN_ENV = "PR_STATE_CAPTURE_TOKEN"
+SIGNAL_TOKEN_FILE = Path.home() / ".orient-control" / "pr-state-capture-token"
+
+# Send-side state: the last identity (see `_delivered_identity`) actually
+# DELIVERED for each PR, kept so a pass does not re-POST a row nobody has
+# touched since the last one (see the module docstring's section on this).
+# It is state, not a cache — losing it does not corrupt anything (the
+# store's own `dedup_key` is still the correctness backstop), but it does
+# re-flood the Library with every PR this repo has, so it is written with
+# the same care `limit_resume.save_state` and `access_assertion`'s JWKS
+# cache give their own `~/.local/state/agent-platform/...` records: the
+# directory 0700, the file 0600, written atomically.
+STATE_DIR = Path.home() / ".local" / "state" / "agent-platform" / "pr-state-capture"
+
+
+def signal_token() -> str | None:
+    """`SIGNAL_TOKEN_ENV` or the 0600 file `SIGNAL_TOKEN_FILE`, or None when
+    neither is set — until the Library mints and installs this job's own
+    credential, `main()` falls back to the shared agent-platform token
+    (`signal_client.token()`, via `post_signal`'s own `tok or token()`) and
+    warns once to stderr that it is doing so."""
+    tok = os.environ.get(SIGNAL_TOKEN_ENV, "").strip()
+    if tok:
+        return tok
+    try:
+        return SIGNAL_TOKEN_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+# Bounds how long one capture run keeps resending a SINGLE signal into the
+# Library's POST /signals 429 (library#176, 120 signals/minute/submitter —
+# see signal_client.post_signal's 429 handling) before main() gives up on it
+# and stops the rest of the pass (see main()'s own 429 handling below). This
+# run's own StartInterval is 900s (launchd/com.convivy.pr-state-capture.plist);
+# 600s leaves 300s of headroom before the next scheduled fire rather than
+# racing it.
+#
+# A prior version of this comment claimed a 300-signal run drains in about
+# 15s at 120/minute. That arithmetic was wrong: 300 signals at 120/minute
+# take 150s (2.5 minutes). It also understated the real passes this was
+# meant to cover — the 2026-10-01 incident that prompted the send-only-
+# what-changed fix (see the module docstring) found one pass attempting
+# over 4,000 rows, which at 120/minute cannot drain inside any deadline this
+# short. Post-fix, a steady-state pass is the handful of PRs that actually
+# changed since the last one, not the whole inventory, so 600s is headroom
+# for an ordinary pass rather than a budget it is expected to spend.
+_RUN_DEADLINE_SECONDS = 600
+
+_PAGE_SIZE = 100
+# Bounds one repo's read to 1000 PRs per pass, so a large repo degrades to "this
+# pass saw its newest-updated 1000" (logged) rather than an unbounded page loop.
+# convivy/vivy passed it on 2026-09-16 with 1,135 PRs. The cap then fell at
+# 2026-05-08 while its least recently updated open PR was touched 2026-09-14, so
+# only long-closed PRs were left out; an open PR idle past the cap would be too.
+_MAX_PAGES = 10
+
+
+def repos_to_capture() -> list[str]:
+    """`convivy/<repo>` for every repo of a registered, non-private project."""
+    private = projects.private_slugs()
+    out = {f"{OWNER}/{r}"
+           for slug, unit in projects.load().items() if slug not in private
+           for r in unit.get("repos", [])}
+    return sorted(out)
+
+
+def installed_repos(token: str, *, opener=urllib.request.urlopen) -> set[str]:
+    """Lowercased `owner/repo` for every repository the installation reaches.
+
+    Read so `main` can tell a registered repo that has no GitHub copy from one
+    the App cannot read. GitHub answers 404 for both, and on 2026-09-16 five
+    registered repos (local-only checkouts, or projects never pushed) turned
+    every pass into exit 1, which hides a real failure behind a permanent one."""
+    out: set[str] = set()
+    for page in range(1, _MAX_PAGES + 1):
+        code, payload = GA.request(
+            "GET", f"{GA.API}/installation/repositories?per_page={_PAGE_SIZE}&page={page}",
+            token, None, opener=opener)
+        repos = payload.get("repositories") if isinstance(payload, dict) else None
+        if code != 200 or not isinstance(repos, list):
+            raise GA.Unreadable(f"the installation's repositories could not be read ({code})")
+        out.update((r.get("full_name") or "").lower() for r in repos)
+        if len(repos) < _PAGE_SIZE:
+            return out
+    raise GA.Unreadable(f"the installation lists more than {_MAX_PAGES * _PAGE_SIZE} "
+                        f"repositories; refusing to treat an unread page as absence")
+
+
+def list_pulls(repo: str, token: str, *, opener=urllib.request.urlopen) -> list[dict]:
+    """Every pull request in `repo`, newest-updated first. `state=all` is what
+    surfaces a recently-closed or recently-merged PR without a second query."""
+    out: list[dict] = []
+    for page in range(1, _MAX_PAGES + 1):
+        code, payload = GA.request(
+            "GET",
+            f"{GA.API}/repos/{repo}/pulls?state=all&sort=updated&direction=desc"
+            f"&per_page={_PAGE_SIZE}&page={page}",
+            token, None, opener=opener)
+        if code != 200 or not isinstance(payload, list):
+            raise GA.Unreadable(f"{repo}: pull requests could not be read ({code})")
+        out.extend(payload)
+        if len(payload) < _PAGE_SIZE:
+            return out
+    print(f"pr-state-capture: {repo}: stopped at the {_MAX_PAGES * _PAGE_SIZE}-PR page "
+          f"cap for this pass; older PRs are not captured this time", file=sys.stderr)
+    return out
+
+
+def _state(pr: dict) -> str:
+    """OPEN | CLOSED | MERGED — the tri-state agentctl's own `pr_state` reads
+    from `gh`, so Deck sees the same vocabulary a PR has everywhere else on this
+    platform. The raw REST list endpoint only ever reports `state` as open/closed
+    plus a `merged_at` timestamp; merged is folded in here rather than left for
+    a reader to infer from two fields."""
+    if pr.get("merged_at"):
+        return "MERGED"
+    return (pr.get("state") or "").upper()
+
+
+def _identity_title(raw_title: str) -> str:
+    """The identity form of a title: two titles a human reads as the SAME
+    text must produce the SAME string here, so `title_hash` cannot be churned
+    by an edit no reader would notice (security-reviewer, #595 rounds 3-5).
+
+    Starts from `SC.sanitise`'s output (NFC-normalised, ANSI/control
+    characters stripped, credentials redacted, whitespace collapsed, and the
+    DISPLAY-safe subset of Default_Ignorable codepoints already gone — see
+    `signal_client._DISPLAY_KEEP_CODEPOINTS`), NFKC-folds it (round 3's
+    non-blocking finding: NFC alone leaves *visible* compatibility-equivalent
+    forms distinct — a fullwidth "Ａ" from an ASCII "A", the "ﬁ" ligature
+    from "fi", a circled "①" from "1" — because folding those changes what
+    the text actually SAYS, out of scope for `sanitise`, which every OTHER
+    caller uses to render text for display unmodified), THEN removes every
+    remaining Default_Ignorable_Code_Point via `signal_client.
+    is_default_ignorable` directly — with no keep list, unlike `sanitise`.
+
+    That last step is IDENTITY's split from DISPLAY (round 5, #595): display
+    now deliberately keeps the zero-width joiner, the variation selectors,
+    the zero-width non-joiner and the soft hyphen, because removing any of
+    them can change what a reader sees (a ZWJ-joined family emoji splitting
+    into four separate people; a gitmoji recycle symbol losing its forced
+    emoji presentation — reviewer, round 4). Identity has no such contract:
+    two titles differing only by one of THOSE codepoints still read as the
+    same title to a human skimming Deck's panel, so `title_hash` must not
+    change either, even though `row["title"]` (display) now visibly does. A
+    final whitespace collapse is a defensive no-op for every character NFKC
+    or this strip removes today (none introduces new whitespace) and costs
+    nothing to keep in case a future compatibility mapping ever does."""
+    folded = unicodedata.normalize("NFKC", SC.sanitise(raw_title))
+    folded = "".join(ch for ch in folded if not SC.is_default_ignorable(ch))
+    return " ".join(folded.split())
+
+
+def rows_from_pulls(repo: str, pulls: list[dict]) -> list[dict]:
+    """One row per pull, the exact fields Deck's panel needs.
+
+    `title` and `author` are GitHub-authored free text (any collaborator can
+    set a PR's title; `author` is the login GitHub reports for whoever opened
+    it) — the same untrusted-output-not-platform-authored contract every other
+    `sanitise` call in this codebase enforces (see signal_client.sanitise's
+    module docstring; bin/issue-pr-reconcile's `title` extraction is the same
+    shape). Both pass through `SC.sanitise` here, at the one point this script
+    turns GitHub's payload into its own row, so every downstream reader (the
+    emitted body string and the `meta` dict alike) only ever sees the
+    sanitised value. `head_sha` is not sanitised: it comes back from the same
+    payload but git constrains an object id to lowercase hex, so there is no
+    free-text surface to sanitise.
+
+    `title_hash` is a hash of `_identity_title(raw_title)`, not of the 200-char
+    display `title` and not of plain `SC.sanitise` output — see the module
+    docstring's section on the signal's own identity and `_identity_title`'s
+    own docstring for why `dedup_key_for` keys on this instead of either of
+    those."""
+    rows = []
+    for pr in pulls:
+        raw_title = pr.get("title") or ""
+        identity_title = _identity_title(raw_title)
+        rows.append({
+            "repo": repo,
+            "number": pr.get("number"),
+            "title": SC.sanitise(raw_title, max_len=200),
+            "title_hash": hashlib.sha256(identity_title.encode("utf-8")).hexdigest()[:16],
+            "author": SC.sanitise(((pr.get("user") or {}).get("login")) or "?", max_len=100),
+            "draft": bool(pr.get("draft")),
+            "head_sha": ((pr.get("head") or {}).get("sha")) or "",
+            "state": _state(pr),
+            "updated_at": pr.get("updated_at") or "",
+        })
+    return rows
+
+
+def _delivered_identity(row: dict) -> dict:
+    """The subset of *row* that `dedup_key_for` keys on, as a plain dict a
+    JSON record can compare against byte for byte. Everything else in *row*
+    (`title`, `author`, `updated_at`) can change with no transition
+    `dedup_key_for` would recognise, so it must not make `_changed_rows`
+    treat the row as changed when it isn't."""
+    return {"head_sha": row["head_sha"], "state": row["state"],
+            "draft": row["draft"], "title_hash": row["title_hash"]}
+
+
+def _changed_rows(rows: list[dict], delivered: dict) -> list[dict]:
+    """*rows* (one repo's) whose identity differs from what *delivered*
+    (that repo's `load_delivered` result) last recorded. A PR with no entry
+    at all counts as changed too — the same "nothing delivered yet" case
+    `load_delivered` itself falls back to."""
+    return [row for row in rows
+           if delivered.get(str(row["number"])) != _delivered_identity(row)]
+
+
+def _state_path(repo: str) -> Path:
+    return STATE_DIR / f"{repo.replace('/', '__')}.json"
+
+
+def load_delivered(repo: str) -> dict:
+    """The last-delivered identity per PR number for *repo*, keyed by the PR
+    number as a string (JSON object keys are always strings), or `{}` with
+    one stderr line when nothing has been recorded yet or the record cannot
+    be read. Both cases mean "nothing delivered yet" to the rest of main(),
+    which then emits every row for *repo* this pass — see the module
+    docstring for why that self-heals rather than risking a duplicate."""
+    path = _state_path(repo)
+    try:
+        raw = path.read_text()
+    except OSError:
+        print(f"pr-state-capture: {repo}: no delivered-state record yet; "
+              f"emitting every PR for this repo this pass", file=sys.stderr)
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        print(f"pr-state-capture: {repo}: delivered-state record at {path} is "
+              f"corrupt; emitting every PR for this repo this pass", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_delivered(repo: str, delivered: dict) -> None:
+    """Atomic write of *delivered* for *repo*: a pid-unique temp file plus
+    `os.replace`, mirroring `limit_resume.save_state`, so a reader never sees
+    a half-written file. Called at most once per repo per pass (see main()),
+    not once per PR."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)  # mkdir's mode is a no-op on an already-existing dir
+    path = _state_path(repo)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(delivered, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def dedup_key_for(row: dict) -> str:
+    """The transition identity: a repeated capture of the SAME (repo, pr, head
+    sha, state, draft flag, title) reuses this key, so the store's own dedup
+    on `dedup_key` is what keeps it to one row — see the module docstring's
+    section on the signal's own identity for why draft and title are in the
+    key alongside head sha and state, and why the title component is
+    `title_hash` (the title's identity form, hashed — see `_identity_title`)
+    rather than the 200-char `title` field. `_delivered_identity` mirrors
+    this same field set for the local send-state record, deliberately —
+    anything that moves this key must move that record's identity too."""
+    draft_flag = "draft" if row["draft"] else "ready"
+    return (f"pr-state:{row['repo']}#{row['number']}:{row['head_sha']}:"
+            f"{row['state']}:{draft_flag}:{row['title_hash']}")
+
+
+def emit(row: dict, *, tok: str | None = None, deadline: float | None = None,
+        sleep=time.sleep) -> str:
+    flag = " (draft)" if row["draft"] else ""
+    body = (f"{row['repo']}#{row['number']} {row['state']}{flag}: "
+            f"{row['title']} — {row['author']}")
+    # The registry's project for the repo, the same mapping the Library applies
+    # when it scopes a review record, so a PR's state and its reviews share one
+    # product. product_for_channel maps Slack channels and filed most repos
+    # under `platform`.
+    product = projects.project_for_repo(row["repo"].split("/", 1)[-1])
+    # produced_at is the PR's updated_at, not this pass's clock. The store keeps
+    # only the first post of a dedup_key, so the stamp lands on the pass that
+    # first sees a transition. GitHub's updated_at there falls between the
+    # transition and the observation, so it is never later than this pass's clock
+    # and equals the transition unless something else touched the PR in the
+    # interval. updated_at is
+    # deliberately NOT in dedup_key_for: a comment moves it without changing
+    # anything the panel draws.
+    #
+    # `deadline`/`sleep` reach signal_client.post_signal's 429 handling: a 429
+    # from the Library waits out its Retry-After and resends until this run's
+    # own deadline passes (see _RUN_DEADLINE_SECONDS), at which point the
+    # still-unsent signal comes back as 'error:429' here — main() treats that
+    # specially (stops the rest of the pass rather than counting it as a
+    # delivery failure like any other 'error:' result; see main()'s own 429
+    # handling).
+    return SC.post_structured(_KIND, _STREAM, body, product=product, meta=row,
+                              dedup_key=dedup_key_for(row),
+                              produced_at=row["updated_at"] or None,
+                              deadline=deadline, sleep=sleep, tok=tok)
+
+
+def main() -> int:
+    argparse.ArgumentParser(
+        description="Capture per-repository pull-request state as signals, "
+                    "authenticating as the convivy-bosun GitHub App.").parse_args()
+
+    problem = GA.key_problem(KEY_PATH, label="the convivy-bosun App")
+    if problem:
+        print(f"pr-state-capture: {problem}", file=sys.stderr)
+        return 1
+    try:
+        jwt = GA.app_jwt(KEY_PATH, APP_ID)
+        inst = GA.single_installation(jwt, OWNER)
+        inst_id = str(inst.get("id") or "")
+        if not inst_id:
+            raise GA.Unreadable("the installation carries no id")
+        token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS)
+    except GA.Unreadable as e:
+        print(f"pr-state-capture: {e}", file=sys.stderr)
+        return 1
+
+    exit_code = 0
+    sig_tok = signal_token()
+    if not sig_tok:
+        print(f"pr-state-capture: no {SIGNAL_TOKEN_FILE} and no ${SIGNAL_TOKEN_ENV}; "
+              "sharing the agent-platform signal bucket until the Library mints "
+              "pr-state-capture's own credential", file=sys.stderr)
+    # One deadline for the whole run, not per signal: a 429 on signal 1 and a
+    # 429 on signal 300 both resend against the same run budget, so a burst
+    # early in the pass can't eat the time a later repo's signals need.
+    deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
+    # A repo absent from the installation's list is skipped, not failed, ONLY
+    # when the installation covers every repository in the org: absence then
+    # means the repo is not on GitHub. Under a "selected" installation absence
+    # also means "the App was never granted it", which must stay loud, so
+    # every repo is read and a 404 fails the pass as before.
+    present: set[str] | None = None
+    if inst.get("repository_selection") == "all":
+        try:
+            present = installed_repos(token)
+        except GA.Unreadable as e:
+            print(f"pr-state-capture: {e}; reading every registered repo instead",
+                  file=sys.stderr)
+            exit_code = 1
+    # Phase 1: read every repo, diff each row against what was last
+    # delivered, and collect only the changed ones — see the module
+    # docstring for why a pass no longer re-emits everything it reads.
+    pending: list[dict] = []
+    delivered_by_repo: dict[str, dict] = {}
+    for repo in repos_to_capture():
+        if present is not None and repo.lower() not in present:
+            print(f"pr-state-capture: {repo}: not on GitHub (the installation covers "
+                  f"every repository and does not list it); skipped", file=sys.stderr)
+            continue
+        try:
+            pulls = list_pulls(repo, token)
+        except GA.Unreadable as e:
+            print(f"pr-state-capture: {e}", file=sys.stderr)
+            exit_code = 1
+            continue
+        delivered = load_delivered(repo)
+        delivered_by_repo[repo] = delivered
+        pending.extend(_changed_rows(rows_from_pulls(repo, pulls), delivered))
+
+    # Phase 2: newest-updated first, across every repo together — not
+    # repo-by-repo — so a fresh merge in one repo is never queued behind an
+    # older repo's backlog.
+    pending.sort(key=lambda row: row["updated_at"], reverse=True)
+
+    # Phase 3: emit, stopping the WHOLE pass — every remaining row in every
+    # repo, not just the one being posted — the first time a 429 survives
+    # signal_client.post_signal's own retry/backoff against `deadline`. The
+    # Library's limit is per submitter, so once it has been hit, trying the
+    # next row costs the same 429 for no gain; everything from that point on
+    # is left pending for the next pass instead, and reported as one summary
+    # line rather than once per row (see the module docstring's incident:
+    # one line per refused PR is what grew the launchd log to 6 MB).
+    sent = 0
+    rate_limited = False
+    touched: set[str] = set()
+    for row in pending:
+        if rate_limited:
+            continue
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = emit(row, tok=sig_tok, deadline=deadline)
+        if result == "error:429":
+            rate_limited = True
+            continue
+        captured = buf.getvalue()
+        if captured:
+            sys.stderr.write(captured)
+        if result.startswith("error"):
+            print(f"pr-state-capture: {row['repo']}#{row['number']} NOT "
+                  f"delivered: {result}", file=sys.stderr)
+            exit_code = 1
+            continue
+        if result in ("created", "duplicate"):
+            sent += 1
+            delivered_by_repo[row["repo"]][str(row["number"])] = _delivered_identity(row)
+            touched.add(row["repo"])
+        # 'skip' means no token at all: nothing landed and nothing to record,
+        # same as before this change — not itself a pass failure.
+
+    for repo in touched:
+        save_delivered(repo, delivered_by_repo[repo])
+
+    if rate_limited:
+        print(f"pr-state-capture: stopped on the Library's rate limit: sent "
+              f"{sent}, {len(pending) - sent} change(s) left pending for the "
+              f"next pass", file=sys.stderr)
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
