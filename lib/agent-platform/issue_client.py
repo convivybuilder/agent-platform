@@ -26,6 +26,7 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+import builder_root as BR
 import vault_plane
 import signal_client as _signal_client
 from signal_client import token
@@ -224,12 +225,45 @@ def post_review_record(fields: dict[str, Any], *, tok: str | None = None,
 # no filter recognises never reaches the ledger as a surprise.
 LEDGER_SOURCE = "agentctl"
 
+# The Bosun's dedicated ledger-reporting credential (E1·6), minted by the
+# Library as `bosun-ledger-reporter` holding the `ledger.spend.subscription`
+# grant the general `token()` credential lacks. Resolved under the real
+# account home (`BR.real_account_home()`), the same way `bin/agentctl`
+# resolves `bosun-app.pem`, so a dispatched run's sandboxed `$HOME` can never
+# redirect this read — and `run_sandbox.DENIED_HOME_FILES` refuses a
+# dispatched run this path outright regardless of where it resolves.
+LEDGER_TOKEN_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-ledger-reporter.token"
+
+
+def _ledger_reporter_token() -> str | None:
+    """The `bosun-ledger-reporter` credential from LEDGER_TOKEN_PATH, or None
+    when the file is absent or empty."""
+    try:
+        return LEDGER_TOKEN_PATH.read_text().strip() or None
+    except OSError:
+        return None
+
 
 def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
+                      lane: str,
                       agent: str | None = None, model: str | None = None,
+                      item_id: str | None = None,
                       tok: str | None = None, timeout: float = _TIMEOUT) -> dict[str, Any]:
     """Report one run's cost to the Library's ledger (`POST /ledger-entries`,
     the Bosun's first writer — issue_01M0TP37M3RRRY5BD1Z4B8GCB0 Part 1).
+
+    `lane` ("gateway" or "subscription") is required and sent on every entry
+    (E1·6): the Library stores it and refuses to sum a product's gateway and
+    subscription spend together. The caller decides which lane a row belongs
+    to; this client has no opinion on what a model's lane is.
+
+    `item_id`, when given, is the work item the run served (E16·5). The
+    Library derives the entry's `epic_id` from it server-side — the item's
+    own id when it is an epic, else its parent — so sending it is what lets
+    a per-epic cost reconcile to the ledger's own total for that epic at all.
+    Sent only when present: an entry with no `item_id` gets `epic_id: null`
+    and reads as unattributed to the Library the same way it does in
+    `cost_join`'s run-record report.
 
     Returns `{"status": "recorded"|"not-recorded"|"skip"|"error:<code>|
     <ExceptionName>|bad-body", "entry": <the route's body, or {}>}`, plus
@@ -254,26 +288,30 @@ def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
 
     Uses `vault_plane.library_url` (the Library's own address, since
     `/ledger-entries` has no Orient counterpart to translate from) and the
-    `token()` credential, unlike `post_review_record` and
-    `get_item_from_default_library` above: those run inside a DISPATCHED
-    agent's own process, where the environment is adversarial and the fixed
-    address + direct token-file read matter. This runs as an ordinary
-    scheduled job (`model-scorecard`), the same non-adversarial trust level
-    this module's other plain-`token()` calls run at. The trade-off: this
-    call carries none of the fixed-address/pinned-opener hardening the
-    dispatched-agent path above does, accepted because a scheduled job's own
-    environment, unlike a dispatched run's, isn't adversarial."""
-    tok = tok or token()
+    `bosun-ledger-reporter` credential (`_ledger_reporter_token`), NOT the
+    general `token()` this module's other calls use: the Library refuses a
+    `lane: "subscription"` entry with 403 unless the posting credential holds
+    the `ledger.spend.subscription` grant, which only this dedicated token
+    carries. `tok`, when given, overrides it — tests inject a token this way
+    rather than pointing `LEDGER_TOKEN_PATH` at a real file. An absent or
+    empty credential file is a `"skip"`, the same status an absent `token()`
+    used to produce here: there is no fallback to `token()`, because the
+    general credential lacks the subscription grant and a gateway-only
+    credential posting a subscription entry would still be refused."""
+    tok = tok or _ledger_reporter_token()
     if not tok:
-        return {"status": "skip", "entry": {}}
+        return {"status": "skip", "entry": {},
+               "error": f"no bosun-ledger-reporter credential at {LEDGER_TOKEN_PATH}"}
     payload: dict[str, Any] = {
         "product": product, "source": LEDGER_SOURCE, "usd": usd,
-        "run_id": run_id, "dedup_key": dedup_key,
+        "run_id": run_id, "dedup_key": dedup_key, "lane": lane,
     }
     if agent:
         payload["agent"] = agent
     if model:
         payload["model"] = model
+    if item_id:
+        payload["item_id"] = item_id
     try:
         req = urllib.request.Request(
             vault_plane.library_url("/ledger-entries"),
@@ -430,6 +468,118 @@ def list_courses(product: str, tok: str | None = None) -> list[dict[str, Any]]:
     raise IssueQueueUnavailable(
         f"Course list for {product} still reports more after {_MAX_PAGES} pages "
         f"({len(out)} courses); refusing to keep paging")
+
+
+def list_corrections_queues(product: str | None = None,
+                            tok: str | None = None) -> list[dict[str, Any]]:
+    """Every corrections queue (`GET /corrections-queues`, optionally
+    `?product=`), scoped by product the way `get_item` is (one-home-per-work-
+    item, library/specs/one-home-per-work-item).
+
+    The Library has confirmed the route's shape (2026-10-09): a 200 response
+    is `{"corrections_queues": [...], "count": n}`, with an empty list (not a
+    404) when the product has no queue. No response carries a `"queues"`
+    key. The route still answers 404 only before the deploy that adds it
+    (Library PR 1) has landed — not for "no queue matches" after that, since
+    a 200 with an empty list covers that case.
+
+    A 404 means the route does not exist yet — not that no queue matches.
+    Since no item carries a queue parent before that deploy either, the two
+    happen to read the same way to a caller: returns [] on a 404 rather than
+    raising.
+
+    RAISES IssueQueueUnavailable on any other failure (a 5xx, a parse
+    failure, no token, or a response without a `"corrections_queues"` list)
+    rather than returning [] — a caller that cannot tell those apart from
+    "no queues exist" would, after the deploy, start bucketing
+    queue-parented spend as if the queue id were an unlisted epic instead of
+    reporting that it could not tell."""
+    tok = tok or token()
+    if not tok:
+        raise IssueQueueUnavailable("no ops API token available")
+    url = vault_plane.url("/api/corrections-queues")
+    if product:
+        url += "?product=" + urllib.parse.quote(product, safe="")
+    try:
+        req = urllib.request.Request(url, headers=vault_plane.headers(token=tok))
+        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return []
+        raise IssueQueueUnavailable(f"could not read corrections queues: {e}") from e
+    except Exception as e:
+        raise IssueQueueUnavailable(f"could not read corrections queues: {e}") from e
+    queues = payload.get("corrections_queues")
+    if not isinstance(queues, list):
+        raise IssueQueueUnavailable(
+            f"corrections queue list returned no queues list: {payload!r:.200}")
+    return queues
+
+
+def list_ledger_entries(*, epic_id: str | None = None, item_id: str | None = None,
+                        run_id: str | None = None, product: str | None = None,
+                        source: str | None = None, day: str | None = None,
+                        tok: str | None = None) -> list[dict[str, Any]]:
+    """Every ledger entry matching the given filters (`GET /ledger-entries`,
+    `library/contracts/library-protocol` §6.4 — the read side of the Bosun's
+    first ledger writer, `post_ledger_entry`), following pagination to the
+    end the same way `list_issues_by_state` does and for the same reason: a
+    per-epic cost reconciliation that read only the first page would treat a
+    partial slice of the ledger as the whole one, and a real mismatch sitting
+    on a later page would read as a clean match.
+
+    Each entry carries `run_id`, `usd`, `lane` (`gateway`, `subscription` or
+    null — never a `billing_source` string; see `cost_join.reconcile_epic_cost`
+    for why the two are compared without trying to share a lane vocabulary),
+    `model`, `agent`, `item_id`, `epic_id` and `voided_at`.
+
+    Uses `vault_plane.library_url`/`library_headers`, the same as
+    `post_ledger_entry`: `/ledger-entries` has no Orient counterpart to
+    translate from.
+
+    RAISES IssueQueueUnavailable on any failure — the same posture as
+    `get_item`: a reconciler cannot tell an empty ledger from an unreachable
+    Library, and reporting a clean match while blind is worse than refusing
+    to report at all."""
+    tok = tok or token()
+    if not tok:
+        raise IssueQueueUnavailable("no ops API token available")
+    params: dict[str, str] = {}
+    if epic_id:
+        params["epic_id"] = epic_id
+    if item_id:
+        params["item_id"] = item_id
+    if run_id:
+        params["run_id"] = run_id
+    if product:
+        params["product"] = product
+    if source:
+        params["source"] = source
+    if day:
+        params["day"] = day
+    out: list[dict[str, Any]] = []
+    offset = 0
+    for _ in range(_MAX_PAGES):
+        qs = urllib.parse.urlencode({**params, "offset": offset})
+        url = vault_plane.library_url(f"/ledger-entries?{qs}")
+        try:
+            req = urllib.request.Request(url, headers=vault_plane.library_headers(token=tok))
+            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            raise IssueQueueUnavailable(f"could not read ledger entries: {e}") from e
+        entries = payload.get("entries")
+        if not isinstance(entries, list):
+            raise IssueQueueUnavailable(
+                f"ledger entries returned no entries list: {payload!r:.200}")
+        out.extend(entries)
+        if not payload.get("truncated") or not entries:
+            return out
+        offset += len(entries)
+    raise IssueQueueUnavailable(
+        f"ledger entries still report more after {_MAX_PAGES} pages ({len(out)} entries); "
+        "refusing to keep paging")
 
 
 def list_claimable_issues(product: str | None = None,

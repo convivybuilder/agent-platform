@@ -13,10 +13,24 @@ gone from this report too.
 
 With --course or --product, the report instead joins by epic and rolls up to a Course
 (E16·2): per-epic lanes beside the epic's progress and the Course's position, Course
-totals per lane broken down by model, and a persona (agent) x model x item-type table.
+totals per lane broken down by model, and an outcome (agent) x model x class table.
 This mode needs the Library's Course and item reads and exits 1 if either is unreachable.
 
-CLI: --days N (default 30) · --json · --course <id> · --product <name>.
+This mode also reconciles each epic's run-record cost against the Library's own
+ledger total for that epic (E16·5): a mismatch, or a run the ledger files under a
+different epic than this report does, is named explicitly and exits 1. An epic whose
+ledger read failed reports "unavailable" rather than a clean match. A run posted to the
+ledger before this change, or to a product with no live ledger, is not a mismatch —
+it is reported as its own "run-only"/"ledger-only" count.
+
+With --outcomes, the report is cost per outcome (agent x model x work-item class,
+cost_join.build_outcome_table, E16·3) with no Course needed: a fixed item's and an
+abandoned item's cost are kept apart, and a coverage block says what share of runs in
+the window carried a work-item id at all.
+
+CLI: --days N (default 30) · --json · --course <id> · --product <name> · --outcomes.
+--outcomes exits 1 if given with --course or --product: --course/--product already
+print an outcome table, and the two modes are not additive.
 """
 from __future__ import annotations
 
@@ -104,6 +118,19 @@ def render(report: dict) -> str:
     return "\n".join(lines)
 
 
+def fetch_queue_ids() -> set[str] | None:
+    """Every corrections queue's id (`issue_client.list_corrections_queues`,
+    unscoped, since fetch_items() reads every product too), or None when the
+    lookup failed for a reason other than the route not existing yet (a 404).
+    cost_join.build_course_costs reads None as "cannot tell a queue parent
+    from an epic parent" and reports the corrections figure as
+    cannot_be_measured rather than guessing."""
+    try:
+        return {q["id"] for q in IC.list_corrections_queues()}
+    except IC.IssueQueueUnavailable:
+        return None
+
+
 def resolve_course(product: str | None, course_id: str | None) -> dict:
     """The Course to report on: `course_id` read directly when given, else
     `product`'s one live Course. Raises IssueQueueUnavailable — the same
@@ -124,10 +151,10 @@ def _money_value(usd: float | None) -> str:
     return f"${usd:,.2f}" if usd is not None else "None"
 
 
-def render_course(course_report: dict, persona: dict) -> str:
+def render_course(course_report: dict, outcome: dict) -> str:
     """The terminal table for --course/--product: per-epic lanes, Course totals
-    per lane broken down by model, and the persona x model x item-type table.
-    Every lane is its own line; nothing here sums across lanes."""
+    per lane broken down by model, and the outcome (agent) x model x class
+    table. Every lane is its own line; nothing here sums across lanes."""
     lines = [
         f"Course cost, runs that started {course_report['window']['start']} to "
         f"{course_report['window']['end']}.",
@@ -141,7 +168,11 @@ def render_course(course_report: dict, persona: dict) -> str:
     for epic in course_report["epics"]:
         label = _printable(f"{epic['id']} [{epic['position']}]")[:26]
         lines += _lane_lines(label, _printable(epic["title"] or "")[:30], epic["lanes"])
-    lines += _lane_lines("(corrections)", "", course_report["corrections"]["lanes"])
+    if course_report["corrections"]["cannot_be_measured"]:
+        lines.append(f"(corrections) cannot be measured: "
+                     f"{course_report['corrections']['reason']}")
+    else:
+        lines += _lane_lines("(corrections)", "", course_report["corrections"]["lanes"])
     lines += _lane_lines("(unattributed)", "",
                          course_report["unattributed"]["by_billing_source"])
     lines += ["", "Course totals, per lane, by model:"]
@@ -149,16 +180,105 @@ def render_course(course_report: dict, persona: dict) -> str:
         models = ", ".join(f"{_printable(m)} {_money_value(u)}"
                            for m, u in totals["by_model"].items())
         lines.append(f"  {_printable(lane)}: {_money(totals)} ({models or 'no models'})")
-    lines += ["", f"{'AGENT':<18} {'MODEL':<26} {'TYPE':<10} {'LANE':<22} {'RUNS':>5} "
-              f"{'COST':>12} {'FINISHED':>9} {'MEDIAN':>10}"]
-    for row in persona["rows"]:
+    lines += _render_outcome_rows(outcome["rows"])
+    return "\n".join(lines)
+
+
+def _render_outcome_rows(rows: list[dict]) -> list[str]:
+    """The agent x model x class table shared by --course/--product and
+    --outcomes: one line per (row, lane), with fixed and abandoned cost kept
+    apart on the same line rather than summed."""
+    lines = [f"{'AGENT':<18} {'MODEL':<26} {'CLASS':<12} {'LANE':<22} {'RUNS':>5} "
+             f"{'COST':>12} {'FIXED':>6} {'MEDIAN':>10} {'ABANDONED':>9} {'AB. COST':>10}"]
+    for row in rows:
         for lane, lb in row["lanes"].items():
-            median = (f"${lb['median_finished_item_usd']:,.2f}"
-                      if lb["median_finished_item_usd"] is not None else "—")
+            median = (f"${lb['median_fixed_item_usd']:,.2f}"
+                      if lb["median_fixed_item_usd"] is not None else "—")
             lines.append(
                 f"{_printable(row['agent'])[:18]:<18} {_printable(row['model'])[:26]:<26} "
-                f"{_printable(row['item_type'])[:10]:<10} {_printable(lane)[:22]:<22} "
-                f"{lb['runs']:>5} {_money(lb):>12} {lb['finished_items']:>9} {median:>10}")
+                f"{_printable(row['class'])[:12]:<12} {_printable(lane)[:22]:<22} "
+                f"{lb['runs']:>5} {_money(lb):>12} {lb['fixed_items']:>6} {median:>10} "
+                f"{lb['abandoned_items']:>9} {_money_value(lb['abandoned_usd']):>10}")
+    return lines
+
+
+def render_outcomes(outcome: dict) -> str:
+    """The terminal table for --outcomes: the agent x model x class table,
+    with its own window header, cannot_be_measured line and coverage block —
+    no Course is read for this mode."""
+    lines = [
+        f"Cost per outcome, runs that started {outcome['window']['start']} to "
+        f"{outcome['window']['end']}.",
+        f"Source: run directories under {cj.RUNS_ROOT}, NOT the Library ledger "
+        "(platform/decisions/0020).",
+    ]
+    if outcome["cannot_be_measured"]:
+        lines.append(f"cannot be measured: {outcome['reason']}")
+    lines += [""] + _render_outcome_rows(outcome["rows"])
+    lines += ["", "Coverage — runs that carried a work-item id, by agent:"]
+    for agent, c in outcome["coverage"]["by_agent"].items():
+        lines.append(f"  {_printable(agent)}: {c['runs_with_work_item']} with, "
+                     f"{c['runs_without_work_item']} without")
+    lines += ["", "Coverage — runs that carried a work-item id, by model:"]
+    for model, c in outcome["coverage"]["by_model"].items():
+        lines.append(f"  {_printable(model)}: {c['runs_with_work_item']} with, "
+                     f"{c['runs_without_work_item']} without")
+    return "\n".join(lines)
+
+
+def fetch_ledger_reconciliation(course_report: dict, epic_run_costs: dict) -> dict:
+    """Per-epic reconciliation against the Library's own ledger (E16·5): for each
+    of this Course's epics, read every page of `IC.list_ledger_entries(epic_id=)`
+    and compare it to `epic_run_costs` via `cj.reconcile_epic_cost`. An epic
+    whose ledger read fails reports its own `unavailable` + `reason`, rather
+    than being skipped or read as a clean match.
+
+    `ok` is True only when every epic reconciled with no mismatches and no
+    epic's ledger read failed — "the Library couldn't be read" is never
+    reported as "it passed"."""
+    run_epic_map = {rid: eid for eid, runs in epic_run_costs.items() for rid in runs}
+    by_epic: dict[str, dict] = {}
+    ok = True
+    for epic in course_report["epics"]:
+        eid = epic["id"]
+        try:
+            entries = IC.list_ledger_entries(epic_id=eid)
+        except IC.IssueQueueUnavailable as e:
+            by_epic[eid] = {"epic_id": eid, "unavailable": True, "reason": str(e), "ok": False}
+            ok = False
+            continue
+        result = cj.reconcile_epic_cost(epic_run_costs.get(eid, {}), entries, run_epic_map, eid)
+        by_epic[eid] = result
+        if not result["ok"]:
+            ok = False
+    return {"by_epic": by_epic, "ok": ok}
+
+
+def render_reconciliation(reconciliation: dict) -> str:
+    """The terminal block for the ledger reconciliation: one status line per
+    epic, with every mismatch named on its own line rather than folded into a
+    count."""
+    lines = ["", "Ledger reconciliation (per epic, against the Library's own total):"]
+    for eid, r in sorted(reconciliation["by_epic"].items()):
+        label = _printable(eid)
+        if r.get("unavailable"):
+            lines.append(f"  {label}: unavailable ({_printable(r['reason'])})")
+            continue
+        status = "ok" if r["ok"] else "MISMATCH"
+        lines.append(
+            f"  {label}: {status} — run-only {r['run_only']['count']} "
+            f"({_money_value(r['run_only']['usd'])}), ledger-only {r['ledger_only']['count']} "
+            f"({_money_value(r['ledger_only']['usd'])})")
+        for m in r["mismatches"]:
+            if m["kind"] == "amount":
+                lines.append(
+                    f"    MISMATCH run {_printable(m['run_id'])}: run record "
+                    f"{_money_value(m['run_usd'])} vs ledger {_money_value(m['ledger_usd'])}")
+            else:
+                lines.append(
+                    f"    MISMATCH run {_printable(m['run_id'])}: the ledger files it under "
+                    f"{_printable(m['ledger_epic_id'])}, cost_join under "
+                    f"{_printable(m['cost_join_epic_id'])}")
     return "\n".join(lines)
 
 
@@ -169,7 +289,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="print the report as JSON")
     ap.add_argument("--course", help="a Course id to report cost and progress against")
     ap.add_argument("--product", help="the product whose live Course --course defaults to")
+    ap.add_argument("--outcomes", action="store_true",
+                    help="cost per outcome: agent x model x work-item class, no Course needed")
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
+
+    if args.outcomes and (args.course or args.product):
+        print("work-item-cost: --outcomes cannot be combined with --course or "
+              "--product; --course/--product already print an outcome table, "
+              "no report written", file=sys.stderr)
+        return 1
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=args.days)
@@ -180,6 +308,13 @@ def main(argv: list[str] | None = None) -> int:
               "no report written", file=sys.stderr)
         return 1
 
+    if args.outcomes:
+        queue_ids = fetch_queue_ids()
+        outcome = cj.build_outcome_table(start, end, items, queue_ids)
+        print(json.dumps(outcome, indent=2, sort_keys=True) if args.json
+              else render_outcomes(outcome))
+        return 0
+
     if args.course or args.product:
         try:
             course = resolve_course(args.product, args.course)
@@ -189,14 +324,20 @@ def main(argv: list[str] | None = None) -> int:
             print(f"work-item-cost: cannot read the Course ({e}); no report written",
                   file=sys.stderr)
             return 1
-        course_report = cj.build_course_costs(start, end, items, course, epic_progress)
-        persona = cj.build_persona_table(start, end, items)
+        queue_ids = fetch_queue_ids()
+        course_report = cj.build_course_costs(start, end, items, course, epic_progress,
+                                              queue_ids)
+        outcome = cj.build_outcome_table(start, end, items, queue_ids)
+        epic_run_costs = cj.build_epic_run_costs(start, end, items, queue_ids)
+        reconciliation = fetch_ledger_reconciliation(course_report, epic_run_costs)
         if args.json:
-            print(json.dumps({"course": course_report, "persona": persona},
+            print(json.dumps({"course": course_report, "outcome": outcome,
+                             "reconciliation": reconciliation},
                              indent=2, sort_keys=True))
         else:
-            print(render_course(course_report, persona))
-        return 0
+            print(render_course(course_report, outcome))
+            print(render_reconciliation(reconciliation))
+        return 0 if reconciliation["ok"] else 1
 
     report = cj.build_item_costs(start, end, items)
     print(json.dumps(report, indent=2, sort_keys=True) if args.json else render(report))

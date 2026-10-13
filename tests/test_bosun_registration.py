@@ -250,6 +250,77 @@ def test_operator_server_construction_creates_the_schema_without_a_prior_ensure_
 
 
 # ============================================================================
+# custody column migration (D2, 2026-10-12) — mirrors kb_writes.py's own
+# ALTER-TABLE-migration tests (test_migrating_an_old_shape_db_*)
+# ============================================================================
+
+_OLD_SESSIONS_SCHEMA = """
+CREATE TABLE sessions (
+    id                  TEXT PRIMARY KEY,
+    token_sha256        TEXT NOT NULL UNIQUE,
+    machine             TEXT NOT NULL,
+    fingerprint_sha256  TEXT NOT NULL,
+    account             TEXT NOT NULL,
+    caller_kind         TEXT NOT NULL CHECK (caller_kind IN ('operator', 'agent')),
+    ceiling             TEXT NOT NULL,
+    availability_lever  TEXT NOT NULL
+        CHECK (availability_lever IN ('strict', 'cached_grants', 'degraded_offline')),
+    protocol_version    TEXT NOT NULL,
+    registered_at       TEXT NOT NULL,
+    revoked_at          TEXT
+);
+"""
+
+
+def _seed_old_shape_sessions_db(path) -> None:
+    """A `sessions` table exactly as it existed before `custody` — one row,
+    the shape every sessions.db on disk is in until this migration runs."""
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(_OLD_SESSIONS_SCHEMA)
+        conn.execute(
+            "INSERT INTO sessions (id, token_sha256, machine, fingerprint_sha256, "
+            "account, caller_kind, ceiling, availability_lever, protocol_version, "
+            "registered_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'strict', ?, ?, NULL)",
+            ("s1", "t" * 64, "macstudio", "f" * 64, "operator", "operator", "full", "1",
+             "2026-01-01T00:00:00Z"))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_migrating_an_old_shape_sessions_db_adds_custody_and_leaves_existing_rows_null(
+        tmp_path, monkeypatch):
+    db_path = tmp_path / "old-sessions.db"
+    _seed_old_shape_sessions_db(db_path)
+    monkeypatch.setattr(BRG, "SESSIONS_DB", db_path)
+
+    BRG.ensure_db()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("SELECT custody FROM sessions WHERE id = 's1'").fetchone()
+        count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+    assert row[0] is None  # nothing backfills a guess for a pre-existing row
+    assert count == 1
+
+
+def test_migrating_an_old_shape_sessions_db_is_idempotent(tmp_path, monkeypatch):
+    db_path = tmp_path / "old-sessions.db"
+    _seed_old_shape_sessions_db(db_path)
+    monkeypatch.setattr(BRG, "SESSIONS_DB", db_path)
+
+    BRG.ensure_db()
+    BRG.ensure_db()  # must not raise a second time, or duplicate the column
+
+    columns = [r[1] for r in sqlite3.connect(str(db_path)).execute(
+        "PRAGMA table_info(sessions)")]
+    assert columns.count("custody") == 1
+
+
+# ============================================================================
 # client-certificate checks (0092 decision #1) — pure functions
 # ============================================================================
 
@@ -337,6 +408,7 @@ def test_library_machine_verify_accepts_an_active_matching_row(library_stub):
                                         token="tok", timeout=2)
     assert result.ok is True
     assert result.reason is None
+    assert result.custody == "hardware"  # read and forwarded (D2, 2026-10-12)
     # The exact request shape the Library expects (library-protocol §2.3).
     assert stub.requests[0]["path"] == f"/machine-certificates/{'f' * 64}"
     assert stub.requests[0]["headers"]["Authorization"] == "Bearer tok"
@@ -734,6 +806,109 @@ def test_an_unknown_fingerprint_claiming_a_live_machines_name_leaves_its_session
     session, reason = BRG.check_session_binding(live["session_token"], "old-fp")
     assert reason is None
     assert session["machine"] == MACHINE
+
+
+# ============================================================================
+# custody refusal (operator decision D2, 2026-10-12, amending 0092 decision
+# #4 — 0092 itself accepted a file-held key in stage one)
+# ============================================================================
+
+
+def _session_row_count() -> int:
+    conn = sqlite3.connect(str(BRG.SESSIONS_DB))
+    try:
+        return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _stub_verify(monkeypatch, result: "BRG.LookupResult"):
+    """Stands in for `library_machine_verify`, the same way
+    `test_handle_registration_sends_no_request_when_the_lookup_credential_is_missing`
+    already does above. A dispatched run's own sandbox refuses local socket
+    binding, so these tests cannot stand up a real `library_stub` HTTP
+    server; stubbing the lookup result directly also isolates the custody
+    decision this slice adds in `handle_registration` from the registry's
+    wire format, which `test_library_machine_verify_accepts_an_active_matching_row`
+    and its siblings already cover."""
+    monkeypatch.setattr(BRG, "library_machine_verify", lambda *a, **k: result)
+
+
+@pytest.mark.parametrize("custody", ["file", None, "", "Hardware"],
+                         ids=["file", "none", "empty", "wrong-case"])
+def test_handle_registration_refuses_every_custody_other_than_hardware(
+        root, token_file, monkeypatch, custody):
+    """Required test (this slice's brief): `"file"`, `None`, `""` and a
+    differently-cased spelling are all refused the same way —
+    `REQUIRED_CUSTODY` is compared for exact string equality, so nothing
+    here needs its own special case. No session row is added for any of
+    them."""
+    root_key, root_cert = root
+    _key, cert = make_machine_cert(root_key, root_cert, machine=MACHINE)
+    d = der(cert)
+    _stub_verify(monkeypatch, BRG.LookupResult(
+        True, status="active", machine=MACHINE, custody=custody))
+
+    before = _session_row_count()
+    outcome = BRG.handle_registration(d, _body())
+
+    assert outcome.ok is False
+    assert outcome.reason == "machine_custody_not_hardware"
+    assert _session_row_count() == before
+
+
+def test_handle_registration_refuses_a_missing_custody_key(root, token_file, monkeypatch):
+    """Required test (this slice's brief): a row that never carried a
+    `custody` key at all — `LookupResult`'s own default — is refused the
+    same as every other non-`"hardware"` value."""
+    root_key, root_cert = root
+    _key, cert = make_machine_cert(root_key, root_cert, machine=MACHINE)
+    d = der(cert)
+    _stub_verify(monkeypatch, BRG.LookupResult(True, status="active", machine=MACHINE))
+
+    before = _session_row_count()
+    outcome = BRG.handle_registration(d, _body())
+
+    assert outcome.ok is False
+    assert outcome.reason == "machine_custody_not_hardware"
+    assert _session_row_count() == before
+
+
+def test_handle_registration_registers_a_hardware_custody_machine_and_records_it(
+        root, token_file, monkeypatch):
+    root_key, root_cert = root
+    _key, cert = make_machine_cert(root_key, root_cert, machine=MACHINE)
+    d = der(cert)
+    fp = BRG.fingerprint_sha256_der(d)
+    _stub_verify(monkeypatch, BRG.LookupResult(
+        True, status="active", machine=MACHINE, custody="hardware"))
+
+    outcome = BRG.handle_registration(d, _body())
+
+    assert outcome.ok is True
+    session, reason = BRG.check_session_binding(outcome.session_token, fp)
+    assert reason is None
+    assert session["custody"] == "hardware"
+
+
+def test_handle_registration_reports_the_earlier_refusal_reason_even_when_custody_is_also_wrong(
+        root, token_file, monkeypatch):
+    """A machine already refused for an earlier reason (`machine_mismatch`,
+    picked from the existing refusal order) still reports that reason — the
+    custody check in `handle_registration` runs strictly after `result.ok`,
+    so it never overrides a refusal that fires first."""
+    root_key, root_cert = root
+    _key, cert = make_machine_cert(root_key, root_cert, machine=MACHINE)
+    d = der(cert)
+    _stub_verify(monkeypatch, BRG.LookupResult(
+        False, "machine_mismatch", machine="some-other-machine", custody="file"))
+
+    before = _session_row_count()
+    outcome = BRG.handle_registration(d, _body())
+
+    assert outcome.ok is False
+    assert outcome.reason == "machine_mismatch"
+    assert _session_row_count() == before
 
 
 # ============================================================================
@@ -1934,6 +2109,83 @@ def test_a_successful_registrations_connection_is_closed_by_the_server_after_the
     status = int(head.split(b" ")[1])
     assert status == 200
     assert json.loads(raw_body)["session_token"]
+
+
+def test_shutdown_request_sends_a_close_notify_the_peer_reads_as_a_clean_tls_eof(
+        tls_material, tmp_path):
+    """Round 1 finding on PR #869: `RegistrationServer.shutdown_request`'s
+    override (round 4's own fix, see that method's doc comment) has no
+    Python test — the Swift mTLS integration test that exercises it only
+    runs when a diff touches `individuator/`, so a change to this file
+    alone could drop the override with CI still green.
+
+    Runs over `socket.socketpair()`, never a loopback bind, so this also
+    runs in a sandbox that refuses one. Both the handshake and the shutdown
+    run with one side in a background thread and the other in the main
+    thread, because each is a two-party exchange that needs both ends
+    making progress at once: `unwrap()` (inside `shutdown_request`) sends
+    a close_notify and then BLOCKS reading for the peer's own close_notify
+    in reply, which the client only ever sends as a side effect of its own
+    blocking `recv()` noticing the shutdown — calling `shutdown_request`
+    and `recv()` one after the other in a single thread deadlocks. Both
+    raw sockets get a 5s timeout first, so a regression here fails loudly
+    rather than hanging the suite. The "server" is never bound to a port
+    at all — `RegistrationServer.__new__` builds an instance without
+    running `HTTPServer.__init__` (which would bind one), which is fine
+    because `shutdown_request` touches no instance state of its own, only
+    `request` and (via `super()`) `self.close_request`.
+
+    Confirmed to fail with the override removed: restoring
+    `socketserver.BaseServer.shutdown_request`'s plain `request.shutdown
+    (socket.SHUT_WR)` (no `unwrap()`) made the client observe a ragged EOF
+    (`ssl.SSLEOFError`) instead of a clean one, so this test went red
+    before the override was restored by an edit (never `git checkout`)."""
+    ca_path, cert_path, key_path, root_key, root_cert = tls_material
+    server_ctx = BRG.build_server_ssl_context(
+        trust_anchor_path=ca_path, server_cert_path=str(cert_path), server_key_path=str(key_path))
+
+    client_key, client_cert = make_machine_cert(root_key, root_cert, machine=MACHINE)
+    client_cert_path = tmp_path / "client.crt"
+    client_key_path = tmp_path / "client.key"
+    write_pem_cert(client_cert_path, client_cert)
+    write_pem_key(client_key_path, client_key)
+    client_ctx = _client_ssl_context(ca_path, certfile=client_cert_path, keyfile=client_key_path)
+
+    server_raw, client_raw = socket.socketpair()
+    server_raw.settimeout(5)
+    client_raw.settimeout(5)
+    handshake = {}
+
+    def do_server_handshake():
+        handshake["server"] = server_ctx.wrap_socket(
+            server_raw, server_side=True, do_handshake_on_connect=True)
+
+    thread = threading.Thread(target=do_server_handshake)
+    thread.start()
+    tls_client = client_ctx.wrap_socket(client_raw, do_handshake_on_connect=True)
+    thread.join(timeout=5)
+    tls_server = handshake["server"]
+
+    # No instance of `RegistrationServer` is ever bound to a port — see the
+    # docstring above for why `__new__` (never `__init__`) is enough here.
+    server = BRG.RegistrationServer.__new__(BRG.RegistrationServer)
+    shutdown_thread = threading.Thread(target=server.shutdown_request, args=(tls_server,))
+    shutdown_thread.start()
+    try:
+        clean_eof = tls_client.recv(1024) == b""
+    except ssl.SSLZeroReturnError:
+        clean_eof = True
+    except OSError:
+        # A ragged close surfaces several ways depending on exactly where
+        # the raw socket closed under the SSL object: `ssl.SSLEOFError`
+        # ("unexpected EOF") on some paths, a plain `BrokenPipeError` on
+        # others (both are `OSError`) — none of them a clean EOF.
+        clean_eof = False
+    finally:
+        tls_client.close()
+        shutdown_thread.join(timeout=5)
+
+    assert clean_eof, "the client saw a ragged EOF, not a TLS close_notify"
 
 
 # ============================================================================

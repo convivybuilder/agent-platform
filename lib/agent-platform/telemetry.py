@@ -75,7 +75,38 @@ VALID_EXIT_STATUSES = {"completed", "killed", "errored", "budget_refused", "runn
                        # made it invisible for a month. TERMINAL, unlike
                        # committed_not_pushed which it overrides: publish must not
                        # promote a run that touched a checkout it does not own.
-                       "primary_mutated"}
+                       "primary_mutated",
+                       # the run committed, but its commit(s) never rejoined the shared
+                       # git store — the end-of-run `import_private_objects` call failed
+                       # even after retrying a transient fork failure (run-89f78c3f,
+                       # 2026-10-12: the box at its per-user process limit). Distinct from
+                       # committed_not_pushed/committed_local_only: those commits are
+                       # readable from the shared store and just need a push (or have
+                       # nowhere to push to); this one is NOT readable there at all — only
+                       # from the run's own private object directory, named in
+                       # error_reason. `agentctl publish --run <id>` imports it (same
+                       # helper, remove=False) and pushes. Outranks cost_stopped below:
+                       # stranded work needs its recovery command surfaced even when the
+                       # run also hit a cost/token cap.
+                       "committed_private_only",
+                       # the per-run cost or token cap (ARCH-185/ARCH-245) fired and
+                       # `agentctl`'s transcript streamer terminated the process — a
+                       # budget decision, not a crash. Distinct from "errored"/"killed"
+                       # so a caller (and `agentctl wait`) can tell a run stopped on
+                       # purpose for spending too much from one that died for some
+                       # other reason; the breach's own text lands in error_reason.
+                       # Decided at finalize from the cap reason `_stream_transcript`
+                       # returns in memory through `_run_session`'s locals, never from
+                       # `cost-killed.txt` (a human-readable record only, in a
+                       # directory the run's own subprocess can write for its whole
+                       # execution window). Applied only when none of the ARCH-397
+                       # review-stamp downgrade, `primary_mutated` or
+                       # `committed_private_only` fired instead — checked last of the
+                       # three, below all of them, because a silently failed review, a
+                       # checkout it doesn't own, or stranded commits needing
+                       # `agentctl publish --run <id>` are the more serious facts, and
+                       # the cap's reason still lands in error_reason either way.
+                       "cost_stopped"}
 # Subscription rate-limit states, in SEVERITY ORDER — the list is the ordering,
 # so `RATE_LIMIT_SEVERITY.index()` is what compares two of them and there is no
 # second copy to drift. Values observed across every transcript on the box:

@@ -8,7 +8,7 @@ daytime report or vice versa — the $0-cost-report class of bug. The window:
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -145,3 +145,28 @@ def test_cost_by_model_section_renders_split_and_rows(agent_summary):
 
 def test_cost_by_model_section_empty(agent_summary):
     assert "No attributable spend" in agent_summary.cost_by_model_section([])
+
+
+def test_issues_section_lists_a_cost_stopped_run(agent_summary, tmp_path, monkeypatch):
+    """A run the per-run cost/token cap killed (clause 9 of the
+    budget-enforcement epic) is a digest-worthy issue, named the same way an
+    `errored`/`killed`/`capacity_refused` run is."""
+    monkeypatch.setattr(agent_summary, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(agent_summary, "STALE_LOG", tmp_path / "stale-runs.jsonl")
+    start = datetime(2026, 5, 31, 7, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 1, 1, 0, tzinfo=timezone.utc)
+    runs = [{"run_id": "run-cost01", "meta": {"agent": "coder"},
+             "outcome": {"exit_status": "cost_stopped"}}]
+    out = agent_summary.issues_section(start, end, runs)
+    assert "run-cost01" in out
+    assert "cost_stopped" in out
+
+
+def test_issues_section_no_issues_when_nothing_is_bad(agent_summary, tmp_path, monkeypatch):
+    monkeypatch.setattr(agent_summary, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(agent_summary, "STALE_LOG", tmp_path / "stale-runs.jsonl")
+    start = datetime(2026, 5, 31, 7, 0, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 1, 1, 0, tzinfo=timezone.utc)
+    runs = [{"run_id": "run-ok01", "meta": {"agent": "coder"},
+             "outcome": {"exit_status": "completed"}}]
+    assert agent_summary.issues_section(start, end, runs) == "_No issues._\n"

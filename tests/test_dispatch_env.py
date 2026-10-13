@@ -38,6 +38,17 @@ def _reset_private_gh_config_dir_singleton():
         DE._gh_config_dir = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_private_git_wrapper_dir_singleton():
+    """Same contract as `_reset_private_tmpdir_singleton`, for `_private_git_wrapper_dir()`."""
+    DE._git_wrapper_dir = None
+    yield
+    if DE._git_wrapper_dir is not None:
+        import shutil
+        shutil.rmtree(DE._git_wrapper_dir, ignore_errors=True)
+        DE._git_wrapper_dir = None
+
+
 def test_strips_tmux_and_tmux_pane_from_the_default_environment(monkeypatch):
     monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,1314,3")
     monkeypatch.setenv("TMUX_PANE", "%3")
@@ -359,6 +370,272 @@ def test_object_store_redirect_keeps_a_real_fetch_past_the_default_unpack_limit_
     after = sorted(shared.rglob("*"))
     assert after == before, f"the fetch wrote under the shared objects dir: {set(after) - set(before)}"
     assert any(private.rglob("*")), "the fetch should have written something under the private dir"
+
+
+# --- the redirect is process-wide, so it must be scoped to the run's own repository
+# (issue_01M4QXDGVE43R2WYT01VDQQBPY) --------------------------------------------------
+
+def _repo_with_a_commit_at(path, message):
+    path.mkdir()
+    _git("init", "-q", "-b", "main", cwd=path)
+    _git("config", "user.email", "t@example.com", cwd=path)
+    _git("config", "user.name", "t", cwd=path)
+    _git("commit", "-q", "--allow-empty", "-m", message, cwd=path)
+    return path
+
+
+def test_object_store_redirect_sets_the_wrapper_vars_and_path(tmp_path):
+    private = tmp_path / "private-objects"
+    private.mkdir()
+    shared = tmp_path / "shared" / "objects"
+    shared.mkdir(parents=True)
+
+    env = DE.dispatch_env(private_object_dir=private, shared_object_dir=shared)
+
+    assert env["AGENTCTL_OWN_GIT_COMMON_DIR"] == os.path.realpath(str(shared.parent))
+    assert env["AGENTCTL_REAL_GIT"]
+    assert Path(env["AGENTCTL_REAL_GIT"]).is_file()
+    wrapper_dir = env["PATH"].split(os.pathsep)[0]
+    assert (Path(wrapper_dir) / "git").is_file()
+    assert os.access(Path(wrapper_dir) / "git", os.X_OK)
+
+
+def test_object_store_redirect_wrapper_vars_absent_without_a_private_dir():
+    env = DE.dispatch_env()
+
+    assert "AGENTCTL_REAL_GIT" not in env
+    assert "AGENTCTL_OWN_GIT_COMMON_DIR" not in env
+
+
+def test_resolve_real_git_skips_an_inherited_wrapper_elsewhere_on_path(tmp_path):
+    """route (b) of the 2026-10-12 20:52 outage: a `dispatch_env()` call made from
+    INSIDE an already-dispatched run inherits an ANCESTOR process's wrapper directory
+    already first on PATH, under a tmp path this call's own `_private_git_wrapper_dir()`
+    never created, so a plain `entry != wrapper_dir` filter lets it through.
+    `_resolve_real_git` must skip that directory too, by recognizing its `git` as a
+    wrapper copy (the marker), never by running anything — this builds only a plain
+    fake `git` script that prints a word, plus a separate file carrying the marker
+    text, and never executes either as a wrapper."""
+    inherited_wrapper_dir = tmp_path / "inherited-wrapper"
+    inherited_wrapper_dir.mkdir()
+    fake_wrapper = inherited_wrapper_dir / "git"
+    fake_wrapper.write_text(f"#!/bin/bash\n# {DE._GIT_WRAPPER_MARKER}\necho should-never-run\n")
+    fake_wrapper.chmod(0o755)
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    fake_real_git = real_dir / "git"
+    fake_real_git.write_text("#!/bin/bash\necho real-git\n")
+    fake_real_git.chmod(0o755)
+
+    path = os.pathsep.join([str(inherited_wrapper_dir), str(real_dir)])
+
+    # wrapper_dir names a THIRD, unrelated directory — never the inherited one above —
+    # so a pass here proves the marker-based skip did the work, not the plain equality
+    # filter.
+    resolved = DE._resolve_real_git(path, wrapper_dir=str(tmp_path / "some-other-wrapper-dir"))
+
+    assert resolved == str(fake_real_git)
+
+
+# --- OUTAGE, 2026-10-12: AGENTCTL_REAL_GIT resolved to a copy of the wrapper itself,
+# whose probe (a command substitution) forked a child running the same script with the
+# same self-referential env, which forked the next the same way — 9,256 bash processes
+# between two runs before the host's per-user process limit stopped it. The wrapper now
+# refuses, before any exec or probe, whenever AGENTCTL_REAL_GIT resolves to a copy of
+# itself rather than the real git binary. These tests run only the FIXED script (never
+# a reverted one — that revert is exactly the fork bomb above) and bound every run with
+# subprocess's own timeout, which a passing run never approaches: the refusal fires on
+# the very first invocation, before anything forks. -----------------------------------
+
+def test_git_wrapper_script_carries_its_own_marker_line():
+    """`_agentctl_is_wrapper_copy` in the script tells a second run's wrapper copy
+    apart from the real git binary by this exact line — it has to stay present."""
+    assert DE._GIT_WRAPPER_MARKER in DE._GIT_WRAPPER_SCRIPT
+
+
+def _run_wrapper_against(tmp_path, wrapper_path, real_git):
+    env = {**os.environ, "AGENTCTL_REAL_GIT": real_git,
+           "AGENTCTL_OWN_GIT_COMMON_DIR": str(tmp_path),
+           "GIT_OBJECT_DIRECTORY": str(tmp_path / "private"),
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(tmp_path / "shared")}
+    return subprocess.run([str(wrapper_path), "-C", str(tmp_path), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, timeout=10, env=env)
+
+
+def test_wrapper_refuses_when_agentctl_real_git_is_its_own_file(tmp_path):
+    """The exact incident shape: AGENTCTL_REAL_GIT names this wrapper's own file."""
+    wrapper = tmp_path / "git"
+    wrapper.write_text(DE._GIT_WRAPPER_SCRIPT)
+    wrapper.chmod(0o755)
+
+    result = _run_wrapper_against(tmp_path, wrapper, str(wrapper))
+
+    assert result.returncode == 127, (result.returncode, result.stdout, result.stderr)
+    assert "AGENTCTL_REAL_GIT" in result.stderr
+
+
+def test_wrapper_refuses_when_agentctl_real_git_is_a_different_copy_of_the_wrapper(tmp_path):
+    """The $0 comparison alone would miss this: a SECOND run's wrapper is a different
+    file. Only the marker line (shared, verbatim, across every copy of the script)
+    catches it."""
+    wrapper = tmp_path / "git"
+    wrapper.write_text(DE._GIT_WRAPPER_SCRIPT)
+    wrapper.chmod(0o755)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    copy = other_dir / "git"
+    copy.write_text(DE._GIT_WRAPPER_SCRIPT)
+    copy.chmod(0o755)
+
+    result = _run_wrapper_against(tmp_path, wrapper, str(copy))
+
+    assert result.returncode == 127, (result.returncode, result.stdout, result.stderr)
+    assert "AGENTCTL_REAL_GIT" in result.stderr
+
+
+def test_wrapper_does_not_refuse_a_bare_name_that_resolves_to_the_real_git(tmp_path):
+    """AGENTCTL_REAL_GIT unset falls back to the bare name `git` inside the script
+    (_resolve_real_git's own fallback, for when nothing else set it) — resolved through
+    PATH, bash 3.2 style, by the same check that refuses a wrapper copy. A PATH with no
+    wrapper directory on it must resolve this to the real git and run normally, not
+    refuse it as if it were a copy.
+
+    SAFETY: this test's PATH must never contain a wrapper directory, including this
+    process's OWN ambient one if it is itself running inside a dispatched run — a bare
+    `git` resolving to a wrapper is exactly the recursion this file guards against (see
+    the OUTAGE comment above), so every `git` call here, including the setup calls,
+    uses `clean_path`, never the ambient PATH as-is: when this test is itself running
+    dispatched, `clean_path` is this process's own AGENTCTL_REAL_GIT's directory
+    (dispatch_env's invariant is that var always names the real binary, never a
+    wrapper); otherwise (an undispatched run, e.g. CI) it falls back to the ambient
+    PATH, which has no wrapper on it in the first place."""
+    wrapper = tmp_path / "git"
+    wrapper.write_text(DE._GIT_WRAPPER_SCRIPT)
+    wrapper.chmod(0o755)
+    ambient_real_git = os.environ.get("AGENTCTL_REAL_GIT")
+    clean_path = (os.path.dirname(ambient_real_git) if ambient_real_git
+                 else os.environ.get("PATH", os.defpath))
+    clean_env = {**os.environ, "PATH": clean_path}
+    clean_env.pop("AGENTCTL_REAL_GIT", None)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)],
+                   check=True, timeout=10, env=clean_env)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "x"],
+                   check=True, timeout=10, env=clean_env)
+    own_common_dir = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True, text=True, check=True, timeout=10, env=clean_env).stdout.strip()
+
+    private = tmp_path / "private"
+    private.mkdir()
+    env = {**clean_env,
+           "AGENTCTL_OWN_GIT_COMMON_DIR": own_common_dir,
+           "GIT_OBJECT_DIRECTORY": str(private),
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo / ".git" / "objects")}
+
+    result = subprocess.run([str(wrapper), "-C", str(repo), "rev-parse", "HEAD"],
+                            capture_output=True, text=True, timeout=10, env=env)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+
+
+def test_object_store_redirect_lets_a_different_repositorys_own_git_read_its_own_objects(tmp_path):
+    """The defect this closes, reproduced in plain git with no sandbox and no spawned
+    run: `dispatch_env`'s own GIT_OBJECT_DIRECTORY / GIT_ALTERNATE_OBJECT_DIRECTORIES
+    are process-wide, so before this fix, `git -C <another repository>` read ONLY from
+    repository A's private/shared stores and reported A's own commit as a 'bad object'
+    for repository B, even though B has that object in its own, real store. This test
+    fails on origin/main (confirmed: `fatal: git cat-file: could not get object info`,
+    the exact failure the occurrence's report names) and passes with the wrapper."""
+    a = _repo_with_a_commit_at(tmp_path / "a", "commit in A")
+    b = _repo_with_a_commit_at(tmp_path / "b", "commit in B")
+    private = tmp_path / "private-objects"
+    private.mkdir()
+    shared = a / ".git" / "objects"
+    env = DE.dispatch_env(private_object_dir=private, shared_object_dir=shared)
+    b_head = _git("rev-parse", "HEAD", cwd=b).stdout.strip()
+
+    result = _git("-C", str(b), "cat-file", "-t", b_head, cwd=tmp_path, env=env, check=False)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "commit", (result.stdout, result.stderr)
+
+
+def test_object_store_redirect_still_redirects_the_runs_own_repository(tmp_path):
+    """The converse the wrapper must not break: a commit made against the run's OWN
+    repository (A) under the same env still lands in A's private object store, never
+    in A's own shared `objects` directory — exactly `test_object_store_redirect_keeps_a_
+    real_fetch_past_the_default_unpack_limit_to_the_private_dir`'s property, now checked
+    with the wrapper on PATH too."""
+    a = _repo_with_a_commit_at(tmp_path / "a", "commit in A")
+    private = tmp_path / "private-objects"
+    private.mkdir()
+    shared = a / ".git" / "objects"
+    env = DE.dispatch_env(private_object_dir=private, shared_object_dir=shared)
+    before_shared = sorted(shared.rglob("*"))
+
+    result = _git("-C", str(a), "-c", "user.name=t", "-c", "user.email=t@t",
+                  "commit", "-q", "--allow-empty", "-m", "second commit",
+                  cwd=tmp_path, env=env, check=False)
+
+    assert result.returncode == 0, result.stderr
+    after_shared = sorted(shared.rglob("*"))
+    assert after_shared == before_shared, (
+        f"the own-repository commit wrote under the shared objects dir: "
+        f"{set(after_shared) - set(before_shared)}")
+    assert any(private.rglob("*")), "the own-repository commit should have written to the private dir"
+
+
+def test_a_runs_git_init_bare_creates_a_usable_repository_and_can_be_pushed_to(tmp_path):
+    """issue_01M4R8KTY7THR8HYGJA849N3AH. `git init -q --bare <path>`, issued from inside
+    the run's own worktree (no -C/--git-dir of its own — the shape the live confinement
+    test actually runs), creates a repository that doesn't exist yet, so the wrapper's
+    run's-own-repository probe can't resolve it. Before this fix, the redirect was left
+    in place, the new repository's objects landed in the run's private store instead of
+    `<path>/objects`, and a push to it failed. Fails on origin/main before this fix
+    (confirmed: `remote.git/objects` absent, and the push's `fatal: ... does not appear
+    to be a git repository`)."""
+    a = _repo_with_a_commit_at(tmp_path / "a", "commit in A")
+    private = tmp_path / "private-objects"
+    private.mkdir()
+    shared = a / ".git" / "objects"
+    env = DE.dispatch_env(private_object_dir=private, shared_object_dir=shared)
+    remote = tmp_path / "remote.git"
+
+    init_result = _git("init", "-q", "--bare", str(remote), cwd=a, env=env, check=False)
+    assert init_result.returncode == 0, init_result.stderr
+    assert (remote / "objects").is_dir(), "the new bare repo has no objects directory of its own"
+
+    push_result = _git("push", "-q", str(remote), "HEAD:refs/heads/sandbox-check",
+                       cwd=a, env=env, check=False)
+    assert push_result.returncode == 0, push_result.stderr
+    show_ref = _git("--git-dir", str(remote), "show-ref", cwd=tmp_path)
+    assert "refs/heads/sandbox-check" in show_ref.stdout, show_ref.stdout
+
+
+def test_a_runs_git_clone_creates_a_usable_checkout(tmp_path):
+    """Same gap, the other direction. `git clone <src> <dst>`, issued from inside the
+    run's own worktree, creates a destination repository that doesn't exist yet either.
+    Fails on origin/main before this fix (confirmed: the destination's `.git/objects` is
+    empty and `git log` there reports no commits)."""
+    a = _repo_with_a_commit_at(tmp_path / "a", "commit in A")
+    b = _repo_with_a_commit_at(tmp_path / "b", "commit in B")
+    private = tmp_path / "private-objects"
+    private.mkdir()
+    shared = a / ".git" / "objects"
+    env = DE.dispatch_env(private_object_dir=private, shared_object_dir=shared)
+    dest = tmp_path / "clone-dest"
+
+    clone_result = _git("clone", "-q", str(b), str(dest), cwd=a, env=env, check=False)
+    assert clone_result.returncode == 0, clone_result.stderr
+    assert any((dest / ".git" / "objects").rglob("*")), "the clone's own objects directory is empty"
+
+    log = _git("log", "--format=%s", "-1", cwd=dest, env=env)
+    assert log.stdout.strip() == "commit in B"
 
 
 def test_deny_push_refuses_an_https_push_without_contacting_the_network(tmp_path):

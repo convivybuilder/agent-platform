@@ -1790,6 +1790,55 @@ def test_recheck_candidate_does_not_confirm_a_dead_dispatchers_unimported_commit
     assert _resolves_in_shared_store(wt, saved)
 
 
+def test_import_leftover_private_objects_leaves_a_live_runs_store_in_place(
+        tmp_path, monkeypatch):
+    """CQ·477 (run-421dd904, 2026-10-12): `agentctl publish`, run from inside a live
+    run's own shell on its own worktree, reached this function, found nothing
+    missing from the shared store (the run's own git env already resolves its HEAD
+    through the private store's own alternate), skipped `index-pack`, and ran
+    `shutil.rmtree` on the private store that SAME run's own git was still pointed
+    at — breaking every git call for the rest of the run. `in_use_map` (registry-
+    backed liveness, the same source `allocate_worktree`/`allocate_on_branch`/
+    `cleanup_candidates`/`recheck_candidate` already check before ever reaching this
+    function) must make this function itself refuse to delete a store its owning
+    run is still alive to write into, not only rely on the four callers that
+    already guard it on their own."""
+    import run_sandbox as RS
+    root, primary = _demo_root(tmp_path, monkeypatch)
+    wt = _add_worktree(primary, root)
+    git_dir = RS.git_common_dir(wt)
+    private_dir = RS.run_private_objects_dir(wt, git_dir)
+    saved = _commit_into_private_store(wt, msg="committed by a run that is still alive")
+    monkeypatch.setattr(W, "in_use_map", lambda: {wt.resolve(): {"run_id": "run-x"}})
+
+    existed = W.import_leftover_private_objects(wt)
+
+    assert existed is True
+    assert private_dir.is_dir(), "a live run's own private store must not be deleted"
+    # Still imported (folded into the shared store) — a live run's commit must stay
+    # visible to any OTHER reader of the shared store too, just not removed.
+    assert _resolves_in_shared_store(wt, saved)
+
+
+def test_import_leftover_private_objects_removes_a_dead_runs_store(tmp_path, monkeypatch):
+    """Negative control for the test above, same fixture: with NO registry entry —
+    the ordinary dead-dispatcher case this function exists for — it still imports
+    AND removes the store, exactly as before this round's own change."""
+    import run_sandbox as RS
+    root, primary = _demo_root(tmp_path, monkeypatch)
+    wt = _add_worktree(primary, root)
+    git_dir = RS.git_common_dir(wt)
+    private_dir = RS.run_private_objects_dir(wt, git_dir)
+    saved = _commit_into_private_store(wt, msg="committed by a run that has ended")
+    monkeypatch.setattr(W, "in_use_map", lambda: {})
+
+    existed = W.import_leftover_private_objects(wt)
+
+    assert existed is True
+    assert not private_dir.exists(), "a dead run's store must still be removed"
+    assert _resolves_in_shared_store(wt, saved)
+
+
 def test_worktrees_cleanup_commit_does_not_discard_the_worktree_or_the_commit(
         tmp_path, monkeypatch):
     """End-to-end through the actual CLI entry point the launchd job runs. On the

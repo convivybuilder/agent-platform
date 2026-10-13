@@ -401,7 +401,7 @@ def open_prs_section(runs: list[dict]) -> str:
 
 def issues_section(start: datetime, end: datetime, runs: list[dict]) -> str:
     issues: list[str] = []
-    bad = [r for r in runs if r["outcome"].get("exit_status") in ("errored", "killed", "budget_refused", "capacity_refused")]
+    bad = [r for r in runs if r["outcome"].get("exit_status") in ("errored", "killed", "budget_refused", "capacity_refused", "cost_stopped")]
     for r in bad:
         issues.append(f"- `{r['run_id']}` {r['meta'].get('agent', '?')}: **{r['outcome'].get('exit_status')}**")
     # Daily budget markers are filed per UTC date dir; the window can straddle two.

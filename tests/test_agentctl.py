@@ -1242,6 +1242,46 @@ def test_cmd_status_shows_a_usage_hold(agentctl, tmp_path, monkeypatch, capsys):
     assert "usage_hold:" not in out
 
 
+def test_cmd_status_shows_error_reason_for_a_committed_private_only_run(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Reviewer, PR #870 round 1. Until now `cmd_status` printed
+    `terminal_reason`/`api_error_status`/`api_error_message` but never
+    `error_reason` — so an operator checking a `committed_private_only` run via
+    `agentctl status <run-id>` saw the bare exit status and neither the private
+    directory nor the `agentctl publish --run <id>` recovery command, both of
+    which exist only in `error_reason`."""
+    from types import SimpleNamespace
+    run_dirs_root = tmp_path / "agent-runs"
+    day = run_dirs_root / "2026-10-12"
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", run_dirs_root)
+
+    rd = day / "run-priv02"
+    rd.mkdir(parents=True)
+    meta = {"run_id": "run-priv02", "agent": "coder", "task": "t", "repo": "agent-platform",
+            "worktree": "/wt", "profile": "p", "model": "m",
+            "started_at": "2026-10-12T00:00:00Z", "pid": None}
+    (rd / "meta.json").write_text(json.dumps(meta))
+    reason = ("private-object import failed after retrying (OSError: ...); "
+              "commits exist only in /wt-private/objects. `agentctl publish "
+              "--run run-priv02` imports them and pushes — do not re-dispatch.")
+    (rd / "outcome.json").write_text(json.dumps({
+        "exit_status": "committed_private_only", "error_reason": reason}))
+
+    agentctl.cmd_status(SimpleNamespace(run_id="run-priv02"))
+    out = capsys.readouterr().out
+    assert "error_reason:" in out
+    assert "agentctl publish --run run-priv02" in out
+    assert "/wt-private/objects" in out
+
+    rd2 = day / "run-clean02"
+    rd2.mkdir(parents=True)
+    (rd2 / "meta.json").write_text(json.dumps({**meta, "run_id": "run-clean02"}))
+    (rd2 / "outcome.json").write_text(json.dumps({"exit_status": "completed"}))
+    agentctl.cmd_status(SimpleNamespace(run_id="run-clean02"))
+    out = capsys.readouterr().out
+    assert "error_reason:" not in out
+
+
 def test_cmd_spawn_names_the_agent_when_it_activates_the_profile(agentctl):
     """The call site is what carries the agent name, and a refactor that keeps
     `activate_profile`'s signature while dropping the argument here would leave
@@ -3883,12 +3923,11 @@ def test_run_session_subprocess_env_wires_the_private_object_store_for_a_real_wo
     shared `objects` directory (knowledge#793 round 6).
 
     Whether the private dir exists is checked from INSIDE the stub, at spawn time, rather
-    than on `expected_private` after `_run_session` returns: the stub here never commits
-    anything, so the end-of-run `RS.import_private_objects` call (`remove=True`, the
-    default) finds nothing to pack and removes the now-empty directory anyway — correctly,
-    per that function's own docstring ("deleting the whole directory loses nothing"), not a
-    sign the dir was never created. Checking post-return would be testing that unrelated
-    cleanup, not this test's own claim."""
+    than on `expected_private` after `_run_session` returns: `_finalize_run` — which now
+    makes the end-of-run `RS.import_private_objects` call itself, moved there under
+    issue_01M4RP1K026XJE740DMQ7AP31M — is stubbed out below, so that call never runs in
+    this test at all. Checking post-return would be testing that unrelated import/cleanup,
+    not this test's own claim, which is only the env wiring above."""
     import subprocess
     import run_sandbox as RS
 
@@ -5424,7 +5463,8 @@ _INDEX_OR_CHECKOUT_EXEMPT = {
     "_kb_blob_at_origin": "fetches a kb document's blob from origin/main",
     "cmd_kb_sync": "fast-forwards the knowledge checkout and reindexes it",
     "cmd_kb_audit": "reads the kb write history; no agent file is read",
-    "cmd_kb_merge": "merges a Library-opened knowledge PR; git on the checkout",
+    "_kb_merge_read": "gathers the facts a knowledge-PR merge decides from; git on the checkout",
+    "_kb_merge_rebuild": "rebuilds a stale knowledge-PR branch onto main; git on the checkout",
     "cmd_docs_merge": "merges a reviewed docs PR; policy and git on the checkout",
     "cmd_kb_apply": "writes a doc through the sha-gated cage",
     "_kb_refuse_if_not_github": "checks the knowledge origin is GitHub",
@@ -5879,6 +5919,134 @@ def test_finalize_run_deletes_a_stale_cost_partial(agentctl, tmp_path, monkeypat
     assert cost["usd"] == pytest.approx(0.02)   # the real close, not the stale 999.0
 
 
+def test_finalize_records_cost_stopped_when_the_supervisor_reports_the_cap_fired(
+        agentctl, tmp_path, monkeypatch):
+    """Clause 9 of the budget-enforcement epic: a run the per-run cost/token cap
+    killed must read distinctly from one that errored or was killed for another
+    reason. The fact arrives as the `cost_stopped_reason` PARAMETER — the
+    harness's own in-memory record, threaded from `_stream_transcript`'s return
+    value through `_run_session`'s locals — not read back off `cost-killed.txt`
+    (security review, PR #874 round 1: that file sits in a directory the run's
+    own subprocess can write to for its whole execution window). The run dir
+    still carries the file too (the human-readable record `_stream_transcript`
+    always writes), planted here to prove it is no longer what decides this."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    rd, wt = _mk_run_dir(tmp_path)
+    (rd / "cost-killed.txt").write_text(
+        "gateway spend $12.50 exceeded per-run cap $10.00\n")
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test",
+        exit_code=1, final_event=None,
+        profile="agent-platform/daytime", agent={"model_alias": "opus"},
+        cost_stopped_reason="gateway spend $12.50 exceeded per-run cap $10.00",
+    )
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "cost_stopped"
+    assert "exceeded per-run cap $10.00" in outcome["error_reason"]
+
+
+def test_finalize_ignores_a_planted_cost_killed_file_with_no_supervisor_report(
+        agentctl, tmp_path, monkeypatch):
+    """Security review, PR #874 round 1: the run's own subprocess can write
+    `cost-killed.txt` into its own run dir for its whole execution window, so a
+    planted marker with NO corresponding `cost_stopped_reason` from the
+    supervisor must not read as `cost_stopped` — that would let a run forge the
+    cap's own kill to recolor a silently failed review or a primary-checkout
+    mutation as a benign budget stop. Fails against the pre-fix branch, which
+    read `exit_status` off the file alone."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    rd, wt = _mk_run_dir(tmp_path)
+    (rd / "cost-killed.txt").write_text(
+        "FORGED: gateway spend $999.00 exceeded per-run cap $1.00\n")
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test",
+        exit_code=1, final_event=None,
+        profile="agent-platform/daytime", agent={"model_alias": "opus"},
+    )
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "errored"
+    assert "error_reason" not in outcome
+
+
+def test_finalize_records_cost_stopped_even_when_the_run_also_errored_for_another_reason(
+        agentctl, tmp_path, monkeypatch):
+    """The cap is what stopped the run, so a run that crossed it and THEN also
+    carries a final_event marking it errored for an unrelated reason must still
+    read as cost_stopped, not errored — the cap's kill is the cause, not
+    whatever the terminated process reported on its way out."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    rd, wt = _mk_run_dir(tmp_path)
+    final_event = {"type": "result", "subtype": "error", "is_error": True}
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test",
+        exit_code=1, final_event=final_event,
+        profile="agent-platform/daytime", agent={"model_alias": "opus"},
+        cost_stopped_reason="gateway tokens 500,000 exceeded per-run token cap 400,000",
+    )
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "cost_stopped"
+    assert "token cap" in outcome["error_reason"]
+
+
+def test_finalize_leaves_an_unrelated_error_alone_without_the_cost_marker(
+        agentctl, tmp_path, monkeypatch):
+    """The negative case: an errored run with no cap report at all keeps the
+    ordinary `errored` status and no error_reason — the check must fire only
+    on the supervisor's own report, not on every failure."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    rd, wt = _mk_run_dir(tmp_path)
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test",
+        exit_code=1, final_event=None,
+        profile="agent-platform/daytime", agent={"model_alias": "opus"},
+    )
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "errored"
+    assert "error_reason" not in outcome
+
+
+def test_finalize_lets_primary_mutated_outrank_a_cost_stop(agentctl, tmp_path, monkeypatch):
+    """Security review, PR #874 round 1, part (b): `primary_mutated` is a safety
+    signal and must win over a budget stop — a run that hit the cap and ALSO
+    wrote into a primary checkout it does not own must not be recorded as the
+    benign `cost_stopped`, which would hide the more serious fact. The cost
+    reason stays visible in `error_reason` alongside the mutation (which is
+    itself durable in `primary_mutations.json`), since nothing here restructures
+    `write_outcome` to carry two reasons."""
+    _stub_guard_signals(monkeypatch)
+    rd, wt, _ = _guard_run(
+        agentctl, tmp_path, monkeypatch,
+        leak=lambda p: (p / "leaked.py").write_text("# oops"),
+        echo_in_worktree=("leaked.py",),
+        cost_stopped_reason="gateway spend $12.50 exceeded per-run cap $10.00",
+    )
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "primary_mutated"
+    assert "exceeded per-run cap $10.00" in outcome["error_reason"]
+
+
+def test_finalize_lets_the_arch397_downgrade_outrank_a_cost_stop(
+        agentctl, tmp_path, monkeypatch):
+    """Security review, PR #874 round 1, part (b): the ARCH-397 review-stamp
+    downgrade is a safety signal and must win over a budget stop too — a review
+    run that hit the cap and ALSO ended without posting its stamp must read
+    `errored` (ARCH-397), not the benign `cost_stopped`, which would hide a
+    silently failed review behind a budget decision. The cost reason still
+    rides along in `error_reason`."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda *a, **k: {"comments": []})  # no stamp
+    rd, wt = _mk_review_run_dir(tmp_path)
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test", exit_code=0,
+        final_event={"type": "result", "subtype": "success"},
+        profile="agent-platform/daytime", agent={"model_alias": "sonnet"},
+        cost_stopped_reason="gateway spend $12.50 exceeded per-run cap $10.00",
+    )
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "errored"
+    assert "exceeded per-run cap $10.00" in outcome["error_reason"]
+
+
 def test_write_cost_partial_checkpoint_prefers_gateway_spend_log(agentctl, tmp_path):
     """The checkpoint sources a gateway run's partial from gateway_spend.jsonl
     — the same source `_resolve_cost` reads at finalisation — not from
@@ -6100,10 +6268,11 @@ def test_stream_transcript_survives_a_live_import_failure(agentctl, tmp_path, mo
     monkeypatch.setattr(agentctl.RS, "import_private_objects", _raise)
     run_dir = tmp_path / "run-test"
     run_dir.mkdir()
-    result = agentctl._stream_transcript(
+    final_event, cost_stop_reason = agentctl._stream_transcript(
         _FakeStreamProc([_assistant_event(), {"type": "system", "subtype": "init"}]), run_dir,
         git_dir=tmp_path / "git-dir", private_objects_dir=tmp_path / "private-dir")
-    assert result is None  # drained past the failed import on line 1, line 2 too
+    assert final_event is None  # drained past the failed import on line 1, line 2 too
+    assert cost_stop_reason is None  # no cap configured: never a candidate breach
     assert "live import" in (run_dir / "stderr.log").read_text()
 
 
@@ -6148,10 +6317,11 @@ def test_stream_transcript_survives_a_checkpoint_write_failure_and_cap_breach_st
     terminated = []
     proc.terminate = lambda: terminated.append(True)
 
-    result = agentctl._stream_transcript(proc, run_dir, cost_cap=1.0)
+    final_event, cost_stop_reason = agentctl._stream_transcript(proc, run_dir, cost_cap=1.0)
 
     assert terminated == [True]          # the cap breach on line 2 still fires
-    assert result is None                # drained past line 1's failed checkpoint
+    assert final_event is None           # drained past line 1's failed checkpoint
+    assert cost_stop_reason is not None  # the breach that terminated it is reported back
     assert not (run_dir / "cost-partial.json").exists()  # the failed write left nothing
     assert "checkpoint" in (run_dir / "stderr.log").read_text()
 
@@ -6186,10 +6356,11 @@ def test_stream_transcript_survives_a_non_numeric_usage_field_and_cap_breach_sti
     terminated = []
     proc.terminate = lambda: terminated.append(True)
 
-    result = agentctl._stream_transcript(proc, run_dir, cost_cap=1.0)
+    final_event, cost_stop_reason = agentctl._stream_transcript(proc, run_dir, cost_cap=1.0)
 
     assert terminated == [True]          # the cap breach on line 2 still fires
-    assert result is None                # drained past line 1's malformed usage
+    assert final_event is None           # drained past line 1's malformed usage
+    assert cost_stop_reason is not None  # the breach that terminated it is reported back
     assert "usage" in (run_dir / "stderr.log").read_text()
 
 
@@ -6231,10 +6402,11 @@ def test_stream_transcript_survives_any_malformed_usage_field_and_cap_breach_sti
     terminated = []
     proc.terminate = lambda: terminated.append(True)
 
-    result = agentctl._stream_transcript(proc, run_dir, cost_cap=1.0)
+    final_event, cost_stop_reason = agentctl._stream_transcript(proc, run_dir, cost_cap=1.0)
 
     assert terminated == [True]          # the cap breach on line 2 still fires
-    assert result is None                # drained past line 1's malformed usage
+    assert final_event is None           # drained past line 1's malformed usage
+    assert cost_stop_reason is not None  # the breach that terminated it is reported back
 
 
 def _finalize_with_final_event(agentctl, rd, wt, *, model="claude-opus-4-7",
@@ -9942,6 +10114,37 @@ def _repo_with_base(tmp_path, branch, *, commits_beyond_base=0):
     return wt
 
 
+def test_publish_refuses_inside_a_dispatched_runs_own_object_redirected_env(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """CQ·477 (run-421dd904, 2026-10-12): a coder's own `agentctl publish`, run from
+    inside its own live run's shell on its own worktree, reached
+    `import_leftover_private_objects`, which found nothing missing from the shared
+    store and ran `shutil.rmtree` on the private store that SAME run's own git was
+    still pointed at — breaking every git call for the rest of the run.
+    `publish` must refuse up front, before any git call or import, whenever its own
+    process carries the redirect a dispatched run's shell always does
+    (`dispatch_env`'s `GIT_OBJECT_DIRECTORY`/`GIT_ALTERNATE_OBJECT_DIRECTORIES`).
+    `publish` is the orchestrator's own step, run after the run has ended."""
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(tmp_path / "private"))
+    calls = []
+    monkeypatch.setattr(agentctl.subprocess, "run",
+                        lambda *a, **k: calls.append(("subprocess.run", a, k)))
+    monkeypatch.setattr(agentctl.W, "import_leftover_private_objects",
+                        lambda *a, **k: calls.append(("import_leftover_private_objects", a, k)))
+    monkeypatch.setattr(agentctl.RS, "import_private_objects",
+                        lambda *a, **k: calls.append(("import_private_objects", a, k)))
+
+    # A worktree that doesn't even exist — the refusal must fire before this
+    # (or any other) path is even resolved, let alone touched.
+    rc = agentctl.cmd_publish(_publish_args(tmp_path / "nonexistent-wt"))
+
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "REFUSED" in err
+    assert "orchestrator's step" in err
+    assert calls == [], "no subprocess call and no import before the refusal"
+
+
 def _publish_args(wt, **over):
     import types
     base = dict(worktree=str(wt), run=None, repo=None, purpose=None, pr=None, dry_run=True)
@@ -10042,6 +10245,7 @@ def test_publish_pushes_a_commit_the_run_made_in_its_own_private_object_store(
     RS.import_private_objects(git_dir, private_dir)
 
     monkeypatch.setattr(agentctl, "_ruff_format_gate", lambda _wt: 0)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", lambda *a, **k: 0)
     rc = agentctl.cmd_publish(_publish_args(wt, dry_run=False))
     err = capsys.readouterr().err
     assert rc == 0, err
@@ -10092,6 +10296,7 @@ def test_publish_imports_a_commit_its_dispatcher_died_before_importing(
     # Deliberately NO RS.import_private_objects call — the dispatcher never ran it.
 
     monkeypatch.setattr(agentctl, "_ruff_format_gate", lambda _wt: 0)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", lambda *a, **k: 0)
     rc = agentctl.cmd_publish(_publish_args(wt, dry_run=False))
     err = capsys.readouterr().err
     assert rc == 0, err
@@ -10101,6 +10306,119 @@ def test_publish_imports_a_commit_its_dispatcher_died_before_importing(
         ["git", "--git-dir", str(origin), "show", f"{head}:f.py"],
         capture_output=True, text=True, check=True).stdout
     assert shown == "made in the private store, dispatcher died\n"
+
+
+def test_publish_imports_private_objects_only_when_head_is_unreadable(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """The targeted gate (issue_01M4RP1K026XJE740DMQ7AP31M, round 2 of the
+    knowledge#793 family): publish imports the run's private objects when, and only
+    when, `git cat-file -e HEAD^{commit}` fails — the exact check `rev-parse HEAD`
+    cannot make, since it reads the ref file and never the object. Same fixture as
+    the test above; this one SPIES on `RS.import_private_objects` (delegating to the
+    real call) to pin that it ran, and with `remove=False` — a push that failed
+    right after must not have already deleted the one copy of the commit it just
+    proved exists."""
+    import run_sandbox as RS
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    primary = tmp_path / "primary"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True)
+
+    def g(*a, cwd=primary, env=None):
+        return subprocess.run(
+            ["git", "-C", str(cwd), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True, env=env)
+
+    g("commit", "-q", "--allow-empty", "-m", "base")
+    g("remote", "add", "origin", str(origin))
+    g("push", "-q", "origin", "main")
+    wt = tmp_path / "wt"
+    g("worktree", "add", "-q", "-b", "agent/unreadable-head-test", str(wt))
+
+    git_dir = RS.git_common_dir(wt)
+    private_dir = RS.run_private_objects_dir(wt, git_dir)
+    private_dir.mkdir()
+    # A dispatched test run's OWN PATH carries a `git` wrapper (`dispatch_env.py`)
+    # that drops GIT_OBJECT_DIRECTORY/GIT_ALTERNATE_OBJECT_DIRECTORIES for any
+    # repository other than that run's own (compared against
+    # AGENTCTL_OWN_GIT_COMMON_DIR) — this fixture's `wt` is never that run's own
+    # repository, so without this the wrapper would silence the redirect for
+    # EVERY git call below, this test's own setup and `RS.import_private_objects`'s
+    # real internal calls alike, and "made only in the private store" would
+    # silently land in the shared store like any other commit. Pointing the var at
+    # THIS fixture's own `git_dir` makes every call below match it instead.
+    monkeypatch.setenv("AGENTCTL_OWN_GIT_COMMON_DIR", str(git_dir))
+    env = {**os.environ, "GIT_OBJECT_DIRECTORY": str(private_dir),
+          "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(git_dir / "objects")}
+    (wt / "f.py").write_text("made in the private store only\n")
+    g("add", ".", cwd=wt, env=env)
+    g("commit", "-qm", "private-store work", cwd=wt, env=env)
+    head = g("rev-parse", "HEAD", cwd=wt).stdout.strip()
+    # No import call at all yet — HEAD is unreadable from the shared store.
+
+    calls = []
+    real_import = RS.import_private_objects
+
+    def _spy(gd, pd, **kw):
+        calls.append((gd, pd, kw))
+        return real_import(gd, pd, **kw)
+    monkeypatch.setattr(agentctl.RS, "import_private_objects", _spy)
+    monkeypatch.setattr(agentctl, "_ruff_format_gate", lambda _wt: 0)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", lambda *a, **k: 0)
+    rc = agentctl.cmd_publish(_publish_args(wt, dry_run=False))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert "REFUSED" not in err and "FAILED" not in err
+
+    assert calls == [(git_dir, private_dir, {"remove": False})]
+    shown = subprocess.run(
+        ["git", "--git-dir", str(origin), "show", f"{head}:f.py"],
+        capture_output=True, text=True, check=True).stdout
+    assert shown == "made in the private store only\n"
+
+
+def test_publish_does_not_import_when_head_is_already_readable(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """The other half of the same gate: an ORDINARY push, with no dead run and no
+    private store involved at all, must not fork the four git subprocesses
+    `import_private_objects` makes on every single publish — only when HEAD is
+    actually unreadable."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    primary = tmp_path / "primary"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(primary)], check=True)
+
+    def g(*a, cwd=primary, env=None):
+        return subprocess.run(
+            ["git", "-C", str(cwd), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True, env=env)
+
+    g("commit", "-q", "--allow-empty", "-m", "base")
+    g("remote", "add", "origin", str(origin))
+    g("push", "-q", "origin", "main")
+    wt = tmp_path / "wt"
+    g("worktree", "add", "-q", "-b", "agent/readable-head-test", str(wt))
+    (wt / "f.py").write_text("made directly in the shared store\n")
+    g("add", ".", cwd=wt)
+    g("commit", "-qm", "ordinary work", cwd=wt)
+    head = g("rev-parse", "HEAD", cwd=wt).stdout.strip()
+    # HEAD is readable from the shared store straight away — no dead run involved.
+
+    calls = []
+    monkeypatch.setattr(agentctl.RS, "import_private_objects",
+                        lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(agentctl, "_ruff_format_gate", lambda _wt: 0)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", lambda *a, **k: 0)
+    rc = agentctl.cmd_publish(_publish_args(wt, dry_run=False))
+    err = capsys.readouterr().err
+    assert rc == 0, err
+    assert "REFUSED" not in err and "FAILED" not in err
+    assert calls == [], "head was already readable — the import must not be called"
+
+    shown = subprocess.run(
+        ["git", "--git-dir", str(origin), "show", f"{head}:f.py"],
+        capture_output=True, text=True, check=True).stdout
+    assert shown == "made directly in the shared store\n"
 
 
 def test_default_base_falls_back_to_main_when_origin_head_is_unset(agentctl):
@@ -10396,6 +10714,30 @@ def _fake_run_for_pr_open(created):
         return R()
 
     return run
+
+
+def test_pr_open_refuses_inside_a_dispatched_runs_own_object_redirected_env(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Same guard as `publish` (CQ·477): `cmd_pr_open` also calls
+    `W.import_leftover_private_objects` (default `remove=True`) on the resolved
+    worktree, unconditionally, with no in-use check of its own — the second
+    unguarded path to the same deletion. Refuses up front, before that call or any
+    git/gh subprocess, on the same signal `publish` refuses on."""
+    wt = _pr_open_worktree(tmp_path)
+    monkeypatch.setenv("GIT_ALTERNATE_OBJECT_DIRECTORIES", str(tmp_path / "shared"))
+    calls = []
+    monkeypatch.setattr(agentctl.subprocess, "run",
+                        lambda *a, **k: calls.append(("subprocess.run", a, k)))
+    monkeypatch.setattr(agentctl.W, "import_leftover_private_objects",
+                        lambda *a, **k: calls.append(("import_leftover_private_objects", a, k)))
+
+    rc = agentctl.main(["pr-open", str(wt), "--title", "feat: a thing"])
+
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "REFUSED" in err
+    assert "orchestrator's step" in err
+    assert calls == [], "no subprocess call and no import before the refusal"
 
 
 def test_pr_open_opens_a_draft_by_default(agentctl, monkeypatch, tmp_path):
@@ -13439,6 +13781,204 @@ def _finalize(agentctl, rd, wt, run_id="run-test", dry_run=False):
     return json.loads((rd / "outcome.json").read_text())["exit_status"]
 
 
+# --- private-object import: retry, and the committed_private_only outcome -----
+#
+# issue_01M4RP1K026XJE740DMQ7AP31M (run-89f78c3f, 2026-10-12): the box hit its
+# per-user process limit mid-run, every fork failed with BlockingIOError/EAGAIN,
+# and `_finalize_run` crashed inside `_commits_since` BEFORE it imported the run's
+# own objects into the shared store — leaving the commit reachable only from the
+# run's private object directory, with no outcome.json ever written at all.
+
+
+def test_finalize_retries_a_transient_private_import_failure_and_succeeds(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """The first attempts raise BlockingIOError (the exact EAGAIN-on-fork shape of
+    run-89f78c3f); a later attempt within the retry budget succeeds. Finalize must
+    import the objects (not give up early) and write a NORMAL outcome — proving the
+    rest of finalize's own logic (the committed_not_pushed check here) still runs
+    against a worktree whose commit the import call already rejoined."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda _s: None)
+    calls = []
+
+    def _flaky(git_dir, private_dir, **kw):
+        calls.append((git_dir, private_dir, kw))
+        if len(calls) < 3:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+    monkeypatch.setattr(agentctl.RS, "import_private_objects", _flaky)
+
+    rd, wt = _mk_worker_run_dir(tmp_path, pre_existing_commits=1, with_commit=True,
+                                with_remote_configured=True)
+    git_dir = tmp_path / "git-dir"
+    private_dir = tmp_path / "private-dir"
+    agentctl._finalize_run(run_dir=rd, worktree=wt, run_id="run-test", exit_code=0,
+                           final_event={"type": "result", "subtype": "success"},
+                           profile="agent-platform/daytime", agent={"model_alias": "sonnet"},
+                           git_dir=git_dir, private_objects_dir=private_dir)
+
+    assert len(calls) == 3, "two failed attempts, then a third that succeeded"
+    assert calls == [(git_dir, private_dir, {})] * 3
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "committed_not_pushed", \
+        "a normal outcome — the retry succeeding must not itself become the story"
+    assert "error_reason" not in outcome
+    err = capsys.readouterr().err
+    assert err.count("retrying") == 2
+
+
+def test_finalize_records_committed_private_only_when_every_retry_fails(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Every attempt raises — the exact shape run-89f78c3f hit eight times running.
+    Finalize must not crash (the bug: it used to reach this point only AFTER
+    `_commits_since`, so a second, unrelated fork failure there crashed with no
+    outcome written at all) and must not stay silent about it either: the outcome
+    gets its own state naming the private directory, not a bare `completed`."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda _s: None)
+    calls = []
+
+    def _always_fails(git_dir, private_dir, **kw):
+        calls.append((git_dir, private_dir, kw))
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+    monkeypatch.setattr(agentctl.RS, "import_private_objects", _always_fails)
+
+    rd, wt = _mk_worker_run_dir(tmp_path, pre_existing_commits=1, with_commit=True,
+                                with_remote_configured=True)
+    git_dir = tmp_path / "git-dir"
+    private_dir = tmp_path / "private-dir"
+    agentctl._finalize_run(run_dir=rd, worktree=wt, run_id="run-test", exit_code=0,
+                           final_event={"type": "result", "subtype": "success"},
+                           profile="agent-platform/daytime", agent={"model_alias": "sonnet"},
+                           git_dir=git_dir, private_objects_dir=private_dir)
+
+    assert len(calls) == agentctl._PRIVATE_IMPORT_RETRY_ATTEMPTS
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "committed_private_only"
+    assert str(private_dir) in outcome["error_reason"]
+    assert "BlockingIOError" in outcome["error_reason"]
+    assert "agentctl publish --run run-test" in outcome["error_reason"]
+    err = capsys.readouterr().err
+    assert "COMMITTED, but" in err
+    assert "do not re-dispatch" in err
+
+
+def test_finalize_lets_committed_private_only_outrank_a_cost_stop(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """A run can cross its cost/token cap AND strand its commits in its private
+    object store in the same run (the cap fires, the harness tears the process
+    down, and the end-of-run import then fails too). `committed_private_only`
+    must win: stranded work needs its `agentctl publish --run <id>` recovery
+    line surfaced, which the benign `cost_stopped` status would bury. Neither
+    reason is lost — the private-import reason (with its publish command) and
+    the cost reason both land in error_reason. Fails against the rebased code
+    with the precedence change reverted (cost_stopped applied before this
+    override's _safety_downgrade_applied guard existed), on the status
+    assertion: that code reads `exit_status == "cost_stopped"` here instead."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda _s: None)
+
+    def _always_fails(git_dir, private_dir, **kw):
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+    monkeypatch.setattr(agentctl.RS, "import_private_objects", _always_fails)
+
+    rd, wt = _mk_worker_run_dir(tmp_path, pre_existing_commits=1, with_commit=True,
+                                with_remote_configured=True)
+    git_dir = tmp_path / "git-dir"
+    private_dir = tmp_path / "private-dir"
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test", exit_code=1, final_event=None,
+        profile="agent-platform/daytime", agent={"model_alias": "sonnet"},
+        git_dir=git_dir, private_objects_dir=private_dir,
+        cost_stopped_reason="gateway spend $12.50 exceeded per-run cap $10.00")
+
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "committed_private_only"
+    assert "agentctl publish --run run-test" in outcome["error_reason"]
+    assert "exceeded per-run cap $10.00" in outcome["error_reason"]
+    err = capsys.readouterr().err
+    assert "COMMITTED, but" in err
+
+
+def test_finalize_lets_the_arch397_downgrade_outrank_committed_private_only(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Security review, PR #874 round 3: the override above used to gate only on
+    `exit_status != "primary_mutated"`, not on whether ARCH-397 had already
+    fired — and a review run has write access to its OWN private-objects
+    directory for its whole execution window, so a run that lets its own stamp
+    go unposted and ALSO makes its own import fail got the worse of the two
+    bypasses this class covers: the missing-stamp finding, recorded as
+    `errored`, was silently overwritten by the benign-reading
+    `committed_private_only`, whose own `wait` advice ("do not re-dispatch") is
+    exactly wrong for a review that never stamped. Both facts must survive: the
+    status says `errored` and `error_reason` carries both the missing-stamp
+    reason and the private-import reason (with its publish command), the same
+    way the cost reason rides alongside a winning safety downgrade above.
+    Fails against the pre-fix code on the status assertion: that code reads
+    `exit_status == "committed_private_only"` here instead."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda *a, **k: {"comments": []})  # no stamp
+    monkeypatch.setattr(agentctl.time, "sleep", lambda _s: None)
+
+    def _always_fails(git_dir, private_dir, **kw):
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+    monkeypatch.setattr(agentctl.RS, "import_private_objects", _always_fails)
+
+    rd, wt = _mk_review_run_dir(tmp_path)  # pr="5", repo="agent-platform"
+    git_dir = tmp_path / "git-dir"
+    private_dir = tmp_path / "private-dir"
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test", exit_code=0,
+        final_event={"type": "result", "subtype": "success"},
+        profile="agent-platform/daytime", agent={"model_alias": "sonnet"},
+        git_dir=git_dir, private_objects_dir=private_dir)
+
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "errored"
+    assert "without posting a review stamp" in outcome["error_reason"]
+    assert "agentctl publish --run run-test" in outcome["error_reason"]
+    assert str(private_dir) in outcome["error_reason"]
+    err = capsys.readouterr().err
+    assert "COMPLETED WITHOUT POSTING" in err
+    assert "status stays 'errored', the more serious finding" in err
+
+
+def test_finalize_private_import_failure_still_wins_for_a_non_review_run(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Negative control for the fix above (security review, PR #874 round 3):
+    ARCH-397 only ever fires for a review agent against a PR, so a non-review
+    run's `_safety_downgrade_applied` stays False and `committed_private_only`
+    must still win exactly as it did before this change — the new gate must
+    not have widened past the one case it exists to catch."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda _s: None)
+
+    def _always_fails(git_dir, private_dir, **kw):
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+    monkeypatch.setattr(agentctl.RS, "import_private_objects", _always_fails)
+
+    rd, wt = _mk_review_run_dir(tmp_path, agent="bug-fixer")
+    git_dir = tmp_path / "git-dir"
+    private_dir = tmp_path / "private-dir"
+    agentctl._finalize_run(
+        run_dir=rd, worktree=wt, run_id="run-test", exit_code=0,
+        final_event={"type": "result", "subtype": "success"},
+        profile="agent-platform/daytime", agent={"model_alias": "sonnet"},
+        git_dir=git_dir, private_objects_dir=private_dir)
+
+    outcome = json.loads((rd / "outcome.json").read_text())
+    assert outcome["exit_status"] == "committed_private_only"
+    assert "agentctl publish --run run-test" in outcome["error_reason"]
+    err = capsys.readouterr().err
+    assert "COMMITTED, but" in err
+
+
+def test_finalize_private_import_failure_is_a_wait_failure_status(agentctl):
+    """`agentctl wait` must report this as a failure (exit 4, `error_reason` shown)
+    rather than reading it as success or an unrecognised status — the whole point
+    of giving it its own name instead of leaving the run with no outcome at all."""
+    assert "committed_private_only" in agentctl.WAIT_FAILURE_STATUSES
+
+
 def test_arch397_review_run_that_did_not_post_is_errored(agentctl, tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
     monkeypatch.setattr(agentctl, "_gh_pr_json", lambda *a, **k: {"comments": []})  # no stamp
@@ -13987,6 +14527,7 @@ def test_committed_not_pushed_publish_promotes_to_completed(agentctl, tmp_path,
     import types
     monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
     monkeypatch.setattr(agentctl, "_ruff_format_gate", lambda _wt: 0)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", lambda *a, **k: 0)
 
     # Build the run dir and a production-representative worktree by hand so the git
     # layout is unambiguous: base on main, worker commit on a feature branch, remote
@@ -14062,6 +14603,7 @@ def test_committed_not_pushed_publish_promotes_via_repo_purpose(agentctl, tmp_pa
     import types
     monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
     monkeypatch.setattr(agentctl, "_ruff_format_gate", lambda _wt: 0)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", lambda *a, **k: 0)
 
     # Build a fake RUNS_ROOT with one date dir containing the run.
     runs_root = tmp_path / "agent-runs"
@@ -14827,6 +15369,105 @@ def test_typecheck_table_covers_the_repos_whose_ci_typechecks(agentctl):
     # other gate does. Pinned so it cannot be dropped as noise.
     assert agentctl._TYPECHECK_GATES["convivy-deck"][1] == [
         "swift", "build", "--disable-automatic-resolution"]
+
+
+# --- _content_scan_gate: Builder's content scan, run on the commit about to be
+# pushed (agent-platform#... — Builder's release export, 1e641c0c then four
+# reviewed PRs reintroduced a name in a day because nothing in the PR flow runs
+# this scan). Unlike the style gates above, a scan that cannot run BLOCKS the
+# push rather than warning and proceeding — see the gate's own docstring. ------
+
+def test_content_scan_gate_passes_a_clean_scan(agentctl, tmp_path, monkeypatch):
+    monkeypatch.setattr(agentctl.PS, "scan_commit", lambda repo, wt, head: None)
+    assert agentctl._content_scan_gate(tmp_path, "agent-platform", "abc123") == 0
+
+
+def test_content_scan_gate_blocks_on_findings_without_printing_a_value(
+        agentctl, tmp_path, monkeypatch, capsys):
+    def refuse(repo, wt, head):
+        raise agentctl.PS.PublishScanRefused(
+            "agent-platform at abc123 cannot be exported as it stands.\n"
+            "  content scan (1):\n    tests/fixture.py:3: an email address")
+
+    monkeypatch.setattr(agentctl.PS, "scan_commit", refuse)
+    assert agentctl._content_scan_gate(tmp_path, "agent-platform", "abc123") == 1
+    err = capsys.readouterr().err
+    assert "BLOCKED" in err
+    assert "tests/fixture.py:3: an email address" in err
+
+
+def test_content_scan_gate_blocks_when_publish_scan_is_unlinked(agentctl, tmp_path, monkeypatch, capsys):
+    """`PS is None` (the deploy-window seam `bin/agentctl`'s own fail-soft import
+    leaves) must refuse the push rather than silently behave as if nothing were
+    there to scan — the opposite default from every other fail-soft module."""
+    monkeypatch.setattr(agentctl, "PS", None)
+    assert agentctl._content_scan_gate(tmp_path, "agent-platform", "abc123") == 1
+    assert "BLOCKED" in capsys.readouterr().err
+
+
+def test_content_scan_gate_skips_a_repo_publish_engine_does_not_export(
+        agentctl, tmp_path, monkeypatch):
+    """Mirrors `scan_commit`'s own contract: returning None (not raising) for a
+    repository `publish-engine` does not know about is what lets the gate pass
+    through — `cmd_publish` must never block an unrelated repository's push."""
+    monkeypatch.setattr(agentctl.PS, "scan_commit", lambda repo, wt, head: None)
+    assert agentctl._content_scan_gate(tmp_path, "sous-chef", "abc123") == 0
+
+
+def test_cmd_publish_refuses_the_real_push_when_the_content_scan_blocks(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """THE WIRING, not just the gate function in isolation — review on the ruff
+    gates' own history flagged exactly this gap once already (every existing
+    test called a helper directly, and the real call site was where it broke)."""
+    import argparse
+    real_gate = agentctl._content_scan_gate  # _publishable stubs this; restored below
+    bare, wt = _publishable(tmp_path, monkeypatch, agentctl)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", real_gate)
+    git = _git_in(wt)
+    (wt / "app.py").write_text("code\nnew work\n")
+    git("commit", "-aqm", "fix: work")
+
+    def refuse(repo, worktree, head):
+        raise agentctl.PS.PublishScanRefused("agent-platform at abc123: content scan (1):\n"
+                                             "    app.py:1: a person's name")
+
+    monkeypatch.setattr(agentctl.PS, "scan_commit", refuse)
+    args = argparse.Namespace(worktree=str(wt), run=None, repo=None, purpose=None,
+                              pr=None, dry_run=False, skip_checks=False, force=False)
+    rc = agentctl.cmd_publish(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "BLOCKED by Builder's content scan" in err
+    import subprocess as sp
+    remote_feature = sp.run(["git", "-C", str(bare), "rev-parse", "feature"],
+                            capture_output=True, text=True).stdout.strip()
+    local_head = git("rev-parse", "HEAD").stdout.strip()
+    assert remote_feature != local_head, "the unscanned commit must never reach origin"
+
+
+def test_content_scan_gate_runs_even_when_skip_checks_is_set(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """`--skip-checks` is documented (and tested, `test_skip_checks_is_logged`) as
+    covering lint/format/typecheck only; the content scan is not one of those
+    style checks and must still run — and still block — under `--skip-checks`."""
+    import argparse
+    real_gate = agentctl._content_scan_gate  # _publishable stubs this; restored below
+    _, wt = _publishable(tmp_path, monkeypatch, agentctl)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", real_gate)
+    git = _git_in(wt)
+    (wt / "app.py").write_text("code\nnew work\n")
+    git("commit", "-aqm", "fix: work")
+
+    def refuse(repo, worktree, head):
+        raise agentctl.PS.PublishScanRefused("agent-platform at abc123: content scan (1):\n"
+                                             "    app.py:1: a person's name")
+
+    monkeypatch.setattr(agentctl.PS, "scan_commit", refuse)
+    args = argparse.Namespace(worktree=str(wt), run=None, repo=None, purpose=None,
+                              pr=None, dry_run=False, skip_checks=True, force=False)
+    rc = agentctl.cmd_publish(args)
+    assert rc == 1
+    assert "BLOCKED by Builder's content scan" in capsys.readouterr().err
 
 
 def test_skip_checks_is_logged(agentctl, tmp_path, monkeypatch):
@@ -16261,6 +16902,38 @@ def test_wait_does_not_fail_on_the_two_statuses_that_are_not_failures(
     assert agentctl._wait_for_runs([f"run-{status[:8]}"], timeout=5, poll=0.01) == 0
 
 
+def test_wait_does_not_tell_the_caller_to_redispatch_a_private_only_run(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Reviewer, PR #870 round 1. A `committed_private_only` run's per-run line
+    (from `error_reason`) already says "do not re-dispatch" — the commits exist,
+    just not yet in the shared store, and `agentctl publish --run <id>` recovers
+    them. Before this fix the status fell into the generic `barren` bucket, whose
+    message says "Re-dispatch" in the very next line: the same invocation told
+    the caller both to re-dispatch and not to, which is the contradiction a
+    caller reading only the aggregate line would act on."""
+    import telemetry as T
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path)
+    _finished_run(agentctl, T, tmp_path, "run-priv01", "committed_private_only",
+                 error_reason=("private-object import failed after retrying "
+                               "(OSError: ...); commits exist only in "
+                               "/tmp/x/private-objects. `agentctl publish "
+                               "--run run-priv01` imports them and pushes — "
+                               "do not re-dispatch."))
+    rc = agentctl._wait_for_runs(["run-priv01"], timeout=5, poll=0.01)
+
+    assert rc == agentctl.EXIT_RUN_FAILED, "still a failure status — the exit is unchanged"
+    err = capsys.readouterr().err
+    assert "Nothing was published" not in err, \
+        "the commits exist; this is the false sentence from the barren bucket"
+    assert "Re-dispatch, and check the worktree" not in err, \
+        "the generic barren advice, which contradicts the per-run line above it"
+    assert "Do NOT re-dispatch" in err, \
+        "the aggregate message must carry the same instruction as error_reason"
+    assert "agentctl publish --run" in err
+    assert "run-priv01" in err
+
+
 def test_wait_does_not_tell_the_caller_a_mutated_run_published_nothing(
         agentctl, tmp_path, monkeypatch, capsys):
     """`issue_01KZ94NMS1CD2FQBEG5X1JWH83`. `primary_mutated` is assigned in
@@ -16300,6 +16973,50 @@ def test_wait_still_says_nothing_was_published_for_a_run_that_produced_nothing(
     err = capsys.readouterr().err
     assert "Nothing was published" in err
     assert "should be read" not in err, "and must not invite reading a result there is none of"
+
+
+def test_wait_reports_cost_stopped_as_a_failure_with_budget_advice(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """A cost-stopped run is still a failure (clause 9 of the budget-enforcement
+    epic), and gets its own budget-specific advice ("re-dispatching as-is
+    repeats the same spend"). Reviewer, PR #874 round 1: it ALSO goes through
+    the barren bucket's generic committed-work detection — a run the cap killed
+    can still have committed real work first, and that instruction must not be
+    withheld just because this status also carries its own note."""
+    import telemetry as T
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path)
+    _finished_run(agentctl, T, tmp_path, "run-cost01", "cost_stopped",
+                  error_reason="gateway spend $12.50 exceeded per-run cap $10.00")
+    rc = agentctl._wait_for_runs(["run-cost01"], timeout=5, poll=0.01)
+    assert rc == agentctl.EXIT_RUN_FAILED
+    err = capsys.readouterr().err
+    assert "run-cost01 FAILED" in err
+    assert "budget" in err.lower()
+    assert "Re-dispatching as-is repeats the same spend" in err
+    assert "check the worktree for local commits" in err, (
+        "a cost-capped run can still have committed real work before the cap "
+        "fired, and the generic barren-bucket instruction must say so")
+
+
+def test_wait_names_the_commit_instruction_and_budget_advice_together_for_cost_stopped(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Reviewer, PR #874 round 1, finding 2: a run killed by its cap AFTER
+    committing real work must not get only the budget note — it must also get
+    the same "check the worktree for local commits" instruction any other
+    killed run gets, so the caller knows there may be something to recover.
+    Fails against the pre-fix branch, which excluded `cost_stopped` from the
+    `barren` bucket entirely and printed the budget note alone."""
+    import telemetry as T
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path)
+    _finished_run(agentctl, T, tmp_path, "run-cost02", "cost_stopped",
+                  error_reason="gateway tokens 500,000 exceeded per-run token cap 400,000")
+    rc = agentctl._wait_for_runs(["run-cost02"], timeout=5, poll=0.01)
+    assert rc == agentctl.EXIT_RUN_FAILED
+    err = capsys.readouterr().err
+    assert "check the worktree for local commits" in err
+    assert "Re-dispatching as-is repeats the same spend" in err
 
 
 def test_wait_separates_the_two_kinds_of_failure_in_one_batch(
@@ -17914,7 +18631,7 @@ def _stub_guard_signals(monkeypatch, *, boom=False, result=_UNSET):
 
 
 def _guard_run(agentctl, tmp_path, monkeypatch, *, leak, exit_code=0, final_event=None,
-               echo_in_worktree=(), dirty=()):
+               echo_in_worktree=(), dirty=(), cost_stopped_reason=None):
     """Baseline a fake primary root, optionally leak into it, then finalize.
 
     `echo_in_worktree` writes the same relative paths into the run's OWN worktree,
@@ -17922,6 +18639,10 @@ def _guard_run(agentctl, tmp_path, monkeypatch, *, leak, exit_code=0, final_even
     else shared the window — and therefore what lets it downgrade the run
     (`issue_01KZ94PCSF9HFQ9487FR4A3V5F`). A real leak is the same write landing at
     two roots, so a test asserting a downgrade has to stage both.
+
+    `cost_stopped_reason` lets a caller stage a run that was ALSO cost-capped,
+    to pin that the primary-mutation guard still wins (security review, PR #874
+    round 1).
     """
     import primary_guard as PG
     monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
@@ -17945,6 +18666,7 @@ def _guard_run(agentctl, tmp_path, monkeypatch, *, leak, exit_code=0, final_even
         final_event=final_event if final_event is not None
         else {"type": "result", "subtype": "success"},
         profile="agent-platform/daytime", agent={"model_alias": "sonnet"},
+        cost_stopped_reason=cost_stopped_reason,
     )
 
 
@@ -20298,7 +21020,12 @@ def test_a_record_naming_a_path_we_never_suppress_is_ignored(agentctl, tmp_path,
 
 
 def _publishable(tmp_path, monkeypatch, agentctl):
-    """A worktree with a real bare `origin`, so `cmd_publish` can actually push."""
+    """A worktree with a real bare `origin`, so `cmd_publish` can actually push.
+
+    Stubs `_content_scan_gate`: every caller here builds a throwaway repo with
+    no Shipwright checkout anywhere nearby, and this fixture is about the push
+    mechanics (repair commits, decoy refs, verification), not the content scan —
+    that gate has its own tests, below."""
     import subprocess as sp
     bare = tmp_path / "origin.git"
     sp.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
@@ -20319,6 +21046,7 @@ def _publishable(tmp_path, monkeypatch, agentctl):
         sp.run(["git", "config", k, v], cwd=wt, check=True)
     sp.run(["git", "push", "-q", "-u", "origin", "feature"], cwd=wt, check=True)
     monkeypatch.setattr(agentctl.W, "is_primary_checkout", lambda repo, path: False)
+    monkeypatch.setattr(agentctl, "_content_scan_gate", lambda *a, **k: 0)
     return bare, wt
 
 
@@ -21865,6 +22593,162 @@ def test_a_dry_run_dispatch_ignores_a_forged_profile_documents_current_line(
     assert meta.get("docs_unavailable_reason") == (
         "render did not produce a current individuation (e.g. --dry-run)")
     assert calls == [], "a dry-run dispatch must never open .profile-documents.json"
+
+
+# --- docs_consulted.json is written AT DISPATCH, not only at finalize --------
+# CQ·464: Deck's `GET /runs/<id>/docs_given` pane reads `docs_consulted.json`,
+# but `_spawn_dispatch` used to leave it unwritten until `_finalize_run` ran —
+# so a run still in flight (every run `/runs` lists) answered `docs_consulted:
+# null` for its whole execution window. Each test below stubs `_finalize_run`
+# to a no-op so whatever is on disk once `_spawn_dispatch` returns is exactly
+# the dispatch-time write — proving it exists and is correct independent of
+# whether finalize ever runs.
+
+def _fake_activate_profile_with_row(worktree, profile, *, dry_run, agent, issue,
+                                    allow_default, loaded, row_hash):
+    claude = worktree / ".claude"
+    claude.mkdir(parents=True, exist_ok=True)
+    (claude / ".profile-documents.json").write_text(json.dumps({
+        "documents": [{"id": "agent-platform/agents/scout", "kind": "agent",
+                       "body_sha256": row_hash}],
+    }))
+    loaded["profile"] = profile
+    loaded["profile_documents_current"] = True
+    return None
+
+
+def test_docs_consulted_is_written_at_dispatch_before_the_agent_exits(
+        agentctl, tmp_path, monkeypatch, runs_root):
+    """The dispatch-time write (`_spawn_dispatch`'s own call into
+    `T.write_docs_consulted`) must land before `_finalize_run` ever runs —
+    stubbed here to a no-op — with the captured `docs` and an empty
+    `queried_at_runtime`."""
+    original_create_run_dir = agentctl.T.create_run_dir
+    s = _detached_main_setup(agentctl, tmp_path, monkeypatch, runs_root, agent="scout")
+    row_hash = "1" * 64
+    monkeypatch.setattr(agentctl, "activate_profile",
+                        lambda *a, **kw: _fake_activate_profile_with_row(*a, **kw, row_hash=row_hash))
+    monkeypatch.setattr(agentctl, "_finalize_run", lambda **kw: None)
+    s.args.dry_run = True
+
+    rc, run_id = _dispatch_to_completion(agentctl, s, monkeypatch, original_create_run_dir)
+    assert rc == 0
+
+    rd = agentctl.T.run_dir(run_id)
+    consulted = json.loads((rd / "docs_consulted.json").read_text())
+    assert consulted["docs"] == [{"id": "agent-platform/agents/scout", "kind": "agent",
+                                  "body_sha256": row_hash}]
+    assert consulted["queried_at_runtime"] == []
+
+
+def test_a_skipped_render_writes_an_empty_docs_list_at_dispatch(
+        agentctl, tmp_path, monkeypatch, runs_root):
+    """A dispatch class whose render is skipped (`is_local`/primary-kept)
+    forces `materialized_documents` to `[]` — the dispatch-time write must
+    still happen, with that empty list, rather than leaving
+    `docs_consulted.json` absent for a run that will never get a render."""
+    original_create_run_dir = agentctl.T.create_run_dir
+    s = _detached_main_setup(agentctl, tmp_path, monkeypatch, runs_root, agent="cfo-ingest",
+                             resolved={"local": True})
+    (s.primary / "cfo.db").write_text("ledger\n")
+    (s.primary / ".gitignore").write_text("cfo.db\n")
+    monkeypatch.setattr(agentctl, "_finalize_run", lambda **kw: None)
+    s.args.dry_run = True
+
+    rc, run_id = _dispatch_to_completion(agentctl, s, monkeypatch, original_create_run_dir)
+    assert rc == 0
+
+    rd = agentctl.T.run_dir(run_id)
+    consulted = json.loads((rd / "docs_consulted.json").read_text())
+    assert consulted["docs"] == []
+    assert consulted["queried_at_runtime"] == []
+
+
+def test_the_dispatch_write_uses_the_captured_rows_even_if_the_worktree_changes_after(
+        agentctl, tmp_path, monkeypatch, runs_root):
+    """The dispatch-time write must use the SAME in-memory `materialized_documents`
+    `_spawn_dispatch` already captured, never re-reading
+    `.profile-documents.json` from the worktree a second time — which, by the
+    time the write actually happens, could hold whatever a racing process (or
+    this very dispatch's not-yet-started agent) left there (security review,
+    PR #740 round 1, for the pre-existing finalize-time write; the same
+    property must hold for the new dispatch-time one)."""
+    original_create_run_dir = agentctl.T.create_run_dir
+    s = _detached_main_setup(agentctl, tmp_path, monkeypatch, runs_root, agent="scout")
+    row_hash = "1" * 64
+    forged_hash = "2" * 64
+    monkeypatch.setattr(agentctl, "activate_profile",
+                        lambda *a, **kw: _fake_activate_profile_with_row(*a, **kw, row_hash=row_hash))
+
+    real_materialized = agentctl._materialized_documents
+
+    def _capture_then_mutate(worktree):
+        result = real_materialized(worktree)
+        (worktree / ".claude" / ".profile-documents.json").write_text(json.dumps({
+            "documents": [{"id": "agent-platform/agents/scout", "kind": "agent",
+                           "body_sha256": forged_hash}],
+        }))
+        return result
+    monkeypatch.setattr(agentctl, "_materialized_documents", _capture_then_mutate)
+    monkeypatch.setattr(agentctl, "_finalize_run", lambda **kw: None)
+    s.args.dry_run = True
+
+    rc, run_id = _dispatch_to_completion(agentctl, s, monkeypatch, original_create_run_dir)
+    assert rc == 0
+
+    rd = agentctl.T.run_dir(run_id)
+    consulted = json.loads((rd / "docs_consulted.json").read_text())
+    assert consulted["docs"] == [{"id": "agent-platform/agents/scout", "kind": "agent",
+                                  "body_sha256": row_hash}]
+
+
+def test_dispatch_and_finalize_agree_on_docs_and_finalize_fills_queried_at_runtime(
+        agentctl, tmp_path, monkeypatch, runs_root):
+    """`_finalize_run` rewrites `docs_consulted.json` once the run ends,
+    adding `queried_at_runtime` from the run's own tool calls — the `docs`
+    list it writes must be the IDENTICAL list the dispatch-time write already
+    put there, because both come from the one captured
+    `materialized_documents`. Snapshots the file right before `_finalize_run`
+    runs (via a spy, not a stub, so the real finalize still runs) and again
+    after, to compare the two writes directly rather than only checking the
+    final state."""
+    original_create_run_dir = agentctl.T.create_run_dir
+    s = _detached_main_setup(agentctl, tmp_path, monkeypatch, runs_root, agent="scout")
+    row_hash = "3" * 64
+    monkeypatch.setattr(agentctl, "activate_profile",
+                        lambda *a, **kw: _fake_activate_profile_with_row(*a, **kw, row_hash=row_hash))
+
+    before_finalize = {}
+    real_finalize = agentctl._finalize_run
+
+    def _spy_finalize(*, run_dir, **kw):
+        before_finalize["docs_consulted"] = json.loads(
+            (run_dir / "docs_consulted.json").read_text())
+        # Simulate a kb lookup the run made before it ended — a dry run
+        # never writes a real tool_calls.jsonl of its own.
+        (run_dir / "tool_calls.jsonl").write_text(json.dumps({
+            "timestamp": "2026-10-10T00:00:00Z", "tool_name": "mcp__kb__kb_get",
+            "input": {"id": "platform/decisions/0082"}, "result_summary": "ok",
+            "duration_ms": 1, "is_error": False,
+        }) + "\n")
+        return real_finalize(run_dir=run_dir, **kw)
+    monkeypatch.setattr(agentctl, "_finalize_run", _spy_finalize)
+    s.args.dry_run = True
+
+    rc, run_id = _dispatch_to_completion(agentctl, s, monkeypatch, original_create_run_dir)
+    assert rc == 0
+
+    rd = agentctl.T.run_dir(run_id)
+    after_finalize = json.loads((rd / "docs_consulted.json").read_text())
+    expected_docs = [{"id": "agent-platform/agents/scout", "kind": "agent",
+                      "body_sha256": row_hash}]
+
+    assert before_finalize["docs_consulted"]["docs"] == expected_docs
+    assert before_finalize["docs_consulted"]["queried_at_runtime"] == []
+    assert after_finalize["docs"] == expected_docs
+    assert after_finalize["queried_at_runtime"] == [
+        {"id": "platform/decisions/0082", "via": "mcp__kb__kb_get",
+         "args": {"id": "platform/decisions/0082"}}]
 
 
 def _record_render_skip(agentctl, tmp_path, monkeypatch, *, dry_run, render_skipped):

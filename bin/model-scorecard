@@ -40,12 +40,14 @@ CLI: `--days N` (window, default 14), `--no-write` (don't update the ledger),
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
 import sys
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from importlib.machinery import SourceFileLoader
 from itertools import zip_longest
 from pathlib import Path
 
@@ -60,6 +62,46 @@ import builder_root as BR
 RUNS_ROOT = BR.runs_root()
 LEDGER_PATH = RUNS_ROOT / "scorecard" / "scorecard.jsonl"
 JUDGE_PATH = RUNS_ROOT / "scorecard" / "judge.jsonl"
+
+
+def _load_agentctl():
+    """`bin/agentctl`, imported for its `is_gateway_model`/`is_codex_model`
+    predicates (no drift from the dispatcher's own gateway-routing and
+    `_billing_source_for` rules — ARCH-102). `bin/` CLIs are extension-less
+    and not importable as normal modules, the same reason `bin/kb-eval`
+    loads `bin/mcp-kb-server` this way."""
+    path = Path(__file__).resolve().parent / "agentctl"
+    loader = SourceFileLoader("agentctl", str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("agentctl", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+_AC = _load_agentctl()
+is_gateway_model = _AC.is_gateway_model
+is_codex_model = _AC.is_codex_model
+
+
+def ledger_lane(model: str | None) -> str | None:
+    """The Library's ledger lane for `model` — "gateway", "subscription", or
+    None when it cannot be determined (E1·6).
+
+    None covers two cases: no model on the row at all, and a Codex model
+    (`is_codex_model`). Codex runs are billed at OpenAI's API rates
+    (`telemetry.CODEX_BILLING_SOURCE`, kept a distinct `billing_source` from
+    both `subscription_credit` and the gateway's `provider_api:*` for exactly
+    this reason — the operator's 2026-09-23 decision), so labelling one
+    "subscription" would mix OpenAI-billed spend into the Anthropic
+    subscription total, the exact cross-lane mixing this field exists to
+    prevent; the Library's ledger has no third lane to hold it instead."""
+    if not model:
+        return None
+    if is_gateway_model(model):
+        return "gateway"
+    if is_codex_model(model):
+        return None
+    return "subscription"
+
 
 # Phase 3 (T3) — sampled LLM judge. Sonnet, not Opus: judging is moderate-leverage,
 # sampled (bounded $), and feeds a human-reviewed gate (ARCH-020/079 tiering). The
@@ -173,6 +215,10 @@ def build_row(run: dict, pr: dict | None, ci_first_pass,
         "model": meta.get("model"),
         "billing_source": meta.get("billing_source"),
         "repo": meta.get("repo"),
+        # The work item the dispatch named (`agentctl spawn --issue`), carried through
+        # to `report_to_ledger` so the ledger's own `epic_id` (derived server-side from
+        # this) lets a Course's per-epic cost reconcile against it (E16·5).
+        "item_id": meta.get("issue"),
         "cost_usd": round(float(cost.get("usd", 0.0) or 0.0), 6),
         "exit_status": run["outcome"].get("exit_status"),
         "pr_number": None,
@@ -259,6 +305,21 @@ def report_to_ledger(rows: list[dict]) -> dict:
     collides at the Library and is answered with the existing entry rather
     than double-counted.
 
+    `item_id` is sent only when `build_row` recorded one (`meta.issue`
+    at dispatch time) — E16·5, the counterpart `cost_join.reconcile_epic_cost`
+    reads against. A run dispatched before this change, or with no work item
+    named, posts exactly as it did before: no `item_id`, `epic_id: null` at
+    the Library, and it reconciles as the ledger's own "run only in the run
+    records" bucket rather than a mismatch.
+
+    `lane` (`ledger_lane`, "gateway" or "subscription") is computed from each
+    row's `model` and sent on every posted entry (E1·6). A row whose lane
+    can't be determined is never posted — the Library refuses to mix gateway
+    and subscription totals, so guessing a lane would risk exactly that — and
+    is counted into `errors` instead, with status `"skip:no-lane"` and a
+    reason naming the model, the same way the harvest's other skips are
+    reported.
+
     Best-effort over the WHOLE set: one row's refusal or an unreachable
     Library never stops the rest, and never undoes the local upsert this
     pass already wrote — `issue_client.post_ledger_entry` itself never
@@ -273,9 +334,17 @@ def report_to_ledger(rows: list[dict]) -> dict:
     errors: list[tuple[str, str, str]] = []
     for r in rows:
         run_id = r["run_id"]
+        model = r.get("model")
+        lane = ledger_lane(model)
+        if lane is None:
+            errors.append((run_id, "skip:no-lane", f"no ledger lane for model {model!r}"))
+            continue
+        kwargs = {"agent": r.get("agent"), "model": model}
+        if r.get("item_id"):
+            kwargs["item_id"] = r["item_id"]
         res = issue_client.post_ledger_entry(
             r.get("repo"), r.get("cost_usd"), run_id=run_id, dedup_key=run_id,
-            agent=r.get("agent"), model=r.get("model"))
+            lane=lane, **kwargs)
         status = res.get("status")
         if status == "recorded":
             recorded += 1

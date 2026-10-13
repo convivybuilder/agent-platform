@@ -194,6 +194,62 @@ def test_list_courses_raises_without_a_token(monkeypatch):
         bc.list_courses("bosun")
 
 
+def test_list_corrections_queues_builds_url_and_returns_the_list(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _Resp(200, {"corrections_queues": [{"id": "cq_1", "product": "bosun"}]})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    queues = bc.list_corrections_queues("bosun", tok="t")
+    assert queues == [{"id": "cq_1", "product": "bosun"}]
+    assert "product=bosun" in captured["url"]
+
+
+def test_list_corrections_queues_empty_list_reads_as_no_queues(monkeypatch):
+    """The Library-confirmed shape: a product with no queue gets a 200 with
+    an empty `corrections_queues` list, not a 404."""
+    monkeypatch.setattr(bc.urllib.request, "urlopen",
+                        lambda *_a, **_k: _Resp(200, {"corrections_queues": [], "count": 0}))
+    assert bc.list_corrections_queues("bosun", tok="t") == []
+
+
+def test_list_corrections_queues_404_reads_as_no_queues_not_an_error(monkeypatch):
+    """A 404 means the route does not exist yet (the deploy has not landed),
+    which is indistinguishable from "no queue exists" to a caller, since no
+    item can carry a queue parent before that same deploy either."""
+    def not_found(req, timeout=None):
+        raise bc.urllib.error.HTTPError(req.full_url, 404, "not found", {}, None)
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", not_found)
+    assert bc.list_corrections_queues(tok="t") == []
+
+
+def test_list_corrections_queues_raises_on_a_5xx_rather_than_reading_as_empty(monkeypatch):
+    """Unlike a 404, a 5xx is not "no queues exist" — it is "unknown" — so a
+    caller must not read it as the empty set."""
+    def server_error(req, timeout=None):
+        raise bc.urllib.error.HTTPError(req.full_url, 503, "Service Unavailable", {}, None)
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", server_error)
+    with pytest.raises(bc.IssueQueueUnavailable):
+        bc.list_corrections_queues(tok="t")
+
+
+def test_list_corrections_queues_raises_rather_than_reading_as_empty(monkeypatch):
+    monkeypatch.setattr(bc.urllib.request, "urlopen",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("down")))
+    with pytest.raises(bc.IssueQueueUnavailable):
+        bc.list_corrections_queues(tok="t")
+
+
+def test_list_corrections_queues_raises_without_a_token(monkeypatch):
+    monkeypatch.setattr(bc, "token", lambda: None)
+    with pytest.raises(bc.IssueQueueUnavailable):
+        bc.list_corrections_queues()
+
+
 def test_claim_issue_posts_and_returns_item(monkeypatch):
     captured = {}
 
@@ -518,25 +574,33 @@ def test_the_client_and_server_agree_on_the_resolutions():
         f"client {sorted(bc.RESOLVED_STATES)} != server {sorted(server)}")
 
 
-def test_the_ops_server_advertises_the_types_the_library_accepts(mcp_ops_server):
-    """`bin/mcp-ops-server`'s `issue_create`/`issue_list` docstrings are the only
-    place an agent learns what `type` accepts before filing or filtering — a type
-    the docstring names but the Library rejects is a 400 the agent discovers
-    mid-run, the same failure mode the kinds/severities guards above exist to
-    catch. Reads the SERVER's constant rather than a literal, for the same
-    reason those two do.
+def test_the_ops_server_advertises_only_epic_which_the_library_still_accepts(
+        mcp_ops_server):
+    """`bin/mcp-ops-server`'s `issue_create`/`issue_list` docstrings used to name
+    the Library's whole `ITEM_TYPES` set so an agent would learn every value to
+    pass before filing or filtering — a type the docstring named but the
+    Library rejected was a 400 discovered mid-run, the same failure mode the
+    kinds/severities/resolutions guards above still catch for their own fields.
+
+    Work items are not typed (the operator, 2026-09-24): `type` dropped to one
+    settable value, `epic`, so there is no longer an enum for the two sides to
+    keep in step on. This pins the two halves of what replaced that guard: no
+    multi-value type list has crept back into either docstring, and `epic`
+    itself still names something the Library accepts — if the Library ever
+    dropped it, `issue_create`'s one remaining type value would be filing
+    nothing.
     """
     import re
     server = _server_frozenset(
         LIBRARY_STORE, "ITEM_TYPES",
         absent_skip="library not checked out; cannot read the server's types")
+    assert "epic" in server, (
+        "the Library dropped `epic` from ITEM_TYPES; issue_create's only "
+        "remaining type value no longer names anything it accepts")
     for fn in (mcp_ops_server.issue_create, mcp_ops_server.issue_list):
-        m = re.search(r"\b([a-z]+\|[a-z]+(?:\|[a-z]+)+)\b", fn.__doc__)
-        assert m, f"{fn.__name__}'s docstring names no pipe-separated type list"
-        advertised = set(m.group(1).split("|"))
-        assert advertised == server, (
-            f"{fn.__name__} advertises {sorted(advertised)} but the Library "
-            f"accepts {sorted(server)}")
+        assert not re.search(r"\b[a-z]+\|[a-z]+(?:\|[a-z]+)+\b", fn.__doc__), (
+            f"{fn.__name__}'s docstring names a multi-value type enum again; "
+            f"work items are not typed (the operator, 2026-09-24)")
 
 
 def test_checkout_posts_owner_and_run_id_and_returns_the_lease(monkeypatch):
@@ -759,7 +823,7 @@ def test_post_ledger_entry_sends_the_documented_fields_and_dedup_key(monkeypatch
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
     res = bc.post_ledger_entry("vivy", 0.1234, run_id="run-abc", dedup_key="run-abc",
-                              agent="coder", model="claude-sonnet-5", tok="t")
+                              lane="gateway", agent="coder", model="claude-sonnet-5", tok="t")
     assert res["status"] == "recorded"
     assert res["entry"]["id"] == "entry_1"
     assert captured["url"].endswith("/ledger-entries")
@@ -767,9 +831,25 @@ def test_post_ledger_entry_sends_the_documented_fields_and_dedup_key(monkeypatch
     assert captured["protocol"] == "1"
     assert captured["body"] == {
         "product": "vivy", "source": "agentctl", "usd": 0.1234,
-        "run_id": "run-abc", "dedup_key": "run-abc",
+        "run_id": "run-abc", "dedup_key": "run-abc", "lane": "gateway",
         "agent": "coder", "model": "claude-sonnet-5",
     }
+
+
+def test_post_ledger_entry_sends_the_subscription_lane(monkeypatch):
+    """Against the unfixed code (no `lane` parameter at all), this fails with a
+    TypeError on the `lane=` keyword, not on a wrong body — the parameter itself
+    is what E1·6 adds."""
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp(200, {"recorded": True, "id": "entry_sub"})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", tok="t")
+    assert captured["body"]["lane"] == "subscription"
 
 
 def test_post_ledger_entry_omits_agent_and_model_when_absent(monkeypatch):
@@ -780,9 +860,38 @@ def test_post_ledger_entry_omits_agent_and_model_when_absent(monkeypatch):
         return _Resp(200, {"recorded": True, "id": "entry_2"})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc", tok="t")
+    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", tok="t")
     assert "agent" not in captured["body"]
     assert "model" not in captured["body"]
+
+
+def test_post_ledger_entry_sends_item_id_when_given(monkeypatch):
+    """item_id (E16·5) is what lets the Library derive the entry's epic_id, which
+    is what a per-epic cost reconciliation reads back."""
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp(200, {"recorded": True, "id": "entry_3"})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", item_id="issue_E16_5", tok="t")
+    assert captured["body"]["item_id"] == "issue_E16_5"
+
+
+def test_post_ledger_entry_omits_item_id_when_absent(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp(200, {"recorded": True, "id": "entry_4"})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", tok="t")
+    assert "item_id" not in captured["body"]
 
 
 def test_post_ledger_entry_a_rerun_sends_the_same_dedup_key(monkeypatch):
@@ -793,8 +902,10 @@ def test_post_ledger_entry_a_rerun_sends_the_same_dedup_key(monkeypatch):
         return _Resp(200, {"recorded": True, "id": "entry_1", "idempotent": len(seen) > 1})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc", tok="t")
-    bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc", tok="t")
+    bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", tok="t")
+    bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", tok="t")
     assert seen == ["run-abc", "run-abc"]
 
 
@@ -803,7 +914,8 @@ def test_post_ledger_entry_recorded_false_is_not_recorded_not_an_error(monkeypat
         bc.urllib.request, "urlopen",
         lambda *_a, **_k: _Resp(200, {"recorded": False,
                                       "reason": "no live ledger for this scope"}))
-    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc", tok="t")
+    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+                              lane="subscription", tok="t")
     assert res["status"] == "not-recorded"
 
 
@@ -814,7 +926,8 @@ def test_post_ledger_entry_a_disproportionate_refusal_is_reported_not_retried(mo
         raise bc.urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {}, io.BytesIO(body))
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", raise_422)
-    res = bc.post_ledger_entry("vivy", 999.0, run_id="run-abc", dedup_key="run-abc", tok="t")
+    res = bc.post_ledger_entry("vivy", 999.0, run_id="run-abc", dedup_key="run-abc",
+                              lane="subscription", tok="t")
     assert res["status"] == "error:422"
     assert "soft cap" in res["error"]
 
@@ -822,10 +935,125 @@ def test_post_ledger_entry_a_disproportionate_refusal_is_reported_not_retried(mo
 def test_post_ledger_entry_an_unreachable_library_is_an_error_status(monkeypatch):
     monkeypatch.setattr(bc.urllib.request, "urlopen",
                         lambda *_a, **_k: (_ for _ in ()).throw(OSError("down")))
-    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc", tok="t")
+    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+                              lane="subscription", tok="t")
     assert res["status"].startswith("error:")
 
 
-def test_post_ledger_entry_skips_without_a_token(monkeypatch):
+def test_post_ledger_entry_reads_the_ledger_reporter_token_file(monkeypatch, tmp_path):
+    """No `tok` override: the credential comes from LEDGER_TOKEN_PATH, not the
+    general `token()` — against the unfixed code (which falls back to
+    `token()`), this fails because `token()` is stubbed to a different value
+    than what the fake request actually carries."""
+    token_file = tmp_path / "bosun-ledger-reporter.token"
+    token_file.write_text("real-ledger-token\n")
+    monkeypatch.setattr(bc, "LEDGER_TOKEN_PATH", token_file)
+    monkeypatch.setattr(bc, "token", lambda: "wrong-general-token")
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["auth"] = req.headers.get("Authorization")
+        return _Resp(200, {"recorded": True, "id": "entry_5"})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+                              lane="subscription")
+    assert res["status"] == "recorded"
+    assert captured["auth"] == "Bearer real-ledger-token"
+
+
+def test_post_ledger_entry_skips_without_a_token_file(monkeypatch, tmp_path):
+    """No fallback to the general `token()` credential (E1·6): it lacks the
+    `ledger.spend.subscription` grant, so falling back to it would let a
+    subscription-lane entry through on a credential the Library would refuse
+    anyway — against the unfixed code (plain `token()` fallback), `token()`
+    below would supply a value and the call would NOT skip."""
+    monkeypatch.setattr(bc, "LEDGER_TOKEN_PATH", tmp_path / "missing.token")
+    monkeypatch.setattr(bc, "token", lambda: "general-token-should-not-be-used")
+    calls = []
+    monkeypatch.setattr(bc.urllib.request, "urlopen",
+                        lambda *a, **k: calls.append(1))
+    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+                              lane="subscription")
+    assert res["status"] == "skip"
+    assert calls == []
+
+
+def test_post_ledger_entry_skips_on_an_empty_token_file(monkeypatch, tmp_path):
+    empty = tmp_path / "bosun-ledger-reporter.token"
+    empty.write_text("   \n")
+    monkeypatch.setattr(bc, "LEDGER_TOKEN_PATH", empty)
+    monkeypatch.setattr(bc, "token", lambda: "general-token-should-not-be-used")
+    assert bc.post_ledger_entry(
+        "vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+        lane="subscription")["status"] == "skip"
+
+
+# --- list_ledger_entries: the read side of the Bosun's ledger writer (E16·5) --
+
+
+def test_list_ledger_entries_builds_the_url_from_every_filter(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return _Resp(200, {"entries": [], "truncated": False})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    bc.list_ledger_entries(epic_id="issue_E", item_id="issue_C", run_id="run-1",
+                           product="vivy", source="agentctl", day="2026-10-01", tok="t")
+    url = captured["url"]
+    assert "/ledger-entries?" in url
+    for pair in ("epic_id=issue_E", "item_id=issue_C", "run_id=run-1",
+                "product=vivy", "source=agentctl", "day=2026-10-01"):
+        assert pair in url
+
+
+def test_list_ledger_entries_follows_pagination(monkeypatch):
+    """A per-epic reconciliation that read only the first page would treat a partial
+    slice of the ledger as the whole one, and a real mismatch on a later page would
+    read as a clean match."""
+    pages = [
+        {"entries": [{"run_id": "run-1"}, {"run_id": "run-2"}], "truncated": True},
+        {"entries": [{"run_id": "run-3"}], "truncated": False},
+    ]
+    seen = []
+
+    def fake_urlopen(req, timeout=None):
+        seen.append(req.full_url)
+        return _Resp(200, pages[len(seen) - 1])
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    entries = bc.list_ledger_entries(epic_id="issue_E", tok="t")
+    assert [e["run_id"] for e in entries] == ["run-1", "run-2", "run-3"]
+    assert "offset=0" in seen[0] and "offset=2" in seen[1]
+
+
+def test_list_ledger_entries_stops_on_an_empty_truncated_page(monkeypatch):
+    monkeypatch.setattr(bc.urllib.request, "urlopen",
+                        lambda *_a, **_k: _Resp(200, {"entries": [], "truncated": True}))
+    assert bc.list_ledger_entries(epic_id="issue_E", tok="t") == []
+
+
+def test_list_ledger_entries_refuses_to_page_forever(monkeypatch):
+    monkeypatch.setattr(bc, "_MAX_PAGES", 3)
+    monkeypatch.setattr(bc.urllib.request, "urlopen",
+                        lambda *_a, **_k: _Resp(200, {"entries": [{"run_id": "x"}],
+                                                      "truncated": True}))
+    with pytest.raises(bc.IssueQueueUnavailable, match="refusing to keep paging"):
+        bc.list_ledger_entries(epic_id="issue_E", tok="t")
+
+
+def test_list_ledger_entries_raises_rather_than_reading_as_empty(monkeypatch):
+    """A reconciliation that read [] on an outage would report a clean match while
+    blind — the same ARCH-311 shape list_issues_by_state guards against."""
+    monkeypatch.setattr(bc.urllib.request, "urlopen",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("down")))
+    with pytest.raises(bc.IssueQueueUnavailable):
+        bc.list_ledger_entries(epic_id="issue_E", tok="t")
+
+
+def test_list_ledger_entries_raises_without_a_token(monkeypatch):
     monkeypatch.setattr(bc, "token", lambda: None)
-    assert bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc")["status"] == "skip"
+    with pytest.raises(bc.IssueQueueUnavailable):
+        bc.list_ledger_entries(epic_id="issue_E")

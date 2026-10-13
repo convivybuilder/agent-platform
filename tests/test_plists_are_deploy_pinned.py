@@ -271,11 +271,13 @@ RETIRED_OVERNIGHT_PLISTS = {
 # `overnight-resume-watchdog`, `overnight-digest-assemble`, `overnight-ledger`,
 # `overnight-manifest` and `overnight-claim` are deleted outright, not merely
 # untimered — there is no more interactive `/start-overnight` path left for them
-# to serve. `issue-queue-drain` and `launch-weekly-curation` are unrelated to the
-# overnight drain (they are their own scheduled dispatchers) and stay.
+# to serve. `launch-weekly-curation` is unrelated to the overnight drain (it is
+# its own scheduled dispatcher) and stays. `issue-queue-drain` was also kept
+# here for the same reason at the time, but by 2026-10-09 it had lost its own
+# plist and every other caller too, so it was deleted outright (work item
+# issue_01M4J3CQS16N6GX513M56ZSWPH) rather than kept in this set.
 KEPT_OVERNIGHT_PROGRAMS = {
     "launch-weekly-curation",
-    "issue-queue-drain",
 }
 
 
@@ -305,10 +307,10 @@ def test_the_retired_overnight_fleet_stays_retired():
 
 
 def test_the_overnight_machinery_itself_is_not_deleted():
-    """`issue-queue-drain` and `launch-weekly-curation` are scheduled dispatchers
-    in their own right, unrelated to the overnight drain that was removed
-    alongside its cron timers — this pins that a future cleanup pass does not
-    mistake them for overnight-drain residue and sweep them away too.
+    """`launch-weekly-curation` is a scheduled dispatcher in its own right,
+    unrelated to the overnight drain that was removed alongside its cron
+    timers — this pins that a future cleanup pass does not mistake it for
+    overnight-drain residue and sweep it away too.
     """
     missing = sorted(n for n in KEPT_OVERNIGHT_PROGRAMS
                      if not (REPO / "bin" / n).exists())

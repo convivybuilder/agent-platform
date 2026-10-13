@@ -62,10 +62,6 @@ ALLOWED: dict[tuple[str, str], str] = {
         "prose the script writes into a bead for a person or session to act on; the script calls nothing",
     ("bin/issue-pr-reconcile", "loopback `/api/issues` returns the stored `refs` dict (`{url, pr, repo}`), while"):
         "comment",
-    ("bin/issue-queue-drain", 'items = _get("/api/issues", {"state": "claimable"})'):
-        "GET read: _get is the drain's read-only client",
-    ("bin/issue-queue-drain", 'items = _get("/api/issues", {"state": "open", "needs": "operator"})'):
-        "GET read: _get is the drain's read-only client",
     ("bin/issues-waiting", 'url = vault_plane.url(f"/api/issues?{urllib.parse.urlencode(params)}")'):
         "GET read: a urllib request with no body",
     ("lib/agent-platform/issue_client.py", "orient's /api/bugs path aliases — and will be removed after all callers migrate."):
@@ -82,6 +78,9 @@ ALLOWED: dict[tuple[str, str], str] = {
         "GET read: a urllib request with no body, for a per-item route (/items/{id})",
     ("lib/agent-platform/issue_client.py", 'vault_plane.url("/api/issues?state=open") + ('):
         "GET read: a urllib request with no body",
+    ("lib/agent-platform/cost_join.py",
+     "`issue_create` now refuses bug/improvement/task, so `type` empties out as"):
+        "docstring",
     ("lib/agent-platform/tool_policy.py", "# /api/issues, `issue_get` calls GET /api/issues/{id} — so they belong on the read"):
         "comment",
     ("lib/agent-platform/vault_plane.py", "# would get wrong: `/api/issues` looks like it should become `/issues`, which the"):

@@ -377,7 +377,7 @@ mkdir -p "$LAUNCH_AGENTS"
 # /Library/LaunchDaemons via their own sudo installer — NOT the user gui domain.
 # Skip them here so a stray inert copy doesn't land in ~/Library/LaunchAgents
 # (a latent hazard if someone later bootstraps it gui-side).
-SYSTEM_DAEMON_PLISTS="com.convivy.ip-forwarding.plist com.convivy.sshd-watchdog.plist"
+SYSTEM_DAEMON_PLISTS="com.convivy.ip-forwarding.plist com.convivy.sshd-watchdog.plist com.convivy.individuator.plist"
 # This is the only record of which launchd/ plists are system-domain. A new one
 # added here without a matching entry lands in LaunchAgents as a stray inert
 # copy (already true before this file's new-job notice existed) and now also

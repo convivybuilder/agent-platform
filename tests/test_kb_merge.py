@@ -474,6 +474,230 @@ def test_carry_for_role_never_falls_back_past_the_latest_approve(lrepo):
     assert commit is None and "differs" in why
 
 
+# --- rebuilding a stale branch onto main (platform/decisions/0078, the
+# 2026-10-10 amendment) ----------------------------------------------------
+#
+# `rebuild_blocked` is `carry_blocked`'s three conditions specialised to one
+# side: there is only `head` (the PR's own stale commit, built off the OLD
+# main) and `base` (the freshly fetched, moved-on main) — no second reviewed
+# commit to compare against. Conditions 1 and 2 hold by construction (the
+# rebuilt tree IS `head`'s own changes, copied verbatim); only condition 3,
+# "has `base` itself touched a path `head` changed since it forked", is a
+# real check, so `_scenario`'s `s` (still built off the scenario's OLD main,
+# `m0`) stands in for `head` here — never `h`, which `_scenario` already
+# rebuilt.
+
+
+def test_rebuild_blocked_admits_a_transplant_onto_an_unrelated_main_move(lrepo):
+    s, h, base = _scenario(lrepo)
+    assert KM.rebuild_blocked(lrepo.path, s, base) is None
+
+
+def test_rebuild_blocked_refuses_when_main_moved_the_very_path_being_transplanted(lrepo):
+    s, h, base = _scenario(
+        lrepo, before_main={"projects/x/shared.md": "the original on main\n"},
+        pr_files={"projects/x/shared.md": "the same new text\n"})
+    lrepo.git("checkout", "-q", "--detach", base)
+    newbase = lrepo.commit({"projects/x/shared.md": "a different original, edited on "
+                                                     "main after the branch forked\n"},
+                           "main edits the shared file too", parent=base)
+    why = KM.rebuild_blocked(lrepo.path, s, newbase)
+    assert why is not None and "shared.md" in why and "moved on" in why
+
+
+def test_rebuild_blocked_admits_an_unrelated_edit_to_a_different_shared_file(lrepo):
+    """The control for the test above: `base` never touched the path `s`
+    changed, so the same scenario without the extra edit is safe."""
+    s, h, base = _scenario(
+        lrepo, before_main={"projects/x/shared.md": "the original on main\n"},
+        pr_files={"projects/x/shared.md": "the same new text\n"})
+    assert KM.rebuild_blocked(lrepo.path, s, base) is None
+
+
+def test_rebuild_blocked_refuses_when_no_merge_base_can_be_computed(lrepo):
+    s, h, base = _scenario(lrepo)
+    lrepo.git("checkout", "-q", "--orphan", "unrelated")
+    unrelated = lrepo.commit({"nothing/to/do/with.md": "a disjoint history\n"}, "orphan")
+    with pytest.raises(KM.Unreadable, match="merge-base"):
+        KM.rebuild_blocked(lrepo.path, unrelated, base)
+
+
+def test_rebuild_tree_entries_names_the_heads_own_mode_and_blob(lrepo):
+    s, h, base = _scenario(lrepo, pr_files={"projects/x/new.md": ("100755", "hello\n")})
+    entries = KM.rebuild_tree_entries(lrepo.path, s, base)
+    assert entries == [{"path": "projects/x/new.md", "mode": "100755", "type": "blob",
+                        "sha": lrepo.git("rev-parse", f"{s}:projects/x/new.md")}]
+
+
+def test_rebuild_tree_entries_removes_a_path_the_branch_deleted(lrepo):
+    s, h, base = _scenario(
+        lrepo, before_pr={"projects/x/old.md": "keep me\n"},
+        pr_files={"projects/x/new.md": "hello\n", "projects/x/old.md": None})
+    entries = {e["path"]: e for e in KM.rebuild_tree_entries(lrepo.path, s, base)}
+    assert entries["projects/x/old.md"]["sha"] is None
+    assert entries["projects/x/old.md"]["mode"] == "100644"
+    assert entries["projects/x/new.md"]["sha"] == lrepo.git(
+        "rev-parse", f"{s}:projects/x/new.md")
+
+
+def test_tree_sha_at_matches_gits_own_rev_parse(lrepo):
+    s, h, base = _scenario(lrepo)
+    assert KM.tree_sha_at(lrepo.path, base) == lrepo.git("rev-parse", f"{base}^{{tree}}")
+
+
+def test_tree_sha_at_refuses_an_unreadable_commit(lrepo):
+    s, h, base = _scenario(lrepo)
+    with pytest.raises(KM.Unreadable, match="rev-parse"):
+        KM.tree_sha_at(lrepo.path, "d" * 40)
+
+
+def test_commit_touches_projects_is_false_for_an_empty_commit(lrepo):
+    sha = lrepo.commit({}, "nothing changed")
+    assert KM.commit_touches_projects(lrepo.path, sha) is False
+
+
+def test_commit_touches_projects_is_true_when_a_file_changed(lrepo):
+    sha = lrepo.commit({"projects/x/a.md": "one\n"}, "add a")
+    assert KM.commit_touches_projects(lrepo.path, sha) is True
+
+
+def test_rebuild_message_keeps_the_subject_and_rewrites_the_trailer(lrepo):
+    sha = lrepo.commit({"projects/x/a.md": "one\n"}, "touch a")
+    message = ("docs: a change\n\nsome rationale\n\n"
+              "KB-Write: propose projects/x/a.md proposal somebody\n")
+    old_head = "f" * 40
+    msg = KM.rebuild_message(lrepo.path, [_commit(sha, message)], old_head)
+    assert msg.splitlines()[0] == "docs: a change"
+    assert "KB-Write: rebuild projects/x/a.md proposal somebody" in msg
+    assert f"KB-Rebuilt-From: {old_head}" in msg
+
+
+def test_rebuild_message_carries_every_trailer_from_every_commit(lrepo):
+    sha1 = lrepo.commit({"projects/x/a.md": "one\n"}, "touch a")
+    sha2 = lrepo.commit({"projects/x/b.md": "two\n"}, "touch b")
+    commits = [
+        _commit(sha1, "docs: a\n\nKB-Write: propose projects/x/a.md proposal first\n"),
+        _commit(sha2, "docs: a and b\n\nKB-Write: propose projects/x/b.md proposal first\n"),
+    ]
+    msg = KM.rebuild_message(lrepo.path, commits, "f" * 40)
+    assert msg.splitlines()[0] == "docs: a and b"   # the LAST commit's subject
+    assert "KB-Write: rebuild projects/x/a.md proposal first" in msg
+    assert "KB-Write: rebuild projects/x/b.md proposal first" in msg
+
+
+def test_rebuild_message_carries_every_trailer_from_one_batch_commit(lrepo):
+    sha = lrepo.commit({"projects/x/a.md": "one\n", "projects/x/b.md": "two\n"}, "batch")
+    message = ("docs: a batch\n\n"
+              "KB-Write: propose projects/x/a.md proposal somebody\n"
+              "KB-Write: propose projects/x/b.md proposal somebody\n")
+    msg = KM.rebuild_message(lrepo.path, [_commit(sha, message)], "f" * 40)
+    assert "KB-Write: rebuild projects/x/a.md proposal somebody" in msg
+    assert "KB-Write: rebuild projects/x/b.md proposal somebody" in msg
+
+
+def test_rebuild_message_refuses_a_changed_commit_with_no_parsable_trailer(lrepo):
+    sha = lrepo.commit({"projects/x/a.md": "one\n"}, "fixup by hand")
+    commits = [_commit(sha, "fixup by hand\n")]
+    with pytest.raises(KM.Unreadable, match="carries no parsable"):
+        KM.rebuild_message(lrepo.path, commits, "f" * 40)
+
+
+def test_rebuild_message_never_invents_a_holder_for_an_untouched_commit(lrepo):
+    """An empty commit changes nothing, so it may legitimately carry no
+    trailer — the refusal above is for a commit that DID change a file."""
+    sha = lrepo.commit({}, "an empty commit, no trailer")
+    commits = [_commit(sha, "an empty commit, no trailer\n")]
+    msg = KM.rebuild_message(lrepo.path, commits, "f" * 40)
+    assert "KB-Write:" not in msg
+
+
+def test_rebuild_worth_trying_is_true_when_ancestry_is_the_only_problem():
+    assert KM.rebuild_worth_trying(_facts(head_contains_base=False)) is True
+
+
+def test_rebuild_worth_trying_is_false_when_something_else_also_refuses():
+    other = {"login": "operator-account", "id": 42, "type": "User"}
+    assert KM.rebuild_worth_trying(_facts(head_contains_base=False, author=other)) is False
+
+
+def test_rebuild_worth_trying_is_false_when_the_checkout_is_unreadable():
+    assert KM.rebuild_worth_trying(
+        _facts(head_contains_base=False, git_problem="boom", policy=None,
+              changes=None, base_sha=None)) is False
+
+
+# --- the git-data-API primitives the rebuild writes with -----------------------
+
+
+def test_create_tree_posts_base_tree_and_entries():
+    seen = {}
+
+    def opener(req, timeout=None):
+        seen.update(url=req.full_url, method=req.get_method(), body=json.loads(req.data))
+        return _Resp(201, {"sha": "t" * 40})
+    entries = [{"path": "projects/x/a.md", "mode": "100644", "type": "blob", "sha": "b" * 40}]
+    assert KM.create_tree("ghs_x", "m" * 40, entries, opener=opener) == "t" * 40
+    assert seen["url"].endswith("/repos/convivy/knowledge/git/trees")
+    assert seen["method"] == "POST"
+    assert seen["body"] == {"base_tree": "m" * 40, "tree": entries}
+
+
+def test_create_tree_github_refusal_is_unreadable():
+    def opener(req, timeout=None):
+        return _Resp(422, {"message": "nope"})
+    with pytest.raises(KM.Unreadable, match="422"):
+        KM.create_tree("ghs_x", "m" * 40, [], opener=opener)
+
+
+def test_create_commit_names_the_tree_and_the_parent():
+    seen = {}
+
+    def opener(req, timeout=None):
+        seen.update(url=req.full_url, method=req.get_method(), body=json.loads(req.data))
+        return _Resp(201, {"sha": "c" * 40})
+    sha = KM.create_commit("ghs_x", "docs: x\n", "t" * 40, "m" * 40, opener=opener)
+    assert sha == "c" * 40
+    assert seen["url"].endswith("/repos/convivy/knowledge/git/commits")
+    assert seen["method"] == "POST"
+    assert seen["body"] == {"message": "docs: x\n", "tree": "t" * 40, "parents": ["m" * 40]}
+
+
+def test_create_commit_github_refusal_is_unreadable():
+    def opener(req, timeout=None):
+        return _Resp(422, {"message": "nope"})
+    with pytest.raises(KM.Unreadable, match="422"):
+        KM.create_commit("ghs_x", "docs: x\n", "t" * 40, "m" * 40, opener=opener)
+
+
+def test_update_branch_ref_force_updates_the_named_branch():
+    seen = {}
+
+    def opener(req, timeout=None):
+        seen.update(url=req.full_url, method=req.get_method(), body=json.loads(req.data))
+        return _Resp(200, {})
+    KM.update_branch_ref("ghs_x", "kb/docs-x-1234", "c" * 40, opener=opener)
+    assert seen["url"].endswith("/repos/convivy/knowledge/git/refs/heads/kb/docs-x-1234")
+    assert seen["method"] == "PATCH"
+    assert seen["body"] == {"sha": "c" * 40, "force": True}
+
+
+def test_update_branch_ref_github_refusal_is_unreadable():
+    def opener(req, timeout=None):
+        return _Resp(409, {"message": "update is not a fast forward"})
+    with pytest.raises(KM.Unreadable, match="409"):
+        KM.update_branch_ref("ghs_x", "kb/docs-x-1234", "c" * 40, opener=opener)
+
+
+@pytest.mark.parametrize("branch", ["main", "refs/heads/main", "release/kb-sounds-like-it"])
+def test_update_branch_ref_refuses_any_branch_outside_the_kb_prefix(branch):
+    """The one check standing between this write and `refs/heads/main`: no
+    request is made at all for a branch that does not start with `kb/`."""
+    def opener(req, timeout=None):
+        raise AssertionError(f"no request should be made for {branch!r}")
+    with pytest.raises(KM.Unreadable, match="does not start with"):
+        KM.update_branch_ref("ghs_x", branch, "c" * 40, opener=opener)
+
+
 # --- the Library's own config, library-app.json ---------------------------------
 
 
@@ -962,7 +1186,7 @@ def _wire(agentctl, monkeypatch, kb, *, head, gate_head=None, gate_ok=True, gate
     monkeypatch.setattr(agentctl, "_review_status_decision", fake_review)
     if dry_run:
         monkeypatch.setattr(KM, "merge_pr", never_merge)
-    args = argparse.Namespace(pr=7, repo=None, dry_run=dry_run)
+    args = argparse.Namespace(pr=7, repo=None, dry_run=dry_run, check_wait=1800.0)
     return agentctl.cmd_kb_merge(args), calls
 
 
@@ -1169,6 +1393,47 @@ def test_a_rebuild_with_identical_blobs_onto_a_moved_main_admits_on_carried_stam
     assert "every condition holds" in out
 
 
+def test_a_stale_approve_is_not_reported_as_settled_while_ci_is_pending(
+        agentctl, monkeypatch, capsys, kb):
+    """Same rebuild as the admitting case above — the carry would hold once CI
+    clears — but CI is still pending at the rebuilt head. `other` (`required
+    CI is not green`) refuses regardless of any carry, so the attempt never
+    runs. The two stale-APPROVE lines `review-status` reported must not read
+    as a settled "re-review needed": nothing here checked whether
+    `KM.carry_for_role` would admit them (agent-platform#857 — a `kb merge
+    --dry-run` read exactly this output as a finished refusal while CI was
+    still pending, and reported a carry that in fact later held as a defect).
+    The refusal itself (exit 1) is unchanged."""
+    s = kb.head
+    kb.pin(s)
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    work = kb.author_clone
+    kb.git("fetch", "-q", "origin", "main", cwd=work)
+    kb.git("checkout", "-q", "pr-branch", cwd=work)
+    kb.git("rebase", "-q", "origin/main", cwd=work)
+    h = kb.git("rev-parse", "HEAD", cwd=work)
+    kb.git("push", "-q", "-f", "origin", "HEAD:refs/pull/7/head", cwd=work)
+    kb.head = h
+    rc, _ = _wire(
+        agentctl, monkeypatch, kb, head=h, gate_ok=False,
+        gate_reasons=["required CI is not green",
+                      f"reviewer APPROVE is stale — reviewed {s}, head is {h} "
+                      f"(re-review needed)",
+                      f"security-reviewer APPROVE is stale — reviewed {s}, head is {h} "
+                      f"(re-review needed)"],
+        stamps=[_stamp("reviewer", "run-00000001", commit=s),
+               _stamp("security-reviewer", "run-00000002", commit=s)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "required CI is not green" in out
+    # Neither stale line survives verbatim...
+    assert f"reviewer APPROVE is stale — reviewed {s}" not in out
+    assert f"security-reviewer APPROVE is stale — reviewed {s}" not in out
+    # ...and each is replaced with one that says the carry was not evaluated.
+    assert f"reviewer's APPROVE reviewed {s} not yet evaluated for carry" in out
+    assert f"security-reviewer's APPROVE reviewed {s} not yet evaluated for carry" in out
+
+
 def test_a_byte_changed_at_the_rebuilt_head_is_not_carried(agentctl, monkeypatch, capsys, kb):
     s = kb.head
     kb.pin(s)
@@ -1206,6 +1471,987 @@ def test_an_unauthenticated_approve_never_carries(agentctl, monkeypatch, capsys,
     out = capsys.readouterr().out
     assert rc == 1
     assert "no carried APPROVE from reviewer: no stamp from this role to carry" in out
+
+
+# --- rebuilding a stale branch onto main — the command's own orchestration
+# (platform/decisions/0078, the 2026-10-10 amendment,
+# issue_01M4JFSBA38N836QE0VANPCWNB) -----------------------------------------
+
+
+def _config():
+    return KM.load_config()
+
+
+def test_kb_merge_write_token_mints_the_same_shape_the_merge_call_uses(agentctl, monkeypatch):
+    calls = []
+    monkeypatch.setattr(KM, "key_problem", lambda *a, **k: None)
+    monkeypatch.setattr(KM, "app_jwt", lambda *a, **k: "jwt.x.y")
+    monkeypatch.setattr(KM, "knowledge_installation",
+                        lambda jwt, **k: calls.append(("derive", jwt)) or "inst")
+    monkeypatch.setattr(KM, "installation_token",
+                        lambda jwt, inst, **k: calls.append(("mint", jwt, inst)) or "ghs_x")
+    token, problem = agentctl._kb_merge_write_token(_config())
+    assert token == "ghs_x" and problem is None
+    assert calls == [("derive", "jwt.x.y"), ("mint", "jwt.x.y", "inst")]
+
+
+def test_kb_merge_write_token_names_a_missing_key(agentctl, monkeypatch):
+    monkeypatch.setattr(KM, "key_problem", lambda *a, **k: "no key at the configured path")
+    token, problem = agentctl._kb_merge_write_token(_config())
+    assert token is None and problem == "no key at the configured path"
+
+
+def test_kb_merge_write_token_reports_an_unreadable_installation(agentctl, monkeypatch):
+    monkeypatch.setattr(KM, "key_problem", lambda *a, **k: None)
+    monkeypatch.setattr(KM, "app_jwt", lambda *a, **k: "jwt.x.y")
+
+    def boom(jwt, **k):
+        raise KM.Unreadable("count: two installations")
+    monkeypatch.setattr(KM, "knowledge_installation", boom)
+    token, problem = agentctl._kb_merge_write_token(_config())
+    assert token is None and "two installations" in problem
+
+
+def test_kb_merge_rebuild_builds_the_tree_commit_and_moves_the_branch(
+        agentctl, monkeypatch, kb):
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    facts = kb.read(s)
+    calls = []
+    monkeypatch.setattr(
+        KM, "create_tree",
+        lambda tok, base_tree, entries, **k:
+        calls.append(("tree", tok, base_tree, entries)) or "t" * 40)
+    monkeypatch.setattr(
+        KM, "create_commit",
+        lambda tok, msg, tree, parent, **k:
+        calls.append(("commit", tok, msg, tree, parent)) or "c" * 40)
+    monkeypatch.setattr(
+        KM, "update_branch_ref",
+        lambda tok, branch, sha, **k: calls.append(("ref", tok, branch, sha)))
+    monkeypatch.setattr(agentctl, "_gh_pr_json",
+                        lambda pr, fields, repo=None: {"headRefOid": s})
+    new_head, problem = agentctl._kb_merge_rebuild(
+        "convivy/knowledge", "7", facts, _config(), "ghs_x")
+    assert problem is None and new_head == "c" * 40
+    expected_base_tree = kb.git("rev-parse", f"{facts.base_sha}^{{tree}}")
+    assert calls[0][:3] == ("tree", "ghs_x", expected_base_tree)
+    assert calls[1][0] == "commit" and calls[1][1] == "ghs_x" and calls[1][4] == facts.base_sha
+    assert calls[2] == ("ref", "ghs_x", facts.head_ref, "c" * 40)
+
+
+def test_kb_merge_rebuild_refuses_without_writing_anything_when_main_moved_the_path(
+        agentctl, monkeypatch, kb):
+    kb.publish_main({"projects/x/new.md": "a change on main too\n"})
+    s = kb.head
+    facts = kb.read(s)
+
+    def boom(*a, **k):
+        raise AssertionError("no write should be attempted")
+    monkeypatch.setattr(KM, "create_tree", boom)
+    monkeypatch.setattr(KM, "create_commit", boom)
+    monkeypatch.setattr(KM, "update_branch_ref", boom)
+    new_head, problem = agentctl._kb_merge_rebuild(
+        "convivy/knowledge", "7", facts, _config(), "ghs_x")
+    assert new_head is None and "moved on" in problem
+
+
+def test_kb_merge_rebuild_refuses_and_does_not_move_the_branch_when_the_head_moved(
+        agentctl, monkeypatch, kb):
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    facts = kb.read(s)
+    monkeypatch.setattr(KM, "create_tree", lambda *a, **k: "t" * 40)
+    monkeypatch.setattr(KM, "create_commit", lambda *a, **k: "c" * 40)
+
+    def boom(*a, **k):
+        raise AssertionError("the branch must not be moved once its head has")
+    monkeypatch.setattr(KM, "update_branch_ref", boom)
+    monkeypatch.setattr(agentctl, "_gh_pr_json",
+                        lambda pr, fields, repo=None: {"headRefOid": "b" * 40})
+    new_head, problem = agentctl._kb_merge_rebuild(
+        "convivy/knowledge", "7", facts, _config(), "ghs_x")
+    assert new_head is None
+    assert "moved to" in problem and "not updating the branch" in problem
+
+
+def _check_entry(name, conclusion, run_id, when="2026-10-10T01:00:00Z"):
+    return {"name": name, "conclusion": conclusion,
+            "detailsUrl": f"https://github.com/convivy/knowledge/actions/runs/{run_id}/job/1",
+            "completedAt": when}
+
+
+def test_kb_merge_required_check_conclusions_reads_only_the_named_and_correctly_pathed_checks(
+        agentctl, monkeypatch):
+    """Keyed by GraphQL `statusCheckRollup` + (workflow file path, name) —
+    never REST `commits/<sha>/check-runs` matched by name alone (round 2
+    security finding on agent-platform#853, reopening the #182 bypass
+    ARCH-380's `_latest_per_check` closed, one level down in this rebuild
+    gate). A same-named `validate` from a workflow OTHER than
+    `.github/workflows/ci.yml` is never counted, success or not."""
+    sha = "c" * 40
+    rollup = [
+        _check_entry("kb-write-trailer", "SUCCESS", 1),
+        _check_entry("md-serial-docs", None, 2),
+        _check_entry("some-other-check", "SUCCESS", 3),
+        _check_entry("validate", "SUCCESS", 4),   # shadow: wrong workflow file
+    ]
+    path_map = {
+        1: ".github/workflows/kb-write-trailer.yml",
+        2: ".github/workflows/ci.yml",
+        3: ".github/workflows/ci.yml",
+        4: ".github/workflows/shadow.yml",
+    }
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda pr, fields, repo=None:
+                        {"headRefOid": sha, "statusCheckRollup": rollup})
+    monkeypatch.setattr(agentctl, "_workflow_path_map", lambda repo, s: path_map)
+    got = agentctl._kb_merge_required_check_conclusions("convivy/knowledge", "7", sha)
+    assert got == {"kb-write-trailer": "success", "md-serial-docs": None, "validate": None}
+
+
+def test_kb_merge_required_check_conclusions_rejects_a_shadow_validate(
+        agentctl, monkeypatch):
+    """The exact round 2 bypass, isolated: a same-named `validate` check-run
+    from a DIFFERENT workflow file, posted after the real one and SUCCESS,
+    must never shadow the real, failing `validate` from `ci.yml` — the same
+    guarantee `_latest_per_check`'s own path-keying gives the merge gate
+    (ARCH-380), now also covering this rebuild gate's REBUILD_REQUIRED_CHECKS."""
+    sha = "c" * 40
+    rollup = [
+        _check_entry("validate", "FAILURE", 1, when="2026-10-10T01:00:00Z"),
+        _check_entry("validate", "SUCCESS", 2, when="2026-10-10T01:05:00Z"),
+        _check_entry("kb-write-trailer", "SUCCESS", 3),
+        _check_entry("md-serial-docs", "SUCCESS", 4),
+    ]
+    path_map = {
+        1: ".github/workflows/ci.yml",
+        2: ".github/workflows/shadow.yml",
+        3: ".github/workflows/kb-write-trailer.yml",
+        4: ".github/workflows/ci.yml",
+    }
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda pr, fields, repo=None:
+                        {"headRefOid": sha, "statusCheckRollup": rollup})
+    monkeypatch.setattr(agentctl, "_workflow_path_map", lambda repo, s: path_map)
+    got = agentctl._kb_merge_required_check_conclusions("convivy/knowledge", "7", sha)
+    assert got["validate"] == "failure"
+
+
+def test_kb_merge_required_check_conclusions_refuses_when_head_moved(
+        agentctl, monkeypatch):
+    """A rollup read for a head other than the one being judged must never
+    be trusted for that judgment — the PR's current head may have moved
+    again while this was polling."""
+    sha = "c" * 40
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda pr, fields, repo=None:
+                        {"headRefOid": "d" * 40, "statusCheckRollup": []})
+    monkeypatch.setattr(agentctl, "_workflow_path_map", lambda repo, s: {})
+    got = agentctl._kb_merge_required_check_conclusions("convivy/knowledge", "7", sha)
+    assert isinstance(got, str)
+    assert "not the rebuilt" in got
+
+
+def test_kb_merge_required_check_conclusions_refuses_when_the_path_map_is_unreadable(
+        agentctl, monkeypatch):
+    """Never falls back to name-only keying when the workflow-path map can't
+    be built — that fallback IS the bypass this function exists to close."""
+    sha = "c" * 40
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda pr, fields, repo=None:
+                        {"headRefOid": sha, "statusCheckRollup": [
+                            _check_entry("validate", "SUCCESS", 1)]})
+    monkeypatch.setattr(agentctl, "_workflow_path_map", lambda repo, s: None)
+    got = agentctl._kb_merge_required_check_conclusions("convivy/knowledge", "7", sha)
+    assert isinstance(got, str)
+    assert "workflow-run paths" in got
+
+
+def test_kb_merge_required_check_conclusions_treats_the_known_old_head_as_not_yet_settled(
+        agentctl, monkeypatch):
+    """agent-platform#853's first live rebuild on knowledge#852: the PR API's
+    `headRefOid` can still read the PRE-rebuild head for a few seconds after
+    the force-push has landed. A caller that knows that old head must get
+    back the same "nothing has concluded yet" shape a not-yet-posted check
+    gets — never the hard, non-retryable refusal a THIRD, unrelated sha gets.
+    The unfixed code (no `old_sha` branch at all) returns a `str` refusal
+    here instead, which this pins against."""
+    sha = "c" * 40
+    old = "a" * 40
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda pr, fields, repo=None:
+                        {"headRefOid": old, "statusCheckRollup": []})
+    monkeypatch.setattr(agentctl, "_workflow_path_map", lambda repo, s: {})
+    got = agentctl._kb_merge_required_check_conclusions(
+        "convivy/knowledge", "7", sha, old_sha=old)
+    assert got == {name: None for name in KM.REBUILD_REQUIRED_CHECKS}
+
+
+def test_kb_merge_required_check_conclusions_still_refuses_a_third_sha_even_with_old_sha_known(
+        agentctl, monkeypatch):
+    """Knowing the pre-rebuild head must narrow the exemption to EXACTLY that
+    sha, not loosen the check to "anything but the rebuilt sha is fine": a
+    head that moved to a THIRD, unrelated sha is still refused even though
+    `old_sha` was passed. The unfixed-code counterexample here is "any
+    mismatch when `old_sha` is given is forgiven", which would wrongly admit
+    this and is what this pins against."""
+    sha = "c" * 40
+    old = "a" * 40
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda pr, fields, repo=None:
+                        {"headRefOid": "d" * 40, "statusCheckRollup": []})
+    monkeypatch.setattr(agentctl, "_workflow_path_map", lambda repo, s: {})
+    got = agentctl._kb_merge_required_check_conclusions(
+        "convivy/knowledge", "7", sha, old_sha=old)
+    assert isinstance(got, str)
+    assert "not the rebuilt" in got
+
+
+def test_kb_merge_await_required_checks_returns_once_every_check_has_settled(
+        agentctl, monkeypatch):
+    calls = []
+    results = iter([
+        {"kb-write-trailer": None, "md-serial-docs": None, "validate": None},
+        {"kb-write-trailer": "success", "md-serial-docs": None, "validate": None},
+        {"kb-write-trailer": "success", "md-serial-docs": "success", "validate": "success"},
+    ])
+    monkeypatch.setattr(agentctl, "_kb_merge_required_check_conclusions",
+                        lambda repo, pr, sha, **kw: next(results))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda s: calls.append(s))
+    assert agentctl._kb_merge_await_required_checks(
+        "convivy/knowledge", "7", "c" * 40, timeout=100, poll=5) is None
+    assert calls == [5, 5]
+
+
+def test_kb_merge_await_required_checks_never_waits_on_the_absence_of_pending(
+        agentctl, monkeypatch):
+    """A check that never even started reads identically to one still
+    running — the wait must settle only on an ACTUAL conclusion appearing,
+    never merely on nothing reading `pending`."""
+    monkeypatch.setattr(agentctl, "_kb_merge_required_check_conclusions",
+                        lambda repo, pr, sha, **kw: {"kb-write-trailer": "success",
+                                               "md-serial-docs": None, "validate": None})
+    times = iter([0, 0, 50, 101])
+    monkeypatch.setattr(agentctl.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda s: None)
+    problem = agentctl._kb_merge_await_required_checks(
+        "convivy/knowledge", "7", "c" * 40, timeout=100, poll=5)
+    assert problem is not None and problem.retryable is True
+    msg = problem.message
+    assert "md-serial-docs" in msg and "validate" in msg and "kb-write-trailer" not in msg
+
+
+def test_kb_merge_await_required_checks_refuses_when_validate_fails(agentctl, monkeypatch):
+    """knowledge#699: a rebuilt head whose `validate` failed must never read
+    as passed — a non-empty conclusion is not the same thing as "success"."""
+    monkeypatch.setattr(agentctl, "_kb_merge_required_check_conclusions",
+                        lambda repo, pr, sha, **kw: {"kb-write-trailer": "success",
+                                               "md-serial-docs": "success",
+                                               "validate": "failure"})
+    problem = agentctl._kb_merge_await_required_checks(
+        "convivy/knowledge", "7", "c" * 40, timeout=100, poll=5)
+    assert problem is not None and problem.retryable is False
+    assert "validate" in problem.message and "'failure'" in problem.message
+    assert "kb-write-trailer" not in problem.message
+
+
+def test_kb_merge_await_required_checks_refuses_a_cancelled_or_skipped_check(
+        agentctl, monkeypatch):
+    """`cancelled` and `skipped` are both non-empty conclusions that are not
+    "success" — accepting either is the same bug as accepting `failure`."""
+    monkeypatch.setattr(agentctl, "_kb_merge_required_check_conclusions",
+                        lambda repo, pr, sha, **kw: {"kb-write-trailer": "cancelled",
+                                               "md-serial-docs": "skipped",
+                                               "validate": "success"})
+    problem = agentctl._kb_merge_await_required_checks(
+        "convivy/knowledge", "7", "c" * 40, timeout=100, poll=5)
+    assert problem is not None and problem.retryable is False
+    assert "kb-write-trailer" in problem.message and "'cancelled'" in problem.message
+    assert "md-serial-docs" in problem.message and "'skipped'" in problem.message
+    assert "validate" not in problem.message
+
+
+def test_kb_merge_await_required_checks_refuses_non_retryably_on_an_unreadable_rollup(
+        agentctl, monkeypatch):
+    """When `_kb_merge_required_check_conclusions` cannot trust the rollup at
+    all — head moved, or the path map was unreadable — it returns a `str`,
+    and the wait must stop and refuse on the first poll rather than retry
+    the same unreadable premise until the timeout."""
+    monkeypatch.setattr(agentctl, "_kb_merge_required_check_conclusions",
+                        lambda repo, pr, sha, **kw: "convivy/knowledge#7's head is now "
+                                              "d1d1d1d1d1d1, not the rebuilt cccccc")
+    problem = agentctl._kb_merge_await_required_checks(
+        "convivy/knowledge", "7", "c" * 40, timeout=100, poll=5)
+    assert problem is not None and problem.retryable is False
+    assert "not the rebuilt" in problem.message
+
+
+def test_kb_merge_await_required_checks_forwards_old_sha_as_defense_in_depth(
+        agentctl, monkeypatch):
+    """`cmd_kb_merge` already waits out the PR API's post-rebuild lag with
+    `_kb_merge_await_head_catchup` before this ever runs — this pins the
+    second, defense-in-depth layer: `old_sha` must reach
+    `_kb_merge_required_check_conclusions` so a recurrence of that same lag
+    reads as retryable here too. The unfixed code never passes `old_sha` at
+    all, which this call-capture would catch."""
+    seen = []
+    monkeypatch.setattr(agentctl, "_kb_merge_required_check_conclusions",
+                        lambda repo, pr, sha, **kw: seen.append(kw.get("old_sha")) or
+                        {"kb-write-trailer": "success", "md-serial-docs": "success",
+                         "validate": "success"})
+    assert agentctl._kb_merge_await_required_checks(
+        "convivy/knowledge", "7", "c" * 40, timeout=100, poll=5, old_sha="a" * 40) is None
+    assert seen == ["a" * 40]
+
+
+def test_kb_merge_await_head_catchup_returns_once_the_head_reads_the_rebuilt_sha(
+        agentctl, monkeypatch):
+    """agent-platform#853's first live rebuild on knowledge#852: the PR API's
+    `headRefOid` lagged the force-push by a couple of reads before catching
+    up. This must wait that out rather than refuse the first time it still
+    sees the pre-rebuild head."""
+    calls = []
+    heads = iter(["a" * 40, "a" * 40, "c" * 40])
+    monkeypatch.setattr(agentctl, "_gh_pr_json",
+                        lambda pr, fields, repo=None: {"headRefOid": next(heads)})
+    monkeypatch.setattr(agentctl.time, "sleep", lambda s: calls.append(s))
+    assert agentctl._kb_merge_await_head_catchup(
+        "convivy/knowledge", "7", "a" * 40, "c" * 40, timeout=100, poll=5) is None
+    assert calls == [5, 5]
+
+
+def test_kb_merge_await_head_catchup_refuses_retryably_once_the_bound_runs_out(
+        agentctl, monkeypatch):
+    """A head that NEVER catches up within the bound is retryable — the
+    rebuilt head's push may simply still be propagating, so a later `kb
+    merge` could succeed. The unfixed-code counterexample (no bound at all,
+    or a non-retryable refusal here) would either hang forever or wrongly
+    tell the operator not to retry."""
+    monkeypatch.setattr(agentctl, "_gh_pr_json",
+                        lambda pr, fields, repo=None: {"headRefOid": "a" * 40})
+    times = iter([0, 0, 50, 101])
+    monkeypatch.setattr(agentctl.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda s: None)
+    problem = agentctl._kb_merge_await_head_catchup(
+        "convivy/knowledge", "7", "a" * 40, "c" * 40, timeout=100, poll=5)
+    assert problem is not None and problem.retryable is True
+    assert "pre-rebuild" in problem.message
+
+
+def test_kb_merge_await_head_catchup_refuses_at_once_on_a_genuine_third_sha(
+        agentctl, monkeypatch):
+    """A head that reads neither the pre-rebuild sha nor the rebuilt one is a
+    genuine concurrent move, not API lag — this must refuse immediately,
+    non-retryably, and never sleep out a bound that cannot fix it. The
+    unfixed-code counterexample (treating any mismatch as lag) would instead
+    poll this to the timeout."""
+    calls = []
+    monkeypatch.setattr(agentctl, "_gh_pr_json",
+                        lambda pr, fields, repo=None: {"headRefOid": "d" * 40})
+    monkeypatch.setattr(agentctl.time, "sleep", lambda s: calls.append(s))
+    problem = agentctl._kb_merge_await_head_catchup(
+        "convivy/knowledge", "7", "a" * 40, "c" * 40, timeout=100, poll=5)
+    assert problem is not None and problem.retryable is False
+    assert calls == []
+    assert "neither" in problem.message
+
+
+def _wire_full(agentctl, monkeypatch, kb, *, heads, dry_run=False, check_wait=1800.0,
+               head_wait=60.0, rebuild=None, settle=None, merge=None):
+    """Wire `cmd_kb_merge` against LIVE reads of `kb`'s own PR head
+    (`heads["current"]`) rather than `_wire`'s fixed canned ones: a rebuild
+    genuinely moves the branch partway through the command, and the SECOND
+    read must see where it landed. `rebuild`/`settle`/`merge` each default to
+    a stub that fails the test if reached — a scenario that expects one of
+    them never to run says so by never overriding it."""
+    import argparse
+
+    def fake_pr_json(pr, fields, repo=None):
+        return {"number": 7, "state": "OPEN", "headRefName": "kb/docs-x-1234",
+                "baseRefName": "main", "isCrossRepository": False, "body": "why\n",
+                "headRefOid": heads["current"]}
+
+    def fake_review(pr_, repo_, required, **kw):
+        h = heads["current"]
+        return agentctl.ReviewStatusResult(
+            ok=True, head=h, reasons=[],
+            stamps=[_stamp("reviewer", "run-00000001", commit=h),
+                   _stamp("security-reviewer", "run-00000002", commit=h)])
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "git":
+            return _REAL_RUN(cmd, **kw)
+        if cmd[:2] == ["gh", "api"] and "/commits" in cmd[3 if "--paginate" in cmd else 2]:
+            out = json.dumps({"sha": "a" * 40,
+                             "commit": {"message": f"docs: x\n\n{TRAILER}\n"}}) + "\n"
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/pulls/7"):
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(BOT), "")
+        raise AssertionError(f"unexpected command {cmd}")
+
+    def _unreached(name):
+        def boom(*a, **k):
+            raise AssertionError(f"{name} reached, but this scenario expects it not to be")
+        return boom
+
+    monkeypatch.setattr(agentctl, "_gh_pr_json", fake_pr_json)
+    monkeypatch.setattr(agentctl.subprocess, "run", fake_run)
+    monkeypatch.setattr(agentctl, "_review_status_decision", fake_review)
+    monkeypatch.setattr(agentctl, "_kb_merge_rebuild",
+                        rebuild or _unreached("_kb_merge_rebuild"))
+    monkeypatch.setattr(agentctl, "_kb_merge_await_required_checks",
+                        settle or _unreached("_kb_merge_await_required_checks"))
+    monkeypatch.setattr(KM, "merge_pr", merge or _unreached("merge_pr"))
+    monkeypatch.setattr(KM, "key_problem", lambda *a, **k: None)
+    monkeypatch.setattr(KM, "app_jwt", lambda *a, **k: "jwt.x.y")
+    monkeypatch.setattr(KM, "knowledge_installation", lambda jwt, **k: "inst")
+    monkeypatch.setattr(KM, "installation_token", lambda jwt, inst, **k: "ghs_scoped")
+    return argparse.Namespace(pr=7, repo=None, dry_run=dry_run, check_wait=check_wait,
+                              head_wait=head_wait)
+
+
+def _rebase_pr_onto_main(kb, old_head, number=7):
+    """What a real `_kb_merge_rebuild` would land, made with plain git: the
+    PR branch rebased onto the bare origin's CURRENT main, force-pushed back
+    to `refs/pull/<number>/head`. Returns the new head's sha."""
+    work = kb.author_clone
+    kb.git("fetch", "-q", "origin", "main", cwd=work)
+    kb.git("checkout", "-q", "-B", "rebuild-tmp", old_head, cwd=work)
+    kb.git("rebase", "-q", "origin/main", cwd=work)
+    h = kb.git("rev-parse", "HEAD", cwd=work)
+    kb.git("push", "-q", "-f", "origin", f"HEAD:refs/pull/{number}/head", cwd=work)
+    return h
+
+
+def _wire_checks(agentctl, monkeypatch, *, heads, head_for_checks, rollup, path_map):
+    """Point the REAL `_kb_merge_required_check_conclusions` at GraphQL
+    responses built for one scenario, layered on top of `_wire_full`'s own
+    `_gh_pr_json` stub: `_kb_merge_read`'s own fields (no `statusCheckRollup`)
+    still need the plain `heads["current"]` shape, while a request that DOES
+    ask for `statusCheckRollup` — the one `_kb_merge_required_check_conclusions`
+    makes — gets `head_for_checks` and `rollup` instead. `_workflow_path_map`
+    is stubbed directly: it shells out over REST on its own, which none of
+    `_wire_full`'s fake `subprocess.run` branches recognize."""
+    def fake_pr_json(pr, fields, repo=None):
+        if "statusCheckRollup" in fields:
+            return {"headRefOid": head_for_checks, "statusCheckRollup": rollup}
+        return {"number": 7, "state": "OPEN", "headRefName": "kb/docs-x-1234",
+                "baseRefName": "main", "isCrossRepository": False, "body": "why\n",
+                "headRefOid": heads["current"]}
+    monkeypatch.setattr(agentctl, "_gh_pr_json", fake_pr_json)
+    monkeypatch.setattr(agentctl, "_workflow_path_map", lambda repo, sha: path_map)
+
+
+def _wire_head_catchup(agentctl, monkeypatch, *, heads, old_head, lag_reads):
+    """Point the REAL `_kb_merge_await_head_catchup` at a `headRefOid`-only
+    read that returns `old_head` for `lag_reads` calls and `heads["current"]`
+    afterwards — layered on top of `_wire_full`'s own `_gh_pr_json` stub,
+    which answers every OTHER field set (`_kb_merge_read`'s own fields, with
+    no bare `["headRefOid"]` request among them) with `heads["current"]`
+    unconditionally, exactly as it already does."""
+    calls = {"n": 0}
+
+    def fake_pr_json(pr, fields, repo=None):
+        if fields == ["headRefOid"]:
+            calls["n"] += 1
+            return {"headRefOid": old_head if calls["n"] <= lag_reads else heads["current"]}
+        return {"number": 7, "state": "OPEN", "headRefName": "kb/docs-x-1234",
+                "baseRefName": "main", "isCrossRepository": False, "body": "why\n",
+                "headRefOid": heads["current"]}
+    monkeypatch.setattr(agentctl, "_gh_pr_json", fake_pr_json)
+
+
+def test_the_command_waits_out_a_lagging_pr_head_read_after_the_rebuild_and_then_merges(
+        agentctl, monkeypatch, capsys, kb):
+    """The live occurrence this item exists for (agent-platform#853's first
+    live rebuild, knowledge#852, 2026-10-11): the push had landed — `git
+    ls-remote` and a `gh pr view` moments later both already read the
+    rebuilt sha — but the read `cmd_kb_merge` made right after pushing still
+    returned the pre-rebuild head for a couple of reads. That lag must be
+    waited out and the merge must still happen, never refused on the first
+    lagging read (the unfixed-code counterexample)."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    merged = []
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        # Wired here, like `_wire_checks` is in the other scenarios below:
+        # it needs `heads["current"]` (the rebuilt sha) to exist first, and
+        # still wins because it runs before `cmd_kb_merge` ever calls
+        # `_kb_merge_await_head_catchup`.
+        _wire_head_catchup(agentctl, monkeypatch, heads=heads, old_head=facts_.head_sha,
+                          lag_reads=2)
+        return heads["current"], None
+
+    def fake_settle(repo_, pr_, sha_, **kw):
+        return None
+
+    def fake_merge(n, sha, tok, **kw):
+        merged.append((n, sha, tok))
+        return True, f"merged as {sha[:12]}"
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=fake_settle, merge=fake_merge, head_wait=30.0)
+    monkeypatch.setattr(agentctl.time, "sleep", lambda s_: None)
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert merged and merged[0][0] == 7 and merged[0][1] == heads["current"]
+
+
+def test_the_command_refuses_retryably_when_the_pr_head_never_catches_up(
+        agentctl, monkeypatch, capsys, kb):
+    """The bound running out while the head still reads the PRE-rebuild sha
+    is retryable: the push may simply still be propagating. This must refuse
+    before ever reaching `_kb_merge_await_required_checks` (the default
+    `_unreached` stub fails the test if it is)."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        return heads["current"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      head_wait=10.0)
+    _wire_head_catchup(agentctl, monkeypatch, heads=heads, old_head=s, lag_reads=10**6)
+    times = iter([0, 0, 20])
+    monkeypatch.setattr(agentctl.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(agentctl.time, "sleep", lambda s_: None)
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "pre-rebuild" in err
+    assert "Re-run kb merge" in err
+    assert "the branch was rebuilt and was not merged" not in err
+
+
+def test_the_command_refuses_at_once_when_the_head_moves_to_a_third_sha_after_rebuild(
+        agentctl, monkeypatch, capsys, kb):
+    """A head that moves to a sha that is neither the pre-rebuild head nor
+    the rebuilt one is a genuine concurrent move, not API lag — this must
+    refuse right away, non-retryably, and never reach
+    `_kb_merge_await_required_checks` (the default `_unreached` stub fails
+    the test if it does)."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        return heads["current"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild)
+    third = "f" * 40
+
+    def fake_pr_json(pr, fields, repo=None):
+        if fields == ["headRefOid"]:
+            return {"headRefOid": third}
+        return {"number": 7, "state": "OPEN", "headRefName": "kb/docs-x-1234",
+                "baseRefName": "main", "isCrossRepository": False, "body": "why\n",
+                "headRefOid": heads["current"]}
+    monkeypatch.setattr(agentctl, "_gh_pr_json", fake_pr_json)
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "neither" in err
+    assert "the branch was rebuilt and was not merged" in err
+    assert "Re-run kb merge" not in err
+
+
+def test_the_command_rebuilds_a_stale_branch_and_merges_once_checks_settle(
+        agentctl, monkeypatch, capsys, kb):
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuild_calls, settle_calls, merged = [], [], []
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuild_calls.append(facts_.head_sha)
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        return heads["current"], None
+
+    def fake_settle(repo_, pr_, sha_, **kw):
+        settle_calls.append((sha_, kw.get("timeout")))
+        return None
+
+    def fake_merge(n, sha, tok, **kw):
+        merged.append((n, sha, tok))
+        return True, f"merged as {sha[:12]}"
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=fake_settle, merge=fake_merge)
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert rebuild_calls == [s]
+    assert settle_calls == [(heads["current"], 1800.0)]
+    assert merged == [(7, heads["current"], "ghs_scoped")]
+    assert "rebuilt the branch" in out
+
+
+def test_the_command_never_rebuilds_to_get_past_an_unrelated_refusal(
+        agentctl, monkeypatch, capsys, kb):
+    """The branch is stale AND the PR was opened by someone other than the
+    App — a rebuild could never fix the second problem, so it must not even
+    be attempted for the first. `_wire_full`'s default stubs fail the test
+    if `_kb_merge_rebuild` runs at all."""
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": kb.head}
+    other = {"login": "operator-account", "id": 42, "type": "User"}
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads)
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "git":
+            return _REAL_RUN(cmd, **kw)
+        if cmd[:2] == ["gh", "api"] and "/commits" in cmd[3 if "--paginate" in cmd else 2]:
+            out = json.dumps({"sha": "a" * 40,
+                             "commit": {"message": f"docs: x\n\n{TRAILER}\n"}}) + "\n"
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        if cmd[:2] == ["gh", "api"] and cmd[2].endswith("/pulls/7"):
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(other), "")
+        raise AssertionError(f"unexpected command {cmd}")
+    monkeypatch.setattr(agentctl.subprocess, "run", fake_run)   # a different author
+
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "does not contain" in out
+    assert "was opened by 'operator-account'" in out
+
+
+def test_the_command_reports_a_rebuild_refusal_without_merging(
+        agentctl, monkeypatch, capsys, kb):
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": kb.head}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        return None, f"cannot rebuild onto {KM.BASE}: projects/x/new.md has moved on main"
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild)
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "does not contain" in out
+    assert "cannot rebuild onto main" in out
+
+
+def test_the_command_asks_for_a_rerun_when_the_rebuilt_heads_checks_time_out(
+        agentctl, monkeypatch, capsys, kb):
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        return "c" * 40, None
+
+    def fake_settle(repo_, pr_, sha_, **kw):
+        return agentctl._RequiredChecksProblem(
+            message=(f"kb-write-trailer still shows no recorded conclusion on "
+                     f"{sha_[:12]} after {kw['timeout']:.0f}s"),
+            retryable=True)
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=fake_settle)
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert f"rebuilt the branch to {('c' * 40)[:12]}" in err
+    assert "Re-run kb merge" in err
+    assert "was not merged" not in err   # a timeout is retryable, not a hard refusal
+
+
+def test_the_command_refuses_without_merging_when_the_rebuilt_heads_validate_check_fails(
+        agentctl, monkeypatch, capsys, kb):
+    """knowledge#699: a rebuilt head whose `validate` failed must never be
+    merged. This drives the REAL `_kb_merge_await_required_checks` (not a
+    stub) through `cmd_kb_merge`, so the integration — not just the unit —
+    is pinned: accepting any non-empty conclusion (this test's unfixed-code
+    counterexample) would merge it anyway."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuilt_head = {}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuilt_head["sha"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        heads["current"] = rebuilt_head["sha"]
+        # The rollup can only be built once the rebuild has actually run (it
+        # needs `rebuilt_head["sha"]`), so it's wired here rather than before
+        # `_wire_full` — this still wins, since it runs (and re-monkeypatches
+        # `_gh_pr_json`/`_workflow_path_map`) before `cmd_kb_merge` ever calls
+        # `_kb_merge_await_required_checks`.
+        rollup = [
+            _check_entry("kb-write-trailer", "SUCCESS", 1),
+            _check_entry("md-serial-docs", "SUCCESS", 2),
+            _check_entry("validate", "FAILURE", 3),
+        ]
+        path_map = {1: ".github/workflows/kb-write-trailer.yml",
+                   2: ".github/workflows/ci.yml",
+                   3: ".github/workflows/ci.yml"}
+        _wire_checks(agentctl, monkeypatch, heads=heads,
+                    head_for_checks=rebuilt_head["sha"], rollup=rollup, path_map=path_map)
+        return rebuilt_head["sha"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=agentctl._kb_merge_await_required_checks)   # real, not a stub
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert f"rebuilt the branch to {rebuilt_head['sha'][:12]}" in err
+    assert "validate concluded 'failure'" in err
+    assert "the branch was rebuilt and was not merged" in err
+    assert "Re-run kb merge" not in err   # a concluded failure is not retryable
+
+
+def test_the_command_refuses_without_merging_when_a_required_check_is_cancelled_or_skipped(
+        agentctl, monkeypatch, capsys, kb):
+    """`cancelled` and `skipped` are both non-empty conclusions that are not
+    "success" — accepting either, like accepting `failure`, would merge a
+    rebuilt head whose required checks did not actually pass."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuilt_head = {}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuilt_head["sha"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        heads["current"] = rebuilt_head["sha"]
+        rollup = [
+            _check_entry("kb-write-trailer", "CANCELLED", 1),
+            _check_entry("md-serial-docs", "SKIPPED", 2),
+            _check_entry("validate", "SUCCESS", 3),
+        ]
+        path_map = {1: ".github/workflows/kb-write-trailer.yml",
+                   2: ".github/workflows/ci.yml",
+                   3: ".github/workflows/ci.yml"}
+        _wire_checks(agentctl, monkeypatch, heads=heads,
+                    head_for_checks=rebuilt_head["sha"], rollup=rollup, path_map=path_map)
+        return rebuilt_head["sha"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=agentctl._kb_merge_await_required_checks)   # real, not a stub
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "kb-write-trailer concluded 'cancelled'" in err
+    assert "md-serial-docs concluded 'skipped'" in err
+    assert "the branch was rebuilt and was not merged" in err
+    assert "Re-run kb merge" not in err
+
+
+def test_the_command_refuses_without_merging_when_a_shadow_workflow_shadows_validate(
+        agentctl, monkeypatch, capsys, kb):
+    """Round 2 security finding on agent-platform#853, case (a): the real
+    `validate` in `.github/workflows/ci.yml` failed, and a LATER same-named
+    `validate` from a different workflow path succeeded. Matching by name
+    alone (the unfixed-code counterexample) would read the shadow's SUCCESS
+    and merge over the real failure — the exact #182 bypass ARCH-380 closed
+    for the merge gate, reopened one level down in this rebuild gate."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuilt_head = {}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuilt_head["sha"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        heads["current"] = rebuilt_head["sha"]
+        rollup = [
+            _check_entry("validate", "FAILURE", 1, when="2026-10-10T01:00:00Z"),
+            _check_entry("validate", "SUCCESS", 2, when="2026-10-10T01:05:00Z"),
+            _check_entry("kb-write-trailer", "SUCCESS", 3),
+            _check_entry("md-serial-docs", "SUCCESS", 4),
+        ]
+        path_map = {1: ".github/workflows/ci.yml",
+                   2: ".github/workflows/shadow.yml",
+                   3: ".github/workflows/kb-write-trailer.yml",
+                   4: ".github/workflows/ci.yml"}
+        _wire_checks(agentctl, monkeypatch, heads=heads,
+                    head_for_checks=rebuilt_head["sha"], rollup=rollup, path_map=path_map)
+        return rebuilt_head["sha"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=agentctl._kb_merge_await_required_checks)   # real, not a stub
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "validate concluded 'failure'" in err
+    assert "the branch was rebuilt and was not merged" in err
+
+
+def test_the_command_refuses_without_merging_when_the_real_check_is_absent(
+        agentctl, monkeypatch, capsys, kb):
+    """Round 2 security finding, case (b): a `validate` check-run from
+    another app, with no workflow association at all, succeeded — and the
+    real `validate` from `ci.yml` never ran. The other app's SUCCESS must
+    never be read as the required check; it stays missing and this times
+    out rather than merge."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuilt_head = {}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuilt_head["sha"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        heads["current"] = rebuilt_head["sha"]
+        rollup = [
+            # No detailsUrl at all — a check-run from another app/context,
+            # never tied to any workflow file.
+            {"name": "validate", "conclusion": "SUCCESS", "detailsUrl": ""},
+            _check_entry("kb-write-trailer", "SUCCESS", 1),
+            _check_entry("md-serial-docs", "SUCCESS", 2),
+        ]
+        path_map = {1: ".github/workflows/kb-write-trailer.yml",
+                   2: ".github/workflows/ci.yml"}
+        _wire_checks(agentctl, monkeypatch, heads=heads,
+                    head_for_checks=rebuilt_head["sha"], rollup=rollup, path_map=path_map)
+        return rebuilt_head["sha"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=agentctl._kb_merge_await_required_checks, check_wait=0)
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "validate" in err and "no recorded conclusion" in err
+
+
+def test_the_command_refuses_without_merging_when_the_rollups_head_has_moved(
+        agentctl, monkeypatch, capsys, kb):
+    """Round 2 security finding, case (c): the rollup read back names a
+    headRefOid other than the rebuilt sha — it must never be trusted for
+    THIS commit's verdict, success or not."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuilt_head = {}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuilt_head["sha"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        heads["current"] = rebuilt_head["sha"]
+        rollup = [
+            _check_entry("kb-write-trailer", "SUCCESS", 1),
+            _check_entry("md-serial-docs", "SUCCESS", 2),
+            _check_entry("validate", "SUCCESS", 3),
+        ]
+        path_map = {1: ".github/workflows/kb-write-trailer.yml",
+                   2: ".github/workflows/ci.yml",
+                   3: ".github/workflows/ci.yml"}
+        # head_for_checks is a DIFFERENT sha than the one being judged.
+        _wire_checks(agentctl, monkeypatch, heads=heads,
+                    head_for_checks="f" * 40, rollup=rollup, path_map=path_map)
+        return rebuilt_head["sha"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=agentctl._kb_merge_await_required_checks)   # real, not a stub
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "not the rebuilt" in err
+    assert "the branch was rebuilt and was not merged" in err
+
+
+def test_the_command_refuses_without_merging_when_the_path_map_cannot_be_built(
+        agentctl, monkeypatch, capsys, kb):
+    """Round 2 security finding, case (d): the workflow-run → path map could
+    not be read at all. Every required check reads SUCCESS in the rollup,
+    but none can be verified against its required workflow path, so this
+    must refuse rather than fall back to name-only keying."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuilt_head = {}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuilt_head["sha"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        heads["current"] = rebuilt_head["sha"]
+        rollup = [
+            _check_entry("kb-write-trailer", "SUCCESS", 1),
+            _check_entry("md-serial-docs", "SUCCESS", 2),
+            _check_entry("validate", "SUCCESS", 3),
+        ]
+        _wire_checks(agentctl, monkeypatch, heads=heads,
+                    head_for_checks=rebuilt_head["sha"], rollup=rollup, path_map=None)
+        return rebuilt_head["sha"], None
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=agentctl._kb_merge_await_required_checks)   # real, not a stub
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "workflow-run paths" in err
+    assert "the branch was rebuilt and was not merged" in err
+
+
+def test_the_command_merges_a_genuine_rerun_in_the_same_workflow(
+        agentctl, monkeypatch, capsys, kb):
+    """A real re-run in the SAME workflow file (first attempt failed, a later
+    attempt in `ci.yml` succeeded) must still pass — the path-keyed fix must
+    not turn every legitimate re-run into a refusal."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    rebuilt_head = {}
+    merged = []
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuilt_head["sha"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        heads["current"] = rebuilt_head["sha"]
+        rollup = [
+            _check_entry("validate", "FAILURE", 1, when="2026-10-10T01:00:00Z"),
+            _check_entry("validate", "SUCCESS", 2, when="2026-10-10T01:05:00Z"),
+            _check_entry("kb-write-trailer", "SUCCESS", 3),
+            _check_entry("md-serial-docs", "SUCCESS", 4),
+        ]
+        path_map = {1: ".github/workflows/ci.yml",
+                   2: ".github/workflows/ci.yml",   # same file — a genuine re-run
+                   3: ".github/workflows/kb-write-trailer.yml",
+                   4: ".github/workflows/ci.yml"}
+        _wire_checks(agentctl, monkeypatch, heads=heads,
+                    head_for_checks=rebuilt_head["sha"], rollup=rollup, path_map=path_map)
+        return rebuilt_head["sha"], None
+
+    def fake_merge(n, sha, tok, **kw):
+        merged.append((n, sha, tok))
+        return True, f"merged as {sha[:12]}"
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=agentctl._kb_merge_await_required_checks,   # real, not a stub
+                      merge=fake_merge)
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert merged == [(7, rebuilt_head["sha"], "ghs_scoped")]
+
+
+def test_the_command_refuses_without_rebuilding_twice_when_main_moves_again(
+        agentctl, monkeypatch, capsys, kb):
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "first move\n"})
+    heads = {"current": s}
+    rebuild_calls = []
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        rebuild_calls.append(facts_.head_sha)
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        return heads["current"], None
+
+    def fake_settle(repo_, pr_, sha_, **kw):
+        # Main moves AGAIN while the rebuilt head's checks "settle".
+        kb.publish_main({"projects/unrelated/z.md": "second move, during the wait\n"})
+        return None
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=fake_settle)
+    rc = agentctl.cmd_kb_merge(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert rebuild_calls == [s]   # never rebuilt a second time in this run
+    assert "moved again" in err and "not rebuilding twice" in err
+
+
+def test_dry_run_never_attempts_a_rebuild(agentctl, monkeypatch, capsys, kb):
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": kb.head}
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, dry_run=True)
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "does not contain" in out
 
 
 # --- routing to `review-status`'s own decision (platform/decisions/0090) --------

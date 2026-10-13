@@ -76,6 +76,11 @@ ALLOWED_KINDS = {
     # the bead in the Chart House once Phase 2 gives it a schema. Keep in sync
     # with knowledge scripts/validate.py.
     "bead",
+    # The build plan (CQ·139, the operator's 2026-09-17 ruling): a Library
+    # document with its own kind, distinct from a scratch checklist that stays
+    # out of the KB, so a profile can select one by binds_topics. Keep in sync
+    # with knowledge scripts/validate.py.
+    "build-plan",
 }
 # `shared`, `convivy`, `utility` and `engineering` are GONE (ARCH-438), and their
 # absence is the end of Phase 0 step 5. Step 5 re-filed every document out of them;
@@ -366,7 +371,6 @@ ALLOWED_AUDIENCE = {
     "orient-coder",
     # outside-view strategy consultant on the agentic operating model (ARCH-158)
     "consultant",
-    OPERATOR_MARKER,
     # "team" is a special human-audience marker (like the operator marker), NOT an agent role: it
     # tags a doc for the team.convivy.com orientation site. convivy-orient/build.py
     # filters the site to team-tagged docs (substrate ARCH-089).
@@ -379,6 +383,14 @@ ALLOWED_AUDIENCE = {
     # CONTRACTOR_HIDDEN_* blocklist.
     "contractor",
 }
+# OPERATOR_MARKER is a runtime value (read from operator config, not a string
+# literal), so it cannot sit inside the set literal above: the Library's
+# `load_crew_registry._roster_from_knowledge_py` parses this file with `ast`
+# and evaluates the FIRST `ast.Assign` to `ALLOWED_AUDIENCE` it finds via
+# `ast.literal_eval`, deliberately, so it never executes agent-platform code.
+# A `Name` node in that literal makes `literal_eval` raise. Add the marker
+# here instead, after the literal is complete.
+ALLOWED_AUDIENCE = ALLOWED_AUDIENCE | {OPERATOR_MARKER}
 
 # The instruction-block rules below MIRROR `scripts/validate.py` in
 # convivy/knowledge (knowledge#527, corrected by #529). Knowledge CI refuses a bad
@@ -390,7 +402,10 @@ ALLOWED_AUDIENCE = {
 # agent. `audience` says who may read a document and `binds_agents` says who must
 # obey a block; the operator reads every document and obeys none, so these are valid
 # audiences and never valid in `binds_agents`.
-NON_AGENT_AUDIENCE = {"consultant", OPERATOR_MARKER, "team", "contractor"}
+NON_AGENT_AUDIENCE = {"consultant", "team", "contractor"}
+# Written as a literal plus a union to match ALLOWED_AUDIENCE above, for
+# consistency: no reader outside this repo parses NON_AGENT_AUDIENCE.
+NON_AGENT_AUDIENCE = NON_AGENT_AUDIENCE | {OPERATOR_MARKER}
 # The derivation's weak point is the next PERSON added to the Library's roster, who
 # becomes bindable unless also added above. A set-partition assertion cannot catch
 # that (it holds whatever was added), so `test_every_audience_value_is_classified`

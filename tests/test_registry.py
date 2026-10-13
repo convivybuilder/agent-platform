@@ -304,6 +304,14 @@ def test_capacity_refused_exit_status_is_valid():
     assert "capacity_refused" in T.VALID_EXIT_STATUSES
 
 
+def test_cost_stopped_exit_status_is_valid():
+    """cost_stopped must be a recognised exit_status so write_outcome doesn't
+    raise when `_finalize_run` records a run the per-run cost/token cap killed
+    (clause 9 of the budget-enforcement epic)."""
+    import telemetry as T
+    assert "cost_stopped" in T.VALID_EXIT_STATUSES
+
+
 def test_write_outcome_records_error_reason(tmp_path):
     """write_outcome persists error_reason in outcome.json when provided."""
     import json

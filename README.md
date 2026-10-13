@@ -1,11 +1,16 @@
 # agent-platform
 
-Backup + source-of-truth for the Convivy agent platform's machine-local code.
+agent-platform is Builder's command line and background jobs: the commands that start
+and run agents and their crews, and the scheduled jobs that run beside them.
+
+Builder's website is [convivybuilder.org](https://convivybuilder.org). It carries the
+documentation and the install pages.
 
 This repo exists so that the platform — `agentctl` and friends, the knowledge-base
 watcher, the daily summary cron, the MCP server bridging the SQLite knowledge
-index to Claude Code, the daytime `co` wrapper — survives mini loss and can be
-restored on a fresh machine in minutes rather than rebuilt from session history.
+index to Claude Code, the daytime `co` wrapper — survives the loss of the machine it
+runs on and can be restored on a fresh machine in minutes rather than rebuilt from
+session history.
 
 It is **not** where agents do their daily work. Product code lives in
 `Convivy/{constance,vivy,vivy-ownerrez-sandbox-tools}`; knowledge docs live in

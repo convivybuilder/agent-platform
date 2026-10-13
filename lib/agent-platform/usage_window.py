@@ -40,14 +40,69 @@ reading from ANY recent dispatched run is as current an answer as the
 account has, whether or not the asking co session dispatched anything
 itself.
 
-BOUNDED, for a reader a hook calls on a fast path. At most `MAX_CANDIDATES`
-run transcripts are opened, newest-`mtime` first, and each read is a tail
-read (`TAIL_BYTES`) rather than the whole file, the same posture
-`bin/co-session-health` already uses for its own per-turn transcript scan.
-Only today's UTC run-day directory is listed; only when it holds no run
-directories at all (the first requests of a new UTC day) does this fall back
-to listing yesterday's — the common case never pays for two directory
-listings.
+BOTH THE TODAY AND YESTERDAY RUN-DAY DIRECTORIES ARE LISTED, EVERY CALL, AND
+KEYED ON THE DISPATCHER'S OWN DAY, NOT UTC. Run-day directories are named by
+`telemetry.today_dir` (`platform_day`, ARCH-156), which buckets on LOCAL
+time on purpose so a day's spend stays in one bucket; this reader used to
+bucket on UTC instead, and used yesterday's directory only as a fallback
+when today's held no run directories at all. Around local midnight (17:00
+UTC on this machine's MST) that UTC key is already "tomorrow" by the
+dispatcher's own local key, so today's directory (by this reader's old UTC
+clock) could hold only today's few earliest runs while the freshest reading
+sat in what the dispatcher calls yesterday — and since that "today"
+directory was non-empty, the fallback never fired at all (the 2026-10-12
+07:35 UTC occurrence: 4 runs in the UTC-today directory, no fallback, the
+freshest reading sitting in the local-yesterday directory's run-46c945f6).
+Listing both of the dispatcher's own day buckets every time, and merging by
+transcript mtime, removes the chance of disagreeing about which bucket
+"today" names.
+
+BOUNDED, for a reader a hook calls on a fast path, by THREE independent
+caps: `MAX_CANDIDATES` run transcripts (newest `mtime` first across the two
+day directories), `MAX_BYTES_READ_PER_FILE` bytes read from any one
+candidate, AND `MAX_BYTES_READ` total bytes read across every candidate in
+the walk. Each candidate is read back from its end in at most two reads
+(first `TAIL_BYTES`, then, only if that misses, one single jump straight to
+the full per-file cap) rather than a single tail read, because a reading
+can sit earlier in a transcript than its last `TAIL_BYTES` — a run's
+transcript keeps writing long after its last `rate_limit_info` event, so a
+long run can carry its freshest reading well before the tail (the same
+2026-10-12 occurrence: an 8-candidate scan's transcripts mostly had no
+reading in their last 64 KiB at all).
+
+THE PER-FILE CAP EXISTS BECAUSE THE TOTAL CAP ALONE LET ONE FILE SPEND THE
+WHOLE WALK'S BUDGET. Before `MAX_BYTES_READ_PER_FILE`, a single candidate's
+`tail` call was handed the walk's entire remaining `budget` as its own
+`max_bytes`, so one large, reading-less transcript at the newest mtime could
+read all the way to `MAX_BYTES_READ` by itself, leave nothing for the next
+candidate, and return `None` even though an older candidate held a live
+reading — found in a real dispatched run's transcript with a 5.5 MB gap
+between two `rate_limit_info` events (byte offsets 1145846 and 6677116),
+bigger than the old single 4 MiB total. Each candidate now gets only
+`min(MAX_BYTES_READ_PER_FILE, <budget left in the walk>)`, so no one
+candidate can exhaust the walk; `MAX_BYTES_READ` still bounds the total so
+the walk as a whole cannot read without limit.
+
+`MAX_BYTES_READ_PER_FILE` is 8 MiB and `MAX_BYTES_READ` is 32 MiB (four
+times the per-file cap), so a reading up to the measured 5.5 MB gap is found
+in a single candidate with headroom to spare, and the walk still admits
+several full-cap candidates before giving up.
+
+A FIRST VERSION OF THE PER-FILE CAP CUT THE REAL SCAN DEPTH BELOW
+`MAX_BYTES_READ_PER_FILE` ITSELF. `_tail_window_reading`'s chunk-growth loop
+re-reads the file from its growing start point to the end on every step
+(needed so a reading found in the larger chunk is still correctly the
+file's true last one, never an earlier one a smaller chunk already ruled
+out) and counted every one of those overlapping re-reads against the
+per-file cap, so the cap was being spent on the SAME bytes more than once —
+a candidate stopped only 700-900 KB deep in practice instead of the full
+1 MiB cap it was meant to guarantee, which is short of the 5.5 MB gap this
+cap exists to cover. Fixed by sizing the growth schedule to two steps
+instead of many — `TAIL_BYTES` first, then (if that misses) one single jump
+straight to the full `max_bytes` — so the cap is spent on at most one
+overlapping re-read (`TAIL_BYTES` extra) rather than on every intermediate
+step of a geometric growth, and the real depth searched reaches `max_bytes`
+itself.
 """
 from __future__ import annotations
 
@@ -55,14 +110,22 @@ import json
 import math
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
+
+import telemetry as T
 
 _FIVE_HOUR_KEY = "five_hour"
 _SEVEN_DAY_KEY = "seven_day"
 
-MAX_CANDIDATES = 8
+MAX_CANDIDATES = 32
 TAIL_BYTES = 65_536
+# Sized so a reading up to the measured 5.5 MB gap between two
+# `rate_limit_info` events in a real transcript (byte offsets 1145846 and
+# 6677116 — see the module docstring) is found with headroom: 8 MiB per
+# file, 32 MiB (four per-file caps) across the whole walk.
+MAX_BYTES_READ_PER_FILE = 8 * 1024 * 1024
+MAX_BYTES_READ = 32 * 1024 * 1024
 
 # A window cannot legitimately reset more than its own length after `now`.
 # `_RESETS_AT_SLACK_SECONDS` widens that to absorb clock skew between the
@@ -120,19 +183,34 @@ def read_seven_day_window(runs_root: Path, now: float | None = None) -> dict | N
 
 def _read_window(runs_root: Path, tail, now: float | None) -> dict | None:
     """The shared candidate walk behind both window readers: the first
-    candidate, freshest-mtime first, whose `tail(path, now)` reading has not
-    yet reset. `tail` is one of the `_tail_*_reading` functions below."""
+    candidate, freshest-mtime first, whose `tail(path, now, per_file_budget)`
+    reading has not yet reset. `tail` is one of the `_tail_*_reading`
+    functions below; it returns `(reading_or_None, bytes_read)`.
+
+    `budget` starts at `MAX_BYTES_READ` and is spent across every candidate
+    in this one call, so the total I/O this walk does is capped regardless
+    of how many candidates `MAX_CANDIDATES` would otherwise let it reach.
+    Each individual candidate's `tail` call is further capped at
+    `min(MAX_BYTES_READ_PER_FILE, budget)` rather than handed the whole
+    remaining `budget` — otherwise one large, reading-less transcript could
+    spend the entire walk's budget by itself and leave none for the next
+    candidate (see the module docstring's 5.5 MB occurrence)."""
     if now is None:
         now = time.time()
     try:
         candidates = _recent_transcripts(Path(runs_root))
     except OSError:
         return None
+    budget = MAX_BYTES_READ
     for path in candidates:
+        if budget <= 0:
+            break
+        per_file_budget = min(MAX_BYTES_READ_PER_FILE, budget)
         try:
-            reading = tail(path, now)
+            reading, consumed = tail(path, now, per_file_budget)
         except Exception:
             continue
+        budget -= consumed
         if reading is not None and reading["resets_at"] > now:
             return reading
     return None
@@ -140,13 +218,18 @@ def _read_window(runs_root: Path, tail, now: float | None) -> dict | None:
 
 def _recent_transcripts(runs_root: Path) -> list[Path]:
     """Up to `MAX_CANDIDATES` run transcripts, newest `transcript.jsonl`
-    mtime first."""
-    today = datetime.now(timezone.utc).date()
-    day_dir = runs_root / today.strftime("%Y-%m-%d")
-    stats = _stat_run_transcripts(day_dir)
-    if not stats:
-        yesterday = today - timedelta(days=1)
-        stats = _stat_run_transcripts(runs_root / yesterday.strftime("%Y-%m-%d"))
+    mtime first, across BOTH today's and yesterday's run-day directories
+    (`telemetry.today_dir`'s own local-time day key, not UTC — see the
+    module docstring). Both are listed and merged every call, not only as a
+    fallback when today's is empty: a day directory having runs is no
+    guarantee the freshest reading is in one of them, so sorting the merged
+    set by mtime is what finds the true freshest candidate across the
+    boundary between the two."""
+    today_str = T.today_dir()
+    yesterday_str = (datetime.strptime(today_str, "%Y-%m-%d").date()
+                      - timedelta(days=1)).strftime("%Y-%m-%d")
+    stats = _stat_run_transcripts(runs_root / today_str)
+    stats += _stat_run_transcripts(runs_root / yesterday_str)
     stats.sort(key=lambda pair: pair[0], reverse=True)
     return [path for _, path in stats[:MAX_CANDIDATES]]
 
@@ -201,40 +284,79 @@ def resets_at_is_plausible(value: object, now: float,
     return _is_finite_number(value) and 0 < value <= now + window_seconds + _RESETS_AT_SLACK_SECONDS
 
 
-def _tail_five_hour_reading(path: Path, now: float) -> dict | None:
-    """The last `unifiedWindows.five_hour` reading in the tail of *path*, or
-    `None`."""
-    return _tail_window_reading(path, _FIVE_HOUR_KEY, FIVE_HOUR_WINDOW_SECONDS, now)
+def _tail_five_hour_reading(path: Path, now: float, max_bytes: int) -> tuple[dict | None, int]:
+    """The last `unifiedWindows.five_hour` reading found in *path*, reading
+    back from its end in at most two reads bounded by *max_bytes*, or
+    `None`. Returns `(reading_or_None, bytes_read)`."""
+    return _tail_window_reading(path, _FIVE_HOUR_KEY, FIVE_HOUR_WINDOW_SECONDS, now, max_bytes)
 
 
-def _tail_seven_day_reading(path: Path, now: float) -> dict | None:
-    """The last `unifiedWindows.seven_day` reading in the tail of *path*, or
+def _tail_seven_day_reading(path: Path, now: float, max_bytes: int) -> tuple[dict | None, int]:
+    """The last `unifiedWindows.seven_day` reading found in *path*, or
     `None`. The `is_using_overage` key is dropped: `isUsingOverage` is
     account-level, so the seven-day line carries the same flag as the
     five-hour one, and only the five-hour reading may hold on it."""
-    reading = _tail_window_reading(path, _SEVEN_DAY_KEY, SEVEN_DAY_WINDOW_SECONDS, now)
+    reading, consumed = _tail_window_reading(path, _SEVEN_DAY_KEY, SEVEN_DAY_WINDOW_SECONDS,
+                                              now, max_bytes)
     if reading is not None:
         del reading["is_using_overage"]
-    return reading
+    return reading, consumed
 
 
 def _tail_window_reading(path: Path, window_key: str, window_seconds: float,
-                         now: float) -> dict | None:
-    """The last `unifiedWindows.<window_key>` reading in the tail of *path*,
-    or `None`. "Last" because a run's transcript accumulates `rate_limit_info`
-    events over its whole lifetime; the freshest is whichever appears latest
-    in file order, and the tail is where that is.
+                         now: float, max_bytes: int) -> tuple[dict | None, int]:
+    """The last `unifiedWindows.<window_key>` reading in *path*, or `None`.
+    "Last" because a run's transcript accumulates `rate_limit_info` events
+    over its whole lifetime; the freshest is whichever appears latest in
+    file order.
 
-    *window_seconds* and *now* bound how far out a `resetsAt` may plausibly be
-    — see `_RESETS_AT_SLACK_SECONDS`."""
+    Reads back from the file's end in at most two steps: `TAIL_BYTES` first,
+    then, only if that misses, one single jump straight to the full
+    *max_bytes* depth (this candidate's own `min(MAX_BYTES_READ_PER_FILE,
+    <budget left in the walk>)` cap) — never more than `TAIL_BYTES +
+    max_bytes` total across the two reads, so the cap is spent on at most
+    one overlapping re-read rather than on every step of a geometric growth
+    (see the module docstring's "A FIRST VERSION..." paragraph). The second
+    read re-parses the whole `max_bytes` window rather than only the part
+    beyond the first `TAIL_BYTES`: a match in that window is still the true
+    last reading in the file, never an earlier one the first, smaller read
+    already ruled out, and parsing the whole window is what makes this safe
+    against a `rate_limit_info` line that straddles the boundary between the
+    two reads.
+
+    *window_seconds* and *now* bound how far out a `resetsAt` may plausibly
+    be — see `_RESETS_AT_SLACK_SECONDS`. Returns `(reading_or_None,
+    bytes_read)`, *bytes_read* being the sum of every chunk actually read,
+    for the caller to deduct from its own budget."""
     try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - TAIL_BYTES))
-            chunk = fh.read().decode("utf-8", "ignore")
+        size = path.stat().st_size
     except OSError:
-        return None
+        return None, 0
+    read_so_far = 0
+    chunk_size = min(TAIL_BYTES, size, max_bytes)
+    while chunk_size > 0:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(size - chunk_size)
+                data = fh.read(chunk_size)
+        except OSError:
+            return None, read_so_far
+        read_so_far += len(data)
+        found = _parse_window_reading(data.decode("utf-8", "ignore"), window_key,
+                                       window_seconds, now)
+        if found is not None:
+            return found, read_so_far
+        if chunk_size >= size or chunk_size >= max_bytes:
+            return None, read_so_far
+        chunk_size = min(max_bytes, size)
+    return None, read_so_far
+
+
+def _parse_window_reading(chunk: str, window_key: str, window_seconds: float,
+                          now: float) -> dict | None:
+    """The last `unifiedWindows.<window_key>` reading among *chunk*'s lines,
+    or `None` — the per-chunk parse `_tail_window_reading` re-runs on every
+    growth step."""
     found = None
     for line in chunk.split("\n"):
         if '"rate_limit_info"' not in line:
@@ -242,7 +364,7 @@ def _tail_window_reading(path: Path, window_key: str, window_seconds: float,
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
-            continue  # a partial line, cut by the tail seek or a live write
+            continue  # a partial line, cut by the chunk seek or a live write
         if not isinstance(event, dict):
             continue
         info = event.get("rate_limit_info")

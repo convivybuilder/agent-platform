@@ -4859,21 +4859,32 @@ def test_unqueue_pops_messages_in_order_and_clears_the_box(SI, unqueue_env):
 
 
 def test_unqueue_reports_an_empty_list_and_clears_nothing_when_up_did_nothing(
-        SI, unqueue_env):
+        SI, unqueue_env, monkeypatch):
     """No `popAll`, and the box still parses as empty: the keystroke changed
     nothing. Positively known, so the answer is an empty list — and there is
     nothing to clear, which is asserted rather than assumed. A clear here
-    would be twelve keystrokes into a box that never needed them."""
+    would be twelve keystrokes into a box that never needed them.
+
+    The clock is driven rather than slept through (see
+    test_unqueue_stops_polling_once_the_deadline_passes), so this pins the
+    outcome without spending the real `POPALL_DEADLINE_SECONDS`."""
     unqueue_env["on_up"]["lines"] = []
+    ticks = iter([0.0, 0.0] + [SI.POPALL_DEADLINE_SECONDS + 1.0] * 50)
+    monkeypatch.setattr(SI.time, "monotonic", lambda: next(ticks))
     result = SI.unqueue("deck")
     assert result == {"messages": []}
     assert _keys(unqueue_env["calls"]) == ["Up"]
 
 
-def test_unqueue_ignores_a_popall_that_predates_the_press(SI, unqueue_env):
+def test_unqueue_ignores_a_popall_that_predates_the_press(SI, unqueue_env, monkeypatch):
+    """The clock is driven rather than slept through (see
+    test_unqueue_stops_polling_once_the_deadline_passes), so this pins the
+    outcome without spending the real `POPALL_DEADLINE_SECONDS`."""
     with open(unqueue_env["transcript"], "a") as fh:
         fh.write(json.dumps(_qop("popAll", "stale")) + "\n")
     unqueue_env["on_up"]["lines"] = []
+    ticks = iter([0.0, 0.0] + [SI.POPALL_DEADLINE_SECONDS + 1.0] * 50)
+    monkeypatch.setattr(SI.time, "monotonic", lambda: next(ticks))
     result = SI.unqueue("deck")
     assert result == {"messages": []}
 
@@ -4994,8 +5005,14 @@ def test_unqueue_refuses_when_no_popall_arrived_and_the_pane_is_unexplained(
         SI, unqueue_env, monkeypatch):
     """No `popAll`, no empty box, and no history divider either. That leaves
     a pop whose records never came, and clearing would destroy the only copy
-    of what it returned — so the box is left exactly as `Up` drew it."""
+    of what it returned — so the box is left exactly as `Up` drew it.
+
+    The clock is driven rather than slept through (see
+    test_unqueue_stops_polling_once_the_deadline_passes), so this pins the
+    outcome without spending the real `POPALL_DEADLINE_SECONDS`."""
     unqueue_env["on_up"]["lines"] = []
+    ticks = iter([0.0, 0.0] + [SI.POPALL_DEADLINE_SECONDS + 1.0] * 50)
+    monkeypatch.setattr(SI.time, "monotonic", lambda: next(ticks))
     pressed = {"up": False}
     real_run = SI.TT.run
 

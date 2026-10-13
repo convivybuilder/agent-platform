@@ -46,25 +46,21 @@ permissions:
 # Supersede in-flight runs for the same ref; only the newest commit is worth
 # testing. This matters more here than elsewhere because the macOS job below
 # bills at 10x the Linux rate, and GitHub does not bill the Linux jobs, which
-# run on ci1.
+# run on ci1 — a five-runner pool every Convivy repo shares. On 2026-10-10
+# ~08:00 UTC all five were running this workflow's `python` job, three of
+# them main pushes already superseded by a later merge, and twenty
+# knowledge-repo runs queued over 25 minutes behind them.
+#
+# The group key carries the event name as well as the ref so a push and a
+# pull_request can never land in the same group, even when a PR's branch is
+# itself named `refs/heads/main` (`head_ref` is then the literal string
+# `refs/heads/main`, identical to `github.ref` on a push to main). Within a
+# group, a newer push or synchronize cancels an older run still in
+# progress. Nothing reads a superseded run's result, because every gate
+# reads a PR head's check-runs by sha (2026-10-10).
 concurrency:
-  # A PR groups by branch, so a new push supersedes the previous run. A push
-  # groups by COMMIT, so main commits never share a group and can neither cancel
-  # nor evict each other.
-  #
-  # `cancel-in-progress: false` alone does not achieve that. It stops a new run
-  # cancelling a RUNNING one, but a newer run still queues, and GitHub keeps only
-  # the most recently queued run per group — so a third merge arriving while the
-  # second is still pending evicts the second, which is recorded `cancelled`. That
-  # is the same end state the old comment forbade, reached by eviction rather than
-  # cancellation. Observed on selector 2026-07-19: 4da4c94e ran from 02:42:30,
-  # 45e80f01 queued 6s later, 78d4d55 arrived 8 minutes on and evicted it.
-  #
-  # Cost is concurrent runners during a merge burst. What it buys is the
-  # guarantee the old comment already promised: a completed CI result for every
-  # commit on main.
-  group: ci-${{ github.head_ref || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Does this PR touch anything that is not documentation? Seconds on the Linux
@@ -91,6 +87,13 @@ jobs:
       # main, on a PR that skipped it, means this list is stale — the fix is
       # to the list as well as to the code.
       installer_tests: ${{ steps.filter.outputs.installer_tests }}
+      # Whether this PR touches the Individuator's Swift package
+      # (CQ·447) or this workflow file itself. Same fail-safe polarity as
+      # `code` and `installer_tests` above: starts true, flips to false
+      # only after positively proving no changed path matches, so an API
+      # failure or a truncated page still runs the `swift` job rather than
+      # silently skipping it.
+      individuator: ${{ steps.filter.outputs.individuator }}
       # Whether a `push` to main is a merge commit whose tree already passed,
       # as a PR head, the same two check-runs this workflow is about to run
       # again. Empty on every pull_request event (the step below only runs on
@@ -134,6 +137,7 @@ jobs:
           # exists to save; a wrong `false` ships untested code.
           code=true
           installer_tests=true
+          individuator=true
           files=""
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             if files=$(gh api --paginate \
@@ -173,6 +177,14 @@ jobs:
                   fi
                   rm -f "$active_patterns"
                 fi
+
+                # individuator: same counting discipline as `code` above.
+                # `.github/workflows/` is included so an edit to this
+                # workflow's own `swift` job still runs it.
+                hit=$(printf '%s\n' "$files" | grep -cE '^individuator/|^\.github/workflows/' || true)
+                if [ "${hit:-1}" -eq 0 ]; then
+                  individuator=false
+                fi
               elif [ "${n:-0}" -ge 3000 ]; then
                 # GitHub's listFiles caps at 3000 entries, so a larger PR may
                 # arrive truncated and hide a code file. Do not inspect it.
@@ -188,8 +200,10 @@ jobs:
           printf '%s\n' "${files:-<not a pull_request; full suite>}"
           echo "code=$code"
           echo "installer_tests=$installer_tests"
+          echo "individuator=$individuator"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "installer_tests=$installer_tests" >> "$GITHUB_OUTPUT"
+          echo "individuator=$individuator" >> "$GITHUB_OUTPUT"
 
       # Full rationale, and why a PR head's job runs must exclude any
       # concluded `skipped` (the ARCH-364 draft-stage run every PR head
@@ -300,7 +314,7 @@ jobs:
         run: pip install -r requirements-dev.txt
       - name: pytest (with coverage)
         if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
-        run: python -m pytest -rs --cov --cov-report=term-missing --cov-report=json
+        run: python -m pytest -rs --durations=25 --cov --cov-report=term-missing --cov-report=json
       # `always()` publishes the number even when pytest fails, but it must not
       # outlive the gate: with the suite skipped there is no coverage.json to
       # upload, and the step would warn about a missing artifact on every docs PR
@@ -411,3 +425,82 @@ jobs:
         env:
           OPERATOR_HOME: ${{ vars.OPERATOR_HOME }}
         run: /bin/bash scripts/ci/runner-isolation-probe.sh
+
+  # Builds and tests the Individuator's identity core and mutual-TLS client
+  # (CQ·447 slices 2 and 3), the one Swift package in a repo that is
+  # otherwise bash and Python. Draft-gated like `python`/`bash` above, and
+  # gated by the `changes` job's `individuator` output — most PRs never
+  # touch individuator/, and the step-level `if` (not a job-level one)
+  # keeps this job reporting a real SUCCESS rather than SKIPPED on those
+  # PRs, for the same reason the `bash` job's own comment gives.
+  #
+  # Also skipped, same step-level way, on a push whose merge tree already
+  # passed as a PR head (`tree_skip`, set by the `changes` job) — the same
+  # guard `python`/`bash` apply, so a push to main does not always rerun
+  # `swift test` regardless of whether anything changed.
+  #
+  # Hosted `macos-latest`, not the self-hosted `convivy-macos-bash` runner
+  # the `bash` job uses: that runner is the one backing the machine that
+  # runs the crews' own infrastructure, and this job is rare enough that
+  # the hosted macOS 10x-cost concern the `bash` job's history documents
+  # does not apply.
+  #
+  # `cryptography` is installed (pinned to the same version requirements.txt
+  # carries) because `IndividuatorNetworkTests`' integration test
+  # (BosunRegistrationClientIntegrationTests) spawns a real
+  # `bosun_registration.RegistrationServer` as a Python subprocess
+  # (individuator/Tests/support/bosun_test_harness.py) to exercise the Swift
+  # mTLS client against it. Hosted `macos-latest` ships a `python3`, but its
+  # Homebrew install refuses a bare `pip3 install` with
+  # "externally-managed-environment" (PEP 668), so this installs into an
+  # interpreter actions/setup-python puts under this job's own control, and
+  # tells the Swift test which one with INDIVIDUATOR_TEST_PYTHON rather than
+  # leaving it to resolve `python3` off PATH. INDIVIDUATOR_REQUIRE_MTLS_INTEGRATION_TEST
+  # turns that test's own cryptography-unimportable skip into a failure here,
+  # so a broken install step (this is the second one) fails the job instead
+  # of leaving the mTLS client untested under a green check.
+  #
+  # NOT a required check: this PR's body leaves that decision to the
+  # operator.
+  swift:
+    needs: changes
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: record tree-equality skip
+        if: needs.changes.outputs.tree_skip == 'true'
+        run: |
+          echo "Skipped: merge commit ${{ github.sha }} has the same tree as PR #${{ needs.changes.outputs.skip_pr }} head ${{ needs.changes.outputs.skip_head }}, whose run ${{ needs.changes.outputs.skip_run_url }} passed." >> "$GITHUB_STEP_SUMMARY"
+      - name: set up Python (for the mTLS integration test's Python harness)
+        id: setup-python
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.individuator == 'true') && needs.changes.outputs.tree_skip != 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11" # matches the `python` job's own pin
+      - name: pip install cryptography (for the mTLS integration test's Python harness)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.individuator == 'true') && needs.changes.outputs.tree_skip != 'true'
+        # Installs into the actions/setup-python interpreter above, not the
+        # runner's Homebrew python3 (see the job comment for why that one
+        # refuses). The pin is read from requirements.txt, so this can't
+        # drift from the version already pinned there.
+        run: |
+          set -euo pipefail
+          pin=$(sed -n 's/^cryptography==//p' requirements.txt)
+          pip install "cryptography==$pin"
+      - name: swift test
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.individuator == 'true') && needs.changes.outputs.tree_skip != 'true'
+        working-directory: individuator
+        env:
+          # The interpreter the step above just installed cryptography into;
+          # BosunRegistrationClientIntegrationTests launches its Python
+          # harness with this one rather than whatever `python3` resolves to
+          # first on PATH.
+          INDIVIDUATOR_TEST_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+          # Turns BosunRegistrationClientIntegrationTests' own
+          # cryptography-unimportable skip into a test failure here: this
+          # job just installed cryptography, so a skip at this point means
+          # that install silently broke, exactly what left this job green
+          # while mTLS went untested the first time.
+          INDIVIDUATOR_REQUIRE_MTLS_INTEGRATION_TEST: "1"
+        run: swift test

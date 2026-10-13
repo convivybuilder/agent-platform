@@ -6,9 +6,11 @@ plane). It mirrors signal_client.py's post shape and reuses its bearer token —
 the agent-platform token holds `decision.create` (the `create` capability) but
 never `decide`, so a job can raise a decision for the operator and can never decide it.
 
-Used by `bin/issue-queue-drain` (`get_decision`) to read back a decision an
-item was escalated to. This is the ARCH-359 headless-GitHub move: the record
-is the in-box decision item, not a GitHub label or a Slack reaction.
+Was used by `bin/issue-queue-drain` (`get_decision`) to read back a decision
+an item was escalated to; that script was deleted 2026-10-09 when the nightly
+drain ended, and no caller remains in this repo. This is the ARCH-359
+headless-GitHub move: the record is the in-box decision item, not a GitHub
+label or a Slack reaction.
 """
 from __future__ import annotations
 

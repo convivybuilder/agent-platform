@@ -858,3 +858,524 @@ def test_serving_checkout_present_absent_present_logs_again_on_the_later_day(
     back = _serving_keys(csc, tmp_path, monkeypatch, day="2030-01-03", breach=True)
     assert absent == []
     assert back == ["serving-checkout:branchy:branch:2030-01-03"] and back != present
+
+
+# --- a host that cannot fork is not a finding against any repository --------
+#
+# THE INCIDENT THIS FIXES. On 2026-10-12, between 18:15 and 18:28 UTC, the
+# operator account hit its per-user process limit and every `git`/`plutil`
+# call this script makes failed with EAGAIN (errno 35). This check read that
+# the same way it reads a genuinely broken checkout — an `unreadable` finding
+# against each repository it happened to be checking — and the selector crew
+# had to close those findings by hand. `HostForkExhausted` makes that
+# condition abandon the whole pass instead: no per-repository finding, one
+# stderr line, exit 0, and the next 900s launchd tick retries.
+
+
+def test_eagain_on_git_status_skips_the_pass_without_a_per_repo_finding(
+        csc, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    calls = []
+    original = csc._post_signal
+    csc._post_signal = lambda *a, **k: calls.append((a, k)) or {"status": "stub"}
+    try:
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    finally:
+        csc._post_signal = original
+
+    assert rc == 0
+    assert calls == [], "a host that cannot fork must not become a per-repository finding"
+    err = capsys.readouterr().err
+    assert "[SKIP]" in err and "host resource exhaustion" in err and "EAGAIN" in err
+
+
+def test_a_non_eagain_git_status_failure_is_still_an_unreadable_finding(
+        csc, tmp_path, monkeypatch):
+    """Not every git-status failure is the host failing to fork — an ordinary
+    broken repository must still fail closed exactly as before this change."""
+    repo = _repo(tmp_path, "somesvc")
+
+    class _FakeResult:
+        returncode = 128
+        stdout = ""
+        stderr = "fatal: not a git repository (or any of the parent directories): .git"
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv:
+            return _FakeResult()
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    findings = csc.check(repo)
+    assert len(findings) == 1
+    assert findings[0]["kind"] == "unreadable"
+
+
+@pytest.mark.parametrize("raised", [
+    FileNotFoundError(2, "No such file or directory: 'git'"),  # ENOENT, missing git
+    PermissionError(13, "Permission denied"),                  # EPERM
+])
+def test_a_non_eagain_oserror_raised_on_git_status_is_unreadable_not_a_skip(
+        csc, tmp_path, monkeypatch, raised):
+    """Reviewer suggestion (PR #871 round 1): the four prior EAGAIN tests only
+    exercise a `git` call that RUNS and returns a non-zero exit — none of them
+    raise an actual `OSError`, so none distinguish "skip on EAGAIN only" from a
+    wrong "skip on every OSError". `FileNotFoundError`/`PermissionError` are not
+    `EAGAIN` and must fall through to the ordinary unreadable finding — `check()`
+    raising `HostForkExhausted` here (misrouting this into a pass-wide skip)
+    would itself fail this test, since nothing below catches it."""
+    repo = _repo(tmp_path, "somesvc")
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv:
+            raise raised
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    findings = csc.check(repo)
+    assert len(findings) == 1
+    assert findings[0]["kind"] == "unreadable"
+
+
+def test_eagain_on_current_branch_skips_the_pass(csc, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    real_popen = subprocess.Popen
+
+    def _fake_popen(argv, *a, **k):
+        if "symbolic-ref" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_popen(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "Popen", _fake_popen)
+
+    calls = []
+    original = csc._post_signal
+    csc._post_signal = lambda *a, **k: calls.append((a, k)) or {"status": "stub"}
+    try:
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    finally:
+        csc._post_signal = original
+
+    assert rc == 0
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "[SKIP]" in err and "EAGAIN" in err
+
+
+@pytest.mark.skipif(not _HAS_PLUTIL, reason="this guards plutil's own subprocess call")
+def test_eagain_on_the_launchd_status_read_skips_the_pass(csc, tmp_path, monkeypatch, capsys):
+    """The same rule for `_plist_fields`'s `plutil -lint` call — reading a
+    launchd plist's own status is as much a host fork as reading a repo's."""
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "-lint" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    calls = []
+    original = csc._post_signal
+    csc._post_signal = lambda *a, **k: calls.append((a, k)) or {"status": "stub"}
+    try:
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    finally:
+        csc._post_signal = original
+
+    assert rc == 0
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "[SKIP]" in err and "EAGAIN" in err
+
+
+def test_a_finding_discovered_before_the_eagain_is_not_posted_either(
+        csc, tmp_path, monkeypatch, capsys):
+    """THE EXIT-STATUS/SUMMARY MISMATCH (reviewer, PR #871 round 1). A pass can
+    post a real finding for one repository and then hit `EAGAIN` on the next,
+    which previously left a real finding posted to the shared store while the
+    run's own exit code and `[DONE]` summary read as a clean skip. Fixed by
+    gathering every pass's findings and posting them only once the pass
+    completes — an abandoned pass must post NOTHING, including the finding it
+    already found before the host stopped forking. Reproduces the reviewer's
+    exact repro shape: one genuinely dirty checkout sorted before one that
+    raises `EAGAIN` on `git status`."""
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    dirty = _repo(tmp_path, "aaa_dirty")
+    (dirty / "app.py").write_text("x = 1\n")
+    _run(dirty, "add", "-A")
+    _run(dirty, "commit", "-q", "-m", "seed2")
+    (dirty / "app.py").write_text("x = 2\n")
+    fails = _repo(tmp_path, "zzz_fails")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.dirty", working_directory=str(dirty))
+    _plist(la, "b.plist", label="svc.fails", working_directory=str(fails))
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv and str(fails) in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    calls = []
+    original = csc._post_signal
+    csc._post_signal = lambda *a, **k: calls.append((a, k)) or {"status": "stub"}
+    try:
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    finally:
+        csc._post_signal = original
+
+    assert rc == 0
+    assert calls == [], "the already-discovered dirty finding must not be posted either"
+    err = capsys.readouterr().err
+    assert "[SKIP]" in err and "EAGAIN" in err
+    assert "[DONE]" not in err, "a pass that posted nothing must not claim findings in its summary"
+
+
+def test_an_unparseable_plist_finding_is_also_abandoned_when_the_pass_hits_eagain_later(
+        csc, tmp_path, monkeypatch, capsys):
+    """THE GAP THE "an abandoned pass posts nothing" CLAIM MISSED (reviewer,
+    PR #871 round 2). The unparseable-plist finding used to post through
+    `_post_signal` before the per-repository loop even started, so a pass
+    that discovered an unparseable plist and THEN hit `EAGAIN` on a
+    different checkout's `git status` call had already posted a real
+    finding to the shared store before abandoning the rest of the pass —
+    the exact exit-status/store mismatch the round-1 fix closed for
+    per-repository findings, just not for this one. One plist fails to
+    parse for an ordinary, non-EAGAIN reason; one checkout's `git status`
+    call then raises EAGAIN later in the same pass."""
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    la = tmp_path / "LaunchAgents"
+    la.mkdir()
+    (la / "com.convivy.broken.plist").write_text("not a plist\x00", encoding="utf-8")
+    fails = _repo(tmp_path, "zzz_fails")
+    _plist(la, "b.plist", label="svc.fails", working_directory=str(fails))
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv and str(fails) in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    calls = []
+    original = csc._post_signal
+    csc._post_signal = lambda *a, **k: calls.append((a, k)) or {"status": "stub"}
+    try:
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    finally:
+        csc._post_signal = original
+
+    assert rc == 0
+    assert calls == [], "the unparseable-plist finding must not post either"
+    err = capsys.readouterr().err
+    assert "[SKIP]" in err and "EAGAIN" in err
+
+
+@pytest.mark.skipif(not _HAS_PLUTIL, reason="this guards plutil's own -extract subprocess call")
+def test_eagain_on_the_plutil_extract_call_skips_the_pass_not_a_silent_drop(
+        csc, tmp_path, monkeypatch, capsys):
+    """THE FALSE-CLEAN GAP (reviewer suggestion, PR #871 round 1). `_plist_fields`'s
+    `-lint` call was already covered by the EAGAIN rule, but its two `-extract`
+    calls (Label/WorkingDirectory) were not: before this fix, an `EAGAIN` there
+    was swallowed by `except (OSError, subprocess.TimeoutExpired): continue`,
+    leaving `fields` empty — the plist is then silently dropped from `found`,
+    `excluded`, AND `unparseable`, so the serving checkout it names goes
+    unchecked with no error anywhere (a false clean). Must now raise
+    `HostForkExhausted` and skip the whole pass instead, exactly like `-lint`."""
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "-extract" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    calls = []
+    original = csc._post_signal
+    csc._post_signal = lambda *a, **k: calls.append((a, k)) or {"status": "stub"}
+    try:
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    finally:
+        csc._post_signal = original
+
+    assert rc == 0
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "[SKIP]" in err and "EAGAIN" in err
+
+
+def test_a_completed_pass_always_records_which_checkouts_it_checked(
+        csc, tmp_path, monkeypatch):
+    """Supersedes the round-1 rule that a clean pass with nothing to reset
+    must not touch the state file (PR #871 round 1) — true when the file
+    held nothing but a skip counter resetting to the value it already held.
+    It no longer holds once the file is also the only record of which
+    serving checkouts the last completed pass examined (security-reviewer,
+    PR #871 round 2): a pass that finds nothing wrong still has something
+    new to record, which checkouts it looked at and when, so a completed
+    pass must write that record even when the skip streak was already
+    zero."""
+    state_path = tmp_path / "state" / "skip.json"
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", state_path)
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    assert rc == 0
+    checked, checked_at = csc._read_last_checked()
+    assert checked == ["somesvc (svc.one)"]
+    assert checked_at is not None
+
+
+def test_skips_past_the_bound_raise_exactly_one_host_level_finding_and_reset_clears_it(
+        csc, tmp_path, monkeypatch):
+    """Four consecutive skipped passes (one hour at the 900s launchd interval)
+    is the bound. Below it, nothing is filed about the host at all — only
+    crossing it files the one host-level finding, and a pass that completes
+    (the host can fork again) must reset the streak rather than let it carry
+    into an unrelated later outage."""
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    real_run = subprocess.run
+    eagain = {"on": True}
+
+    def _fake_run(argv, *a, **k):
+        if eagain["on"] and "status" in argv and "--porcelain=v1" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    seen = []
+    original = csc._post_signal
+    csc._post_signal = lambda *a, dedup_key, **k: seen.append(dedup_key) or {"status": "stub"}
+    try:
+        for _ in range(csc.FORK_SKIP_FINDING_THRESHOLD):
+            rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la),
+                          "--no-report"])
+            assert rc == 0
+        assert len(seen) == 1, "crossing the bound must file exactly one host-level finding"
+        assert seen[0].startswith("serving-checkout:host-fork-exhaustion:")
+
+        # The host can fork again: a pass completes cleanly, which must reset
+        # the streak.
+        eagain["on"] = False
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la),
+                      "--no-report"])
+        assert rc == 0
+
+        # A single skip right after a completed pass is back below the bound —
+        # it must not refile immediately, which would only be possible if the
+        # streak had NOT been cleared by the pass above.
+        eagain["on"] = True
+        rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la),
+                      "--no-report"])
+        assert rc == 0
+        assert len(seen) == 1, "the reset pass must have cleared the streak"
+    finally:
+        csc._post_signal = original
+
+
+# --- a skipped pass still names what it hides (security-reviewer, PR #871
+# round 2) ---------------------------------------------------------------
+#
+# A skip hides every serving checkout's branch/dirty state for that pass, not
+# only the one whose `git`/`plutil` call happened to raise EAGAIN — a writer
+# with access to just one checkout's `.git/config` or hooks, or any unrelated
+# process sharing the operator account's process ceiling, can trigger it. The
+# old per-repository path at least named each repository it could not check;
+# the host-level finding after four skipped passes must too.
+
+
+def test_the_host_level_finding_lists_the_checkouts_from_the_last_completed_pass(
+        csc, tmp_path, monkeypatch):
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    # One ordinary completed pass first, to leave a record of what was checked.
+    rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    assert rc == 0
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    bodies = []
+    original = csc._post_signal
+    csc._post_signal = lambda product, title, body, dedup_key, **k: (
+        bodies.append(body) or {"status": "stub"})
+    try:
+        for _ in range(csc.FORK_SKIP_FINDING_THRESHOLD):
+            rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la),
+                          "--no-report"])
+            assert rc == 0
+    finally:
+        csc._post_signal = original
+
+    assert len(bodies) == 1
+    assert "somesvc" in bodies[0] and "svc.one" in bodies[0]
+
+
+def test_the_host_level_finding_says_no_pass_has_completed_when_there_is_no_record(
+        csc, tmp_path, monkeypatch):
+    """If this host has never once completed a pass — right after a fresh
+    install, or if every pass since has hit EAGAIN — there is no
+    completed-pass record to name checkouts from at all; the finding must
+    say that plainly rather than silently listing nothing."""
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    repo = _repo(tmp_path, "somesvc")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.one", working_directory=str(repo))
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    bodies = []
+    original = csc._post_signal
+    csc._post_signal = lambda product, title, body, dedup_key, **k: (
+        bodies.append(body) or {"status": "stub"})
+    try:
+        for _ in range(csc.FORK_SKIP_FINDING_THRESHOLD):
+            rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la),
+                          "--no-report"])
+            assert rc == 0
+    finally:
+        csc._post_signal = original
+
+    assert len(bodies) == 1
+    assert "no pass has ever completed" in bodies[0].lower()
+
+
+# --- the host-level finding never names a private checkout (security-
+# reviewer, PR #871 round 3) ----------------------------------------------
+#
+# Round 2 made the host-level finding name every serving checkout the last
+# completed pass examined, so a human can see what a skip hides. That
+# listing is built from the full, unfiltered `checkouts` dict with no call
+# to `_is_private_checkout` anywhere on its path to `FORK_SKIP_STATE_PATH`
+# or to the finding body — the same leak `test_a_private_checkouts_finding_
+# is_not_filed` already proves this file closes for an ordinary
+# per-repository finding, just reopened for this one.
+
+
+def test_the_host_level_finding_never_names_a_private_checkout(
+        csc, tmp_path, monkeypatch):
+    """One ordinary and one private checkout recorded from a completed pass;
+    four EAGAIN passes later, the host-level finding posted to the shared
+    store must name the ordinary one and must not contain the private
+    checkout's name or label anywhere in its body."""
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", tmp_path / "state" / "skip.json")
+    ordinary = _repo(tmp_path, "ordinary-svc")
+    private = _repo(tmp_path, "blackbox-crew")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.ordinary", working_directory=str(ordinary))
+    _plist(la, "b.plist", label="svc.blackbox", working_directory=str(private))
+
+    private_resolved = private.resolve()
+    monkeypatch.setattr(csc, "_is_private_checkout",
+                        lambda repo_dir: repo_dir.resolve() == private_resolved)
+
+    # One ordinary completed pass first, to leave a record of what was
+    # checked — both checkouts are examined, but only the ordinary one may
+    # end up in the record.
+    rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    assert rc == 0
+
+    real_run = subprocess.run
+
+    def _fake_run(argv, *a, **k):
+        if "status" in argv and "--porcelain=v1" in argv:
+            raise BlockingIOError(35, "Resource temporarily unavailable")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(csc.subprocess, "run", _fake_run)
+
+    bodies = []
+    original = csc._post_signal
+    csc._post_signal = lambda product, title, body, dedup_key, **k: (
+        bodies.append(body) or {"status": "stub"})
+    try:
+        for _ in range(csc.FORK_SKIP_FINDING_THRESHOLD):
+            rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la),
+                          "--no-report"])
+            assert rc == 0
+    finally:
+        csc._post_signal = original
+
+    assert len(bodies) == 1
+    assert "ordinary-svc" in bodies[0] and "svc.ordinary" in bodies[0]
+    assert "blackbox-crew" not in bodies[0], "a private checkout's name reached the shared finding"
+    assert "svc.blackbox" not in bodies[0], "a private checkout's label reached the shared finding"
+
+
+def test_the_state_file_never_holds_a_private_checkouts_name(csc, tmp_path, monkeypatch):
+    """The leak is not only in the posted body — `FORK_SKIP_STATE_PATH` is
+    read back verbatim by `_skip_pass_for_fork_exhaustion`, so a private
+    checkout's name must never be written to it in the first place, not
+    merely filtered when the finding is rendered."""
+    state_path = tmp_path / "state" / "skip.json"
+    monkeypatch.setattr(csc, "FORK_SKIP_STATE_PATH", state_path)
+    ordinary = _repo(tmp_path, "ordinary-svc")
+    private = _repo(tmp_path, "blackbox-crew")
+    la = tmp_path / "LaunchAgents"
+    _plist(la, "a.plist", label="svc.ordinary", working_directory=str(ordinary))
+    _plist(la, "b.plist", label="svc.blackbox", working_directory=str(private))
+
+    private_resolved = private.resolve()
+    monkeypatch.setattr(csc, "_is_private_checkout",
+                        lambda repo_dir: repo_dir.resolve() == private_resolved)
+
+    rc = csc.main(["--convivy-root", str(tmp_path), "--launch-agents", str(la), "--no-report"])
+    assert rc == 0
+
+    state_text = state_path.read_text()
+    assert "ordinary-svc" in state_text
+    assert "blackbox-crew" not in state_text, "a private checkout's name reached disk"
+    assert "svc.blackbox" not in state_text, "a private checkout's label reached disk"
+
+    checked, _ = csc._read_last_checked()
+    assert checked == ["ordinary-svc (svc.ordinary)"]

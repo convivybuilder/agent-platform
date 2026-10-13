@@ -1205,6 +1205,18 @@ def test_the_bosun_app_key_is_denied(tmp_path):
     assert str(key) in settings["sandbox"]["filesystem"]["denyRead"]
 
 
+def test_the_bosun_ledger_reporter_token_is_denied(tmp_path):
+    # The credential the Library will mint for agentctl's ledger client to POST spend
+    # entries (including subscription-lane ones) — read by the dispatcher, never by a
+    # run. Denied ahead of the Library minting it, per the steward's request.
+    settings = RS.settings(home=tmp_path, worktree=tmp_path / "wt")
+    token = tmp_path / ".config" / "convivy" / "bosun-ledger-reporter.token"
+    deny = settings["permissions"]["deny"]
+    assert f"Read({_rule(token)})" in deny
+    assert f"Edit({_rule(token)})" in deny
+    assert str(token) in settings["sandbox"]["filesystem"]["denyRead"]
+
+
 def test_the_credential_helper_paths_are_denied_for_every_home(tmp_path, monkeypatch):
     # Same "caller's own HOME too" shape as test_the_denial_covers_the_callers_home_too.
     caller_home = tmp_path / "caller-home"
@@ -1216,6 +1228,7 @@ def test_the_credential_helper_paths_are_denied_for_every_home(tmp_path, monkeyp
         assert str(home / "Library" / "Keychains") in deny_read
         assert str(home / ".gitconfig") in deny_read
         assert str(home / ".config" / "convivy" / "bosun-app.pem") in deny_read
+        assert str(home / ".config" / "convivy" / "bosun-ledger-reporter.token") in deny_read
 
 
 def test_the_extra_deny_home_also_covers_the_credential_helper_paths(tmp_path, monkeypatch):
@@ -1226,6 +1239,7 @@ def test_the_extra_deny_home_also_covers_the_credential_helper_paths(tmp_path, m
     assert str(extra / ".config" / "gh") in deny_read
     assert str(extra / ".gitconfig") in deny_read
     assert str(extra / ".config" / "convivy" / "bosun-app.pem") in deny_read
+    assert str(extra / ".config" / "convivy" / "bosun-ledger-reporter.token") in deny_read
 
 
 def test_mach_lookup_names_only_trustd_so_the_keychains_service_is_denied_by_omission():

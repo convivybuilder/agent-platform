@@ -1,0 +1,644 @@
+#!/usr/bin/env python3.11
+"""ci-result-capture — every tracked repository's CI results, captured as
+signals in the Library's Archives (CQ-455, issue_01M4J1ASMSFFPC6S0RQ6VVVT57).
+
+The operator ruled 2026-10-09 that the Bosun posts all CI results to the Library, the
+way PR state already is. Until this job covers it, the Library's own
+`bin/ci_result_fetch.py` polls GitHub for the same data riding the operator's
+personal `gh` login — forbidden by platform/decisions/0051, the same rule
+`bin/pr-state-capture` answers for PR state. This job answers it for CI.
+
+AUTHENTICATES AS THE `convivy-bosun` GITHUB APP (app id 4666673), never `gh`,
+mirroring `bin/pr-state-capture` end to end: same App, same org-wide
+installation, same read-only posture (`_READ_ONLY_PERMISSIONS` mints a token
+that can only read `actions` and `metadata`, so a bug that tried to write
+would be refused by GitHub itself). See that script's module docstring and
+`lib/agent-platform/github_app.py` for the shared JWT/token plumbing both use.
+
+**THE TRACKED LIST IS OWNED HERE, A COPY, NOT A LIVE READ OF THE LIBRARY'S
+OWN `TRACKED`.** The Library's fetcher lives in a separate repository
+(`convivy/library`) this job cannot import across a deploy boundary without
+making itself depend on that repo's own install layout — the two jobs must
+be able to run independently through changeover, including the day the
+Library's own is retired. `TRACKED` below is seeded from that file's list as
+read on 2026-10-13 (all ~20 pairs, not a vivy-specific subset), so the two
+jobs cover the same ground during the overlap and `dedup_key` absorbs
+whichever one gets to a run first. Keeping the two lists in sync from here
+on is a manual cost, accepted the same way `bin/pr-state-capture`'s own
+`repos_to_capture()` note (derived from the registry, not copied) chose the
+opposite tradeoff for repo lists that change far more often than CI workflow
+wiring does.
+
+READ-ONLY, separate from any write path: the only non-GET calls here are the
+GitHub App token mint (`github_app.installation_token`, a POST to
+`/access_tokens`) and the Library's own `POST /signals` — no `/repos/...`
+write of any kind.
+
+THE SIGNAL CONTRACT MATCHES `ci_result_fetch.py`'s `signal_from_run` BYTE FOR
+BYTE, SO BOTH CAN RUN DURING CHANGEOVER WITH NO DUPLICATE ROW: `source: ci`,
+`kind: test-result`, `actor: github-actions`, `stream` the workflow's slug
+(`workflow_slug`), `refs.commit` the run's head sha (the Library's `GET
+/signals/pr-state` joins a PR's CI by it), `dedup_key:
+ci:<product>:<workflow-slug>:<run-id>` — the same scheme a retired push used
+before it (see that file's own docstring), so a run captured by either path
+first makes the other's post a no-op `duplicate`, never a second row.
+
+**THE CURSOR INVARIANTS ARE THE SAME ONES `ci_result_fetch.py`'s MODULE
+DOCSTRING DERIVES FROM A PRODUCTION BUG (2026-08-31)**, carried over here
+rather than re-derived, because the bug is general to any "poll since a
+cursor, in flight runs excluded by a status filter" design, not specific to
+that file's own transport (`gh api` there, this module's own
+`urllib`/`github_app` here):
+
+  - `gh_runs` fetches every run since the cursor REGARDLESS of status; a
+    completed run is turned into a signal, an incomplete one holds the
+    cursor back to its own `created_at` so it is asked for again until it
+    finishes. Filtering to `status=completed` server-side is what caused the
+    original bug: a run still in flight is excluded from the page that would
+    have caught it, and once the cursor moves past its creation time on
+    wall-clock alone it is excluded from every later page too — gone, with
+    no error and nothing in the log.
+  - The held-back cursor uses `created >=`, not `>`: holding to the run's
+    EXACT `created_at` and then re-querying with a strict `>` would exclude
+    that exact run on the very next poll, the same class of loss one step
+    removed. `dedup_key` absorbs whatever `>=` re-fetches a second time.
+  - `STALE_PENDING_AFTER` bounds how long one incomplete run may hold a
+    pair's cursor back before it is treated as abandoned — excluded from the
+    watermark and logged loudly as `stale_pending`, not dropped silently —
+    so one run that never legitimately finishes cannot freeze that pair's
+    cursor and grow its refetch window forever.
+  - A pair's cursor advances only once its whole window is fetched AND
+    posted with zero errors (`capture_workflow`'s own `errors` tally) — a
+    fetch failure or one failed post leaves the cursor exactly where it was,
+    so the next run re-covers the whole window rather than skipping over
+    data this run never actually wrote; `dedup_key` absorbs the re-covered
+    rows that already landed.
+  - GitHub caps a `created`-filtered run list at `GITHUB_CREATED_FILTER_CAP`
+    results and never errors on the page past it — it returns empty, the
+    same silent truncation `ci_result_fetch.py` measured in production
+    (`convivy/knowledge#ci.yml`'s 90-day window: `total_count` 2500, page 10
+    returned 100, page 11 returned 0). A pair whose window holds more than
+    the cap would otherwise have its cursor advanced past runs the capped
+    query never returned. `gh_runs` answers this the same way that file's
+    own `gh_runs` does: a `>=since` query that comes back at exactly the cap
+    is re-fetched as a split, recursive range query (`_gh_runs_window`)
+    instead of trusted as the whole window, and a capped range already
+    under one second wide raises rather than being trusted, since splitting
+    it any further cannot produce evidence it covered the window in full.
+
+Usage:
+    ci-result-capture
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import builder_root as BR  # noqa: E402
+import github_app as GA  # noqa: E402
+import signal_client as SC  # noqa: E402
+
+# The convivy-bosun GitHub App, the same installation `bin/pr-state-capture`
+# already reads through (issue_01M2KV16ZRG3N49GRER8Q7545H, app id 4666673,
+# installed org-wide). Re-derived per run, never stored.
+APP_ID = "4666673"
+OWNER = "convivy"
+
+# Read from the passwd home, never $HOME — see builder_root.real_account_home.
+KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
+
+# The token this script mints can only ever read workflow runs and the
+# installation's own metadata, whatever the App itself holds — see the
+# module docstring's READ-ONLY section.
+_READ_ONLY_PERMISSIONS = {"actions": "read", "metadata": "read"}
+
+# Every (repo, workflow_file) pair this job captures, and the product each
+# posts under — see the module docstring's TRACKED-LIST section for why this
+# is a copy of, not a live read of, the Library's own list. Read from
+# `convivy/library`'s `bin/ci_result_fetch.py` on 2026-10-13.
+TRACKED = (
+    {"repo": "convivy/constance", "workflow_file": "ci.yml", "product": "constance"},
+    {"repo": "convivy/vivy", "workflow_file": "ci.yml", "product": "vivy"},
+    {"repo": "convivy/vivy", "workflow_file": "e2e-stage-smoke.yml", "product": "vivy"},
+    {"repo": "convivy/vivy-ownerrez-sandbox-tools", "workflow_file": "ci.yml", "product": "vivy"},
+    {"repo": "convivy/sous-chef", "workflow_file": "ci.yml", "product": "sous-chef"},
+    {"repo": "convivy/hollis", "workflow_file": "ci.yml", "product": "hollis"},
+    {"repo": "convivy/selector", "workflow_file": "ci.yml", "product": "selector"},
+    {"repo": "convivy/selector-backend", "workflow_file": "ci.yml", "product": "selector"},
+    {"repo": "convivy/library", "workflow_file": "ci.yml", "product": "library"},
+    {"repo": "convivy/knowledge", "workflow_file": "ci.yml", "product": "library"},
+    {"repo": "convivy/agent-platform", "workflow_file": "ci.yml", "product": "bosun"},
+    {"repo": "convivy/placard", "workflow_file": "ci.yml", "product": "placard"},
+    {"repo": "convivy/shipwright", "workflow_file": "ci.yml", "product": "shipwright"},
+    {"repo": "convivy/convivy-orient", "workflow_file": "ci.yml", "product": "convivy-orient"},
+    {"repo": "convivy/www", "workflow_file": "build-deploy.yml", "product": "convivy-orient"},
+    {"repo": "convivy/convivy-app-kit", "workflow_file": "ci.yml", "product": "svc"},
+    {"repo": "convivy/convivy-services", "workflow_file": "ci.yml", "product": "svc"},
+    {"repo": "convivy/convivy-deck", "workflow_file": "ci.yml", "product": "convivy-deck"},
+    {"repo": "convivy/substrate", "workflow_file": "checks.yml", "product": "steward"},
+    {"repo": "convivy/vivy-landing", "workflow_file": "ci.yml", "product": "vivy"},
+)
+
+# This job's OWN POST /signals credential, the same reasoning as
+# `pr-state-capture`'s `SIGNAL_TOKEN_ENV`/`SIGNAL_TOKEN_FILE` (library#176:
+# 120 signals/minute is per authenticated actor, and a capture job posting at
+# this job's volume needs its own bucket rather than sharing the shared
+# agent-platform one). Until the Library mints and installs this job's own
+# credential, `main()` falls back to the shared token and warns once.
+SIGNAL_TOKEN_ENV = "CI_RESULT_CAPTURE_TOKEN"
+SIGNAL_TOKEN_FILE = Path.home() / ".orient-control" / "ci-result-capture-token"
+
+# STATE, not configuration shipped with the code (platform/decisions/0059
+# rule 3) — the cursor outlives any one deploy, and an atomic install swap
+# replaces the deploy area wholesale, which would destroy it if it lived
+# there. Mirrors `pr-state-capture.STATE_DIR`'s own placement and mode.
+STATE_DIR = Path.home() / ".local" / "state" / "agent-platform" / "ci-result-capture"
+CURSOR_FILE_NAME = "cursor.json"
+
+# GitHub's own eventual-consistency margin: a run that concluded moments
+# before this process read "now" might not yet be visible to the API, so the
+# next cursor sits a little behind "now" rather than exactly at it.
+# `dedup_key` absorbs the re-covered runs this creates. This is a fallback
+# for that gap alone — a run still incomplete when a pass started holds the
+# cursor back to its OWN `created_at` regardless of how long it takes to
+# finish (see `capture_workflow`).
+OVERLAP = dt.timedelta(minutes=5)
+
+# The ceiling on how long an incomplete run may hold a pair's cursor back
+# before it is treated as abandoned rather than in flight. GitHub force-
+# resolves every run to `completed` within 35 days; 24 hours is grounded in
+# GitHub-hosted runners' own 6-hour job-execution cap plus a wide margin, not
+# in any one workflow's observed runtime.
+STALE_PENDING_AFTER = dt.timedelta(hours=24)
+
+# The bound a pair with no stored cursor starts from, so a first run captures
+# a bounded recent window rather than a workflow's entire history.
+NO_CURSOR_WINDOW_DAYS = 90
+
+# Bounds one run deadline the same way `pr-state-capture._RUN_DEADLINE_SECONDS`
+# does: this job's own `StartInterval` is 900s; 600s leaves headroom before
+# the next scheduled fire rather than racing it.
+_RUN_DEADLINE_SECONDS = 600
+
+# The delivery-wanting timeout `signal_client._DELIVERY_TIMEOUT` uses for a
+# one-shot launchd job that cares whether a write landed, not the tee's
+# short budget.
+_SIGNAL_TIMEOUT = 30
+
+_PAGE_SIZE = 100
+
+# GitHub's own cap on a `created`-filtered run list, regardless of how many
+# pages are asked for — see the module docstring's cursor-invariants
+# section for the production measurement this is carried over from. A
+# `>=since` (or split range) query that comes back at exactly this many
+# results has not necessarily seen the whole window; `gh_runs` and
+# `_gh_runs_window` answer that, not `_gh_runs_page`'s own pagination loop.
+GITHUB_CREATED_FILTER_CAP = 1000
+
+# One more than `GITHUB_CREATED_FILTER_CAP` divided into `_PAGE_SIZE`-sized
+# pages, so a capped fetch actually reaches the short page GitHub returns
+# past its own cap rather than stopping one page short of it. A guard
+# against an unbounded page loop only — GitHub itself never returns more
+# than `GITHUB_CREATED_FILTER_CAP` results for one `created`-filtered query
+# no matter how many pages this loop asks for.
+_MAX_PAGES = GITHUB_CREATED_FILTER_CAP // _PAGE_SIZE + 1
+
+_CONCLUSION_TO_META_STATUS = {"success": "pass", "failure": "fail"}
+
+
+class CaptureError(RuntimeError):
+    """A GitHub fetch failed, or a run in its response could not be turned
+    into a signal. Raised rather than swallowed, and raised BEFORE anything
+    in the same batch is posted, so a partial or malformed page never
+    leaves the cursor advanced past data this run never actually wrote."""
+
+
+# --- pure transforms (unit-tested, no network) ------------------------------
+
+
+def workflow_slug(workflow_file: str) -> str:
+    """ci.yml -> ci; e2e-stage-smoke.yml -> e2e-stage-smoke."""
+    return Path(workflow_file).stem
+
+
+def _parse_timestamp(value: str) -> dt.datetime:
+    """GitHub's run timestamps are always `YYYY-MM-DDTHH:MM:SSZ` (UTC, zero
+    padded, no fractional seconds); swapping the trailing `Z` for an
+    explicit offset is enough for `fromisoformat`."""
+    return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def conclusion_to_meta_status(conclusion: str | None) -> str | None:
+    """GitHub's `conclusion` -> the Library's `meta.status` vocabulary
+    (`pass`/`fail`), or `None` for anything else — `skipped`, `cancelled`,
+    `timed_out`, `neutral`, `action_required`, or `None` for a run still in
+    flight. The caller omits `meta.status` entirely for those rather than
+    writing a guessed `pass`/`fail`."""
+    return _CONCLUSION_TO_META_STATUS.get(conclusion)
+
+
+def signal_from_run(run: dict, product: str, workflow: str) -> dict:
+    """One completed GitHub Actions run -> one Library `POST /signals` body,
+    matching `ci_result_fetch.py`'s `signal_from_run` field for field (see
+    the module docstring). Raises `CaptureError` when the run is missing a
+    field the dedup key depends on (`id`, `created_at`)."""
+    run_id = run.get("id")
+    created_at = run.get("created_at")
+    if not isinstance(run_id, int) or not created_at:
+        raise CaptureError(f"malformed workflow run in GitHub's response: {run!r}")
+    conclusion = run.get("conclusion")
+    meta = {"run_number": run.get("run_number"), "event": run.get("event"),
+            "run_url": run.get("html_url")}
+    status = conclusion_to_meta_status(conclusion)
+    if status is not None:
+        meta["status"] = status
+    return {
+        "source": "ci",
+        "kind": "test-result",
+        "product": product,
+        "stream": workflow,
+        "actor": "github-actions",
+        "body": f"{workflow}: {conclusion or 'unknown'}",
+        "refs": {
+            "conclusion": conclusion,
+            "workflow": workflow,
+            "commit": run.get("head_sha"),
+            "run_url": run.get("html_url"),
+        },
+        "meta": meta,
+        "produced_at": created_at,
+        "dedup_key": f"ci:{product}:{workflow}:{run_id}",
+    }
+
+
+# --- I/O: GitHub fetch, signal post, cursor and token files -----------------
+
+
+def _gh_runs_page(repo: str, workflow_file: str, created_filter: str, token: str, *,
+                  opener=urllib.request.urlopen) -> list[dict]:
+    """Every run GitHub returns for this exact `created` filter value,
+    paginated up to `_MAX_PAGES` pages — the shared low-level fetch both
+    `gh_runs` and `_gh_runs_window` build on. `created_filter` is the
+    complete, already `urllib.parse.quote`d query-string value to send as
+    `created=<created_filter>`.
+
+    `_MAX_PAGES` is sized to actually reach the short page GitHub returns
+    past `GITHUB_CREATED_FILTER_CAP`, so this call's own result length is
+    never ambiguous between "exactly the cap" and "one page short of a
+    longer loop that was never tried" — but it never returns more than the
+    cap for one `created` filter value either way, which `gh_runs`/
+    `_gh_runs_window` are what detect and answer. Raises `CaptureError` on
+    any non-200 or malformed response — never returns a partial list
+    silently."""
+    out: list[dict] = []
+    for page in range(1, _MAX_PAGES + 1):
+        url = (f"{GA.API}/repos/{repo}/actions/workflows/{workflow_file}/runs"
+              f"?per_page={_PAGE_SIZE}&page={page}&created={created_filter}")
+        code, payload = GA.request("GET", url, token, None, opener=opener)
+        runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+        if code != 200 or not isinstance(runs, list):
+            raise CaptureError(f"{repo}/{workflow_file}: workflow runs could not be read ({code})")
+        out.extend(runs)
+        if len(runs) < _PAGE_SIZE:
+            return out
+    print(f"ci-result-capture: {repo}/{workflow_file}: hit the {_MAX_PAGES}-page "
+         f"pagination guard without a short page — GitHub returned more than "
+         f"{GITHUB_CREATED_FILTER_CAP} runs for this exact created filter, which "
+         f"its own cap is not supposed to allow; returning what was read rather "
+         f"than looping without bound", file=sys.stderr)
+    return out
+
+
+def _gh_runs_window(repo: str, workflow_file: str, since_dt: dt.datetime,
+                    until_dt: dt.datetime, token: str, *,
+                    opener=urllib.request.urlopen) -> list[dict]:
+    """Every run with `created` inside `[since_dt, until_dt]`, BOTH ends
+    inclusive (GitHub's `A..B` range syntax) — recursing by splitting the
+    range in half whenever one query comes back at exactly
+    `GITHUB_CREATED_FILTER_CAP` results, which means GitHub truncated it
+    rather than that being the true count for the range. Deduplicates by
+    `id` across the two halves, since the shared inclusive boundary can
+    return the same run from both.
+
+    Raises `CaptureError` — never silently returns a window it cannot prove
+    it covered in full — if a capped query's range is already under one
+    second wide and so cannot be split any further. That needs over
+    `GITHUB_CREATED_FILTER_CAP` runs created inside the same second and has
+    never been observed; failing the fetch (which leaves the pair's cursor
+    exactly where it was, same as any other `CaptureError`) is the correct
+    answer to a case this code cannot prove it got right, not a guess at
+    one."""
+    since_s = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until_s = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    created_filter = urllib.parse.quote(f"{since_s}..{until_s}", safe="")
+    runs = _gh_runs_page(repo, workflow_file, created_filter, token, opener=opener)
+    if len(runs) < GITHUB_CREATED_FILTER_CAP:
+        return runs
+    if until_dt - since_dt <= dt.timedelta(seconds=1):
+        raise CaptureError(
+            f"{repo}/{workflow_file}: created-filter cap "
+            f"({GITHUB_CREATED_FILTER_CAP}) reached for a window "
+            f"({since_s}..{until_s}) under one second wide — cannot split it "
+            f"any further, refusing to advance the cursor past a range this "
+            f"call cannot prove it fetched in full")
+    mid_dt = since_dt + (until_dt - since_dt) / 2
+    newer = _gh_runs_window(repo, workflow_file, mid_dt, until_dt, token, opener=opener)
+    older = _gh_runs_window(repo, workflow_file, since_dt, mid_dt, token, opener=opener)
+    seen_ids = set()
+    merged = []
+    for run in newer + older:
+        run_id = run.get("id")
+        if run_id not in seen_ids:
+            seen_ids.add(run_id)
+            merged.append(run)
+    return merged
+
+
+def gh_runs(repo: str, workflow_file: str, since: str, token: str, *,
+           opener=urllib.request.urlopen) -> list[dict]:
+    """Every run of one workflow — ANY status, completed or not — with
+    `created` on/after `since` (GitHub's inclusive `>=` range filter).
+
+    Deliberately not filtered to `status=completed` server-side — see the
+    module docstring's cursor-invariants section for the bug that filter
+    caused elsewhere. `capture_workflow` does the completed/incomplete split
+    itself, because only it can hold the cursor back for whatever this call
+    returns as still running.
+
+    **A `>=since` query that comes back at exactly `GITHUB_CREATED_FILTER_CAP`
+    results is retried as a split, recursive range fetch instead of returned
+    as-is** (`_gh_runs_window`, over `[since, now]`) — see that constant's
+    own comment for the cap this answers. The ordinary, nowhere-near-the-cap
+    case (every tracked pair's incremental poll, and most pairs' very first
+    fetch) costs exactly the one `>=since` query this function always used
+    to make; only a pair whose window holds more than the cap pays for the
+    extra queries the split needs.
+
+    Raises `CaptureError` on any non-200 or malformed response — never
+    returns a partial list silently."""
+    created_filter = f"%3E%3D{urllib.parse.quote(since, safe='')}"
+    runs = _gh_runs_page(repo, workflow_file, created_filter, token, opener=opener)
+    if len(runs) < GITHUB_CREATED_FILTER_CAP:
+        return runs
+    since_dt = _parse_timestamp(since)
+    until_dt = dt.datetime.now(dt.timezone.utc)
+    return _gh_runs_window(repo, workflow_file, since_dt, until_dt, token, opener=opener)
+
+
+def signal_token() -> str | None:
+    """`SIGNAL_TOKEN_ENV` or the 0600 file `SIGNAL_TOKEN_FILE`, or None —
+    `main()` falls back to the shared agent-platform signal credential
+    (`signal_client.post_signal`'s own `tok or token()`) and warns once."""
+    tok = os.environ.get(SIGNAL_TOKEN_ENV, "").strip()
+    if tok:
+        return tok
+    try:
+        return SIGNAL_TOKEN_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _cursor_path() -> Path:
+    return STATE_DIR / CURSOR_FILE_NAME
+
+
+def load_cursor() -> dict:
+    """The `created` lower bound for every tracked pair's next incremental
+    fetch, or `{}` when nothing has been recorded yet or the record cannot
+    be read — both mean "start every pair from `NO_CURSOR_WINDOW_DAYS` ago"
+    to the rest of `main()`."""
+    try:
+        raw = _cursor_path().read_text()
+    except OSError:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        print(f"ci-result-capture: cursor file at {_cursor_path()} is corrupt; "
+             f"starting every pair from its no-cursor window", file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_cursor(cursor: dict) -> None:
+    """Atomic write: a pid-unique temp file in the same directory, then
+    `os.replace` — a process killed mid-write must never leave the cursor
+    file holding a truncated JSON fragment, which `load_cursor`'s broad
+    `except` would read as "no cursor at all" and trigger a full refetch of
+    every tracked pair (safe via `dedup_key`, but slow)."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)  # mkdir's mode is a no-op on an already-existing dir
+    path = _cursor_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(cursor, sort_keys=True))
+    os.replace(tmp, path)
+
+
+# --- the capture run ---------------------------------------------------------
+
+
+def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
+                     gh_token: str, sig_tok: str | None, *,
+                     fetcher=None, poster=None, run_started=None,
+                     deadline: float | None = None, sleep=time.sleep,
+                     stale_pending_after: dt.timedelta | None = None) -> dict:
+    """One tracked (repo, workflow_file) pair. Returns a tally dict with keys
+    `created`/`duplicate`/`errors`/`stale_pending`, plus `next_since` — the
+    cursor value `main()` should persist for this pair when `errors == 0`
+    (`None` whenever it isn't safe to advance at all) — and `reason`, the
+    first failure's text (`None` on a clean run).
+
+    See the module docstring's cursor-invariants section for why an
+    incomplete run holds `next_since` back to its own `created_at`, why a
+    run stuck past `stale_pending_after` is excluded from that watermark
+    instead, and why `errors` is what gates whether `main()` advances this
+    pair's cursor at all.
+
+    `fetcher`/`poster` default to the module-level `gh_runs`/
+    `signal_client.post_signal`, resolved at call time so a caller going
+    through `main()` still gets whatever the module currently names; a test
+    passes its own fake directly.
+
+    A fetch failure, OR one incomplete run with no parseable `created_at`,
+    aborts the WHOLE window before anything is posted — the watermark
+    cannot be computed safely without it, so the whole window aborts rather
+    than guessing.
+
+    A signal reporting `'error:429'` (`post_signal`'s own retry-to-deadline
+    exhausted) stops the posting loop for the REST of this pair's batch: the
+    deadline it was retried against is shared across every payload in this
+    run, so a further payload would retry into an already-expired budget for
+    no gain. Any other post failure is tallied as an ordinary error and the
+    loop continues — only a sustained 429 is a case where trying the next
+    payload is already known to be pointless."""
+    fetcher = fetcher if fetcher is not None else gh_runs
+    poster = poster if poster is not None else SC.post_signal
+    run_started = run_started if run_started is not None else dt.datetime.now(dt.timezone.utc)
+    stale_pending_after = (stale_pending_after if stale_pending_after is not None
+                           else STALE_PENDING_AFTER)
+    workflow = workflow_slug(workflow_file)
+    tally = {"created": 0, "duplicate": 0, "errors": 0, "stale_pending": 0,
+            "next_since": None, "reason": None}
+    try:
+        runs = fetcher(repo, workflow_file, since, gh_token)
+    except CaptureError as ex:
+        print(f"ci-result-capture: {repo}/{workflow_file}: {ex}", file=sys.stderr)
+        tally["errors"] += 1
+        tally["reason"] = str(ex)
+        return tally
+
+    completed_runs = [r for r in runs if r.get("status") == "completed"]
+    incomplete_runs = [r for r in runs if r.get("status") != "completed"]
+    try:
+        payloads = [signal_from_run(r, product, workflow) for r in completed_runs]
+        in_flight_created_ats = []
+        for r in incomplete_runs:
+            created_at = r.get("created_at")
+            if not created_at:
+                raise CaptureError(
+                    f"{repo}/{workflow_file}: incomplete run with no "
+                    f"created_at, cannot safely place it relative to the "
+                    f"cursor: {r!r}")
+            try:
+                created_dt = _parse_timestamp(created_at)
+            except (ValueError, AttributeError, TypeError) as ex:
+                raise CaptureError(
+                    f"{repo}/{workflow_file}: incomplete run with an "
+                    f"unparseable created_at, cannot safely place it "
+                    f"relative to the cursor: {r!r} "
+                    f"({type(ex).__name__}: {ex})") from ex
+            age = run_started - created_dt
+            if age > stale_pending_after:
+                print(f"ci-result-capture: {repo}/{workflow_file}: STALE_PENDING "
+                     f"(still {r.get('status')!r} after {age}, past the "
+                     f"{stale_pending_after} ceiling — treated as abandoned, "
+                     f"cursor advances past it): run {r.get('id')}, created "
+                     f"{created_at}", file=sys.stderr)
+                tally["stale_pending"] += 1
+            else:
+                in_flight_created_ats.append(created_dt)
+    except CaptureError as ex:
+        print(f"ci-result-capture: {ex}", file=sys.stderr)
+        tally["errors"] += 1
+        tally["reason"] = str(ex)
+        return tally
+
+    for payload in payloads:
+        result = poster(payload, tok=sig_tok, timeout=_SIGNAL_TIMEOUT,
+                        deadline=deadline, sleep=sleep)
+        if result == "created":
+            tally["created"] += 1
+        elif result == "duplicate":
+            tally["duplicate"] += 1
+        elif result == "error:429":
+            print(f"ci-result-capture: {repo}/{workflow_file}: sustained 429 "
+                 f"on {payload['dedup_key']}; stopping this pair's batch "
+                 f"here, cursor held, all of it re-asked for next poll",
+                 file=sys.stderr)
+            tally["errors"] += 1
+            if tally["reason"] is None:
+                tally["reason"] = f"sustained 429 on {payload['dedup_key']}"
+            break
+        else:
+            print(f"ci-result-capture: {repo}/{workflow_file}: post failed: "
+                 f"{result} ({payload['dedup_key']})", file=sys.stderr)
+            tally["errors"] += 1
+            if tally["reason"] is None:
+                tally["reason"] = f"post failed: {result} ({payload['dedup_key']})"
+
+    watermark_candidates = [run_started - OVERLAP, *in_flight_created_ats]
+    tally["next_since"] = min(watermark_candidates).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return tally
+
+
+def main() -> int:
+    argparse.ArgumentParser(
+        description="Capture tracked repositories' CI results as signals, "
+                    "authenticating as the convivy-bosun GitHub App.").parse_args()
+
+    problem = GA.key_problem(KEY_PATH, label="the convivy-bosun App")
+    if problem:
+        print(f"ci-result-capture: {problem}", file=sys.stderr)
+        return 1
+    try:
+        jwt = GA.app_jwt(KEY_PATH, APP_ID)
+        inst = GA.single_installation(jwt, OWNER)
+        inst_id = str(inst.get("id") or "")
+        if not inst_id:
+            raise GA.Unreadable("the installation carries no id")
+        gh_token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS)
+    except GA.Unreadable as e:
+        print(f"ci-result-capture: {e}", file=sys.stderr)
+        return 1
+
+    sig_tok = signal_token()
+    if not sig_tok:
+        print(f"ci-result-capture: no {SIGNAL_TOKEN_FILE} and no "
+             f"${SIGNAL_TOKEN_ENV}; sharing the agent-platform signal bucket "
+             f"until the Library mints ci-result-capture's own credential",
+             file=sys.stderr)
+
+    run_started = dt.datetime.now(dt.timezone.utc)
+    no_cursor_since = (run_started - dt.timedelta(days=NO_CURSOR_WINDOW_DAYS)
+                      ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cursor = load_cursor()
+    # One deadline for the whole run, not per signal — see
+    # `pr-state-capture._RUN_DEADLINE_SECONDS` for the same reasoning.
+    deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
+
+    exit_code = 0
+    grand = {"created": 0, "duplicate": 0, "errors": 0, "stale_pending": 0}
+    for entry in TRACKED:
+        key = f"{entry['repo']}#{entry['workflow_file']}"
+        since = cursor.get(key) or no_cursor_since
+        try:
+            t = capture_workflow(entry["repo"], entry["workflow_file"], entry["product"],
+                                 since, gh_token, sig_tok, run_started=run_started,
+                                 deadline=deadline)
+        except Exception as ex:
+            # THE OUTER SAFETY NET (`ci_result_fetch.py`'s own, carried over):
+            # `capture_workflow` only catches `CaptureError` — anything else (a
+            # transport failure `gh_runs`/`GA.request` doesn't wrap, say)
+            # propagates here uncaught. Caught at THIS level and tallied as an
+            # error for this pair alone, so every OTHER pair in `TRACKED` still
+            # gets its turn and its own `save_cursor` call below, rather than
+            # one pair's unexpected exception aborting the rest of this run.
+            print(f"ci-result-capture: {key}: unexpected failure: "
+                 f"{type(ex).__name__}: {ex}", file=sys.stderr)
+            t = {"created": 0, "duplicate": 0, "errors": 1, "stale_pending": 0,
+                "next_since": None, "reason": f"{type(ex).__name__}: {ex}"}
+        print(f"{key}: {t}")
+        for k in grand:
+            grand[k] += t[k]
+        if t["errors"] == 0:
+            cursor[key] = t["next_since"]
+        # Saved every iteration, not once after the loop — mirrors
+        # `pr-state-capture`'s own per-repo save, for the same reason: a
+        # failure this loop doesn't anticipate loses at most the pair being
+        # processed, never the advances every earlier pair already earned,
+        # and (now the above `try` catches it) never a later pair's own turn
+        # either.
+        save_cursor(cursor)
+        if t["errors"]:
+            exit_code = 1
+    print(f"total: {grand}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

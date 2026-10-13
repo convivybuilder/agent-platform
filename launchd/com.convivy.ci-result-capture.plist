@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.ci-result-capture</string>
+
+    <!-- Every tracked repository's CI results, posted to the Library's Archives
+         (CQ-455, issue_01M4J1ASMSFFPC6S0RQ6VVVT57), authenticating as the
+         convivy-bosun GitHub App rather than `gh` under the operator's personal
+         account — the same cadence `com.convivy.pr-state-capture` already uses
+         for the same reason: this reader is fine lagging one capture interval,
+         and a tighter cadence buys nothing a reader needs while multiplying
+         calls against every tracked pair for no visible gain. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of ci-result-capture, not someone working on it, so this
+         reads a COPY installed from `main` into
+         ~/.local/deploy/agent-platform-shared/ (rules 2, 6, 7) instead of the
+         ~/.local/bin symlink into the checkout — that symlink still exists and
+         still reaches the tree, for the person who re-invokes ci-result-capture
+         interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH.
+
+         NOT INSTALLED BY THIS CHANGE: this plist is committed so its shape and
+         interval are reviewable; the orchestrator loads it after merge
+         (`launchctl load`/`kickstart`) rather than this PR touching
+         ~/Library/LaunchAgents or ~/.local. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/ci-result-capture</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/ci-result-capture.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/ci-result-capture.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ~/.local/bin is not load-bearing here (no subprocess call anywhere
+             in this script) but is kept for parity with this repo's other
+             deploy-pinned jobs, same as com.convivy.pr-state-capture.plist. -->
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

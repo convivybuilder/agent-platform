@@ -453,7 +453,7 @@ def _github_api_get(path: str, *, token: str, timeout: int, paginate: bool = Fal
             # those come from `h.getresponse()`/`resp.read()` and are not `OSError`
             # subclasses, so a truncated or malformed response would otherwise escape
             # this function uncaught, past `eligible_issues`'s `except BranchScanError`,
-            # and abort `issue-queue-drain`'s whole per-product loop instead of costing
+            # and abort a caller's whole per-product loop instead of costing
             # one product one quiet night (round-9 review, PR comment on #736).
             # `ValueError` covers `Request(url, ...)` itself rejecting `url` (its
             # constructor parses the URL the same way `urlsplit` does) — from round 2

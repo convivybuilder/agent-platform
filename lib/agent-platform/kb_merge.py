@@ -136,12 +136,13 @@ import re
 import subprocess
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import agent_policy as AP
 import builder_root as BR
 import github_app as GA
+import kb_writes as KW
 import review_protocol as RP
 from github_app import Unreadable
 
@@ -898,6 +899,251 @@ def carry_for_role(root: Path, candidates: list, head: str, base: str) -> "tuple
     if reason is None:
         return latest.reviewed_commit, ""
     return None, reason
+
+
+# --- rebuilding a stale branch onto main (platform/decisions/0078, the
+# 2026-10-10 amendment) -----------------------------------------------------
+#
+# `head_contains_base` refuses a PR whose branch does not contain the freshly
+# fetched `main` — every merge moves `main`, so every OTHER open `kb/` PR goes
+# stale the moment one lands. Until now the fix was the proposing crew's: run
+# `kb propose` again with the same content, wait for a fresh CI run. This
+# section lets `kb merge` do that rebuild itself: a new commit, parented on
+# the fresh `main`, whose tree is `main`'s with the PR's own changed paths set
+# to the PR head's own blobs — never a three-way merge, never new content.
+
+# The required checks the rebuilt head must settle before the gate re-runs
+# (issue_01M4JFSBA38N836QE0VANPCWNB). Named literally, as the convivy/knowledge
+# workflow defines them, like `BASE`/`BRANCH_PREFIX` above — not read from the
+# agent policy, which says nothing about which checks are required.
+REBUILD_REQUIRED_CHECKS = ("kb-write-trailer", "md-serial-docs", "validate")
+
+# Which workflow file in convivy/knowledge each of REBUILD_REQUIRED_CHECKS's
+# names must come from, keyed the same way the merge gate's shadow-workflow
+# defense keys a rollup (`_latest_per_check`, ARCH-380): by workflow FILE
+# PATH, never by name alone. Round 2 security review of agent-platform#853
+# found the rebuild gate reading REST `commits/<sha>/check-runs` and matching
+# by name only — exactly the #182 bypass ARCH-380 exists to close, reopened
+# one level down: a check-run named `validate` with conclusion `success`
+# counted whichever workflow or app posted it. A check-run is read as one of
+# these required checks only when it also comes from the path named here;
+# one from any other path or app is never counted, success or not.
+REBUILD_REQUIRED_CHECK_WORKFLOWS = {
+    "validate": ".github/workflows/ci.yml",
+    "md-serial-docs": ".github/workflows/ci.yml",
+    "kb-write-trailer": ".github/workflows/kb-write-trailer.yml",
+}
+
+
+def rebuild_blocked(root: Path, head: str, base: str) -> "str | None":
+    """Why rebuilding `head`'s own branch onto `base` is unsafe, or `None`
+    iff it is safe.
+
+    The rebuilt commit transplants `head`'s own changes — against its merge
+    base with `base`, call it M — onto `base` directly: new parent `base`,
+    same blobs `head` already carries at every path it changed since M. That
+    is `carry_blocked`'s three conditions (platform/decisions/0078)
+    specialised to ONE side rather than two: conditions 1 and 2 (the same
+    changed paths, byte- and mode-identical at every one) hold BY
+    CONSTRUCTION, since the rebuilt commit's changes literally ARE `head`'s,
+    copied verbatim — there is no second commit to compare them against.
+    Only condition 3 is live: for every path `head` changed since M, does
+    `base` (today's fetched `main`) still carry M's blob there, or has `main`
+    moved that path since the branch forked? A blind rebuild over the second
+    case would silently overwrite a change on `main` that `head`'s own review
+    never saw — exactly what the ancestry refusal this rebuild answers exists
+    to catch, so it must not reappear one level down.
+
+    Raises `Unreadable` on a git failure reading any of these, matching
+    `carry_blocked`'s own handling: an unreadable merge base or blob refuses
+    outright, never reads as "safe to rebuild".
+    """
+    mb = _merge_base(root, head, base)
+    for path in sorted(_changed_path_set(root, mb, head)):
+        before_fork = _entry_at(root, mb, path)
+        before_now = _entry_at(root, base, path)
+        if before_fork != before_now:
+            blob_fork = before_fork[1] if before_fork else None
+            blob_now = before_now[1] if before_now else None
+            return (f"{path} has moved on {BASE} since the branch forked at "
+                    f"{mb[:12]}: {blob_fork} there, {blob_now} at {base[:12]} now")
+    return None
+
+
+def rebuild_tree_entries(root: Path, head: str, base: str) -> list[dict]:
+    """The git-data-API tree entries that transplant `head`'s own changes
+    onto `base`: one entry per path `head` changed against its merge base
+    with `base`, naming `head`'s own mode and blob there, or `sha: None` to
+    remove a path `head` deleted (with the mode it carried before the
+    deletion, since GitHub's tree API still wants one).
+
+    Every blob named here already exists on GitHub: it is reachable from
+    `head`, which was fetched FROM GitHub, so nothing here uploads content —
+    it only re-points `base`'s own tree at blobs GitHub already holds. Call
+    only once `rebuild_blocked` has returned `None`; this does not re-check
+    condition 3 itself. Raises `Unreadable` on a git failure, same as
+    `rebuild_blocked`."""
+    mb = _merge_base(root, head, base)
+    out: list[dict] = []
+    for path in sorted(_changed_path_set(root, mb, head)):
+        entry = _entry_at(root, head, path)
+        if entry is None:
+            before = _entry_at(root, mb, path)
+            mode = before[0] if before else "100644"
+            out.append({"path": path, "mode": mode, "type": "blob", "sha": None})
+        else:
+            mode, sha = entry
+            out.append({"path": path, "mode": mode, "type": "blob", "sha": sha})
+    return out
+
+
+def tree_sha_at(root: Path, commit: str) -> str:
+    """The tree object `commit` points at (`git rev-parse commit^{tree}`),
+    read locally rather than over the API: `commit` is already a local
+    object (fetched from GitHub), so its tree is too, and the sha is git's
+    own hash either way."""
+    done = _git(root, "rev-parse", f"{commit}^{{tree}}")
+    sha = done.stdout.decode("ascii", "replace").strip()
+    if done.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha):
+        raise Unreadable(f"git rev-parse {commit[:12]}^{{tree}} failed: "
+                         f"{done.stderr.decode('utf-8', 'replace').strip()}")
+    return sha
+
+
+def commit_touches_projects(root: Path, sha: str) -> bool:
+    """Whether commit `sha` changes any path at all (every knowledge path is
+    under `projects/`, and this is cheaper than resolving each changed path's
+    classification) — used to decide which of the PR's ORIGINAL commits must
+    carry a parsable `KB-Write:` trailer for `rebuild_message` to replace.
+    `sha` must already be a local object (an ancestor of the PR head this
+    module fetched); any other git failure is `Unreadable`.
+
+    `--root` is load-bearing: without it, `git diff-tree` reports NOTHING
+    for a commit with no parent, reading a root commit that added every
+    file as touching none (checked live, git 2.54.0) — and a PR's single
+    squashed commit, forked straight off `main`, is routinely one."""
+    done = _git(root, "diff-tree", "--no-commit-id", "--name-only", "-r", "--root", sha)
+    if done.returncode != 0:
+        raise Unreadable(f"git diff-tree {sha[:12]} failed: "
+                         f"{done.stderr.decode('utf-8', 'replace').strip()}")
+    return bool(done.stdout.strip())
+
+
+def rebuild_message(root: Path, commits: list[dict], old_head: str) -> str:
+    """The rebuilt commit's message: the PR's current (pre-rebuild) subject,
+    one `KB-Write: rebuild <ref> proposal <holder>` per trailer line on the
+    commits being replaced (`trailer_re()`, the regex `kb_audit` and the
+    knowledge repo's own check share), and one `KB-Rebuilt-From: <old_head>`
+    line naming the head this replaces.
+
+    `commits` is the PR's own commit list (GitHub's order, oldest first);
+    the subject is the LAST one's — the PR's current head, whose subject is
+    what a reader of the rebuilt commit should see. The verb changes from
+    `propose` to `rebuild` and the ref/holder are copied verbatim from each
+    original line, so `kb_audit`'s read-back still names the original
+    proposer as the trailer's `holder`, with the verb alone saying the App
+    rebuilt it rather than the proposer proposing it.
+
+    Raises `Unreadable`, naming the commit, when one of `commits` that
+    changes any file at all (`commit_touches_projects`) carries no parsable
+    trailer: a holder is never invented, and every changed file on a `kb/`
+    branch is a knowledge document under `projects/` by the time `refusals()`
+    has already passed, so a commit "touching nothing" is the only kind that
+    may legitimately carry none."""
+    rx = trailer_re()
+    lines: list[str] = []
+    for c in commits:
+        sha = c.get("sha", "?")
+        message = ((c.get("commit") or {}).get("message")) or ""
+        matches = list(rx.finditer(message))
+        if not matches and commit_touches_projects(root, sha):
+            raise Unreadable(f"commit {sha[:12]} changes files but carries no parsable "
+                             f"KB-Write: trailer to rebuild")
+        for m in matches:
+            lines.append(KW.write_trailer("rebuild", m.group("ref"), "proposal",
+                                          m.group("holder")))
+    last_message = ((commits[-1].get("commit") or {}).get("message")) or ""
+    subject = last_message.splitlines()[0] if last_message.splitlines() else "docs: rebuild"
+    body = "\n".join(lines + [f"KB-Rebuilt-From: {old_head}"])
+    return f"{subject}\n\n{body}\n"
+
+
+def create_tree(token: str, base_tree: str, entries: list[dict], repo: str | None = None,
+                opener=urllib.request.urlopen) -> str:
+    """A new tree (`base_tree` with `entries` applied, the git data API's
+    `POST .../git/trees`). Returns the new tree's sha, or `Unreadable`."""
+    if repo is None:
+        repo = load_config().repo
+    code, payload = GA.request(
+        "POST", f"{GA.API}/repos/{repo}/git/trees", token,
+        {"base_tree": base_tree, "tree": entries}, opener=opener)
+    sha = payload.get("sha") if code == 201 else None
+    if not sha:
+        raise Unreadable(f"GitHub refused the tree ({code}): "
+                         f"{payload.get('message', 'no message')}")
+    return sha
+
+
+def create_commit(token: str, message: str, tree: str, parent: str, repo: str | None = None,
+                  opener=urllib.request.urlopen) -> str:
+    """A new commit (`POST .../git/commits`), authored and committed as
+    whichever identity `token` names — GitHub defaults both to the token's
+    own account when neither is given, so the rebuilt commit carries the
+    App's identity, same as every other write this module makes. Returns the
+    new commit's sha, or `Unreadable`."""
+    if repo is None:
+        repo = load_config().repo
+    code, payload = GA.request(
+        "POST", f"{GA.API}/repos/{repo}/git/commits", token,
+        {"message": message, "tree": tree, "parents": [parent]}, opener=opener)
+    sha = payload.get("sha") if code == 201 else None
+    if not sha:
+        raise Unreadable(f"GitHub refused the commit ({code}): "
+                         f"{payload.get('message', 'no message')}")
+    return sha
+
+
+def update_branch_ref(token: str, branch: str, sha: str, repo: str | None = None,
+                      opener=urllib.request.urlopen) -> None:
+    """Force-update `refs/heads/<branch>` to `sha` (`PATCH .../git/refs/heads/<branch>`).
+
+    `branch` MUST start with `BRANCH_PREFIX` — refused otherwise, before any
+    request is made. This is the one check that keeps the rebuild from ever
+    reaching a ref this App did not open itself: the only branches
+    `agentctl kb propose` ever creates, and the one thing standing between
+    this write and `refs/heads/main` is this string check (platform/decisions/
+    0078, 2026-10-10 amendment — "the App pushes the rebuilt commit onto the
+    proposal's own kb/ branch ... and reaches no other repository"). Raises
+    `Unreadable` on a refused or failed update."""
+    if not branch.startswith(BRANCH_PREFIX):
+        raise Unreadable(f"refusing to update {branch!r}: it does not start with "
+                         f"{BRANCH_PREFIX!r}, so this is not a branch `agentctl kb propose` "
+                         f"opened")
+    if repo is None:
+        repo = load_config().repo
+    code, payload = GA.request(
+        "PATCH", f"{GA.API}/repos/{repo}/git/refs/heads/{branch}", token,
+        {"sha": sha, "force": True}, opener=opener)
+    if code != 200:
+        raise Unreadable(f"GitHub refused updating refs/heads/{branch} ({code}): "
+                         f"{payload.get('message', 'no message')}")
+
+
+def rebuild_worth_trying(f: Facts) -> bool:
+    """Whether `head_contains_base` being `False` is the ONLY thing standing
+    between `f` and admission — the gate for attempting a rebuild at all
+    (platform/decisions/0078, 2026-10-10 amendment: "never rebuild to get
+    past any other refusal").
+
+    Recomputes `refusals()` on a copy of `f` with `head_contains_base`
+    forced `True`: if that list comes back empty, the ancestry check is the
+    one and only problem, so rebuilding onto a fresh `main` is worth
+    attempting. If anything else is still wrong — a missing trailer, a round
+    over cap, a stale review with nothing to carry — rebuilding would not
+    help, and must not be tried. `f.head_contains_base` must already be
+    `False` (or `None`); this does not check that itself, since its only
+    caller already knows."""
+    return refusals(replace(f, head_contains_base=True)) == []
 
 
 # --- the credential -------------------------------------------------------------

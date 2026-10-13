@@ -8,6 +8,9 @@ change is a visible, deliberate edit.
 """
 from __future__ import annotations
 
+import ast
+import inspect
+
 import pytest
 
 import knowledge
@@ -112,6 +115,19 @@ def test_field_notes_kind_and_visibility():
     # visibility is fail-closed and enumerated — a typo can't silently open a doc up
     assert any("invalid visibility" in e
                for e in knowledge.validate_frontmatter({**doc, "visibility": "semi-public"}))
+
+
+def test_build_plan_kind_is_admitted_and_an_unknown_kind_still_refused():
+    """CQ·139 (the operator's 2026-09-17 ruling): the build plan is a Library
+    document with its own kind, so a profile can select one by binds_topics.
+    `validate_frontmatter` is the function the watcher calls to admit a
+    document into the index — this pins that it admits `build-plan` and
+    still refuses a kind neither copy of the vocabulary names."""
+    doc = _ok_doc(id="agent-platform/build-plans/example", kind="build-plan",
+                  binds_topics=["example-topic"])
+    assert knowledge.validate_frontmatter(doc) == []
+    assert any("invalid kind" in e
+               for e in knowledge.validate_frontmatter(_ok_doc(kind="bogus-kind")))
 
 
 def test_platform_crew_audience_in_roster():
@@ -692,6 +708,54 @@ def test_every_audience_value_is_classified():
         "The roster changed. Decide whether each new name is a person "
         "(add it to NON_AGENT_AUDIENCE) or an agent (nothing to do), then update "
         "EXPECTED_AUDIENCE_ROSTER_SIZE.")
+
+
+# --- the Library's roster loader reads these two sets without importing this file --
+#
+# convivy-library's `load_crew_registry._roster_from_knowledge_py` never imports
+# this module: it parses the file with `ast`, walks it, and calls `ast.literal_eval`
+# on the value of the FIRST `ast.Assign` whose target is the bare name, deliberately,
+# so it never executes agent-platform code. 729be139 put the runtime value
+# OPERATOR_MARKER inside the ALLOWED_AUDIENCE set literal, so `literal_eval` raised
+# on every fresh Builder install's `stand-up-backend` step
+# (issue_01M4KB3Z06J8A645DH8WSESRDA). NON_AGENT_AUDIENCE had the same shape. The fix
+# keeps both a pure literal and adds the marker in a later top-level
+# `NAME = NAME | {OPERATOR_MARKER}` statement, so these two tests pin the Library's
+# exact reading algorithm against this file, not knowledge.py's own idea of itself.
+
+
+def _first_assign_value(source: str, name: str) -> ast.AST:
+    """The FIRST `ast.Assign` to `name` in `ast.walk` order — for top-level
+    statements, `ast.walk`'s breadth-first order is source order, so a union
+    statement placed ahead of the literal is read instead of the literal."""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == name):
+            return node.value
+    raise AssertionError(f"no assignment to {name!r} found in knowledge.py")
+
+
+def _knowledge_py_source() -> str:
+    with open(inspect.getfile(knowledge), encoding="utf-8") as f:
+        return f.read()
+
+
+def test_allowed_audience_first_assign_is_a_pure_literal_with_the_marker_added_back():
+    """ast.literal_eval raises if the marker is still inside the literal (729be139's
+    bug) or if a union statement was placed ahead of the literal (literal_eval then
+    sees a BinOp, not a set). The second assertion catches the marker being dropped
+    entirely: literal_eval would still pass on a pure literal missing it."""
+    value_node = _first_assign_value(_knowledge_py_source(), "ALLOWED_AUDIENCE")
+    ast.literal_eval(value_node)
+    assert knowledge.OPERATOR_MARKER in knowledge.ALLOWED_AUDIENCE
+
+
+def test_non_agent_audience_first_assign_is_a_pure_literal_with_the_marker_added_back():
+    value_node = _first_assign_value(_knowledge_py_source(), "NON_AGENT_AUDIENCE")
+    ast.literal_eval(value_node)
+    assert knowledge.OPERATOR_MARKER in knowledge.NON_AGENT_AUDIENCE
 
 
 # --- a malformed value is refused, never raised ------------------------------------

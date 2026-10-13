@@ -10,7 +10,7 @@ test checks, from the run's own transcript:
   (the six paths of knowledge#793, plus the escape-hatch parameter on one of them);
 - the Write tool is refused outside the worktree and /tmp, and allowed inside them;
 - a Bash `tmux -S` to a stand-in operator socket is refused;
-- a Bash item-create call with `VAULTS_ON_LIBRARY=0`, aimed at a stub standing in for
+- a Bash item-write call with `VAULTS_ON_LIBRARY=0`, aimed at a stub standing in for
   Orient's 8099, is refused, and the stub receives no request. The controls are the same
   call from outside the sandbox (must reach the stub as an authenticated write), a
   connect to the real 8099 and 8100 from outside (must be accepted), and an allowed
@@ -168,9 +168,13 @@ class _Stub:
 
 
 def _issue_code(lib: Path) -> str:
-    """The item-create call a run would make. The run and the control run the same code."""
+    """The item-write call a run would make. `post_issue` (and `post_bug`) were removed
+    by 70d902ee; `comment_on_issue` is that commit's own named replacement for this probe
+    ("the write-guard probe uses comment_on_issue, which still exists") and reaches the
+    same route class — an authenticated POST under `/api/issues/...`, through the same
+    `_post` helper and the same bearer token. The run and the control run the same code."""
     return (f"import sys; sys.path.insert(0, '{lib}'); import issue_client as IC; "
-            "print(IC.post_issue('agent-platform', 'confinement probe', severity='low', body='probe'))")
+            "print(IC.comment_on_issue('issue_probe', 'confinement probe'))")
 
 
 def _connect_code(port: int) -> str:
@@ -445,11 +449,11 @@ def test_dispatched_run_is_confined_and_still_works(tmp_path):
         #    controls are the same call from outside the sandbox and an external host from
         #    inside it.
         inside = _bash_with(calls, "ORIENT_BASE_URL=")
-        expect(inside, "the item-create attempt was never run")
+        expect(inside, "the item-write attempt was never run")
         if inside:
-            print(f"[item create from the run] {inside[0]['text'][:160]!r}")
+            print(f"[item write from the run] {inside[0]['text'][:160]!r}")
             expect("'status': 'created'" not in inside[0]["text"] and "CONNECT_OK" not in inside[0]["text"],
-                   "the item create from the run reached a server")
+                   "the item write from the run reached a server")
         expect(stub8099.requests == [], f"the stub received a request from the run: {stub8099.requests}")
         probes = _bash_with(calls, "socket.socket()")
         expect(len(probes) >= 3 and all("CONNECT_FAILED" in p["text"] for p in probes[-3:]),
@@ -459,7 +463,7 @@ def test_dispatched_run_is_confined_and_still_works(tmp_path):
 
         control = subprocess.run([sys.executable, "-c", _issue_code(LIB)], capture_output=True,
                                  text=True, env=env_control, timeout=60)
-        print("[control outside: item create]", control.stdout.strip()[:160])
+        print("[control outside: item write]", control.stdout.strip()[:160])
         expect(stub8099.requests and stub8099.requests[-1][2],
                f"control: the same call from outside did not reach the stub as an authenticated write: "
                f"{stub8099.requests} {control.stderr[-200:]}")

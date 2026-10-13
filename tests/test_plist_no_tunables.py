@@ -143,7 +143,7 @@ def test_an_agent_spawning_job_puts_local_bin_on_path():
     """
     import plistlib
 
-    spawners = ("changelog-drain", "issue-queue-drain", "launch-overnight",
+    spawners = ("changelog-drain", "launch-overnight",
                 "launch-weekly", "overnight-")
     checked = 0
     for path in sorted(LAUNCHD.glob("*.plist")):

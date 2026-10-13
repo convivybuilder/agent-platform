@@ -548,12 +548,6 @@ def changelog_drain():
 
 
 @pytest.fixture(scope="session")
-def issue_queue_drain():
-    """The `bin/issue-queue-drain` module — the unattended fleet-wide issue drain."""
-    return _load_cli("issue-queue-drain")
-
-
-@pytest.fixture(scope="session")
 def run_observer():
     """The `bin/run-observer` module — reports runs that never finalized."""
     return _load_cli("run-observer")
@@ -576,6 +570,14 @@ def pr_state_capture():
     """The `bin/pr-state-capture` module (issue_01M2KV16ZRG3N49GRER8Q7545H) — the
     Bosun's read-only, convivy-bosun-App-authenticated PR-state signal capture."""
     return _load_cli("pr-state-capture")
+
+
+@pytest.fixture(scope="session")
+def ci_result_capture():
+    """The `bin/ci-result-capture` module (CQ-455,
+    issue_01M4J1ASMSFFPC6S0RQ6VVVT57) — the Bosun's read-only,
+    convivy-bosun-App-authenticated CI-result signal capture."""
+    return _load_cli("ci-result-capture")
 
 
 @pytest.fixture(scope="session")

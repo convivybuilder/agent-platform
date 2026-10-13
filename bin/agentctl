@@ -123,6 +123,20 @@ try:
 except ImportError as _e:  # pragma: no cover — deploy-window only
     CB = CP = None
 
+# Same deploy hazard as the block above, but `_content_scan_gate` (not this
+# import) is where the failure direction differs from every other module
+# here: those fail soft and let their caller proceed on the platform's prior
+# behaviour; an unlinked publish_scan instead makes `cmd_publish` REFUSE every
+# push until it is linked, because this module's whole job is making sure a
+# push is never unscanned.
+try:
+    import publish_scan as PS  # noqa: E402
+except ImportError as _e:  # pragma: no cover — deploy-window only
+    PS = None
+    print(f"agentctl: publish_scan unavailable ({_e}); `agentctl publish` will refuse "
+          f"every push until install.sh (or the next agent-platform-autopull tick) "
+          f"links it. Run install.sh to link it now.", file=sys.stderr)
+
 # Back-off budget for the pre-spawn concurrency reservation (Defect 1 of
 # issue_01KYMF2GZKSG1VX1XSX83MA9FY). Agent runs last minutes; the global
 # ceiling (16 concurrent) drains on this timescale during a normal burst.
@@ -132,6 +146,18 @@ _SPAWN_RETRY_BUDGET_S  = 300
 _SPAWN_RETRY_SLEEP_0   = 5.0
 _SPAWN_RETRY_SLEEP_MAX = 30.0
 _SPAWN_RETRY_BACKOFF   = 2.0
+
+# Back-off for `_finalize_run`'s end-of-run private-object import
+# (issue_01M4RP1K026XJE740DMQ7AP31M, run-89f78c3f, 2026-10-12: the box at its
+# per-user process limit, every fork failing with BlockingIOError/EAGAIN).
+# Much shorter than the spawn budget above — a run's finalize must not sit for
+# minutes on a fork contention that spawn's own retry loop is already easing,
+# just long enough (a few attempts over a few seconds) to ride out the same
+# transient condition rather than crash before the commit ever reaches the
+# shared store.
+_PRIVATE_IMPORT_RETRY_ATTEMPTS = 4
+_PRIVATE_IMPORT_RETRY_SLEEP_0  = 0.5
+_PRIVATE_IMPORT_RETRY_BACKOFF  = 2.0
 
 KB_INDEX = Path.home() / ".knowledge-index" / "index.db"
 # EVERYTHING BELOW THE MACHINE'S ONE ROOT comes from builder_root
@@ -4802,15 +4828,26 @@ def cmd_crew_register(args: argparse.Namespace) -> int:
     the command's own argument shape and exit-code convention.
     """
     import crew_registration as CR
+    import operator_config
 
     overnight = {"true": True, "false": False, "own-drain": "own-drain",
                  None: None}[args.overnight]
+    # The creator is recorded from the operator config's `person_id`, never
+    # refused when it is absent: a fresh install registers crews before the
+    # Library's bootstrap has created anyone to name (issue_01M2QWFR8PCBPANF8Q5P460GHY).
+    created_by = None
+    try:
+        created_by = operator_config.get("person_id")
+    except operator_config.OperatorConfigError as exc:
+        print(f"agentctl crew register: did not record a creator for "
+              f"{args.slug!r} — {exc}", file=sys.stderr)
     spec = CR.CrewSpec(
         slug=args.slug,
         display=args.display,
         repos=args.repos if args.repos is not None else [args.slug],
         crew=args.crew,
         owner=args.owner,
+        created_by=created_by,
         cls=args.cls,
         kb=args.kb,
         kb_project=args.kb_project,
@@ -4845,10 +4882,8 @@ def cmd_crew_register(args: argparse.Namespace) -> int:
     print(json.dumps(row, indent=2, ensure_ascii=False))
     if not args.dry_run:
         print(
-            "agentctl crew register: the Library's own projects.py caches this "
-            "file per-process and does not re-read it on its own — a running "
-            "Library server will not accept this crew's product until it "
-            "restarts or is told to reload")
+            "agentctl crew register: the Library picks up this row on its "
+            "next lookup")
     return 0
 
 
@@ -5666,12 +5701,17 @@ def _spawn_dispatch(args: argparse.Namespace) -> tuple[int, str | None]:
     docs_unavailable_reason = None
     if is_local or render_skipped is not None:
         materialized_documents: list[dict] = []
+        individuated_agents: list[str] = []
+        individuated_skills: list[str] = []
         docs_unavailable_reason = "render skipped for local/private dispatch"
     elif not _loaded.get("profile_documents_current", False):
         materialized_documents = []
+        individuated_agents = []
+        individuated_skills = []
         docs_unavailable_reason = "render did not produce a current individuation (e.g. --dry-run)"
     else:
         materialized_documents = _materialized_documents(worktree)
+        individuated_agents, individuated_skills = _activation_names(worktree)
 
     if not R.ACTIVE_PATH.exists():
         R.bootstrap()
@@ -5688,6 +5728,24 @@ def _spawn_dispatch(args: argparse.Namespace) -> tuple[int, str | None]:
     T.write_owner_only(run_dir / "started_dirty.txt",
                        "\n".join(sorted(_snapshot_dirty_paths(worktree))) + "\n")
     _baseline_primaries(run_dir, worktree)
+
+    # Written NOW, before the agent subprocess exists (most dispatches detach
+    # and fork well after this point — see `_detach_and_run`'s docstring — so
+    # this is well ahead of the actual `claude` launch), so a run's
+    # `docs_consulted.json` answers for it while it is still live rather than
+    # staying absent (and `GET /runs/<id>/docs_given` answering `null`) for a
+    # run's whole execution window. Uses the SAME `materialized_documents`/
+    # `individuated_agents`/`individuated_skills` just computed above — never
+    # re-derived from the worktree a second time — so this write and
+    # `_finalize_run`'s later rewrite of the same file agree on the docs list
+    # by construction. `queried_at_runtime` is empty here because no tool call
+    # has happened yet; `_finalize_run` fills it in from the run's own
+    # transcript once the agent has exited.
+    T.write_docs_consulted(run_dir, profile=profile,
+                           individuated_agents=individuated_agents,
+                           individuated_skills=individuated_skills,
+                           queried_at_runtime=[],
+                           materialized_documents=materialized_documents)
 
     # Record the PR this write-class run belongs to (ARCH-347), so `publish --run` can
     # verify it pushes the PR's own branch and refuse a divergent one. Best-effort: a
@@ -6305,6 +6363,12 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
     # comment for why the placement is load-bearing.
     held_until = None
     hold_reason = None
+    # Set here, before the dry-run/real-dispatch split, because a dry run never
+    # reaches the `else` branch below (where the real one is set from
+    # `_stream_transcript`'s return) but still flows into `_finalize_run` past
+    # the end of this `if`/`else` — and a dry run never spawns a subprocess, so
+    # the cap can never fire.
+    cost_stop_reason: str | None = None
     if args.dry_run:
         dry_run_now = datetime.now(timezone.utc)
         decision = _usage_hold_decision(dry_run_now, pr_round_fix=pr is not None)
@@ -6754,9 +6818,10 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                 env=proc_env,
             )
 
-        def _respawn_in_place(spawn_model: str, **meta_updates) -> tuple[dict | None, int]:
+        def _respawn_in_place(spawn_model: str, **meta_updates
+                              ) -> tuple[dict | None, int, str | None]:
             """Run the session again in the SAME run dir and worktree; returns
-            `(final_event, exit_code)` from the second attempt.
+            `(final_event, exit_code, cost_stop_reason)` from the second attempt.
 
             Shared by the two respawn paths — the ARCH-131 cross-provider fail-over
             and the api_error retry — which differ only in the model they hand
@@ -6806,12 +6871,14 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                 print(f"warning: respawn left unregistered "
                       f"(kill by run-id unavailable): {e}", file=sys.stderr)
             ev: dict | None = None
+            respawn_cost_stop_reason: str | None = None
             try:
-                ev = _stream_transcript(p, run_dir,
-                                        cost_cap=respawn_cost_cap,
-                                        token_cap=_run_token_cap(spawn_model),
-                                        git_dir=git_dir,
-                                        private_objects_dir=private_objects_dir)
+                ev, respawn_cost_stop_reason = _stream_transcript(
+                    p, run_dir,
+                    cost_cap=respawn_cost_cap,
+                    token_cap=_run_token_cap(spawn_model),
+                    git_dir=git_dir,
+                    private_objects_dir=private_objects_dir)
             except KeyboardInterrupt:
                 p.terminate()
                 try: p.wait(timeout=5)
@@ -6819,7 +6886,7 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
             except (BrokenPipeError, OSError) as exc:
                 _on_broken_stream(run_id, run_dir, exc)  # ARCH-253 (OSError-scoped)
             p.wait()
-            return ev, p.returncode
+            return ev, p.returncode, respawn_cost_stop_reason
 
         # Python preflight (worktree interpreter guard): assert the worktree
         # has a usable venv Python before the worker spawns, so a bare pytest
@@ -6999,10 +7066,11 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
         cost_cap, _ = _run_cost_cap_for_agent(model, agent)
         token_cap = _run_token_cap(model)  # pricing-independent backstop (ARCH-245)
         try:
-            final_event = _stream_transcript(proc, run_dir, cost_cap=cost_cap,
-                                             token_cap=token_cap,
-                                             git_dir=git_dir,
-                                             private_objects_dir=private_objects_dir)
+            final_event, cost_stop_reason = _stream_transcript(
+                proc, run_dir, cost_cap=cost_cap,
+                token_cap=token_cap,
+                git_dir=git_dir,
+                private_objects_dir=private_objects_dir)
         except KeyboardInterrupt:
             interrupted = True
             proc.terminate()
@@ -7098,12 +7166,15 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                       f"({final_event.get('result') or 'no detail'}); retrying once on "
                       f"{model}. Its worktree is unchanged and its tool-call log "
                       f"records nothing that reached outside it.", file=sys.stderr)
-                retry_event, exit_code = _respawn_in_place(
+                retry_event, exit_code, retry_cost_stop_reason = _respawn_in_place(
                     model, api_retry_of="api_error", api_retry_at=T.now_iso())
                 # `or final_event`: a retry that itself dies before emitting a
                 # result must not erase the first attempt's diagnosis — the run
                 # would then finalize with no terminal_reason at all.
                 final_event = retry_event or final_event
+                # `or`, not overwrite: the first attempt's own cap breach (if
+                # any) must survive a retry that itself never crosses the cap.
+                cost_stop_reason = retry_cost_stop_reason or cost_stop_reason
 
         # ARCH-131: harness fail-over. An Anthropic-direct claude that died
         # abnormally — nonzero exit (API/rate-limit error) or signal kill
@@ -7163,13 +7234,14 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                 and not (run_dir / "no-fallback").exists()):
             print(f"{run_id}: {model} died (exit {exit_code}); failing over to "
                   f"{fb_model} (ARCH-131)", file=sys.stderr)
-            fb_event, exit_code = _respawn_in_place(
+            fb_event, exit_code, fb_cost_stop_reason = _respawn_in_place(
                 fb_model, model=fb_model,
                 billing_source=_billing_source_for(fb_model),
                 fallback_from=model,
                 fallback_reason=f"exit_code={exit_code}",
                 model_choice="harness_fallback")
             final_event = fb_event or final_event
+            cost_stop_reason = fb_cost_stop_reason or cost_stop_reason
             # The fail-over is a HARNESS decision, not the subprocess's — so
             # updating these local vars (unlike re-reading meta.json) can't be
             # forged by the run. _finalize_run below is threaded these values
@@ -7177,22 +7249,6 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
             # round 2): see _post_model_resolution_signal's docstring.
             model = fb_model
             model_choice = "harness_fallback"
-
-    # Round 6 (knowledge#793): rejoin this run's own objects into the shared store —
-    # see run_sandbox.import_private_objects's docstring. Runs whether the run succeeded
-    # or errored (a failed run may still have committed partial work worth being visible),
-    # and is a no-op when private_objects_dir was never created (dry run, or a worktree
-    # that isn't a git checkout at all). A failure here is loud but must not take down
-    # the rest of finalize: every caller downstream (publish, pr-open, a revise round)
-    # fails its OWN way, visibly, on a worktree whose commits never rejoined the shared
-    # store, rather than this masking it as a clean finish.
-    if private_objects_dir is not None:
-        try:
-            RS.import_private_objects(git_dir, private_objects_dir)
-        except (OSError, subprocess.CalledProcessError) as e:
-            print(f"agentctl: could not import run {run_id}'s own objects into the shared "
-                  f"store ({type(e).__name__}: {e}) — its commits may be unreadable outside "
-                  f"this run's own sandbox until this is retried by hand.", file=sys.stderr)
 
     # Round 6, continued (agent-platform#813), confinement tightened round 8 (round-7
     # finding): the eval directive told this run to write its verdict inside its own
@@ -7216,12 +7272,20 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
         if eval_scratch_dir is not None:
             shutil.rmtree(eval_scratch_dir, ignore_errors=True)
 
+    # The private-object import (round 6, knowledge#793) moved INSIDE
+    # `_finalize_run` — the first thing it now does, before `_commits_since` and
+    # every other subprocess call it makes — under issue_01M4RP1K026XJE740DMQ7AP31M,
+    # so a crash later in finalize can no longer strand an already-import-eligible
+    # commit with no outcome written at all. `git_dir`/`private_objects_dir` are
+    # the same values computed once above, at spawn time.
     _finalize_run(run_dir=run_dir, worktree=worktree, run_id=run_id,
                   exit_code=exit_code, final_event=final_event,
                   profile=profile, agent=agent,
+                  git_dir=git_dir, private_objects_dir=private_objects_dir,
                   model=model, model_resolved=model_resolved, model_choice=model_choice,
                   agent_name=args.agent, repo=repo, issue=issue_val,
                   materialized_documents=materialized_documents,
+                  cost_stopped_reason=cost_stop_reason,
                   dry_run=args.dry_run)
 
     R.remove_run(run_id)
@@ -7333,12 +7397,13 @@ def _detach_and_run(*, args: argparse.Namespace, agent: dict, run_id: str,
         import traceback
         traceback.print_exc(file=sys.stderr)
         exit_code = 1
-    # os._exit() skips atexit, so dispatch_env's private TMUX_TMPDIR and GH_CONFIG_DIR
-    # cleanup (registered inside _run_session's DE.dispatch_env() call) never fires on
-    # its own here — this grandchild's normal termination IS os._exit(), not
-    # just its SIGKILLed case. Clean up explicitly first.
+    # os._exit() skips atexit, so dispatch_env's private TMUX_TMPDIR, GH_CONFIG_DIR and
+    # git-wrapper-dir cleanup (registered inside _run_session's DE.dispatch_env() call)
+    # never fires on its own here — this grandchild's normal termination IS os._exit(),
+    # not just its SIGKILLed case. Clean up explicitly first.
     DE.cleanup_private_tmux_tmpdir()
     DE.cleanup_private_gh_config_dir()
+    DE.cleanup_private_git_wrapper_dir()
     os._exit(exit_code)
 
 
@@ -7590,10 +7655,21 @@ def _stream_transcript(proc: subprocess.Popen, run_dir: Path,
                        cost_cap: float | None = None,
                        token_cap: int | None = None,
                        git_dir: Path | None = None,
-                       private_objects_dir: Path | None = None) -> dict | None:
+                       private_objects_dir: Path | None = None
+                       ) -> tuple[dict | None, str | None]:
     """Drain claude's stdout. Each line is one stream-json event. Tees verbatim
     to transcript.jsonl + stdout, derives tool_calls.jsonl from matched
-    tool_use/tool_result pairs by id. Returns the final 'result' event if any.
+    tool_use/tool_result pairs by id. Returns `(final_event, cost_stop_reason)`:
+    the final 'result' event if any, and the cap's own human-readable reason
+    if the per-run cost/token cap fired and killed the process, else `None`.
+
+    That second value is this function's own in-memory record of the breach —
+    the SAME fact `cost-killed.txt` (below) is written for, but returned
+    rather than left for a caller to read back off disk, because `_finalize_run`
+    must not trust that file (security review, PR #874 round 1): it sits in a
+    directory the run's own subprocess can write to for its whole execution
+    window. The caller threads this return value into `_finalize_run` as
+    `cost_stopped_reason` instead.
 
     When `cost_cap` or `token_cap` is set (gateway runs), polls the run's gateway
     spend at most every ~20s and terminates the process the moment cumulative
@@ -7643,6 +7719,7 @@ def _stream_transcript(proc: subprocess.Popen, run_dir: Path,
     malformed usage value skips only that turn's usage."""
     pending: dict[str, dict] = {}
     final_event: dict | None = None
+    cost_stop_reason: str | None = None
     reaper: threading.Timer | None = None
     assert proc.stdout is not None
     transcript_path = run_dir / "transcript.jsonl"
@@ -7674,6 +7751,7 @@ def _stream_transcript(proc: subprocess.Popen, run_dir: Path,
                                             cost_cap, token_cap)
                 if breach:
                     kind, reason = breach
+                    cost_stop_reason = reason
                     T.write_owner_only(run_dir / "cost-killed.txt", reason + "\n")
                     # don't respawn a runaway; marker names which cap fired (the
                     # respawn gate only existence-checks this, but keep audit honest)
@@ -7815,7 +7893,7 @@ def _stream_transcript(proc: subprocess.Popen, run_dir: Path,
                         f"{type(exc).__name__}: {exc}\n")
     if reaper is not None:
         reaper.cancel()
-    return final_event
+    return final_event, cost_stop_reason
 
 
 def _read_gateway_spend(path: Path) -> tuple[float, int, int, bool]:
@@ -9057,12 +9135,12 @@ def _wait_for_rate_limit_hold(*, pr_round_fix: bool,
     return held
 
 
-# Sentinel default for _finalize_run's seven trusted-value parameters below —
+# Sentinel default for _finalize_run's eight trusted-value parameters below —
 # distinct from `None`, which is a real value a harness caller can legitimately
 # thread. A bare `agentctl._finalize_run(...)` test call that names none of them
 # posts the Archives record below with `None` in their place (`[]` for the one
 # list-valued parameter, `materialized_documents`), since only the real
-# dispatch path (`_run_session`) always passes all seven explicitly.
+# dispatch path (`_run_session`) always passes all eight explicitly.
 _UNSET = object()
 
 
@@ -9273,6 +9351,25 @@ def _materialized_documents(worktree: Path) -> list[dict]:
     return docs
 
 
+def _activation_names(worktree: Path) -> tuple[list[str], list[str]]:
+    """The agent and skill names individuated into `worktree`'s `.claude`
+    dir, as of the moment this is called.
+
+    Shared by both `docs_consulted.json` writes: `_spawn_dispatch` calls this
+    right alongside `_materialized_documents`, before the agent subprocess
+    starts; `_finalize_run` calls it again after the subprocess has exited,
+    since unlike `materialized_documents` (threaded through as a captured
+    parameter so a run's own subprocess can never rewrite its own
+    accountability record) this one has always read the worktree fresh at
+    finalize time, and that is unchanged here. A worktree with neither
+    directory, or whose caller never rendered one, answers `([], [])`."""
+    agents_dir = worktree / ".claude" / "agents"
+    skills_dir = worktree / ".claude" / "skills"
+    individuated_agents = sorted(p.stem for p in agents_dir.glob("*.md")) if agents_dir.exists() else []
+    individuated_skills = sorted(d.name for d in skills_dir.iterdir() if d.is_dir()) if skills_dir.exists() else []
+    return individuated_agents, individuated_skills
+
+
 # Cap matches `_MAX_PROFILE_DOCUMENTS_BYTES`'s reasoning: the largest composed
 # CLAUDE.md (every `scope: fleet` block plus a profile's own `claude_md_extras`) is a
 # handful of KB; 1 MiB is far past any legitimate render's size.
@@ -9356,11 +9453,49 @@ def _fleet_blocks_confirmed_in_claude_md(
     return True, None
 
 
+def _import_private_objects_retrying(git_dir: Path, private_objects_dir: Path,
+                                     run_id: str) -> BaseException | None:
+    """`RS.import_private_objects`, retried on a transient fork failure. Returns
+    None on success (including the ordinary no-op when there is nothing to
+    import), or the exception that finally won once every attempt is spent.
+
+    Retries ONLY `OSError` — `BlockingIOError`/EAGAIN from a fork that cannot
+    start a subprocess at all is one; any other failure to start the
+    subprocess is too. This is the exact failure mode run-89f78c3f hit eight
+    times on 2026-10-12 (the box at its per-user process limit) and a retry
+    is the right response to it: the condition is transient, and clears on
+    its own as other processes exit.
+
+    A `subprocess.CalledProcessError` means a git subprocess started and
+    refused — not the fork-contention failure this retries for, and not one a
+    retry would fix — so it is returned immediately, on the first attempt,
+    the same as an exhausted OSError.
+    """
+    sleep = _PRIVATE_IMPORT_RETRY_SLEEP_0
+    for attempt in range(1, _PRIVATE_IMPORT_RETRY_ATTEMPTS + 1):
+        try:
+            RS.import_private_objects(git_dir, private_objects_dir)
+            return None
+        except subprocess.CalledProcessError as e:
+            return e
+        except OSError as e:
+            if attempt == _PRIVATE_IMPORT_RETRY_ATTEMPTS:
+                return e
+            print(f"agentctl: run {run_id}'s private-object import hit "
+                  f"{type(e).__name__}: {e} (attempt {attempt}/"
+                  f"{_PRIVATE_IMPORT_RETRY_ATTEMPTS}) — retrying", file=sys.stderr)
+            time.sleep(sleep)
+            sleep *= _PRIVATE_IMPORT_RETRY_BACKOFF
+    return None  # unreachable — the loop above always returns
+
+
 def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
                   final_event: dict | None, profile: str, agent: dict,
+                  git_dir: Path | None = None, private_objects_dir: Path | None = None,
                   model=_UNSET, model_resolved=_UNSET, model_choice=_UNSET,
                   agent_name=_UNSET, repo=_UNSET, issue=_UNSET,
                   materialized_documents=_UNSET,
+                  cost_stopped_reason=_UNSET,
                   dry_run: bool = False) -> None:
     """`model`, `model_resolved`, `model_choice`, `agent_name`, `repo` and
     `issue` are the harness's OWN resolved values from the caller's scope
@@ -9370,6 +9505,25 @@ def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
     it back would let a compromised or merely buggy run forge the very
     Archives record meant to hold it accountable (ARCH-193 binds `review_sha`
     via a harness-set value for the same reason).
+
+    `cost_stopped_reason` is the SAME story, and used to not be: this function
+    used to read `cost-killed.txt` back off `run_dir` itself to decide whether
+    the per-run cost/token cap (ARCH-185/ARCH-245) fired, and that file sits
+    in a directory the run's own subprocess can write to for its whole
+    execution window. Because `cost_stopped` sat outside the ARCH-397
+    review-stamp downgrade's and the primary-mutation guard's allow-sets
+    below, a run that planted the marker could permanently skip both and
+    recolor a silently failed review, or a mutation of a primary checkout it
+    does not own, as a benign budget stop (security review, PR #874 round
+    1). The fact now has to arrive as a parameter, carried in memory from
+    `_stream_transcript`'s own return value through `_run_session`'s locals
+    — the one piece of this the run's subprocess never touches, because the
+    cap fires and terminates the subprocess from THIS process, not from
+    inside it. `_stream_transcript` still writes `cost-killed.txt` too, as a
+    human-readable record for anyone reading the run dir by hand, but this
+    function no longer trusts it. `_UNSET` here means "no cap info was
+    threaded", read as `None` (no cap fired) the same way the six scalars
+    above default to it on a bare test call.
 
     `materialized_documents` is the same story, one more time: `_spawn_dispatch`
     calls `_materialized_documents(worktree)` once, right after
@@ -9406,7 +9560,32 @@ def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
     it would have run in, which can carry pre-existing local commits of its
     own (issue_01M2EKF1YCM97QDTZ2EHS6W5NX). Counting THOSE against a dry run
     would be a false positive on every dry run of a repo that has any commits
-    at all."""
+    at all.
+
+    `git_dir`/`private_objects_dir` (issue_01M4RP1K026XJE740DMQ7AP31M) are
+    threaded in from the caller's own `RS.git_common_dir`/
+    `RS.run_private_objects_dir`, the same values `_run_session` computes
+    once at spawn time — rather than re-derived here — for the same
+    never-trust-the-worktree-mid-run reason the six scalars above are.
+    `private_objects_dir` is None only when `worktree` isn't a git checkout
+    at all (`git_dir` is None) — a dry run's `private_objects_dir` is still a
+    real `Path`, computed the same way, because dry-run only skips its
+    `mkdir` at spawn time. No import is attempted for a dry run either way:
+    the import call below still runs, but `RS.import_private_objects`'s own
+    `if not private_dir.is_dir(): return` no-ops on the directory that was
+    never created. The import itself is the FIRST thing this function
+    does, below, before any other subprocess call it makes (`_commits_since`
+    and the rest): it used to run in the caller, right before this function
+    was called, which still left a window where THIS function's own later
+    crash on an unrelated fork failure (`_commits_since`, run-89f78c3f,
+    2026-10-12) stranded an already-import-eligible commit with no outcome
+    written at all. Importing first here does not make that later crash
+    impossible, but it does mean the commit is already safe in the shared
+    store by the time anything else in this function can fail."""
+    private_import_error = (
+        _import_private_objects_retrying(git_dir, private_objects_dir, run_id)
+        if private_objects_dir is not None else None)
+
     try:
         T.update_meta(run_dir, ended_at=T.now_iso())
     except (OSError, ValueError) as e:
@@ -9435,6 +9614,42 @@ def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
     else:
         exit_status = "completed" if exit_code == 0 else "errored"
 
+    # The per-run cost/token cap (ARCH-185/ARCH-245) is what actually stopped this
+    # run, if it fired: `_stream_transcript` terminates the process BEFORE a
+    # result event can ever arrive, so without this the run above reads as a bare
+    # "errored" indistinguishable from a crash — the gap clause 9 of the
+    # budget-enforcement epic names.
+    #
+    # NOT applied yet. `cost_stopped_reason` (the parameter; normalized here the
+    # same way the other _UNSET-defaulted values are) only CANDIDATES this run
+    # for `cost_stopped` — applied at the bottom of this function, after the
+    # ARCH-397 downgrade and the primary-mutation guard below have had their
+    # turn, via `_safety_downgrade_applied`. Those two are safety signals and
+    # must win: a run can be cost-capped AND have silently failed its review, or
+    # cost-capped AND mutated a primary checkout, and recording only
+    # `cost_stopped` would hide the more serious fact behind a benign budget
+    # stop (security review, PR #874 round 1).
+    cost_stopped_reason = (None if cost_stopped_reason is _UNSET
+                           else cost_stopped_reason)
+    if cost_stopped_reason is not None:
+        # Sanitised the same way `fallback_blocked_reason` is at its `wait` print
+        # site: a sentence with spaces and punctuation, collapsed to one line
+        # rather than reduced to a token charset, because this is still a
+        # harness-formatted string built from gateway-reported numbers
+        # (`_cap_breach_reason`), not free text, but the format is cheap
+        # insurance against a future change to that function putting
+        # something less constrained into it.
+        cost_stopped_reason = SC.sanitise(cost_stopped_reason, max_len=200)
+    _safety_downgrade_applied = False
+    # Set only by the ARCH-397 downgrade below, to a FIXED string with no
+    # run-controlled content (unlike the printed stderr explanation a few
+    # lines down, which does interpolate meta.json fields for an operator
+    # reading the log) — this one rides into `error_reason`, which
+    # `cmd_status` and `wait` print verbatim, so it stays off the same
+    # attacker-controlled fields `api_terminal_reason`'s sanitiser exists to
+    # keep out of that path (security review, PR #874 round 3).
+    arch397_reason = None
+
     # ARCH-397: a review run that ends its turn without calling `agentctl
     # review-post` reports `completed` with every signal green, but no stamp ever
     # reaches the PR — so the merge gate reads "no review", a co that trusts the
@@ -9454,6 +9669,10 @@ def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
                 repo=meta.get("repo") or "", pr=str(meta.get("pr")), run_id=run_id)
             if posted is False:
                 exit_status = "errored"
+                _safety_downgrade_applied = True
+                arch397_reason = (
+                    "ended its turn without posting a review stamp (ARCH-397) "
+                    "— see stderr for the rescue/re-dispatch guidance.")
                 rescued, attempted = _rescue_unposted_review(
                     run_dir, run_id, str(meta.get('pr')),
                     reviewed_commit=meta.get("review_sha"))
@@ -9670,6 +9889,63 @@ def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
     if (any(m.downgrades_run for m in mutations)
             and exit_status in ("completed", "committed_not_pushed", "committed_local_only")):
         exit_status = "primary_mutated"
+        _safety_downgrade_applied = True
+
+    # The import retried (and, on exhaustion, reported) at the top of this function
+    # never crashed, so without this the run would still read whatever exit_status the
+    # checks above landed on — "completed", most often — with no sign that its commits
+    # never actually reached the shared store. `primary_mutated` is left alone: that
+    # override already names the more serious problem (a checkout the run does not own
+    # was mutated), and a run cannot be BOTH overrides' headline fact at once.
+    #
+    # Also counts as a safety downgrade for the cost-cap candidate below: stranded
+    # commits that only `agentctl publish --run <id>` can recover are the more
+    # serious fact to surface than a benign budget stop, same as ARCH-397 and
+    # primary_mutated above.
+    #
+    # Gated on `_safety_downgrade_applied` rather than only `!= "primary_mutated"`
+    # (security review, PR #874 round 3): that flag is ALSO raised by the
+    # ARCH-397 downgrade above, and a review run has write access to its own
+    # private-objects directory for its whole execution window — so a run that
+    # makes its OWN import fail, on top of ending without posting its stamp,
+    # used to have this override replace ARCH-397's `errored` with the
+    # benign-reading `committed_private_only`, whose own `wait` advice tells
+    # the operator not to re-dispatch, exactly wrong for a review that never
+    # stamped. Checking the flag catches that case too, and still excludes
+    # `primary_mutated` same as before, since that branch raises the same flag.
+    #
+    # The reason STRING is still built whenever the import failed, win or lose:
+    # same reason `cost_stopped_reason` rides into `error_reason` below even
+    # when it loses to a safety downgrade. A safety finding and a
+    # stranded-commits finding can both be true of one run, and the status can
+    # only name one of them — losing the other's reason text to it is the bug
+    # this guards against.
+    private_import_reason = None
+    if private_import_error is not None:
+        private_import_reason = (
+            f"private-object import failed after retrying "
+            f"({type(private_import_error).__name__}: {private_import_error}); "
+            f"commits exist only in {private_objects_dir}. `agentctl publish "
+            f"--run {run_id}` imports them and pushes — do not re-dispatch.")
+        if not _safety_downgrade_applied:
+            exit_status = "committed_private_only"
+            _safety_downgrade_applied = True
+            print(f"agentctl: run {run_id} COMMITTED, but {private_import_reason}",
+                  file=sys.stderr)
+        else:
+            print(f"agentctl: run {run_id} COMMITTED, but {private_import_reason} "
+                  f"— status stays {exit_status!r}, the more serious finding.",
+                  file=sys.stderr)
+
+    # NOW apply the cost/token-cap candidate from above: the ARCH-397 downgrade,
+    # the primary-mutation guard and the private-import check just had their
+    # turn, and none of the three fired, so the cap's own kill is the most
+    # informative thing left to record. The cost reason still rides in
+    # `error_reason` below even when one of the three DID fire and wins the
+    # status — `write_outcome` has no other source for it, so there is nothing
+    # to restructure to keep it visible alongside that verdict.
+    if cost_stopped_reason is not None and not _safety_downgrade_applied:
+        exit_status = "cost_stopped"
 
     # PERSIST WHATEVER THE HARNESS SAID, not only "api_error". The harness emits
     # a classified terminal record on session end and `_stream_transcript` already
@@ -9739,22 +10015,44 @@ def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
         raw_msg = str(final_event.get("result") or "")
         api_error_message = _scrub_api_error_message(raw_msg) if raw_msg else None
 
+    # Both land here when both fired (committed_private_only wins the status,
+    # but a run can ALSO have crossed its cost/token cap on the way) — combine
+    # rather than let one silently overwrite the other, since `write_outcome`
+    # has only this one field for either.
+    if private_import_reason is not None and cost_stopped_reason is not None:
+        combined_error_reason = (
+            f"{private_import_reason} It also hit its cost/token cap: "
+            f"{cost_stopped_reason}")
+    else:
+        combined_error_reason = private_import_reason or cost_stopped_reason
+
+    # `arch397_reason` goes in front rather than through the branch above: it is
+    # the ONE reason that can be set at the same time its own status
+    # (`errored`) has already been decided, by an override this function runs
+    # before it (ARCH-397), rather than competing for the status the way
+    # `private_import_reason` and `cost_stopped_reason` compete for
+    # `committed_private_only` above. Prepending keeps both of those intact
+    # unchanged and adds the missing-stamp fact alongside whichever of them
+    # still applies (security review, PR #874 round 3).
+    if arch397_reason is not None:
+        combined_error_reason = (
+            f"{arch397_reason} {combined_error_reason}"
+            if combined_error_reason else arch397_reason)
+
     files_mod, files_add, files_del = _changed_files(worktree, run_dir)
     outcome = T.write_outcome(
         run_dir, exit_status=exit_status,
         files_modified=files_mod, files_added=files_add, files_deleted=files_del,
         prs_opened=[], tests_run=None, tests_passed=None,
         subagents_spawned=[],
+        error_reason=combined_error_reason,
         terminal_reason=api_terminal_reason,
         api_error_status=api_error_status,
         api_error_message=api_error_message,
         **_scan_rate_limits(run_dir),
     )
 
-    agents_dir = worktree / ".claude" / "agents"
-    skills_dir = worktree / ".claude" / "skills"
-    individuated_agents = sorted(p.stem for p in agents_dir.glob("*.md")) if agents_dir.exists() else []
-    individuated_skills = sorted(d.name for d in skills_dir.iterdir() if d.is_dir()) if skills_dir.exists() else []
+    individuated_agents, individuated_skills = _activation_names(worktree)
     queried: list[dict] = []
     if (run_dir / "tool_calls.jsonl").exists():
         for entry in T.iter_tool_calls(run_dir):
@@ -10307,6 +10605,8 @@ def cmd_status(args) -> int:
             print(f"api_error_status: {outcome['api_error_status']}")
         if outcome.get("api_error_message"):
             print(f"api_error_message: {outcome['api_error_message']}")
+        if outcome.get("error_reason"):
+            print(f"error_reason: {outcome['error_reason']}")
         print(f"files_mod:    {outcome.get('files_modified') or '-'}")
         print(f"files_add:    {outcome.get('files_added') or '-'}")
         print(f"files_del:    {outcome.get('files_deleted') or '-'}")
@@ -10438,8 +10738,16 @@ EXIT_RUN_FAILED = 4
 #   - `primary_mutated` IS in the set: the run wrote into a checkout it does not
 #     own, so whatever else it produced must be inspected before it is trusted,
 #     and a co that reads exit 0 here would publish a run that touched the operator's tree.
+#   - `committed_private_only` IS in the set: unlike `committed_not_pushed`, the
+#     commit is NOT yet readable from the shared store at all, so a co that reads
+#     exit 0 here would report success over work only `agentctl publish --run <id>`
+#     can still recover (its `error_reason` names the private directory).
+#   - `cost_stopped` IS in the set: the run's per-run cost/token cap fired and the
+#     turn never finished, same as `killed`/`errored` — the cap stopping it on
+#     purpose is still the work not happening.
 WAIT_FAILURE_STATUSES = frozenset(
-    {"errored", "killed", "budget_refused", "capacity_refused", "primary_mutated"})
+    {"errored", "killed", "budget_refused", "capacity_refused", "primary_mutated",
+     "committed_private_only", "cost_stopped"})
 
 # What a terminal_reason means for an operator. Each entry states only what is known
 # of the reason; a value without an entry prints as the bare token.
@@ -11007,10 +11315,36 @@ def _wait_for_runs(run_ids: list[str], *, timeout: float | None, poll: float,
         # Same false-confidence shape as ARCH-397 and ARCH-439, inverted: those
         # were a run reporting success having produced nothing, this is a run
         # reporting nothing having produced its whole output.
+        #
+        # `committed_private_only` gets the same carve-out as `primary_mutated`,
+        # and for the same reason: the generic barren message below says
+        # "Re-dispatch", and that is false for this status specifically. The
+        # run's commits exist — they are sitting in its private object store,
+        # not lost — and `agentctl publish --run <id>` recovers them; dispatching
+        # again pays for the same work twice while the recoverable commits sit
+        # unread. The per-run line printed above, from `error_reason`, already
+        # says this ("do not re-dispatch"); the bucket message used to say the
+        # opposite in the same breath (reviewer, PR #870 round 1).
         mutated = [(rid, o) for rid, o in failed
                    if o.get("exit_status") == "primary_mutated"]
+        private_only = [(rid, o) for rid, o in failed
+                        if o.get("exit_status") == "committed_private_only"]
+        # `cost_stopped` is NOT excluded from `barren` (reviewer, PR #874 round
+        # 1): a run the cap killed mid-turn can still have committed real work
+        # first, and the committed-work detection — "check the worktree for
+        # local commits first if the run was killed" — applies to it exactly as
+        # much as to any other killed run. Leaving it out of `barren` meant that
+        # instruction never printed for a cost-capped run at all, so a caller
+        # got only the budget note below and nothing telling them to look for
+        # local commits before concluding there is nothing to recover.
+        # `primary_mutated` and `committed_private_only` stay excluded: both
+        # buckets' own messages already say their work is REAL and must not be
+        # re-dispatched, the opposite of `barren`'s "did NOT do the work".
+        cost_stopped = [(rid, o) for rid, o in failed
+                        if o.get("exit_status") == "cost_stopped"]
         barren = [(rid, o) for rid, o in failed
-                  if o.get("exit_status") != "primary_mutated"]
+                  if o.get("exit_status") not in
+                  ("primary_mutated", "committed_private_only")]
         if barren:
             print(f"wait: {len(barren)} run(s) did NOT do the work. Nothing was "
                   f"published on their behalf — no review stamp, no PR, no queue "
@@ -11046,6 +11380,24 @@ def _wait_for_runs(run_ids: list[str], *, timeout: float | None, poll: float,
                   + (f" and {len(mutated) - 6} more" if len(mutated) > 6 else "")
                   + ", detail in each run dir's primary_mutations.json.",
                   file=sys.stderr)
+        if private_only:
+            print(f"wait: {len(private_only)} run(s) COMMITTED but the commits "
+                  f"are readable only from each run's own private object store, "
+                  f"not yet from the shared repo. Do NOT re-dispatch on this "
+                  f"status alone — you would pay twice for output you already "
+                  f"have. `agentctl publish --run <id>` imports and pushes each "
+                  f"one: {', '.join(rid for rid, _ in private_only[:6])}"
+                  + (f" and {len(private_only) - 6} more" if len(private_only) > 6 else "")
+                  + ".", file=sys.stderr)
+        if cost_stopped:
+            print(f"wait: {len(cost_stopped)} run(s) were stopped for crossing their "
+                  f"per-run cost or token cap (ARCH-185/ARCH-245) — a budget decision, "
+                  f"not a crash. Re-dispatching as-is repeats the same spend and hits "
+                  f"the same cap; raise the cap deliberately or change what the run is "
+                  f"doing first. See each run's error_reason for which cap fired: "
+                  f"{', '.join(rid for rid, _ in cost_stopped[:6])}"
+                  + (f" and {len(cost_stopped) - 6} more" if len(cost_stopped) > 6 else "")
+                  + ".", file=sys.stderr)
         # `failed` can be EMPTY here now: a run that vanished mid-flight reaches
         # this block with no outcome to have failed. Naming a run id is still the
         # useful last line, so take it from whichever list has one.
@@ -11069,8 +11421,8 @@ def cmd_wait(args) -> int:
     alive until the worker is genuinely done.
 
     Returns 0 when the wait condition is met AND every finished run succeeded,
-    4 when one of them ended errored/killed/budget_refused/capacity_refused OR
-    died without finalizing (its process vanished mid-flight — inspect with
+    4 when one of them ended errored/killed/budget_refused/capacity_refused/
+    cost_stopped OR died without finalizing (its process vanished mid-flight — inspect with
     `agentctl status` before re-dispatching, per the waiter's own stderr), 2 on
     timeout (prints the still-running ids so the caller can kill + skip-defer),
     1 if an id won't resolve, 3 if the waiter itself was killed."""
@@ -12049,6 +12401,40 @@ def _typecheck_gate(wt: Path, repo: str) -> int:
         print(f"publish: BLOCKED — `{' '.join(argv)}` failed in {cwd}:\n{tail}\n"
               f"  Fix the type errors, commit, then re-run publish. This is exactly what "
               f"CI enforces — fixing it here saves a review+CI round.", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _content_scan_gate(wt: Path, repo_name: str, head: str) -> int:
+    """Refuse to push `head` when Builder's content scan (`publish_scan.py`,
+    Shipwright's own `bin/publish-engine`) cannot vouch for it.
+
+    UNLIKE THE STYLE GATES ABOVE, THIS ONE IS NOT BEST-EFFORT. The others warn
+    and proceed on a missing tool because CI still enforces lint/format/
+    typecheck; nothing else in the PR flow runs the content scan (that is the
+    whole reason this gate exists — a cleanup that passed it was undone a day
+    later by ordinary reviewed PRs that added a name back). So a scan that
+    cannot run — Shipwright's checkout, `bin/publish-engine`, or either names
+    file missing — blocks the push exactly like a scan that found something.
+
+    `PS is None` covers the one window this needs its own message for: a
+    machine where this module has not been linked into
+    `~/.local/lib/agent-platform` yet (`bin/agentctl`'s own fail-soft import,
+    same pattern as `tool_policy`/`primary_guard`, so a deploy window never
+    crashes every `agentctl` command over one new module) — refused here
+    rather than silently skipped, because this gate's whole point is that
+    publish must never push unscanned.
+    """
+    if PS is None:
+        print("publish: BLOCKED — publish_scan is not linked into this process; "
+              "refusing to push unscanned. Run install.sh, or wait for the next "
+              "agent-platform-autopull tick, then re-run publish.", file=sys.stderr)
+        return 1
+    try:
+        PS.scan_commit(repo_name, wt, head)
+    except PS.PublishScanRefused as exc:
+        print(f"publish: BLOCKED by Builder's content scan — refusing to push "
+              f"{head[:9]} ({repo_name}):\n{exc}", file=sys.stderr)
         return 1
     return 0
 
@@ -13237,45 +13623,36 @@ def cmd_kb_propose(args) -> int:
                   file=sys.stderr)
 
 
-def cmd_kb_merge(args) -> int:
-    """Merge a knowledge PR the Library opened, once its review cycle passed
-    (platform/decisions/0078), or an earlier APPROVE carries to its current,
-    rebuilt head (the 2026-10-09 amendment under "What the Library may merge").
+def _kb_merge_read(repo: str, pr: str, library) -> "tuple[object, str, dict]":
+    """Gather every fact `kb_merge.refusals` needs for `repo`#`pr`: its own
+    view, commits and author, the review gate's own decision, every
+    `Merge-after` companion's state, and — after fetching `origin/main` and
+    the PR's head fresh into the knowledge checkout with `library` — the
+    agent policy, the changed files, and whether the head still contains
+    that fresh main.
 
-    The conditions, and why each exists, live in lib/agent-platform/kb_merge.py.
-    This gathers the facts they read, from GitHub and from git, and never from
-    the caller: the PR and its author, its commits, the review gate's own
-    decision — `_review_status_decision`, the same function `review-status`
-    itself prints, UNLESS `_review_launch_path()` reports the launcher
-    installed, in which case this reads `_review_status_from_checks` instead,
-    exactly the routing `cmd_review_status` itself makes (platform/decisions/0090)
-    — never a subprocess, so the carry below works from structured reasons and
-    stamps rather than re-parsing printed text, each `Merge-after` companion's
-    state, and the agent policy and changed files from the freshly fetched
-    knowledge checkout. `--dry-run` decides and reports without merging.
+    Returns `(facts, head, carried)`. `head` is THIS read's own fresh
+    headRefOid (used for the author/commits/companions reads and for
+    messages); `facts.head_sha` is the head the review gate's own,
+    separately-read decision reports, so a push landing between the two
+    reads as a moved head (`facts.gate_head != facts.head_sha`). `carried`
+    is `{role: commit}` for every role whose stale APPROVE carried onto
+    `facts.head_sha` here (platform/decisions/0078). When some OTHER reason
+    (CI, draft, mergeability) already refuses regardless, the carry is never
+    attempted, and `facts.review_reasons` says so for a stale-but-APPROVE
+    role rather than reporting it as a settled "re-review needed" — the
+    carry's own conditions are unaffected either way (agent-platform#857).
+
+    `cmd_kb_merge` calls this once, or twice when it rebuilds the branch
+    (issue_01M4JFSBA38N836QE0VANPCWNB): once to decide whether to, once
+    after, against the rebuilt head. May raise `RuntimeError` or
+    `json.JSONDecodeError` from the first PR read; the caller reports that
+    as a refusal.
     """
     import kb_merge as KM  # noqa: PLC0415 — lazy, like the other kb helpers
-    if _kb_refuse_if_not_github("kb merge"):
-        return 2
-    try:
-        config = KM.load_config()
-    except KM.Unreadable as e:
-        print(f"kb merge: refused — {e}", file=sys.stderr)
-        return 2
-    repo = args.repo or config.repo
-    pr = str(args.pr)
-    # The fetch is made as the App with a read-only token, so this refuses before
-    # anything is read when the identity is unavailable, exactly as `kb sync` does.
-    library, _ = _kb_library_git("kb merge", read_only=True)
-    if library is None:
-        return 2
     fields = ["number", "state", "headRefName", "baseRefName", "isCrossRepository",
               "headRefOid", "body"]
-    try:
-        view = _gh_pr_json(pr, fields, repo=repo)
-    except (RuntimeError, json.JSONDecodeError) as e:
-        print(f"kb merge: refused — cannot read {repo}#{pr}: {e}", file=sys.stderr)
-        return 2
+    view = _gh_pr_json(pr, fields, repo=repo)
     head = (view.get("headRefOid") or "").strip()
 
     # One compact JSON object per commit per line, so no paging flag is assumed
@@ -13344,7 +13721,7 @@ def cmd_kb_merge(args) -> int:
     # judged. A fetch or read that fails is one refusal, never a partial read.
     policy = changes = problem = base_sha = head_contains_base = None
     stamp_changes = {}
-    number = int(view.get("number") or args.pr)
+    number = int(view.get("number") or pr)
     carried: dict = {}   # role -> the commit whose APPROVE carried, for the diagnostic below
     if not (KNOWLEDGE_ROOT / ".git").exists():
         problem = f"{KNOWLEDGE_ROOT} is not a git checkout"
@@ -13392,6 +13769,39 @@ def cmd_kb_merge(args) -> int:
                         review_reasons = []
                     else:
                         review_reasons = other + blocked
+                else:
+                    # `other` already refuses regardless of any carry (CI, draft,
+                    # mergeability — none fixable by carrying a stamp), so the
+                    # attempt above never runs and `KM.carry_for_role` never looks
+                    # at these roles' stamps. A "stale" line in `review_reasons` was
+                    # produced by `review-status`'s own per-role check, which knows
+                    # nothing of carrying, and reads as a settled "re-review needed"
+                    # refusal rather than the "not checked yet" it actually is
+                    # (agent-platform#857: a `--dry-run` read it that way while CI
+                    # was still pending at a head whose carry, once CI went green,
+                    # in fact held). Rewrite each such line in place rather than
+                    # evaluate the carry here — evaluating it would mean running
+                    # `KM.carry_for_role`'s git reads on roles `other` has already
+                    # made moot, for a result this command would then discard.
+                    for role in KM.REVIEW_ROLES:
+                        if role in plain.approvals:
+                            continue
+                        candidates = [s for s in stamps if RP._review_base(s.agent) == role]
+                        latest = candidates[-1] if candidates else None
+                        if latest is None or latest.verdict != "APPROVE":
+                            continue
+                        stale_line = (
+                            f"{role} APPROVE is stale — reviewed "
+                            f"{latest.reviewed_commit or '?'}, head is "
+                            f"{head_after or '?'} (re-review needed)")
+                        if stale_line in review_reasons:
+                            review_reasons = [
+                                (f"{role}'s APPROVE reviewed "
+                                 f"{latest.reviewed_commit or '?'} not yet evaluated "
+                                 f"for carry while another reason refuses "
+                                 f"regardless: {'; '.join(other)}") if r == stale_line
+                                else r
+                                for r in review_reasons]
         except KM.Unreadable as e:
             problem = str(e)
         finally:
@@ -13408,7 +13818,383 @@ def cmd_kb_merge(args) -> int:
         author=author, policy=policy, changes=changes, git_problem=problem,
         base_sha=base_sha, head_contains_base=head_contains_base,
         stamp_changes=stamp_changes)
+    return facts, head, carried
+
+
+def _kb_merge_write_token(config) -> "tuple[str | None, str | None]":
+    """A fresh installation token scoped to the configured repository, with
+    `contents: write` and `pull_requests: write` — the same mint the merge
+    call itself makes, shared here so a rebuild and the merge that follows it
+    spend one mint rather than two. `(token, None)`, or `(None, problem)`
+    naming the stage that failed."""
+    import kb_merge as KM  # noqa: PLC0415
+    problem = KM.key_problem(config.key_path)
+    if problem:
+        return None, problem
+    try:
+        jwt = KM.app_jwt(config.key_path, config.app_id)
+        inst = KM.knowledge_installation(jwt, owner=config.owner, repo=config.repo)
+        token = KM.installation_token(jwt, inst, repo=config.repo)
+    except KM.Unreadable as e:
+        return None, str(e)
+    return token, None
+
+
+def _kb_merge_rebuild(repo: str, pr: str, facts, config, token: str
+                      ) -> "tuple[str | None, str | None]":
+    """Attempt the platform/decisions/0078 (2026-10-10 amendment) rebuild of
+    `facts`'s branch onto `facts.base_sha`. `(new_head_sha, None)` on
+    success, or `(None, reason)` — never partial: the branch's ref moves
+    only once the new commit exists on GitHub and the PR's head has just
+    been re-read and confirmed unmoved, so a proposer's concurrent push is
+    never overwritten.
+    """
+    import kb_merge as KM  # noqa: PLC0415
+    try:
+        blocked = KM.rebuild_blocked(KNOWLEDGE_ROOT, facts.head_sha, facts.base_sha)
+        if blocked is not None:
+            return None, f"cannot rebuild onto {KM.BASE}: {blocked}"
+        entries = KM.rebuild_tree_entries(KNOWLEDGE_ROOT, facts.head_sha, facts.base_sha)
+        base_tree = KM.tree_sha_at(KNOWLEDGE_ROOT, facts.base_sha)
+        message = KM.rebuild_message(KNOWLEDGE_ROOT, facts.commits or [], facts.head_sha)
+    except KM.Unreadable as e:
+        return None, f"cannot rebuild onto {KM.BASE}: {e}"
+    try:
+        new_tree = KM.create_tree(token, base_tree, entries, repo=config.repo)
+        new_commit = KM.create_commit(token, message, new_tree, facts.base_sha,
+                                      repo=config.repo)
+    except KM.Unreadable as e:
+        return None, f"could not build the rebuilt commit: {e}"
+    # Re-read the PR's head right before moving the branch, so a push that
+    # landed while the commit above was being built is never overwritten.
+    try:
+        current = (_gh_pr_json(pr, ["headRefOid"], repo=repo).get("headRefOid") or "").strip()
+    except (RuntimeError, json.JSONDecodeError) as e:
+        return None, f"could not re-read {repo}#{pr}'s head before updating the branch: {e}"
+    if current != facts.head_sha:
+        return None, (f"{repo}#{pr}'s head moved to {(current or '?')[:12]} while "
+                      f"the rebuilt commit was being built; not updating the branch")
+    try:
+        KM.update_branch_ref(token, facts.head_ref, new_commit, repo=config.repo)
+    except KM.Unreadable as e:
+        return None, f"could not update {facts.head_ref}: {e}"
+    return new_commit, None
+
+
+class _HeadCatchupProblem(NamedTuple):
+    """Why `_kb_merge_await_head_catchup` is not reporting `new_sha` as the
+    PR's head yet. `retryable` is true only when the bound ran out while the
+    head still read `old_sha`, the pre-rebuild commit — GitHub's pull-request
+    API can lag a force-push that has already landed by a few seconds
+    (agent-platform#853's first live rebuild on knowledge#852: `git
+    ls-remote` and a `gh pr view` moments later both already read the
+    rebuilt sha, while the read this function makes had not caught up yet),
+    so a caller may retry once that passes. `retryable` is false when the
+    head reads a THIRD sha — neither `old_sha` nor `new_sha` — since that is
+    some other, concurrent move of the branch, not API lag, and waiting
+    longer will not fix it."""
+    message: str
+    retryable: bool
+
+
+def _kb_merge_await_head_catchup(repo: str, pr: str, old_sha: str, new_sha: str, *,
+                                 timeout: float, poll: float = None
+                                 ) -> "_HeadCatchupProblem | None":
+    """Poll `repo#pr`'s `headRefOid` — the same read
+    `_kb_merge_required_check_conclusions` trusts — until it reports
+    `new_sha`, the sha a rebuild just force-pushed. `None` once it does.
+
+    Reading `old_sha` during the wait means "not caught up yet" and is
+    retried until `timeout`; reading anything else refuses at once, since a
+    third sha means something other than API lag moved the branch and more
+    polling cannot fix that. This is the fix for agent-platform#853's first
+    live rebuild, which refused its own freshly-pushed head because this
+    exact read still returned the pre-rebuild sha for a few seconds.
+
+    `poll` defaults to `KB_MERGE_HEAD_CATCHUP_POLL_SECS` resolved AT CALL
+    TIME, not as the parameter's own default value — that constant is
+    defined later in this file than this function, so binding it at `def`
+    time would raise `NameError` the moment the module loads."""
+    poll = KB_MERGE_HEAD_CATCHUP_POLL_SECS if poll is None else poll
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            current = (_gh_pr_json(pr, ["headRefOid"], repo=repo).get("headRefOid") or "").strip()
+        except (RuntimeError, json.JSONDecodeError) as e:
+            return _HeadCatchupProblem(
+                message=f"could not read {repo}#{pr}'s head while waiting for it "
+                        f"to catch up: {e}",
+                retryable=False)
+        if current == new_sha:
+            return None
+        if current != old_sha:
+            return _HeadCatchupProblem(
+                message=(f"{repo}#{pr}'s head is now {(current or '?')[:12]}, "
+                         f"neither the pre-rebuild {old_sha[:12]} nor the rebuilt "
+                         f"{new_sha[:12]} — something else moved the branch"),
+                retryable=False)
+        if time.monotonic() >= deadline:
+            return _HeadCatchupProblem(
+                message=(f"{repo}#{pr}'s head still reads the pre-rebuild "
+                         f"{old_sha[:12]}, not yet the rebuilt {new_sha[:12]}, "
+                         f"after {timeout:.0f}s"),
+                retryable=True)
+        time.sleep(poll)
+
+
+def _kb_merge_required_check_conclusions(repo: str, pr: str, sha: str, *,
+                                         old_sha: str = None
+                                         ) -> "dict | str":
+    """Each of `kb_merge.REBUILD_REQUIRED_CHECKS`'s conclusion on `sha`, read
+    through the same GraphQL `statusCheckRollup` + workflow-file-path keying
+    the merge gate itself trusts (`_latest_per_check`, ARCH-380) — never
+    through REST `commits/<sha>/check-runs` matched by name alone, which
+    carries no workflow association and so cannot tell the real `validate`
+    from a same-named check-run an injected workflow or a different app
+    posted (round 2 security finding, agent-platform#853: the #182 bypass
+    ARCH-380 closed, reopened one level down in this rebuild gate).
+
+    Returns `{name: conclusion-or-None}` on success: a name with no
+    correctly-keyed check-run at all, and one whose conclusion is still
+    empty (still running), both map to `None`, exactly as before — the
+    caller waits on every value being a non-empty string, never on none of
+    them being `None`. The same all-`None` shape is returned, rather than a
+    refusal, when `current` reads `old_sha` — the PR API's `headRefOid` can
+    still lag a few seconds behind a force-push that has already landed
+    (agent-platform#853's first live rebuild, knowledge#852), and a caller
+    passing `old_sha` is asking this to treat that lag the same way it
+    treats a check that hasn't posted yet: worth polling again, not a
+    refusal. Pass `old_sha=None` (the default) when the caller has no such
+    sha to compare against, or wants any mismatch treated as a hard refusal.
+
+    Returns a `str` refusal reason, never a dict, when the rollup cannot be
+    trusted at all: `repo#pr`'s current head is neither `sha` nor `old_sha`
+    (so this would be judging a commit that moved out from under it for a
+    reason other than API lag), or the workflow-run → path map could not be
+    built at all (so no check could be verified against its required path,
+    and falling back to name-only keying would restore the bypass this
+    function exists to close). A caller must treat a `str` as an immediate,
+    non-retryable refusal — never as "every check is still missing", which
+    would poll forever against a premise that isn't going to resolve itself."""
+    import kb_merge as KM  # noqa: PLC0415
+    try:
+        view = _gh_pr_json(pr, ["headRefOid", "statusCheckRollup"], repo=repo)
+    except (RuntimeError, json.JSONDecodeError) as e:
+        return f"could not read {repo}#{pr}'s checks: {e}"
+    current = (view.get("headRefOid") or "").strip()
+    if current != sha:
+        if old_sha is not None and current == old_sha:
+            return {name: None for name in KM.REBUILD_REQUIRED_CHECKS}
+        return (f"{repo}#{pr}'s head is now {(current or '?')[:12]}, not the "
+                f"rebuilt {sha[:12]} — refusing rather than judge the wrong "
+                f"commit's checks")
+    path_map = _workflow_path_map(repo, sha)
+    if path_map is None:
+        return (f"could not read {sha[:12]}'s workflow-run paths — refusing "
+                f"rather than key its required checks by name alone")
+    rollup = view.get("statusCheckRollup") or []
+    found: dict[str, str] = {}
+    for c in _latest_per_check(rollup, path_map):
+        name = c.get("name") or c.get("context") or "?"
+        wanted_path = KM.REBUILD_REQUIRED_CHECK_WORKFLOWS.get(name)
+        if wanted_path is None:
+            continue
+        run_id = _run_id_from_details_url(c.get("detailsUrl") or "")
+        actual_path = path_map.get(run_id) if run_id is not None else None
+        if actual_path != wanted_path:
+            continue   # not from its required workflow file — never counted
+        # Lower-cased so this function's contract (and the "success" literal
+        # `_kb_merge_await_required_checks` compares against) stays exactly
+        # what it was when this read REST: GraphQL's CheckConclusionState
+        # enum comes back upper-cased ("SUCCESS"), REST's came back lower.
+        concl = (c.get("conclusion") or "").lower()
+        if concl:
+            found[name] = concl
+    return {name: found.get(name) for name in KM.REBUILD_REQUIRED_CHECKS}
+
+
+class _RequiredChecksProblem(NamedTuple):
+    """Why `_kb_merge_await_required_checks` is not reporting the rebuilt
+    head's required checks as passed. `retryable` is true only when they
+    never settled within the timeout — the rebuilt head's checks may still
+    finish, so re-running `kb merge` later could succeed. Once every one of
+    them HAS concluded, `retryable` is false: a conclusion that isn't
+    "success" (`failure`, `cancelled`, `timed_out`, `neutral`, `skipped`,
+    `action_required`) never becomes "success" on its own, so a caller must
+    never suggest retrying — and must never merge. The same `retryable=False`
+    applies when `_kb_merge_required_check_conclusions` returns a refusal
+    string rather than conclusions at all (the head moved again, or the
+    checks could not be keyed to their required workflow path): a premise
+    that unreadable, like a concluded failure, does not get better by
+    polling the same question again within this call."""
+    message: str
+    retryable: bool
+
+
+def _kb_merge_await_required_checks(repo: str, pr: str, sha: str, *, timeout: float,
+                                    poll: float = None, old_sha: str = None
+                                    ) -> "_RequiredChecksProblem | None":
+    """Wait until every one of `kb_merge.REBUILD_REQUIRED_CHECKS` has a
+    recorded conclusion on `sha`, or `timeout` seconds pass, then judge the
+    rebuilt head by those conclusions. `None` only when every one of them is
+    exactly "success" — a `_RequiredChecksProblem` otherwise, whether because
+    a check never settled, because one settled on something other than
+    "success" (knowledge#699: a rebuilt head whose `validate` failed must
+    never read as passed, let alone merge), or because the rollup itself
+    could not be trusted at all (agent-platform#853 round 2: `repo#pr`'s
+    head moved off `sha` for a reason other than `old_sha` lag, or the
+    required checks could not be keyed to their workflow path and so could
+    not be verified at all).
+
+    `old_sha`, when given, is forwarded to `_kb_merge_required_check_conclusions`
+    so that a `headRefOid` still lagging behind the rebuild (agent-platform#853's
+    first live rebuild) reads as "no conclusions yet" here too, exactly like a
+    check that hasn't posted — never as the hard refusal a genuinely different
+    third sha gets. `cmd_kb_merge` already waits out that lag with
+    `_kb_merge_await_head_catchup` before calling this, so `old_sha` here is
+    defense in depth against the same lag recurring mid-poll, not the primary
+    fix for it.
+
+    Waits for the PRESENCE of a conclusion, never for the ABSENCE of
+    "pending": a check that never started at all would read identically to
+    one still running under the latter, and the rebuilt head deserves actual
+    evidence that each required check ran, not merely that none is known to
+    be in flight. Presence is not success, though: once every check has
+    concluded, each conclusion is read on its own merits, never treated as a
+    pass merely for being non-empty.
+
+    `poll` defaults to `CI_PENDING_POLL_SECS` resolved AT CALL TIME, not as
+    the parameter's own default value — that constant is defined later in
+    this file than this function, so binding it at `def` time would raise
+    `NameError` the moment the module loads."""
+    poll = CI_PENDING_POLL_SECS if poll is None else poll
+    deadline = time.monotonic() + timeout
+    while True:
+        conclusions = _kb_merge_required_check_conclusions(repo, pr, sha, old_sha=old_sha)
+        if isinstance(conclusions, str):
+            return _RequiredChecksProblem(message=conclusions, retryable=False)
+        missing = [name for name, concl in conclusions.items() if not concl]
+        if not missing:
+            failed = [(name, concl) for name, concl in conclusions.items()
+                     if concl != "success"]
+            if not failed:
+                return None
+            named = ", ".join(f"{name} concluded {concl!r}" for name, concl in failed)
+            return _RequiredChecksProblem(
+                message=f"{named} on {sha[:12]}: not every required check succeeded",
+                retryable=False)
+        if time.monotonic() >= deadline:
+            return _RequiredChecksProblem(
+                message=(f"{', '.join(missing)} still show no recorded conclusion on "
+                         f"{sha[:12]} after {timeout:.0f}s"),
+                retryable=True)
+        time.sleep(poll)
+
+
+def cmd_kb_merge(args) -> int:
+    """Merge a knowledge PR the Library opened, once its review cycle passed
+    (platform/decisions/0078): once an earlier APPROVE carries to its
+    current, rebuilt head (the 2026-10-09 amendment under "What the Library
+    may merge"), and — when the only thing wrong is that the branch no
+    longer contains `main` — once this command has rebuilt the branch onto
+    main itself and that rebuilt head's required checks have passed (the
+    2026-10-10 amendment, issue_01M4JFSBA38N836QE0VANPCWNB).
+
+    The conditions, and why each exists, live in lib/agent-platform/kb_merge.py.
+    `_kb_merge_read` gathers the facts they read, from GitHub and from git,
+    and never from the caller. When `kb_merge.refusals()` finds exactly one
+    problem — the branch is stale — and `kb_merge.rebuild_worth_trying` says
+    rebuilding is safe, this builds a new commit transplanting the branch's
+    own changes onto the freshly fetched `main`, force-updates the branch to
+    it, waits for the PR's head to catch up to that push (agent-platform#853's
+    first live rebuild refused its own freshly-pushed head on exactly this
+    lag), waits for its required checks, and re-reads everything from the top
+    against the rebuilt head before deciding again. Never rebuilds twice in
+    one invocation: if `main` moves again during that wait, this refuses and
+    says so, and a second `kb merge` rebuilds again through the same path.
+    `--dry-run` decides and reports without merging OR rebuilding.
+    """
+    import kb_merge as KM  # noqa: PLC0415 — lazy, like the other kb helpers
+    if _kb_refuse_if_not_github("kb merge"):
+        return 2
+    try:
+        config = KM.load_config()
+    except KM.Unreadable as e:
+        print(f"kb merge: refused — {e}", file=sys.stderr)
+        return 2
+    repo = args.repo or config.repo
+    pr = str(args.pr)
+    # The fetch is made as the App with a read-only token, so this refuses before
+    # anything is read when the identity is unavailable, exactly as `kb sync` does.
+    library, _ = _kb_library_git("kb merge", read_only=True)
+    if library is None:
+        return 2
+
+    try:
+        facts, head, carried = _kb_merge_read(repo, pr, library)
+    except (RuntimeError, json.JSONDecodeError) as e:
+        print(f"kb merge: refused — cannot read {repo}#{pr}: {e}", file=sys.stderr)
+        return 2
     why = KM.refusals(facts, config)
+
+    rebuilt = False
+    token = None
+    if why and not args.dry_run and KM.rebuild_worth_trying(facts):
+        token, token_problem = _kb_merge_write_token(config)
+        if token_problem:
+            print(f"kb merge: cannot rebuild {repo}#{pr} — {token_problem}", file=sys.stderr)
+            return 2
+        rebuilt_head, rebuild_problem = _kb_merge_rebuild(repo, pr, facts, config, token)
+        if rebuilt_head is None:
+            why = why + [rebuild_problem]
+        else:
+            catchup_problem = _kb_merge_await_head_catchup(
+                repo, pr, facts.head_sha, rebuilt_head, timeout=args.head_wait)
+            if catchup_problem:
+                if catchup_problem.retryable:
+                    print(f"kb merge: {repo}#{pr} — rebuilt the branch to "
+                          f"{rebuilt_head[:12]}, but {catchup_problem.message}. "
+                          f"Re-run kb merge once the head catches up.", file=sys.stderr)
+                else:
+                    print(f"kb merge: {repo}#{pr} — rebuilt the branch to "
+                          f"{rebuilt_head[:12]}, but {catchup_problem.message}; "
+                          f"the branch was rebuilt and was not merged.", file=sys.stderr)
+                return 1
+            settle_problem = _kb_merge_await_required_checks(
+                repo, pr, rebuilt_head, timeout=args.check_wait, old_sha=facts.head_sha)
+            if settle_problem:
+                if settle_problem.retryable:
+                    print(f"kb merge: {repo}#{pr} — rebuilt the branch to "
+                          f"{rebuilt_head[:12]}, but {settle_problem.message}. "
+                          f"Re-run kb merge once the checks finish.", file=sys.stderr)
+                else:
+                    print(f"kb merge: {repo}#{pr} — rebuilt the branch to "
+                          f"{rebuilt_head[:12]}, but {settle_problem.message}; "
+                          f"the branch was rebuilt and was not merged.", file=sys.stderr)
+                return 1
+            try:
+                facts, head, carried = _kb_merge_read(repo, pr, library)
+            except (RuntimeError, json.JSONDecodeError) as e:
+                print(f"kb merge: refused — cannot read {repo}#{pr} after rebuilding: {e}",
+                      file=sys.stderr)
+                return 2
+            if facts.head_sha != rebuilt_head:
+                print(f"kb merge: refused — {repo}#{pr}'s head moved to "
+                      f"{facts.head_sha[:12]} after the rebuild to {rebuilt_head[:12]}; "
+                      f"re-run kb merge.", file=sys.stderr)
+                return 1
+            why = KM.refusals(facts, config)
+            if why and facts.head_contains_base is False:
+                print(f"kb merge: refused — {repo}#{pr} at {facts.head_sha[:12]}:",
+                      file=sys.stderr)
+                for w in why:
+                    print(f"  - {w}", file=sys.stderr)
+                print(f"kb merge: {KM.BASE} moved again while waiting for the rebuilt "
+                      f"head's checks; not rebuilding twice in one run. Re-run kb merge.",
+                      file=sys.stderr)
+                return 1
+            rebuilt = True
+
     if why:
         print(f"kb merge: refused — {repo}#{pr} at {head[:12] or '?'}:")
         for w in why:
@@ -13416,26 +14202,25 @@ def cmd_kb_merge(args) -> int:
         return 1
     for role, commit in sorted(carried.items()):
         print(f"kb merge: {repo}#{pr} — {role}'s APPROVE at {commit[:12]} carries to "
-              f"{head_after[:12]} (platform/decisions/0078)")
+              f"{facts.head_sha[:12]} (platform/decisions/0078)")
+    if rebuilt:
+        print(f"kb merge: {repo}#{pr} — rebuilt the branch onto {KM.BASE} at "
+              f"{facts.head_sha[:12]}; its required checks passed "
+              f"(platform/decisions/0078)")
     if args.dry_run:
         print(f"kb merge: {repo}#{pr} at {head[:12]} — every condition holds. "
               f"--dry-run, so nothing was merged.")
         return 0
 
-    problem = KM.key_problem(config.key_path)
-    if problem:
-        print(f"kb merge: cannot merge {repo}#{pr} — {problem}", file=sys.stderr)
-        return 2
-    # The installation is derived and checked (the configured repository alone)
-    # before any merge token exists, and the token is minted for that installation.
-    try:
-        jwt = KM.app_jwt(config.key_path, config.app_id)
-        inst = KM.knowledge_installation(jwt, owner=config.owner, repo=config.repo)
-        token = KM.installation_token(jwt, inst, repo=config.repo)
-    except KM.Unreadable as e:
-        print(f"kb merge: cannot merge {repo}#{pr} — {e}", file=sys.stderr)
-        return 2
-    ok, msg = KM.merge_pr(facts.number, head_after, token, repo=config.repo)
+    if token is None:
+        # The installation is derived and checked (the configured repository
+        # alone) before any merge token exists, and the token is minted for
+        # that installation.
+        token, problem = _kb_merge_write_token(config)
+        if problem:
+            print(f"kb merge: cannot merge {repo}#{pr} — {problem}", file=sys.stderr)
+            return 2
+    ok, msg = KM.merge_pr(facts.number, facts.head_sha, token, repo=config.repo)
     print(f"kb merge: {repo}#{pr} — {msg}", file=sys.stdout if ok else sys.stderr)
     return 0 if ok else 1
 
@@ -14631,6 +15416,33 @@ def _restore_suppressed_before_push(git, wt: Path) -> bool:
     return True
 
 
+def _refuse_inside_object_redirected_run(cmd: str) -> str | None:
+    """None when this process is free to touch git and the private-object import;
+    else the refusal message.
+
+    True when any of `RS.GIT_OBJECT_REDIRECT_VARS` is set in this process's own
+    environment — the signal a dispatched run's own shell always carries
+    (`dispatch_env` sets `GIT_OBJECT_DIRECTORY`/`GIT_ALTERNATE_OBJECT_DIRECTORIES`
+    for every real-repo dispatch), and `publish`/`pr-open` running under it means a
+    run is calling one of them on its OWN worktree from inside its OWN shell — the
+    CQ·477 incident (run-421dd904, 2026-10-12): a coder's `agentctl publish` on its
+    own worktree reached `import_leftover_private_objects`, which found nothing
+    missing from the shared store and ran `shutil.rmtree` on the private store this
+    run's own git was still pointed at, breaking every git call for the rest of the
+    run. `publish`/`pr-open` are the orchestrator's own step, run from an
+    unsandboxed `agentctl` invocation after the run has ended; the run-side
+    equivalent is the orchestrator calling `agentctl publish --run <id>` /
+    `pr-open --run <id>` once this run is done, never the run calling either on
+    itself."""
+    hit = [v for v in RS.GIT_OBJECT_REDIRECT_VARS if v in os.environ]
+    if not hit:
+        return None
+    return (f"{cmd}: REFUSED — this process's own git is redirected at a dispatched "
+            f"run's private object store ({', '.join(hit)} set). {cmd} is the "
+            f"orchestrator's step, run after the run ends (`agentctl {cmd} --run <id>`), "
+            f"never a run calling it on its own worktree from inside its own shell.")
+
+
 def cmd_publish(args) -> int:
     """Push a worktree's current branch to origin and verify origin == local HEAD.
 
@@ -14647,6 +15459,11 @@ def cmd_publish(args) -> int:
     Resolve the worktree by explicit path, by --run <id> (registry lookup), or
     by --repo/--purpose (same resolution `spawn` uses).
     """
+    refusal = _refuse_inside_object_redirected_run("publish")
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
     # --- resolve the worktree path ---
     if args.worktree:
         wt = Path(args.worktree).expanduser().resolve()
@@ -14667,13 +15484,6 @@ def cmd_publish(args) -> int:
         print(f"publish: not a git worktree (no .git): {wt}", file=sys.stderr)
         return 2
 
-    # Fold in any leftover private object store before reading or pushing HEAD: a run
-    # dispatched on this tree may have died before its own end-of-run import (a
-    # documented recurring incident, P1b 2026-07-04), leaving its commit reachable only
-    # through the private store — invisible to this function's own plain-git reads and
-    # to `git push`. A no-op when there is nothing to import.
-    W.import_leftover_private_objects(wt)
-
     def git(*a):
         return subprocess.run(["git", "-C", str(wt), *a], capture_output=True, text=True)
 
@@ -14682,6 +15492,26 @@ def cmd_publish(args) -> int:
         print(f"publish: refused — detached HEAD / no branch in {wt}.", file=sys.stderr)
         return 1
     head = git("rev-parse", "HEAD").stdout.strip()
+
+    # Fold in a leftover private object store before reading HEAD's ancestry or
+    # pushing it, but ONLY when HEAD itself is not resolvable from the shared store: a
+    # run dispatched on this tree may have died, or its own end-of-run import may have
+    # exhausted its retries (issue_01M4RP1K026XJE740DMQ7AP31M, run-89f78c3f,
+    # 2026-10-12), leaving its commit reachable only through the private store —
+    # invisible to this function's own plain-git reads and to `git push`.
+    #
+    # `git cat-file -e` is the exact check `rev-parse HEAD` above cannot make: it reads
+    # the ref file (worktree-local), never the object, so it resolves to a sha even
+    # when that sha names no object anywhere — which is exactly how the incident above
+    # was first seen (`git cat-file -t HEAD` printing "fatal: bad object HEAD").
+    # `remove=False`: a push that fails right after this must not have already
+    # deleted the one copy of the commit it just proved exists.
+    if git("cat-file", "-e", f"{head}^{{commit}}").returncode != 0:
+        private_git_dir = RS.git_common_dir(wt)
+        if private_git_dir is not None:
+            RS.import_private_objects(
+                private_git_dir, RS.run_private_objects_dir(wt, private_git_dir),
+                remove=False)
 
     # Repo name for any suggested `--on` in this function's own messages, and
     # reused below for the fast-check gates. `args.repo` wins when given
@@ -14815,6 +15645,13 @@ def cmd_publish(args) -> int:
         print(f"publish: DRY-RUN — would fast-forward origin/{branch} "
               f"{remote_before[:9] or '(absent)'} -> {head[:9]}.")
         return 0
+
+    # NOT subject to --skip-checks (unlike the fast-check gates above): that flag's own
+    # message says it skips "lint/format/typecheck", a style gate CI re-enforces anyway.
+    # Nothing else in the PR flow runs Builder's content scan, so this is the one place
+    # it runs at all, and it runs on the exact commit about to be pushed.
+    if _content_scan_gate(wt, repo_name, head) != 0:
+        return 1
 
     r = git("push", "origin", f"HEAD:{branch}")
     if r.returncode != 0:
@@ -14974,6 +15811,11 @@ def cmd_pr_open(args) -> int:
     The one-line PR title comes from --title (safe as a single argv); only the
     fragile multi-line body comes from the file.
     """
+    refusal = _refuse_inside_object_redirected_run("pr-open")
+    if refusal is not None:
+        print(refusal, file=sys.stderr)
+        return 1
+
     # --- resolve the worktree path (mirrors publish) ---
     # Priority: explicit PATH > --repo+--purpose > --run (registry). repo+purpose
     # is checked before --run so the orchestrator can pass `--run <worker-id>`
@@ -15589,6 +16431,18 @@ CI_BLOCK_PENDING = 5    # CI is still RUNNING — retry once the suite finishes
 # Tune per dispatch with --ci-wait when a repo's suite is slower still.
 CI_PENDING_WAIT_SECS = 1800
 CI_PENDING_POLL_SECS = 20
+
+# How long `kb merge` waits, after a rebuild's force-push, for the PR API's
+# `headRefOid` to catch up to the sha it just pushed — a SEPARATE, much
+# shorter budget than CI_PENDING_WAIT_SECS, which waits for CI to run rather
+# than for a ref update to propagate. agent-platform#853's first live rebuild
+# (knowledge#852, 2026-10-11) saw the lag resolve within seconds: `git
+# ls-remote` and a `gh pr view` moments later both already read the rebuilt
+# sha, while the read `kb merge` made right after pushing still returned the
+# old one. 60s gives wide headroom over that observed lag without leaving a
+# genuinely stuck rebuild polling for anywhere near as long as CI_PENDING_WAIT_SECS.
+KB_MERGE_HEAD_CATCHUP_WAIT_SECS = 60
+KB_MERGE_HEAD_CATCHUP_POLL_SECS = 2
 
 # While CI is merely pending, the wait below re-probes over REST rather than
 # GraphQL. REST has its own 5,000/hr pool; GraphQL is the one a day of review work
@@ -17500,6 +18354,16 @@ def main(argv=None) -> int:
                                   "library-app.json; any other repository is refused")
     sp_kb_merge.add_argument("--dry-run", action="store_true",
                              help="check every condition and report, without merging")
+    sp_kb_merge.add_argument(
+        "--check-wait", dest="check_wait", type=float, default=CI_PENDING_WAIT_SECS,
+        help="seconds to wait for a rebuilt branch's required checks to settle "
+             "before giving up and asking for a re-run (default: %(default)s)")
+    sp_kb_merge.add_argument(
+        "--head-wait", dest="head_wait", type=float,
+        default=KB_MERGE_HEAD_CATCHUP_WAIT_SECS,
+        help="seconds to wait, separately from --check-wait, for the PR's head to "
+             "catch up to a rebuild's force-push before giving up and asking for a "
+             "re-run (default: %(default)s)")
     sp_kb_merge.set_defaults(func=cmd_kb_merge)
 
     sp_kb_audit = kb_sub.add_parser(

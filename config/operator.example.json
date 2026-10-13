@@ -4,5 +4,11 @@
   "operator_marker": "operator",
   "roster_crew": "operator-crew",
   "github_login": "operator-login",
-  "tailnet_host": "tailnet.example"
+  "tailnet_host": "tailnet.example",
+  "_doc_person_id": "Read by `agentctl crew register` (lib/agent-platform/operator_config.py) to write a new project entry's `created_by`. Optional: absent on a fresh install, before the Library's bootstrap has minted this operator a person id, and a crew registered with it absent is registered without a `created_by` rather than refused.",
+  "person_id": "person_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "_doc_publish_scan": "The next three keys are read by lib/agent-platform/publish_scan.py and are optional: each has a default (see that module), so a machine without them still runs `agentctl publish`'s content scan as long as Shipwright sits beside this repository's primary checkout.",
+  "shipwright_checkout": "/path/to/shipwright",
+  "builder_private_names_file": "/path/to/private-names",
+  "builder_machine_names_file": "/path/to/machine-names"
 }

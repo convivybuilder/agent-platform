@@ -618,7 +618,7 @@ def _shape_issue(item: dict) -> dict:
 
 @mcp.tool()
 def issue_create(product: str, title: str, severity: str, body: str = "",
-                 type: str = "bug", needs: str = "agent", url: str | None = None,
+                 type: str | None = None, needs: str = "agent", url: str | None = None,
                  once_key: str | None = None,
                  topics: list[str] | None = None,
                  prerequisites: list[dict] | None = None) -> str:
@@ -699,13 +699,15 @@ def issue_create(product: str, title: str, severity: str, body: str = "",
     low`. In practice a `suggestion` never gets that far, because an idea worth
     considering names no code to write.
 
-    `severity` is required: `high | medium | low`. `type` is
-    bug|nit|improvement|task|epic (default bug); `url` links source context;
-    `once_key` makes the filing idempotent. It goes to the box, not a GitHub
-    issue (ARCH-359).
+    `severity` is required: `high | medium | low`. WORK ITEMS ARE NOT TYPED
+    (the operator, 2026-09-24): omit `type` for an ordinary item, or pass
+    `type="epic"` to file one. Any other value is refused here before the
+    request is made, since the Library is moving to the same refusal. `url`
+    links source context; `once_key` makes the filing idempotent. It goes to
+    the box, not a GitHub issue (ARCH-359).
 
-    `needs` says WHO CAN EXECUTE IT — a different axis from `type`, which says what
-    kind of work it is. Set it deliberately; the default is `agent`.
+    `needs` says WHO CAN EXECUTE IT. Set it deliberately; the default is
+    `agent`.
 
     - `agent` (default): a dispatched worker can complete it. Nearly everything.
     - `operator`: a specific credential or physical act is missing that no agent
@@ -743,8 +745,13 @@ def issue_create(product: str, title: str, severity: str, body: str = "",
     failure fires, and the item waits on a human who is waiting on the queue. There
     is no symmetric correction; the only thing that catches it is a deliberate
     re-check."""
+    if type is not None and type != "epic":
+        return json.dumps({"error": f"type must be 'epic' or omitted — work "
+                           f"items are not typed (got {type!r})"})
     payload: dict = {"product": product, "title": title, "body": body,
-                     "severity": severity, "type": type, "needs": needs}
+                     "severity": severity, "needs": needs}
+    if type == "epic":
+        payload["type"] = type
     if url:
         payload["refs"] = {"url": url}
     if once_key:
@@ -781,8 +788,9 @@ def issue_list(product: str | None = None, state: str = "open",
                offset: int = 0) -> str:
     """List issues from the in-box queue, newest first. `state` filters (open |
     claimed | fixed | wontfix | duplicate); pass "" for all states. `product`
-    narrows scope. `type` filters by issue type (bug|nit|improvement|task|epic);
-    omit for all types. Use it to find open issues to drain in a sweep.
+    narrows scope. `type` filters to epic items when set to `epic` — it is the
+    only value, since work items are not typed; omit it to see every item. Use
+    it to find open issues to drain in a sweep.
 
     `blocked` AND `prerequisites` ARE ON EVERY ITEM. A blocked item is excluded
     from claimable, and checkout and claim refuse it with a 409 — so reading a
@@ -1799,8 +1807,12 @@ def issue_correct(issue_id: str, type: str | None = None,
     `type` and `severity` correct a MISFILING and take no null — send the
     value or omit the parameter. `maturity` and `parent_id` record a fact that
     becomes known LATE rather than a misfiling, and both accept an explicit
-    clear: pass `""` for `maturity` to reset it to "not yet assessed", or `""`
-    for `parent_id` to detach the item to top level. `specification` and
+    clear: pass `""` for `maturity` to reset it to "not yet assessed". Pass
+    `""` for `parent_id` on a WORK ITEM to make it a correction: it leaves its
+    epic and joins its product's corrections queue, which the Library records
+    as a null parent today and will record as the queue's own id once
+    corrections queues are backfilled. On an EPIC, clearing `parent_id`
+    detaches it to top level, as before. `specification` and
     `definition_of_done` also accept `""` to clear — this route can touch them
     too, with no lease required, because a wrong specification is a misfiling
     the same as a wrong type.
@@ -1882,7 +1894,7 @@ def issue_correct(issue_id: str, type: str | None = None,
     ASSERTING THE FLAG ALONGSIDE ONE IS REFUSED (400).** `issue_revise` cannot
     retype, so this qualification is not on it. The refusal exists because a
     flag that covered a retype would rebuild a laundering path a Library
-    reviewer found: retype an approved epic to `improvement` so the text rule
+    reviewer found: retype an approved epic away from `epic` so the text rule
     stops applying, rewrite the specification, retype back. Refusing the
     combination names the misunderstanding at the call site instead of
     letting a caller believe the assertion covered more than it does.
@@ -1903,11 +1915,11 @@ def issue_correct(issue_id: str, type: str | None = None,
     edits to the item's own CONTENT.
 
     Retyping an EPIC that still has children is refused (409, names the
-    descendant count) — re-parent or resolve them first. `type` must be one of
-    `bug | nit | improvement | task | epic`; `severity` one of `high | medium |
-    low`; `maturity` one of `proposed | approved | built | superseded`.
-    Retyping a `task` into `bug | nit | improvement` is UNGATED — no lease, no
-    approval needed — because that is the misfiling this route exists to fix.
+    descendant count) — re-parent or resolve them first. Work items are not
+    typed (the operator, 2026-09-24), so `type` should only ever be `epic`;
+    the Library still accepts the retired values today but is moving to
+    refuse them. `severity` one of `high | medium | low`; `maturity` one of
+    `proposed | approved | built | superseded`.
 
     Returns the corrected item, flat — this route has no wrapper key.
 

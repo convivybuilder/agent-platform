@@ -38,11 +38,11 @@ def test_every_item_state_the_queue_holds_is_fetched_once_per_item(work_item_cos
     assert [i["id"] for i in items] == ["issue_A"]
 
 
-def test_a_redirected_item_is_fetched_and_counted_as_finished(work_item_cost, monkeypatch, tmp_path):
-    """A redirected item is a `_FINISHED_STATES` member (cost_join.py), but only the
+def test_a_redirected_item_is_fetched_and_counted_as_abandoned(work_item_cost, monkeypatch, tmp_path):
+    """A redirected item is an `ABANDONED_STATES` member (cost_join.py), but only the
     CLI's own `ITEM_STATES` decides whether it ever reaches that logic. Fetch it
     through `fetch_items` exactly as `main` does, then feed it to the real
-    `build_persona_table` and check it lands in `finished_items`, not unfinished."""
+    `build_outcome_table` and check it lands in `abandoned_items`, not `fixed_items`."""
     runs = tmp_path / "agent-runs"
     runs.mkdir()
     monkeypatch.setattr(cj, "RUNS_ROOT", runs)
@@ -58,7 +58,7 @@ def test_a_redirected_item_is_fetched_and_counted_as_finished(work_item_cost, mo
     def fake_list(state, *args, **kwargs):
         if state == "redirected":
             return [{"id": "issue_A", "product": "vivy", "state": "redirected",
-                     "title": "issue_A", "type": "bug"}]
+                     "title": "issue_A", "type": "bug", "parent_id": None}]
         return []
 
     monkeypatch.setattr(IC, "list_issues_by_state", fake_list)
@@ -67,9 +67,10 @@ def test_a_redirected_item_is_fetched_and_counted_as_finished(work_item_cost, mo
 
     start = datetime(2026, 6, 1, tzinfo=timezone.utc)
     end = datetime(2026, 6, 30, tzinfo=timezone.utc)
-    [row] = cj.build_persona_table(start, end, items)["rows"]
+    [row] = cj.build_outcome_table(start, end, items, set())["rows"]
     lane = row["lanes"]["subscription_credit"]
-    assert lane["finished_items"] == 1
+    assert lane["abandoned_items"] == 1
+    assert lane["fixed_items"] == 0
 
 
 def test_the_report_names_run_directories_as_its_source_not_the_ledger(work_item_cost):
@@ -201,7 +202,7 @@ def test_a_control_character_in_a_model_name_cannot_forge_a_course_totals_line(w
     course_report = {
         "window": {"start": "2026-06-01T00:00:00+00:00", "end": "2026-06-30T00:00:00+00:00"},
         "cannot_be_measured": False, "reason": None,
-        "epics": [], "corrections": {"lanes": {}},
+        "epics": [], "corrections": {"lanes": {}, "cannot_be_measured": False, "reason": None},
         "unattributed": {"by_billing_source": {}},
         "totals": {"subscription_credit": {
             "usd": 1.0, "cost_missing_runs": 0, "unpriced_models": [],
@@ -237,6 +238,64 @@ def test_an_unreachable_library_ends_the_report_with_no_output(
 def _stub_item_fetch(monkeypatch):
     monkeypatch.setattr(IC, "list_issues_by_state",
                         lambda state, *a, **k: [_item("issue_A")] if state == "open" else [])
+
+
+def test_fetch_queue_ids_returns_the_ids_the_library_lists(work_item_cost, monkeypatch):
+    monkeypatch.setattr(IC, "list_corrections_queues",
+                        lambda *a, **k: [{"id": "cq_A", "product": "vivy"},
+                                         {"id": "cq_B", "product": "bosun"}])
+    assert work_item_cost.fetch_queue_ids() == {"cq_A", "cq_B"}
+
+
+def test_fetch_queue_ids_is_none_when_the_lookup_fails(work_item_cost, monkeypatch):
+    def unreachable(*a, **k):
+        raise IC.IssueQueueUnavailable("connection refused")
+
+    monkeypatch.setattr(IC, "list_corrections_queues", unreachable)
+    assert work_item_cost.fetch_queue_ids() is None
+
+
+def test_a_failed_queue_lookup_reports_corrections_as_cannot_be_measured(
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    """A failure other than the route's own 404 must not make the corrections
+    figure silently read as zero (or misfile a queue-parented run as an
+    epic's): the CLI reports the gap instead."""
+    monkeypatch.setattr(cj, "RUNS_ROOT", tmp_path / "agent-runs")
+    (tmp_path / "agent-runs").mkdir()
+    _stub_item_fetch(monkeypatch)
+    monkeypatch.setattr(IC, "list_courses", lambda product, *a, **k: [{"id": "course_1"}])
+    monkeypatch.setattr(IC, "get_course",
+                        lambda course_id, *a, **k: {"id": course_id, "entries": [],
+                                                     "items": [], "position": {}})
+
+    def unreachable(*a, **k):
+        raise IC.IssueQueueUnavailable("connection refused")
+
+    monkeypatch.setattr(IC, "list_corrections_queues", unreachable)
+    assert work_item_cost.main(["--product", "bosun"]) == 0
+    out = capsys.readouterr().out
+    assert "(corrections) cannot be measured" in out
+
+
+def test_an_empty_queue_list_reports_corrections_as_measured(
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    """A 200 with an empty `corrections_queues` list (the Library-confirmed
+    shape for a product with no queue) is a measured empty set of queue ids,
+    not a lookup failure — the CLI must not report the corrections figure as
+    cannot-be-measured."""
+    monkeypatch.setattr(cj, "RUNS_ROOT", tmp_path / "agent-runs")
+    (tmp_path / "agent-runs").mkdir()
+    _stub_item_fetch(monkeypatch)
+    monkeypatch.setattr(IC, "list_courses", lambda product, *a, **k: [{"id": "course_1"}])
+    monkeypatch.setattr(IC, "get_course",
+                        lambda course_id, *a, **k: {"id": course_id, "entries": [],
+                                                     "items": [], "position": {}})
+    monkeypatch.setattr(IC, "list_corrections_queues", lambda *a, **k: [])
+    assert work_item_cost.fetch_queue_ids() == set()
+    assert work_item_cost.main(["--product", "bosun"]) == 0
+    out = capsys.readouterr().out
+    assert "(corrections) cannot be measured" not in out
+    assert "(corrections)" in out
 
 
 def test_an_unreadable_course_exits_1_and_prints_nothing(work_item_cost, monkeypatch, capsys):
@@ -286,7 +345,9 @@ def test_a_product_with_no_single_live_course_exits_1(work_item_cost, monkeypatc
 
 
 def test_the_course_cli_resolves_by_product_and_prints_the_course_report(
-        work_item_cost, monkeypatch, capsys):
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cj, "RUNS_ROOT", tmp_path / "agent-runs")
+    (tmp_path / "agent-runs").mkdir()
     _stub_item_fetch(monkeypatch)
     monkeypatch.setattr(IC, "list_courses",
                         lambda product, *a, **k: [{"id": "course_1"}])
@@ -299,41 +360,264 @@ def test_the_course_cli_resolves_by_product_and_prints_the_course_report(
                                                                   "remaining_ids": ["issue_E"]}})
     monkeypatch.setattr(IC, "get_item",
                         lambda item_id, *a, **k: {"progress": {"children": 1}})
+    monkeypatch.setattr(IC, "list_corrections_queues",
+                        lambda *a, **k: [{"id": "cq_vivy", "product": "vivy"}])
+    monkeypatch.setattr(IC, "list_ledger_entries", lambda **k: [])
 
-    def fake_course_costs(start, end, items, course, epic_progress):
+    def fake_course_costs(start, end, items, course, epic_progress, queue_ids):
         assert course["id"] == "course_1"
         assert epic_progress == {"issue_E": {"children": 1}}
+        assert queue_ids == {"cq_vivy"}
         return {"window": {"start": start.isoformat(), "end": end.isoformat()},
                 "epics": [{"id": "issue_E", "title": "E", "state": "open",
                           "position": "remaining", "progress": {"children": 1},
                           "run_count": 0, "lanes": {}}],
-                "corrections": {"item_ids": [], "run_count": 0, "lanes": {}},
+                "corrections": {"item_ids": [], "run_count": 0, "lanes": {},
+                               "cannot_be_measured": False, "reason": None},
                 "totals": {}, "unattributed": {"count": 0, "run_ids": [], "by_reason": {},
                                                "by_billing_source": {}},
                 "cannot_be_measured": True, "reason": "no attributed runs"}
 
     monkeypatch.setattr(cj, "build_course_costs", fake_course_costs)
-    monkeypatch.setattr(cj, "build_persona_table",
-                        lambda start, end, items: {"window": {}, "rows": []})
+    monkeypatch.setattr(cj, "build_outcome_table",
+                        lambda start, end, items, queue_ids: {
+                            "window": {}, "rows": [], "coverage": {"by_agent": {}, "by_model": {}},
+                            "cannot_be_measured": True, "reason": "no attributed runs"})
     assert work_item_cost.main(["--product", "bosun"]) == 0
     out = capsys.readouterr().out
     assert "cannot be measured: no attributed runs" in out
     assert "issue_E" in out
+    assert "Ledger reconciliation" in out
 
 
-def test_the_course_cli_json_mode_prints_both_reports(work_item_cost, monkeypatch, capsys):
+def test_the_course_cli_json_mode_prints_both_reports(
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    monkeypatch.setattr(cj, "RUNS_ROOT", tmp_path / "agent-runs")
+    (tmp_path / "agent-runs").mkdir()
     _stub_item_fetch(monkeypatch)
     monkeypatch.setattr(IC, "get_course",
                         lambda course_id, *a, **k: {"id": course_id, "entries": [],
                                                      "items": [], "position": {}})
     monkeypatch.setattr(cj, "build_course_costs",
-                        lambda start, end, items, course, epic_progress: {
+                        lambda start, end, items, course, epic_progress, queue_ids: {
                             "window": {}, "epics": [], "corrections": {}, "totals": {},
                             "unattributed": {}, "cannot_be_measured": True, "reason": "x"})
-    monkeypatch.setattr(cj, "build_persona_table",
-                        lambda start, end, items: {"window": {}, "rows": []})
+    monkeypatch.setattr(cj, "build_outcome_table",
+                        lambda start, end, items, queue_ids: {"window": {}, "rows": []})
     assert work_item_cost.main(["--course", "course_1", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert set(payload) == {"course", "persona"}
+    assert set(payload) == {"course", "outcome", "reconciliation"}
     assert payload["course"]["cannot_be_measured"] is True
-    assert payload["persona"]["rows"] == []
+    assert payload["outcome"]["rows"] == []
+    assert payload["reconciliation"] == {"by_epic": {}, "ok": True}
+
+
+# --- --outcomes (E16·3) -------------------------------------------------------
+
+
+@pytest.mark.parametrize("extra", [["--course", "course_1"], ["--product", "vivy"]])
+def test_outcomes_combined_with_course_or_product_exits_1_with_no_output(
+        work_item_cost, monkeypatch, capsys, extra):
+    """--outcomes already prints its own outcome table; combined with --course or
+    --product it must refuse rather than silently ignore one of them. Nothing is
+    read: not even the item fetch that every other path runs first."""
+    def must_not_be_called(*a, **k):
+        raise AssertionError("--outcomes with --course/--product must read nothing")
+
+    monkeypatch.setattr(IC, "list_issues_by_state", must_not_be_called)
+    assert work_item_cost.main(["--outcomes", *extra]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "--outcomes" in captured.err and "no report written" in captured.err
+
+
+def test_the_outcomes_cli_needs_no_course_argument(work_item_cost, monkeypatch, capsys):
+    """--outcomes reads no Course at all: neither get_course nor list_courses runs."""
+    monkeypatch.setattr(IC, "list_issues_by_state",
+                        lambda state, *a, **k: [_item("issue_A")] if state == "open" else [])
+    monkeypatch.setattr(IC, "list_corrections_queues", lambda *a, **k: [])
+
+    def must_not_be_called(*a, **k):
+        raise AssertionError("--outcomes must not read a Course")
+
+    monkeypatch.setattr(IC, "get_course", must_not_be_called)
+    monkeypatch.setattr(IC, "list_courses", must_not_be_called)
+
+    def fake_build(start, end, items, queue_ids):
+        assert queue_ids == set()
+        return {"window": {"start": start.isoformat(), "end": end.isoformat()},
+                "rows": [], "coverage": {"by_agent": {}, "by_model": {}},
+                "cannot_be_measured": True, "reason": "no attributed runs"}
+
+    monkeypatch.setattr(cj, "build_outcome_table", fake_build)
+    assert work_item_cost.main(["--outcomes"]) == 0
+    out = capsys.readouterr().out
+    assert "Cost per outcome" in out
+    assert "cannot be measured: no attributed runs" in out
+
+
+def test_the_outcomes_cli_renders_rows_and_coverage(work_item_cost, monkeypatch, capsys):
+    monkeypatch.setattr(IC, "list_issues_by_state",
+                        lambda state, *a, **k: [_item("issue_A")] if state == "open" else [])
+    monkeypatch.setattr(IC, "list_corrections_queues", lambda *a, **k: [])
+
+    def fake_build(start, end, items, queue_ids):
+        return {
+            "window": {"start": start.isoformat(), "end": end.isoformat()},
+            "rows": [{"agent": "coder", "model": "claude-sonnet-4-6", "class": "epic",
+                      "runs": 1, "lanes": {"subscription_credit": {
+                          "runs": 1, "usd": 2.0, "unpriced_models": [], "cost_missing_runs": 0,
+                          "fixed_items": 1, "median_fixed_item_usd": 2.0,
+                          "abandoned_items": 0, "abandoned_usd": 0.0}}}],
+            "coverage": {"by_agent": {"coder": {"runs_with_work_item": 1,
+                                                "runs_without_work_item": 1}},
+                        "by_model": {"claude-sonnet-4-6": {"runs_with_work_item": 1,
+                                                           "runs_without_work_item": 1}}},
+            "cannot_be_measured": False, "reason": None,
+        }
+
+    monkeypatch.setattr(cj, "build_outcome_table", fake_build)
+    assert work_item_cost.main(["--outcomes"]) == 0
+    out = capsys.readouterr().out
+    assert "coder" in out and "epic" in out and "$2.00" in out
+    assert "coder: 1 with, 1 without" in out
+
+
+def test_the_outcomes_cli_json_mode_prints_the_full_structure(
+        work_item_cost, monkeypatch, capsys):
+    monkeypatch.setattr(IC, "list_issues_by_state",
+                        lambda state, *a, **k: [_item("issue_A")] if state == "open" else [])
+    monkeypatch.setattr(IC, "list_corrections_queues",
+                        lambda *a, **k: [{"id": "cq_vivy", "product": "vivy"}])
+
+    outcome = {
+        "window": {"start": "2026-06-01T00:00:00+00:00", "end": "2026-06-30T00:00:00+00:00"},
+        "rows": [{"agent": "coder", "model": "claude-sonnet-4-6", "class": "epic", "runs": 1,
+                  "lanes": {"subscription_credit": {
+                      "runs": 1, "usd": 2.0, "unpriced_models": [], "cost_missing_runs": 0,
+                      "fixed_items": 1, "median_fixed_item_usd": 2.0,
+                      "abandoned_items": 0, "abandoned_usd": 0.0}}}],
+        "coverage": {"by_agent": {"coder": {"runs_with_work_item": 1,
+                                            "runs_without_work_item": 0}},
+                    "by_model": {"claude-sonnet-4-6": {"runs_with_work_item": 1,
+                                                       "runs_without_work_item": 0}}},
+        "cannot_be_measured": False, "reason": None,
+    }
+
+    def fake_build(start, end, items, queue_ids):
+        assert queue_ids == {"cq_vivy"}
+        return outcome
+
+    monkeypatch.setattr(cj, "build_outcome_table", fake_build)
+    assert work_item_cost.main(["--outcomes", "--json", "--days", "14"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == outcome
+
+
+# --- ledger reconciliation, end to end (E16·5) --------------------------------
+
+
+def _mk_issue_run(runs_root, date, run_id, *, issue, usd=1.0,
+                  billing_source="provider_api:openai"):
+    d = runs_root / date / run_id
+    d.mkdir(parents=True)
+    meta = {"run_id": run_id, "agent": "coder", "model": "claude-sonnet-4-6", "repo": "vivy",
+            "task": "", "parent_run": None, "profile": "", "started_at": f"{date}T08:00:00Z",
+            "billing_source": billing_source, "issue": issue}
+    (d / "meta.json").write_text(json.dumps(meta))
+    (d / "cost.json").write_text(
+        json.dumps({"usd": usd, "by_model": {"claude-sonnet-4-6": {"usd": usd}}}))
+    (d / "outcome.json").write_text(json.dumps({"exit_status": "completed"}))
+
+
+def _stub_one_epic_course(monkeypatch, tmp_path):
+    """One epic (issue_E) with one child task (issue_C), the Course that orders it,
+    and an empty corrections-queue list — everything `--product vivy` needs besides
+    the run directory and the ledger stub each test supplies itself."""
+    monkeypatch.setattr(cj, "RUNS_ROOT", tmp_path / "agent-runs")
+    (tmp_path / "agent-runs").mkdir()
+    monkeypatch.setattr(
+        IC, "list_issues_by_state",
+        lambda state, *a, **k: [
+            {"id": "issue_E", "product": "vivy", "state": "open", "title": "E",
+             "type": "epic", "parent_id": None},
+            {"id": "issue_C", "product": "vivy", "state": "open", "title": "C",
+             "type": "task", "parent_id": "issue_E"},
+        ] if state == "open" else [])
+    monkeypatch.setattr(IC, "list_courses", lambda product, *a, **k: [{"id": "course_1"}])
+    monkeypatch.setattr(
+        IC, "get_course",
+        lambda course_id, *a, **k: {
+            "id": course_id, "entries": ["issue_E"],
+            "items": [{"id": "issue_E", "title": "E", "state": "open"}],
+            "position": {"reached_ids": [], "in_flight_ids": [], "remaining_ids": ["issue_E"]}})
+    monkeypatch.setattr(IC, "get_item", lambda item_id, *a, **k: {"progress": None})
+    monkeypatch.setattr(IC, "list_corrections_queues", lambda *a, **k: [])
+
+
+def test_a_planted_ledger_divergence_is_caught_and_exits_nonzero(
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    """The core E16·5 requirement, end to end: the same run_id posted to the
+    ledger under a different amount than the run record carries is named in
+    the output and exits non-zero. Against the unfixed code (no reconciliation
+    at all), this would print nothing about it and exit 0."""
+    _stub_one_epic_course(monkeypatch, tmp_path)
+    _mk_issue_run(tmp_path / "agent-runs", "2026-06-10", "run-a", issue="issue_C", usd=2.0)
+    monkeypatch.setattr(
+        IC, "list_ledger_entries",
+        lambda *, epic_id, **k: [{"run_id": "run-a", "usd": 9.99, "lane": "gateway",
+                                  "item_id": "issue_C", "epic_id": "issue_E",
+                                  "voided_at": None}] if epic_id == "issue_E" else [])
+    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "MISMATCH run run-a" in out
+    assert "2.00" in out and "9.99" in out
+
+
+def test_a_matching_ledger_entry_exits_zero(
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    _stub_one_epic_course(monkeypatch, tmp_path)
+    _mk_issue_run(tmp_path / "agent-runs", "2026-06-10", "run-a", issue="issue_C", usd=2.0)
+    monkeypatch.setattr(
+        IC, "list_ledger_entries",
+        lambda *, epic_id, **k: [{"run_id": "run-a", "usd": 2.0, "lane": "gateway",
+                                  "item_id": "issue_C", "epic_id": "issue_E",
+                                  "voided_at": None}] if epic_id == "issue_E" else [])
+    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Ledger reconciliation" in out
+    assert "MISMATCH" not in out
+
+
+def test_a_run_posted_before_e16_5_has_no_ledger_item_and_is_not_a_mismatch(
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    """A run the ledger holds with no item_id at all (every entry posted before
+    this change) never surfaces under this epic_id-filtered read, so it reads as
+    a plain run_only, never a mismatch."""
+    _stub_one_epic_course(monkeypatch, tmp_path)
+    _mk_issue_run(tmp_path / "agent-runs", "2026-06-10", "run-a", issue="issue_C", usd=2.0)
+    monkeypatch.setattr(IC, "list_ledger_entries", lambda **k: [])
+    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "run-only 1" in out
+    assert "MISMATCH" not in out
+
+
+def test_an_unreadable_ledger_reads_unavailable_and_exits_nonzero(
+        work_item_cost, monkeypatch, capsys, tmp_path):
+    """Never treat an unreachable Library as a passed reconciliation."""
+    _stub_one_epic_course(monkeypatch, tmp_path)
+    _mk_issue_run(tmp_path / "agent-runs", "2026-06-10", "run-a", issue="issue_C", usd=2.0)
+
+    def unreachable(*, epic_id, **k):
+        raise IC.IssueQueueUnavailable("connection refused")
+
+    monkeypatch.setattr(IC, "list_ledger_entries", unreachable)
+    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "unavailable" in out
+    assert "connection refused" in out

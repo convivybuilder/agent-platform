@@ -200,13 +200,30 @@ def import_leftover_private_objects(wt: Path) -> bool:
     ahead state BEFORE calling this — `cleanup_candidates`/`recheck_candidate`,
     whose `Worktree` snapshot was built by an earlier, separate scan — uses the
     return value to know that snapshot predates the import and must be
-    re-read, rather than re-reading unconditionally on every worktree."""
+    re-read, rather than re-reading unconditionally on every worktree.
+
+    Imports WITHOUT removing (`remove=False`) when `wt` is still held by a live
+    run, per `in_use_map()` — the same registry-backed liveness `allocate_worktree`/
+    `allocate_on_branch`/`cleanup_candidates`/`recheck_candidate` already check before
+    calling this, re-read here rather than trusted from an earlier snapshot (CQ·477,
+    run-421dd904, 2026-10-12): every existing call site already refuses or skips
+    before reaching here when its OWN `in_use_map()` read found the worktree in use,
+    but each of those reads happened earlier in the same call, and a run can start
+    registering itself against `wt` in the gap between that read and this one —
+    `cleanup_candidates` loops over every worktree on one `in_use_map()` snapshot
+    taken before the loop starts. Deleting the private store of a run that is still
+    writing to it is the incident: `shutil.rmtree`'d a store the live run's own git
+    was still pointed at (`GIT_OBJECT_DIRECTORY`), breaking every git call for the
+    rest of that run. `remove=False` is exactly the posture `import_private_objects`
+    already defines for a live run (`_stream_transcript`'s periodic tick): fold in
+    whatever is safely resolvable now, delete nothing, re-import cheaply next time."""
     git_dir = RS.git_common_dir(wt)
     if git_dir is None:
         return False
     private_dir = RS.run_private_objects_dir(wt, git_dir)
     existed = private_dir.is_dir()
-    RS.import_private_objects(git_dir, private_dir)
+    live = wt.resolve() in in_use_map()
+    RS.import_private_objects(git_dir, private_dir, remove=not live)
     return existed
 
 

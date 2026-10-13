@@ -1158,24 +1158,44 @@ def _course(entries, *, reached=(), in_flight=(), remaining=(), resolved_items=(
 
 
 def test_epic_for_item_counts_an_epic_as_itself():
-    assert cj._epic_for_item({"id": "issue_E", "type": "epic", "parent_id": None}) == "issue_E"
+    assert cj._epic_for_item(
+        {"id": "issue_E", "type": "epic", "parent_id": None}, set()) == "issue_E"
 
 
 def test_epic_for_item_counts_an_epic_as_itself_even_with_a_parent():
     """The Library's rule checks type before parent_id — a sub-epic under another
     epic still counts its own spend against itself, not its parent."""
     assert cj._epic_for_item(
-        {"id": "issue_E", "type": "epic", "parent_id": "issue_Grand"}) == "issue_E"
+        {"id": "issue_E", "type": "epic", "parent_id": "issue_Grand"}, set()) == "issue_E"
 
 
 def test_epic_for_item_counts_a_child_under_its_immediate_parent():
     assert cj._epic_for_item(
-        {"id": "issue_C", "type": "task", "parent_id": "issue_E"}) == "issue_E"
+        {"id": "issue_C", "type": "task", "parent_id": "issue_E"}, set()) == "issue_E"
 
 
 def test_epic_for_item_counts_a_parentless_non_epic_under_corrections():
     assert cj._epic_for_item(
-        {"id": "issue_X", "type": "bug", "parent_id": None}) == cj.CORRECTIONS
+        {"id": "issue_X", "type": "bug", "parent_id": None}, set()) == cj.CORRECTIONS
+
+
+def test_epic_for_item_counts_a_queue_parented_non_epic_under_corrections():
+    """One-home-per-work-item (library/specs/one-home-per-work-item): once the
+    Library backfills, a correction's parent_id names its product's corrections
+    queue instead of being null. It must bucket exactly like a null parent."""
+    assert cj._epic_for_item(
+        {"id": "issue_X", "type": "bug", "parent_id": "cq_01ABC"},
+        {"cq_01ABC"}) == cj.CORRECTIONS
+
+
+def test_epic_for_item_never_reads_the_cq_prefix_itself():
+    """The plan rules the `cq_` prefix out as a way to tell a queue from an
+    epic: only a hit in the looked-up queue_ids counts. An id that merely
+    LOOKS like a queue, but isn't in the set this run resolved, is still read
+    as an (unlisted) epic parent."""
+    assert cj._epic_for_item(
+        {"id": "issue_X", "type": "bug", "parent_id": "cq_not_a_real_queue"},
+        {"cq_01ABC"}) == "cq_not_a_real_queue"
 
 
 def test_a_two_lane_epic_gives_two_lane_rows_and_no_aggregate_key(cj_root):
@@ -1187,7 +1207,7 @@ def test_a_two_lane_epic_gives_two_lane_rows_and_no_aggregate_key(cj_root):
              _item("issue_C", type="task", parent_id="issue_E")]
     course = _course(["issue_E"], remaining=["issue_E"],
                      resolved_items=[{"id": "issue_E", "title": "Epic E", "state": "open"}])
-    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None})
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None}, set())
     [epic] = report["epics"]
     assert set(epic["lanes"]) == {"subscription_credit", "provider_api:openai"}
     assert epic["lanes"]["subscription_credit"]["usd"] == 2.0
@@ -1207,7 +1227,7 @@ def test_an_unattributed_run_stays_out_of_every_epic_and_sits_in_its_own_total(c
              _item("issue_C", type="task", parent_id="issue_E")]
     course = _course(["issue_E"], remaining=["issue_E"],
                      resolved_items=[{"id": "issue_E", "title": "Epic E", "state": "open"}])
-    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None})
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None}, set())
     [epic] = report["epics"]
     assert epic["run_count"] == 1
     assert "run-loose" not in str(epic["lanes"])
@@ -1222,7 +1242,7 @@ def test_a_parentless_non_epic_lands_under_corrections_not_an_epic(cj_root):
              _item("issue_X", type="bug", parent_id=None)]
     course = _course(["issue_E"], remaining=["issue_E"],
                      resolved_items=[{"id": "issue_E", "title": "Epic E", "state": "open"}])
-    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None})
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None}, set())
     [epic] = report["epics"]
     assert epic["run_count"] == 0
     assert report["corrections"]["item_ids"] == ["issue_X"]
@@ -1232,12 +1252,53 @@ def test_a_parentless_non_epic_lands_under_corrections_not_an_epic(cj_root):
     assert report["cannot_be_measured"] is True
 
 
+def test_a_queue_parented_non_epic_lands_under_corrections_not_an_epic(cj_root):
+    """Once the Library backfills (one-home-per-work-item), a correction's
+    parent_id names its product's corrections queue rather than being null.
+    Passing that id's set in as queue_ids must bucket it exactly like the
+    null-parent case above, not drop it under a bare `cq_…` epic key."""
+    _mk_attributed_run(cj_root, "2026-06-10", "run-x", issue="issue_X", usd=4.0)
+    items = [_item("issue_E", type="epic", parent_id=None),
+             _item("issue_X", type="bug", parent_id="cq_01ABC")]
+    course = _course(["issue_E"], remaining=["issue_E"],
+                     resolved_items=[{"id": "issue_E", "title": "Epic E", "state": "open"}])
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None},
+                                   {"cq_01ABC"})
+    [epic] = report["epics"]
+    assert epic["run_count"] == 0
+    assert report["corrections"]["item_ids"] == ["issue_X"]
+    assert report["corrections"]["run_count"] == 1
+    assert report["corrections"]["lanes"]["subscription_credit"]["usd"] == 4.0
+    assert report["corrections"]["cannot_be_measured"] is False
+    assert report["corrections"]["reason"] is None
+
+
+def test_a_failed_queue_lookup_reports_corrections_cannot_be_measured(cj_root):
+    """`queue_ids=None` is what a caller passes when the Library's corrections-
+    queue lookup failed for a reason other than "the route doesn't exist yet"
+    (a 5xx, a parse failure). The spend must not quietly land under an epic
+    (or vanish): the corrections bucket itself reports the gap."""
+    _mk_attributed_run(cj_root, "2026-06-10", "run-x", issue="issue_X", usd=4.0)
+    items = [_item("issue_E", type="epic", parent_id=None),
+             _item("issue_X", type="bug", parent_id="cq_01ABC")]
+    course = _course(["issue_E"], remaining=["issue_E"],
+                     resolved_items=[{"id": "issue_E", "title": "Epic E", "state": "open"}])
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None}, None)
+    [epic] = report["epics"]
+    # issue_X's unresolved parent is never mistaken for issue_E's epic total.
+    assert epic["run_count"] == 0
+    assert report["corrections"]["cannot_be_measured"] is True
+    assert report["corrections"]["reason"]
+    assert report["corrections"]["item_ids"] == []
+    assert report["corrections"]["run_count"] == 0
+
+
 def test_a_course_with_no_attributed_runs_cannot_be_measured_distinct_from_zero(cj_root):
     """No runs at all: cannot_be_measured, with a reason, and no lane claiming $0."""
     items = [_item("issue_E", type="epic", parent_id=None)]
     course = _course(["issue_E"], remaining=["issue_E"],
                      resolved_items=[{"id": "issue_E", "title": "Epic E", "state": "open"}])
-    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None})
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None}, set())
     assert report["cannot_be_measured"] is True
     assert report["reason"]
     [epic] = report["epics"]
@@ -1253,7 +1314,7 @@ def test_a_measured_free_run_reads_zero_not_cannot_be_measured(cj_root):
              _item("issue_C", type="task", parent_id="issue_E")]
     course = _course(["issue_E"], remaining=["issue_E"],
                      resolved_items=[{"id": "issue_E", "title": "Epic E", "state": "open"}])
-    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None})
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_E": None}, set())
     assert report["cannot_be_measured"] is False
     [epic] = report["epics"]
     assert epic["lanes"]["subscription_credit"]["usd"] == 0.0
@@ -1268,7 +1329,7 @@ def test_the_epics_position_reflects_the_courses_own_position(cj_root):
                      resolved_items=[{"id": "issue_A", "title": "A", "state": "fixed"},
                                      {"id": "issue_B", "title": "B", "state": "claimed"}])
     report = cj.build_course_costs(WIN_START, WIN_END, items, course,
-                                   {"issue_A": None, "issue_B": None})
+                                   {"issue_A": None, "issue_B": None}, set())
     positions = {e["id"]: e["position"] for e in report["epics"]}
     assert positions == {"issue_A": "reached", "issue_B": "in_flight"}
 
@@ -1279,57 +1340,275 @@ def test_the_epics_progress_comes_from_the_passed_in_mapping(cj_root):
     course = _course(["issue_A"], remaining=["issue_A"],
                      resolved_items=[{"id": "issue_A", "title": "A", "state": "open"}])
     progress = {"children": 3, "percent_terminal": 0.5}
-    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_A": progress})
+    report = cj.build_course_costs(WIN_START, WIN_END, items, course, {"issue_A": progress}, set())
     [epic] = report["epics"]
     assert epic["progress"] == progress
 
 
-# --- persona x model x item-type table (E16·2) --------------------------------
+# --- ledger reconciliation (E16·5) -------------------------------------------
 
 
-def test_persona_table_separates_agent_model_and_item_type(cj_root):
-    _mk_attributed_run(cj_root, "2026-06-10", "run-coder", agent="coder",
-                       model="claude-sonnet-4-6", issue="issue_A", usd=2.0)
-    _mk_attributed_run(cj_root, "2026-06-10", "run-reviewer", agent="reviewer",
-                       model="claude-opus-5-5", issue="issue_A", usd=1.0)
-    items = [_item("issue_A", type="bug")]
-    table = cj.build_persona_table(WIN_START, WIN_END, items)
-    keys = {(r["agent"], r["model"], r["item_type"]) for r in table["rows"]}
-    assert keys == {("coder", "claude-sonnet-4-6", "bug"), ("reviewer", "claude-opus-5-5", "bug")}
+def test_build_epic_run_costs_groups_runs_by_epic_at_run_granularity(cj_root):
+    _mk_attributed_run(cj_root, "2026-06-10", "run-a", issue="issue_C", usd=2.0,
+                       billing_source="provider_api:openai")
+    items = [_item("issue_E", type="epic", parent_id=None),
+             _item("issue_C", type="task", parent_id="issue_E")]
+    costs = cj.build_epic_run_costs(WIN_START, WIN_END, items, set())
+    assert costs == {"issue_E": {"run-a": {"priced_usd": 2.0,
+                                           "billing_source": "provider_api:openai"}}}
 
 
-def test_persona_table_keeps_lanes_apart_within_a_bucket(cj_root):
+def test_build_epic_run_costs_uses_priced_usd_not_usd_for_an_unpriced_model(cj_root):
+    """model-scorecard's `cost_usd` and this module's per-run `usd` are not the
+    same figure for a run with an unpriced model: `usd` reads None (unmeasured),
+    while both share the raw cost.json figure as `priced_usd` — the number a
+    ledger entry (posted from that same raw figure) must be compared against."""
+    _mk_attributed_run(cj_root, "2026-06-10", "run-a", issue="issue_C", usd=3.5,
+                       by_model={"mystery/model-x": {"usd": 3.5, "unpriced": True}})
+    node = cj.load_node(cj_root / "agent-runs" / "2026-06-10" / "run-a")
+    assert node["usd"] is None  # unmeasured, because of the unpriced model
+    items = [_item("issue_E", type="epic", parent_id=None),
+             _item("issue_C", type="task", parent_id="issue_E")]
+    costs = cj.build_epic_run_costs(WIN_START, WIN_END, items, set())
+    assert costs["issue_E"]["run-a"]["priced_usd"] == 3.5  # the same raw figure either way
+
+
+def _ledger_entry(run_id, usd, *, lane=None, voided_at=None):
+    return {"run_id": run_id, "usd": usd, "lane": lane, "voided_at": voided_at}
+
+
+def test_reconcile_epic_cost_matches_when_the_figures_agree():
+    run_costs = {"run-a": {"priced_usd": 2.0, "billing_source": "provider_api:openai"}}
+    entries = [_ledger_entry("run-a", 2.0, lane="gateway")]
+    result = cj.reconcile_epic_cost(run_costs, entries, {"run-a": "issue_E"}, "issue_E")
+    assert result["ok"] is True
+    assert result["mismatches"] == []
+    assert result["run_total_by_lane"] == {"provider_api:openai": 2.0}
+    assert result["ledger_total_by_lane"] == {"gateway": 2.0}
+
+
+def test_reconcile_epic_cost_catches_a_planted_amount_divergence():
+    """The core E16·5 requirement: the same run_id, a different ledger amount
+    from the run record, caught as a mismatch and failing the `ok` flag."""
+    run_costs = {"run-a": {"priced_usd": 2.0, "billing_source": "provider_api:openai"}}
+    entries = [_ledger_entry("run-a", 9.99, lane="gateway")]
+    result = cj.reconcile_epic_cost(run_costs, entries, {"run-a": "issue_E"}, "issue_E")
+    assert result["ok"] is False
+    assert result["mismatches"] == [{"run_id": "run-a", "kind": "amount",
+                                     "run_usd": 2.0, "ledger_usd": 9.99}]
+
+
+def test_reconcile_epic_cost_catches_a_run_filed_under_a_different_epic():
+    """cost_join attributes run-a to issue_E1; the ledger's own epic_id for it
+    (reflected here by which epic's filtered fetch returned it) is issue_E2."""
+    run_epic_map = {"run-a": "issue_E1"}
+    entries = [_ledger_entry("run-a", 2.0, lane="gateway")]
+    result = cj.reconcile_epic_cost({}, entries, run_epic_map, "issue_E2")
+    assert result["ok"] is False
+    assert result["mismatches"] == [{"run_id": "run-a", "kind": "epic",
+                                     "cost_join_epic_id": "issue_E1",
+                                     "ledger_epic_id": "issue_E2"}]
+
+
+def test_reconcile_epic_cost_a_run_absent_from_the_ledger_is_not_a_mismatch():
+    """A run posted before E16·5, or to a product with no live ledger, is
+    reported as run_only rather than failing the reconciliation."""
+    run_costs = {"run-a": {"priced_usd": 2.0, "billing_source": "provider_api:openai"}}
+    result = cj.reconcile_epic_cost(run_costs, [], {"run-a": "issue_E"}, "issue_E")
+    assert result["ok"] is True
+    assert result["run_only"] == {"count": 1, "usd": 2.0, "run_ids": ["run-a"]}
+
+
+def test_reconcile_epic_cost_a_run_only_in_the_ledger_is_not_a_mismatch_either():
+    """A run the ledger holds for this epic that cost_join did not attribute to
+    ANY of this Course's epics (e.g. ledger history outside --days, or a run
+    `run_epic_map` has no entry for) is reported, not flagged — only a
+    `run_epic_map` entry naming a DIFFERENT epic is a mismatch."""
+    entries = [_ledger_entry("run-old", 1.5, lane="gateway")]
+    result = cj.reconcile_epic_cost({}, entries, {}, "issue_E")
+    assert result["ok"] is True
+    assert result["ledger_only"] == {"count": 1, "usd": 1.5, "run_ids": ["run-old"]}
+
+
+def test_reconcile_epic_cost_ignores_a_voided_entry():
+    run_costs = {"run-a": {"priced_usd": 2.0, "billing_source": "provider_api:openai"}}
+    entries = [_ledger_entry("run-a", 9.99, lane="gateway", voided_at="2026-10-01T00:00:00Z")]
+    result = cj.reconcile_epic_cost(run_costs, entries, {"run-a": "issue_E"}, "issue_E")
+    # a voided entry is dropped before anything else, so run-a reads as absent
+    # from the ledger — not as a $9.99-vs-$2.00 mismatch.
+    assert result["ok"] is True
+    assert result["run_only"] == {"count": 1, "usd": 2.0, "run_ids": ["run-a"]}
+    assert result["ledger_only"] == {"count": 0, "usd": 0.0, "run_ids": []}
+
+
+def test_reconcile_epic_cost_never_sums_across_lanes():
+    run_costs = {
+        "run-sub": {"priced_usd": 2.0, "billing_source": "subscription_credit"},
+        "run-api": {"priced_usd": 3.0, "billing_source": "provider_api:openai"},
+    }
+    entries = [_ledger_entry("run-sub", 2.0, lane="subscription"),
+              _ledger_entry("run-api", 3.0, lane="gateway")]
+    run_epic_map = {"run-sub": "issue_E", "run-api": "issue_E"}
+    result = cj.reconcile_epic_cost(run_costs, entries, run_epic_map, "issue_E")
+    assert result["ok"] is True
+    assert result["run_total_by_lane"] == {"subscription_credit": 2.0,
+                                           "provider_api:openai": 3.0}
+    assert result["ledger_total_by_lane"] == {"subscription": 2.0, "gateway": 3.0}
+
+
+# --- cost per outcome: agent x model x work-item class (E16·3) ---------------
+
+
+def test_outcome_table_separates_agent_model_and_class(cj_root):
+    """Two agents, two models, one item planned under an epic and one a
+    correction with no parent: each lands in its own (agent, model, class)
+    row, keyed on WHERE the item lives, never its (retiring) `type` field."""
+    _mk_attributed_run(cj_root, "2026-06-10", "run-fix", agent="coder",
+                       model="claude-sonnet-4-6", issue="issue_FIX", usd=2.0,
+                       billing_source="subscription_credit")
+    _mk_attributed_run(cj_root, "2026-06-11", "run-wont", agent="reviewer",
+                       model="claude-opus-5-5", issue="issue_WONT", usd=5.0,
+                       billing_source="provider_api:openai", started="2026-06-11T08:00:00Z")
+    items = [_item("issue_EPIC1", type="epic", parent_id=None),
+             _item("issue_FIX", type="task", state="fixed", parent_id="issue_EPIC1"),
+             _item("issue_WONT", type="task", state="wontfix", parent_id=None)]
+    table = cj.build_outcome_table(WIN_START, WIN_END, items, set())
+    keys = {(r["agent"], r["model"], r["class"]) for r in table["rows"]}
+    assert keys == {("coder", "claude-sonnet-4-6", "epic"),
+                    ("reviewer", "claude-opus-5-5", cj.CORRECTIONS)}
+
+
+def test_outcome_table_keeps_fixed_and_abandoned_apart(cj_root):
+    _mk_attributed_run(cj_root, "2026-06-10", "run-fix", agent="coder", issue="issue_FIX",
+                       usd=2.0, billing_source="subscription_credit")
+    _mk_attributed_run(cj_root, "2026-06-11", "run-wont", agent="reviewer",
+                       model="claude-opus-5-5", issue="issue_WONT", usd=5.0,
+                       billing_source="provider_api:openai", started="2026-06-11T08:00:00Z")
+    items = [_item("issue_EPIC1", type="epic", parent_id=None),
+             _item("issue_FIX", type="task", state="fixed", parent_id="issue_EPIC1"),
+             _item("issue_WONT", type="task", state="wontfix", parent_id=None)]
+    rows = {(r["agent"], r["class"]): r for r in
+           cj.build_outcome_table(WIN_START, WIN_END, items, set())["rows"]}
+
+    fixed_lane = rows[("coder", "epic")]["lanes"]["subscription_credit"]
+    assert fixed_lane["usd"] == 2.0
+    assert fixed_lane["fixed_items"] == 1
+    assert fixed_lane["median_fixed_item_usd"] == 2.0
+    assert fixed_lane["abandoned_items"] == 0
+    assert fixed_lane["abandoned_usd"] == 0.0
+
+    abandoned_lane = rows[("reviewer", cj.CORRECTIONS)]["lanes"]["provider_api:openai"]
+    assert abandoned_lane["usd"] == 5.0
+    assert abandoned_lane["fixed_items"] == 0
+    assert abandoned_lane["median_fixed_item_usd"] is None
+    assert abandoned_lane["abandoned_items"] == 1
+    assert abandoned_lane["abandoned_usd"] == 5.0
+
+
+def test_outcome_table_keeps_lanes_apart_within_a_bucket(cj_root):
     _mk_attributed_run(cj_root, "2026-06-10", "run-sub", agent="coder", issue="issue_A", usd=2.0,
                        billing_source="subscription_credit")
     _mk_attributed_run(cj_root, "2026-06-11", "run-api", agent="coder", issue="issue_A", usd=3.0,
                        billing_source="provider_api:openai", started="2026-06-11T08:00:00Z")
-    items = [_item("issue_A", type="bug")]
-    [row] = cj.build_persona_table(WIN_START, WIN_END, items)["rows"]
+    items = [_item("issue_A", type="task", parent_id=None)]
+    [row] = cj.build_outcome_table(WIN_START, WIN_END, items, set())["rows"]
     assert set(row["lanes"]) == {"subscription_credit", "provider_api:openai"}
     assert row["lanes"]["subscription_credit"]["usd"] == 2.0
     assert row["lanes"]["provider_api:openai"]["usd"] == 3.0
 
 
-def test_persona_table_median_is_over_finished_items_own_total_cost(cj_root):
-    """Three items of the same type, same persona/model, finished with totals
-    1/2/3 in the lane: the median is 2, and an open (unfinished) item's cost
-    never enters it."""
-    for name, issue, usd in (("run-1", "issue_1", 1.0), ("run-2", "issue_2", 2.0),
+def test_outcome_table_median_is_over_fixed_items_own_total_cost_abandoned_never_enters_it(
+        cj_root):
+    """Four items of the same class, same agent/model, totals 1/5/3/100 in the
+    lane: item 1 and 3 are fixed (median 2), item 2 is abandoned (wontfix, cost
+    5) and item 4 is still open. The abandoned item's cost must never enter
+    median_fixed_item_usd, and the open item's cost enters neither total."""
+    for name, issue, usd in (("run-1", "issue_1", 1.0), ("run-2", "issue_2", 5.0),
                              ("run-3", "issue_3", 3.0), ("run-4", "issue_4", 100.0)):
         _mk_attributed_run(cj_root, "2026-06-10", name, agent="coder", issue=issue, usd=usd)
-    items = [_item("issue_1", type="bug", state="fixed"),
-             _item("issue_2", type="bug", state="wontfix"),
-             _item("issue_3", type="bug", state="fixed"),
-             _item("issue_4", type="bug", state="open")]
-    [row] = cj.build_persona_table(WIN_START, WIN_END, items)["rows"]
+    items = [_item("issue_1", type="task", state="fixed", parent_id=None),
+             _item("issue_2", type="task", state="wontfix", parent_id=None),
+             _item("issue_3", type="task", state="fixed", parent_id=None),
+             _item("issue_4", type="task", state="open", parent_id=None)]
+    [row] = cj.build_outcome_table(WIN_START, WIN_END, items, set())["rows"]
     lane = row["lanes"]["subscription_credit"]
-    assert lane["finished_items"] == 3
-    assert lane["median_finished_item_usd"] == 2.0
+    assert lane["fixed_items"] == 2
+    assert lane["median_fixed_item_usd"] == 2.0
+    assert lane["abandoned_items"] == 1
+    assert lane["abandoned_usd"] == 5.0
 
 
-def test_persona_table_has_no_zero_filled_cross_product(cj_root):
+def test_outcome_table_has_no_zero_filled_cross_product(cj_root):
     """Only a combination some run actually produced gets a row."""
     _mk_attributed_run(cj_root, "2026-06-10", "run-a", agent="coder", issue="issue_A", usd=1.0)
-    items = [_item("issue_A", type="bug")]
-    table = cj.build_persona_table(WIN_START, WIN_END, items)
+    items = [_item("issue_A", type="task", parent_id=None)]
+    table = cj.build_outcome_table(WIN_START, WIN_END, items, set())
     assert len(table["rows"]) == 1
+
+
+def test_outcome_table_coverage_counts_a_run_with_no_work_item_id(cj_root):
+    _mk_attributed_run(cj_root, "2026-06-10", "run-fix", agent="coder",
+                       model="claude-sonnet-4-6", issue="issue_FIX", usd=2.0)
+    _mk_attributed_run(cj_root, "2026-06-11", "run-loose", agent="coder",
+                       model="claude-sonnet-4-6", usd=9.0, started="2026-06-11T08:00:00Z")
+    items = [_item("issue_FIX", type="task", state="fixed", parent_id=None)]
+    table = cj.build_outcome_table(WIN_START, WIN_END, items, set())
+    assert table["coverage"]["by_agent"]["coder"] == {
+        "runs_with_work_item": 1, "runs_without_work_item": 1}
+    assert table["coverage"]["by_model"]["claude-sonnet-4-6"] == {
+        "runs_with_work_item": 1, "runs_without_work_item": 1}
+
+
+def test_outcome_table_coverage_counts_a_pr_link_only_run_as_covered(cj_root):
+    """A run with no meta.issue that build_item_costs still joins through its
+    PR link lands in a row, same as test_every_run_sits_in_one_row_or_the_
+    unattributed_bucket establishes for build_item_costs itself — so coverage
+    must count it as covered, never as unexplained alongside a row that
+    already explains its spend."""
+    _mk_attributed_run(cj_root, "2026-06-10", "run-pr", agent="coder",
+                       model="claude-sonnet-4-6", pr=5, usd=3.0,
+                       pr_url="https://github.com/convivy/vivy/pull/5")
+    items = [_item("issue_A", type="task", parent_id=None,
+                   pr_url="https://github.com/convivy/vivy/pull/5")]
+    table = cj.build_outcome_table(WIN_START, WIN_END, items, set())
+    assert len(table["rows"]) == 1
+    assert table["coverage"]["by_agent"]["coder"] == {
+        "runs_with_work_item": 1, "runs_without_work_item": 0}
+
+
+def test_outcome_table_an_empty_window_cannot_be_measured(cj_root):
+    table = cj.build_outcome_table(WIN_START, WIN_END, [], set())
+    assert table["rows"] == []
+    assert table["cannot_be_measured"] is True
+    assert table["reason"]
+
+
+def test_outcome_table_a_measured_zero_run_is_not_cannot_be_measured(cj_root):
+    """A run that was actually $0 (priced, just free) must read as a measured
+    zero, never cannot_be_measured — the two must never read the same."""
+    _mk_attributed_run(cj_root, "2026-06-10", "run-free", issue="issue_A", usd=0.0)
+    items = [_item("issue_A", type="task", parent_id=None)]
+    table = cj.build_outcome_table(WIN_START, WIN_END, items, set())
+    assert table["cannot_be_measured"] is False
+    [row] = table["rows"]
+    assert row["lanes"]["subscription_credit"]["usd"] == 0.0
+
+
+def test_outcome_table_a_failed_queue_lookup_leaves_an_ambiguous_item_out_of_rows(cj_root):
+    """`queue_ids=None` means a non-epic item's parent could name a queue or an
+    epic. An item with such a parent is left out of `rows` rather than guessed
+    into a class, and since `rows` cannot explain its run's spend either, that
+    run counts as unexplained in `coverage` too — and because every attributed
+    run in the window landed on such an item, the table itself reads
+    cannot_be_measured, with a reason distinct from "nothing was attributed"."""
+    _mk_attributed_run(cj_root, "2026-06-10", "run-x", agent="coder",
+                       model="claude-sonnet-4-6", issue="issue_X", usd=4.0)
+    items = [_item("issue_X", type="task", parent_id="cq_01ABC")]
+    table = cj.build_outcome_table(WIN_START, WIN_END, items, None)
+    assert table["rows"] == []
+    assert table["coverage"]["by_agent"]["coder"] == {
+        "runs_with_work_item": 0, "runs_without_work_item": 1}
+    assert table["cannot_be_measured"] is True
+    assert table["reason"] == (
+        "the corrections-queue lookup failed, so a parent that names a queue "
+        "cannot be told apart from one that names an epic")

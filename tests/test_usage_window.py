@@ -11,27 +11,30 @@ import json
 import os
 import time
 import unittest.mock as mock
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import pytest
 
 import usage_window as UW
 
 
-def _utc_today() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def _today() -> str:
+    """The same local-time day key `telemetry.today_dir` (and so
+    `usage_window._recent_transcripts`) buckets run directories by —
+    ARCH-156, not UTC."""
+    return datetime.now().strftime("%Y-%m-%d")
 
 
-def _utc_yesterday() -> str:
-    return (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+def _yesterday() -> str:
+    return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def _make_run(runs_root, run_id, *, day=None, lines=(), mtime=None):
     """A run directory with a `transcript.jsonl` of *lines* (already JSON
-    strings), under *day* (default: today, UTC). Returns the transcript path.
-    `mtime`, when given, is applied to the transcript after writing, so a
-    test can control scan order independent of write order."""
-    day_dir = runs_root / (day or _utc_today())
+    strings), under *day* (default: today, local). Returns the transcript
+    path. `mtime`, when given, is applied to the transcript after writing,
+    so a test can control scan order independent of write order."""
+    day_dir = runs_root / (day or _today())
     run_dir = day_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     transcript = run_dir / "transcript.jsonl"
@@ -147,23 +150,27 @@ def test_a_run_with_no_reading_does_not_block_an_older_run_that_has_one(tmp_path
     assert got["utilization"] == 0.55
 
 
-def test_falls_back_to_yesterday_when_today_has_no_run_dirs(tmp_path):
+def test_yesterday_is_read_when_today_has_no_run_dirs(tmp_path):
     runs_root = tmp_path / "agent-runs"
-    _make_run(runs_root, "run-y", day=_utc_yesterday(),
+    _make_run(runs_root, "run-y", day=_yesterday(),
              lines=[_event(five_hour={"utilization": 0.77, "resetsAt": 5})])
     got = UW.read_five_hour_window(runs_root, now=0)
     assert got["utilization"] == 0.77
 
 
-def test_does_not_fall_back_to_yesterday_when_today_has_run_dirs(tmp_path):
-    """Today having run directories (even ones with no reading) is enough to
-    skip the yesterday listing entirely — the common case pays for one
-    directory listing, not two."""
+def test_todays_reading_less_runs_do_not_block_yesterdays_reading(tmp_path):
+    """Today having run directories is NOT enough to skip yesterday's
+    listing — the occurrence this fixes (2026-10-12 07:35 UTC): today's
+    directory held runs with no reading while yesterday's held the freshest
+    one, and the old fallback-only-when-empty rule never looked there. Both
+    days are listed and merged every call now, so yesterday's reading is
+    still found even though today has run directories of its own."""
     runs_root = tmp_path / "agent-runs"
-    _make_run(runs_root, "run-y", day=_utc_yesterday(),
+    _make_run(runs_root, "run-y", day=_yesterday(),
              lines=[_event(five_hour={"utilization": 0.77, "resetsAt": 5})])
     _make_run(runs_root, "run-t", lines=['{"type": "assistant"}'])
-    assert UW.read_five_hour_window(runs_root) is None
+    got = UW.read_five_hour_window(runs_root, now=0)
+    assert got["utilization"] == 0.77
 
 
 def test_survives_a_transcript_truncated_mid_write(tmp_path):
@@ -182,7 +189,7 @@ def test_a_non_run_directory_entry_is_ignored(tmp_path):
     `bin/co-session-health` already filters `active.json` on, applied here to
     directory names instead."""
     runs_root = tmp_path / "agent-runs"
-    day_dir = runs_root / _utc_today()
+    day_dir = runs_root / _today()
     (day_dir / "sub-abc123").mkdir(parents=True)
     (day_dir / "sub-abc123" / "transcript.jsonl").write_text(
         _event(five_hour={"utilization": 0.99, "resetsAt": 1}) + "\n")
@@ -451,10 +458,10 @@ def test_a_file_that_raises_while_reading_does_not_block_an_older_run_with_a_liv
 
     real = UW._tail_five_hour_reading
 
-    def _boom(path, now):
+    def _boom(path, now, max_bytes):
         if path.parent.name == "run-bad":
             raise RuntimeError("boom")
-        return real(path, now)
+        return real(path, now, max_bytes)
 
     with mock.patch.object(UW, "_tail_five_hour_reading", side_effect=_boom):
         got = UW.read_five_hour_window(runs_root, now=now)
@@ -631,10 +638,10 @@ def test_a_seven_day_reader_that_raises_on_one_file_keeps_scanning(tmp_path):
 
     real = UW._tail_seven_day_reading
 
-    def _boom(path, now):
+    def _boom(path, now, max_bytes):
         if path.parent.name == "run-bad":
             raise RuntimeError("boom")
-        return real(path, now)
+        return real(path, now, max_bytes)
 
     with mock.patch.object(UW, "_tail_seven_day_reading", side_effect=_boom):
         got = UW.read_seven_day_window(runs_root, now=now)
@@ -670,3 +677,226 @@ def test_an_expired_newest_weekly_reading_is_skipped_for_the_live_older_one(tmp_
               mtime=now)
     got = UW.read_seven_day_window(runs_root, now=now)
     assert got["utilization"] == 0.97
+
+
+# --- the 2026-10-12 07:35 UTC occurrence: both today and yesterday are listed
+# every call, and a reading deeper than TAIL_BYTES is still found -----------
+
+def test_a_reading_more_than_tail_bytes_before_the_end_is_still_found(tmp_path):
+    """A reading sitting earlier in a transcript than its last `TAIL_BYTES`
+    is still found by reading further back in growing chunks — the second
+    cause of the occurrence: a 709-line, 1.5 MB transcript had its two
+    readings at lines 21 and 396, neither in the final 64 KiB."""
+    runs_root = tmp_path / "agent-runs"
+    reading_line = _event(five_hour={"utilization": 0.73, "resetsAt": 20_000})
+    filler_line = json.dumps({"type": "assistant", "text": "x" * 2000})
+    lines = [reading_line] + [filler_line] * 40  # ~80 KB total, > TAIL_BYTES
+    _make_run(runs_root, "run-a", lines=lines)
+    got = UW.read_five_hour_window(runs_root, now=0)
+    assert got is not None
+    assert got["utilization"] == 0.73
+
+
+def test_todays_empty_runs_still_let_yesterdays_deep_reading_be_found(tmp_path):
+    """Both causes of the occurrence together: today has only a reading-less
+    run, and yesterday's run carries its one reading deeper than
+    `TAIL_BYTES` before its end."""
+    runs_root = tmp_path / "agent-runs"
+    reading_line = _event(five_hour={"utilization": 0.91, "resetsAt": 20_000})
+    filler_line = json.dumps({"type": "assistant", "text": "x" * 2000})
+    lines = [reading_line] + [filler_line] * 40
+    _make_run(runs_root, "run-y", day=_yesterday(), lines=lines)
+    _make_run(runs_root, "run-t", lines=['{"type": "assistant"}'])
+    got = UW.read_five_hour_window(runs_root, now=0)
+    assert got is not None
+    assert got["utilization"] == 0.91
+
+
+def test_the_newest_reading_wins_across_both_directories(tmp_path):
+    runs_root = tmp_path / "agent-runs"
+    now = time.time()
+    _make_run(runs_root, "run-yesterday", day=_yesterday(),
+             lines=[_event(five_hour={"utilization": 0.20, "resetsAt": int(now) + 10_000})],
+             mtime=now - 3600)
+    _make_run(runs_root, "run-today",
+             lines=[_event(five_hour={"utilization": 0.65, "resetsAt": int(now) + 10_000})],
+             mtime=now)
+    got = UW.read_five_hour_window(runs_root, now=now)
+    assert got["utilization"] == 0.65
+
+
+def test_an_expired_todays_reading_falls_through_to_yesterdays_valid_one(tmp_path):
+    runs_root = tmp_path / "agent-runs"
+    now = time.time()
+    _make_run(runs_root, "run-yesterday-valid", day=_yesterday(),
+             lines=[_event(five_hour={"utilization": 0.44, "resetsAt": int(now) + 10_000})],
+             mtime=now - 120)
+    _make_run(runs_root, "run-today-expired",
+             lines=[_event(five_hour={"utilization": 0.95, "resetsAt": 1})],
+             mtime=now)
+    got = UW.read_five_hour_window(runs_root, now=now)
+    assert got["utilization"] == 0.44
+
+
+class _CountingFile:
+    """Wraps a real binary file handle, adding every byte a `.read()` call
+    returns to *total* — the only two methods `_tail_window_reading` calls
+    on a file object are `seek` and `read`."""
+
+    def __init__(self, fh, total):
+        self._fh = fh
+        self._total = total
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._fh.__exit__(*exc_info)
+
+    def seek(self, *args, **kwargs):
+        return self._fh.seek(*args, **kwargs)
+
+    def read(self, *args, **kwargs):
+        data = self._fh.read(*args, **kwargs)
+        self._total["bytes"] += len(data)
+        return data
+
+
+def test_bounded_scan_reads_no_more_than_the_byte_cap(tmp_path, monkeypatch):
+    """Many large, reading-less transcripts: the scan returns `None` without
+    reading past `MAX_BYTES_READ` total, even though `MAX_CANDIDATES` is
+    large enough to let it open every one of them."""
+    runs_root = tmp_path / "agent-runs"
+    now = time.time()
+    filler_line = json.dumps({"type": "assistant", "text": "x" * 5000})
+    lines = [filler_line] * 60  # ~300 KB per transcript, no rate_limit_info anywhere
+    for i in range(20):
+        _make_run(runs_root, f"run-{i}", lines=lines, mtime=now - i)
+
+    total = {"bytes": 0}
+    real_open = open
+
+    def _counting_open(path, mode="r", *args, **kwargs):
+        fh = real_open(path, mode, *args, **kwargs)
+        if "b" in mode:
+            return _CountingFile(fh, total)
+        return fh
+
+    monkeypatch.setitem(UW.__dict__, "open", _counting_open)
+    got = UW.read_five_hour_window(runs_root, now=now)
+    assert got is None
+    assert total["bytes"] <= UW.MAX_BYTES_READ
+
+
+# --- round 2: a per-file cap, so one large reading-less transcript cannot ----
+# spend the whole walk's budget and block an older candidate's reading ------
+
+def test_a_large_readingless_newest_transcript_does_not_block_an_older_reading(
+        tmp_path, monkeypatch):
+    """The round-1 finding: with one budget shared across every candidate, a
+    single large, reading-less transcript at the newest mtime could consume
+    the whole walk's `MAX_BYTES_READ` by itself (the measured occurrence: a
+    5.5 MB gap between two readings in one real transcript, byte offsets
+    1145846 and 6677116), so the scan never reached the next, older
+    candidate even though IT holds a valid reading. Each candidate is now
+    capped at `MAX_BYTES_READ_PER_FILE`, so the newest transcript's read
+    stops well short of the total budget and the older candidate is still
+    reached."""
+    monkeypatch.setattr(UW, "MAX_BYTES_READ_PER_FILE", 65_536)
+    monkeypatch.setattr(UW, "MAX_BYTES_READ", 65_536 * 4)
+    runs_root = tmp_path / "agent-runs"
+    now = time.time()
+    _make_run(runs_root, "run-older",
+             lines=[_event(five_hour={"utilization": 0.42, "resetsAt": int(now) + 10_000})],
+             mtime=now - 60)
+    filler_line = json.dumps({"type": "assistant", "text": "x" * 5000})
+    lines = [filler_line] * 60  # ~300 KB, bigger than the 64 KiB per-file cap, no reading at all
+    _make_run(runs_root, "run-newest-no-reading", lines=lines, mtime=now)
+    got = UW.read_five_hour_window(runs_root, now=now)
+    assert got is not None
+    assert got["utilization"] == 0.42
+
+
+def test_total_byte_cap_still_stops_the_scan_when_every_candidate_is_readingless(
+        tmp_path, monkeypatch):
+    """The per-file cap bounds one candidate's read; `MAX_BYTES_READ` still
+    bounds the whole walk when none of the candidates holds a reading at
+    all — the scan returns `None` rather than reading every one of them."""
+    monkeypatch.setattr(UW, "MAX_BYTES_READ_PER_FILE", 65_536)
+    monkeypatch.setattr(UW, "MAX_BYTES_READ", 65_536 * 3)  # room for 3 full-cap candidates
+    runs_root = tmp_path / "agent-runs"
+    now = time.time()
+    filler_line = json.dumps({"type": "assistant", "text": "x" * 5000})
+    lines = [filler_line] * 60  # no rate_limit_info anywhere, bigger than the per-file cap
+    for i in range(10):
+        _make_run(runs_root, f"run-{i}", lines=lines, mtime=now - i)
+    got = UW.read_five_hour_window(runs_root, now=now)
+    assert got is None
+
+
+# --- round 3: the per-file cap must mean real scan depth, not depth cut -----
+# short by the chunk-growth loop's own overlapping re-reads --------------------
+
+def _make_run_with_raw_transcript(runs_root, run_id, data: bytes, *, day=None):
+    """Like `_make_run`, but writes *data* verbatim instead of joining
+    `_event()` lines with `\\n` — needed to put a reading at an exact byte
+    depth from the file's end."""
+    day_dir = runs_root / (day or _today())
+    run_dir = day_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    transcript = run_dir / "transcript.jsonl"
+    transcript.write_bytes(data)
+    return transcript
+
+
+def _transcript_with_reading_at_depth(depth: int, *, utilization=0.73, resets_at=20_000) -> bytes:
+    """*depth* bytes total: the only `rate_limit_info` reading, followed by
+    enough filler to make the whole file exactly *depth* bytes — so the
+    reading sits exactly *depth* bytes before the file's end, with the
+    reading itself at the very start where nothing can truncate it."""
+    line = _event(five_hour={"utilization": utilization, "resetsAt": resets_at}).encode()
+    line_with_nl = line + b"\n"
+    assert depth >= len(line_with_nl)
+    return line_with_nl + b"y" * (depth - len(line_with_nl))
+
+
+def test_a_reading_5_5mb_from_the_end_is_found(tmp_path):
+    """The measured occurrence this cap exists to cover: a real transcript
+    had a 5.5 MB gap between two `rate_limit_info` events (byte offsets
+    1145846 and 6677116). A single candidate whose only reading sits 5.5 MB
+    from its end, well inside the default `MAX_BYTES_READ_PER_FILE` (8 MiB),
+    must still be found."""
+    runs_root = tmp_path / "agent-runs"
+    data = _transcript_with_reading_at_depth(5_500_000)
+    _make_run_with_raw_transcript(runs_root, "run-a", data)
+    got = UW.read_five_hour_window(runs_root, now=0)
+    assert got is not None
+    assert got["utilization"] == 0.73
+
+
+def test_a_reading_just_inside_the_per_file_cap_is_found(tmp_path, monkeypatch):
+    """A reading just inside `MAX_BYTES_READ_PER_FILE` sits within the
+    window the second (full-cap) read covers, so it is found. Before this
+    fix, the chunk-growth loop's own overlapping re-reads counted against
+    the cap, so the real depth searched fell well short of the cap itself —
+    this failed on the code before that fix."""
+    monkeypatch.setattr(UW, "MAX_BYTES_READ_PER_FILE", 200_000)
+    runs_root = tmp_path / "agent-runs"
+    data = _transcript_with_reading_at_depth(200_000 - 2_000)
+    _make_run_with_raw_transcript(runs_root, "run-a", data)
+    got = UW.read_five_hour_window(runs_root, now=0)
+    assert got is not None
+    assert got["utilization"] == 0.73
+
+
+def test_a_reading_just_outside_the_per_file_cap_is_not_found(tmp_path, monkeypatch):
+    """The twin of the above: a reading just OUTSIDE the per-file cap sits
+    before the window the second read covers, so this single candidate has
+    no reading within its own cap and the scan reports `None` rather than
+    reading past the cap to find it."""
+    monkeypatch.setattr(UW, "MAX_BYTES_READ_PER_FILE", 200_000)
+    runs_root = tmp_path / "agent-runs"
+    data = _transcript_with_reading_at_depth(200_000 + 2_000)
+    _make_run_with_raw_transcript(runs_root, "run-a", data)
+    got = UW.read_five_hour_window(runs_root, now=0)
+    assert got is None

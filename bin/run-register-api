@@ -531,8 +531,8 @@ def _docs_fetched_payload(run_id: str, snapshot: "dict | None") -> dict:
     `{found: False}` for an unknown/malformed/ambiguous run-id — the derivation
     itself lives in `fetched_documents.fetched_and_searched`, which reads
     straight from the run's own `tool_calls.jsonl` rather than waiting for
-    `docs_consulted.json` (written only at finalize, empty for a still-running
-    run). `searches` is one row per successful knowledge or signal search, in
+    `docs_consulted.json`'s `queried_at_runtime` list, which stays empty until
+    finalize fills it in. `searches` is one row per successful knowledge or signal search, in
     call order, with the query it was made with. Every string field in the
     response is bounded before it is served, by `fetched_and_searched`:
     `id` is skipped when it is longer than `_MAX_ID_LEN` or holds a C0 control
@@ -599,16 +599,22 @@ def _docs_fetched_payload(run_id: str, snapshot: "dict | None") -> dict:
 # above is one: Deck only needs this for the one run someone has clicked on.
 #
 # THE GIVEN HALF, NOT THE FETCHED HALF. `docs_fetched` above derives live from
-# `tool_calls.jsonl`; this route instead serves `docs_consulted.json` as
-# `telemetry.write_docs_consulted` wrote it at dispatch time, inside
-# `bin/agentctl`'s `_spawn_dispatch`, unchanged. That file's own `docs` key is
-# the run's materialized given-set, one `{id, kind, body_sha256[, scope]}` row
-# per document (`telemetry.write_docs_consulted`'s own docstring); this route
-# does not pick that key out, read `profile`, `queried_at_runtime`, or
-# anything else inside the file apart — a change to that file's shape is
-# Deck's to read, not this route's to re-shape. A still-running dispatch whose
-# render never wrote the file, or wrote it with an empty `docs`, is served
-# exactly that: an empty `docs` array is not an absent file.
+# `tool_calls.jsonl`; this route instead serves `docs_consulted.json`.
+# `telemetry.write_docs_consulted` writes that file at dispatch time, inside
+# `bin/agentctl`'s `_spawn_dispatch`, before the agent subprocess starts, so a
+# still-live run already answers here rather than staying absent for its whole
+# execution window; `_finalize_run` rewrites the same file once the run ends,
+# adding `queried_at_runtime`. Both writes carry the same `docs` list, because
+# both come from the one `materialized_documents` capture `_spawn_dispatch`
+# makes at dispatch — so this route serves the same given-set whichever write
+# landed most recently. That file's own `docs` key is the run's materialized
+# given-set, one `{id, kind, body_sha256[, scope]}` row per document
+# (`telemetry.write_docs_consulted`'s own docstring); this route does not pick
+# that key out, read `profile`, `queried_at_runtime`, or anything else inside
+# the file apart — a change to that file's shape is Deck's to read, not this
+# route's to re-shape. A dispatch whose render was skipped, or did not produce
+# a current individuation, still gets the file at dispatch, with an empty
+# `docs`: an empty `docs` array is not an absent file.
 _DOCS_GIVEN_PATH_RE = re.compile(r"^/runs/(.+)/docs_given$")
 
 
@@ -633,15 +639,17 @@ def _docs_given_payload(run_id: str, snapshot: "dict | None") -> dict:
     the same no-follow, non-blocking, size-capped guard `_model_fields` and
     `_run_is_private` above already apply to `meta.json`, itself a run-
     writable file inside the same run directory. `docs_consulted.json` is
-    written once, at dispatch (`_spawn_dispatch`'s own call into
-    `write_docs_consulted`), not appended to for the run's whole life the way
-    `tool_calls.jsonl` is, but it sits in the same run-writable directory, so
-    a run that removes it and plants a symlink to `/dev/zero`, a FIFO with no
-    writer, or a many-gigabyte regular file in its place is refused by the
-    same `lstat` + `O_NOFOLLOW` + `O_NONBLOCK` + size cap, never read. That
-    refusal, and a plain missing file, both serve `docs_consulted: None` —
-    this route draws no distinction between "never written" and "unreadable,"
-    since a caller can only act on "I have it" or "I don't."
+    written at dispatch (`_spawn_dispatch`'s own call into
+    `write_docs_consulted`) and rewritten — the whole file replaced, never
+    appended — at finalize once `queried_at_runtime` is known, unlike
+    `tool_calls.jsonl`, which IS appended to for the run's whole life. Either
+    way it sits in the same run-writable directory, so a run that removes it
+    and plants a symlink to `/dev/zero`, a FIFO with no writer, or a
+    many-gigabyte regular file in its place is refused by the same `lstat` +
+    `O_NOFOLLOW` + `O_NONBLOCK` + size cap, never read. That refusal, and a
+    plain missing file, both serve `docs_consulted: None` — this route draws
+    no distinction between "never written" and "unreadable," since a caller
+    can only act on "I have it" or "I don't."
     `RP._read_meta_bounded` returns the parsed JSON only when it is a dict;
     this route serves that dict verbatim as `docs_consulted`, including its
     `docs` key, with no further validation of what is inside it.

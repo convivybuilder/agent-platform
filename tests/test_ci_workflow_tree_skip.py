@@ -60,16 +60,17 @@ def test_decision_step_invokes_the_unit_tested_script():
     assert "ci-tree-skip-decide" in decision.get("run", "")
 
 
-def test_bash_and_python_test_steps_gate_on_tree_skip_not_the_job():
+def test_bash_python_and_swift_test_steps_gate_on_tree_skip_not_the_job():
     """The skip must live on the steps, never the job.
 
     A job-level `if:` that evaluates false reports the job SKIPPED, and
     `agentctl review-status`'s `_skipped_checks` fails any READY PR carrying a
     skipped required check — it cannot distinguish "skipped because the tree
-    already passed" from "skipped because the suite never ran". `bash` and
-    `python` already carry an unrelated, pre-existing job-level `if:` for the
-    ARCH-364 draft gate; the job-level half of this assertion is narrower
-    than "no job-level if:" — it only forbids one that mentions tree_skip.
+    already passed" from "skipped because the suite never ran". `bash`,
+    `python` and `swift` already carry an unrelated, pre-existing job-level
+    `if:` for the ARCH-364 draft gate; the job-level half of this assertion
+    is narrower than "no job-level if:" — it only forbids one that mentions
+    tree_skip.
 
     Both halves are asserted together (rather than as two separate tests) so
     an implementation that wired the skip at job level instead of step level
@@ -82,6 +83,7 @@ def test_bash_and_python_test_steps_gate_on_tree_skip_not_the_job():
     expected_step_name_fragments = {
         "bash": ["bash lint", "bash tests"],
         "python": ["pytest"],
+        "swift": ["swift test"],
     }
     for job_name, fragments in expected_step_name_fragments.items():
         job_if = str(doc["jobs"][job_name].get("if", ""))

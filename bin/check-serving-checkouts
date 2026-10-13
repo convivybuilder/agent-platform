@@ -113,11 +113,35 @@ finding is the exception: its key takes the LOCAL day from `_today()`, and it ca
 of unparseable plists,
 so a same-day return with a different count logs again. It never creates a work item
 (platform/decisions/0073).
+
+A HOST THAT CANNOT FORK IS NOT A FINDING AGAINST ANY REPOSITORY. On 2026-10-12
+the operator account hit its per-process limit for 13 minutes and every
+`git`/`plutil` call failed with EAGAIN; this check read that as an
+`unreadable` finding against each repository it happened to be checking,
+and a person had to close those findings by hand. `HostForkExhausted` makes
+that condition abandon the whole pass instead — no finding of any kind is
+posted for that pass (every finding this check could raise is gathered and
+posted only once the pass completes), one stderr line, exit 0, and the next
+900s launchd tick retries. Four consecutive skipped passes (one hour at
+that interval) instead files ONE host-level finding through the same
+`_post_signal` path, day-scoped like every other finding here, so a host
+that stays broken is still visible — and names every NON-PRIVATE serving
+checkout the last pass that actually completed examined, with the time of
+that pass, so a human can see what has gone unchecked rather than just that
+something has (security-reviewer, PR #871 round 2: a skip hides every
+checkout's state, not only the one whose call happened to hit EAGAIN). A
+private crew's checkout is filtered out of that listing, and out of the
+state file it is built from, by the same `_is_private_checkout` gate every
+other finding in this script already answers to before any of it reaches
+the shared store (security-reviewer, PR #871 round 3).
 """
 from __future__ import annotations
 
 import argparse
 import datetime
+import errno
+import json
+import os
 import pathlib
 import plistlib
 import shutil
@@ -129,6 +153,7 @@ import builder_root as BR  # noqa: E402
 
 CONVIVY_ROOT = BR.root()
 LAUNCH_AGENTS = pathlib.Path.home() / "Library" / "LaunchAgents"
+RUNS_ROOT = BR.runs_root()
 
 # `plutil` only exists on macOS, which is the ONLY platform this ever runs on
 # in production — it reads `~/Library/LaunchAgents`, which does not exist
@@ -145,6 +170,104 @@ _PLUTIL = shutil.which("plutil")
 # same split `check-primary-checkouts` makes, for the same reason: a logging
 # failure must not read on stderr identically to a clean sweep.
 _report_failures: int = 0
+
+
+class HostForkExhausted(Exception):
+    """The HOST could not start a new process at all (EAGAIN on fork), not a
+    defect in whichever repository happened to be checked when it hit.
+
+    THE INCIDENT THIS IS FOR. On 2026-10-12, between 18:15 and 18:28 UTC, the
+    operator account hit its per-user process limit and every `git`/`plutil`
+    call this script makes failed with `EAGAIN` (errno 35). This script read
+    that the same way it reads a genuinely broken checkout — an `unreadable`
+    finding against each repository it happened to be checking — and the
+    selector crew had to close those findings by hand. Raised instead of
+    returned, so one subprocess call that cannot even start aborts the whole
+    pass (see `main`'s fork-exhaustion handling) rather than being
+    misattributed to a repository that was never the problem.
+    """
+
+
+def _is_fork_exhaustion(exc: OSError) -> bool:
+    """Is `exc` the host refusing to fork at all, rather than anything about
+    the one `git`/`plutil` call that raised it?
+
+    `BlockingIOError` is `subprocess`'s own exception for `EAGAIN`/`EWOULDBLOCK`
+    on the fork+exec path; the bare `errno.EAGAIN` check catches the same
+    condition on a code path that raises a plain `OSError` instead. Checked
+    once here so every call site below asks the identical question."""
+    return isinstance(exc, BlockingIOError) or getattr(exc, "errno", None) == errno.EAGAIN
+
+
+# ONE HOUR, NOT THE 15-MINUTE TICK ITSELF (this check's own StartInterval).
+# A single transient EAGAIN must not escalate by itself — the next launchd
+# tick retries for free, and this script already exists to avoid training its
+# reader to ignore noise it can self-clear (see the module docstring's THE
+# NOISE PROBLEM). Four consecutive skipped ticks, at this check's 900s
+# interval, is one hour — the point past which "the host can't fork" has
+# stopped looking transient and become a host-level incident worth a human
+# looking at, rather than something the next tick will quietly fix.
+FORK_SKIP_FINDING_THRESHOLD = 4
+
+FORK_SKIP_STATE_PATH = RUNS_ROOT / "check-serving-checkouts" / "fork-skip-state.json"
+
+
+def _read_state() -> dict[str, Any]:
+    """The state file's contents as a dict. `{}` on no file, a corrupt file,
+    or a value that is not a JSON object — a state this check cannot trust is
+    not a reason to crash, only to read as though nothing has ever been
+    recorded."""
+    if not FORK_SKIP_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(FORK_SKIP_STATE_PATH.read_text())
+    except (json.JSONDecodeError, ValueError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _read_consecutive_skips() -> int:
+    """How many passes in a row ended in `HostForkExhausted`. 0 on no file, a
+    corrupt file, or a value that is not a plain count — a state this check
+    cannot trust is not a reason to under-count a real outage either."""
+    try:
+        return max(0, int(_read_state().get("consecutive_skips", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _read_last_checked() -> tuple[list[str] | None, str | None]:
+    """(checked, checked_at) recorded by the last pass that completed without
+    raising `HostForkExhausted` — the one case a skipped pass cannot speak
+    for itself, since it never reached any checkout at all. `(None, None)`
+    when no pass has ever completed (no file, or a file predating this
+    field)."""
+    state = _read_state()
+    checked, checked_at = state.get("checked"), state.get("checked_at")
+    if not isinstance(checked, list) or not isinstance(checked_at, str):
+        return None, None
+    return checked, checked_at
+
+
+def _write_state(*, consecutive_skips: int, checked: list[str] | None,
+                 checked_at: str | None) -> None:
+    """Atomic write — a sibling temp file then `os.replace`, the same shape
+    `agent-cost-report`'s `_atomic_write` uses, so a reader never sees a
+    truncated file mid-write. `checked`/`checked_at` are omitted from the
+    payload when the caller has nothing to carry forward — a skip's own write
+    (see `_skip_pass_for_fork_exhaustion`) passes through whatever a prior
+    completed pass already recorded rather than erasing it, since a skipped
+    pass is not itself a completed pass and has nothing new to report about
+    which checkouts exist."""
+    FORK_SKIP_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"consecutive_skips": consecutive_skips}
+    if checked is not None:
+        payload["checked"] = checked
+    if checked_at is not None:
+        payload["checked_at"] = checked_at
+    tmp = FORK_SKIP_STATE_PATH.with_name(f".{FORK_SKIP_STATE_PATH.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload))
+    os.replace(tmp, FORK_SKIP_STATE_PATH)
 
 # Two candidates, same order bin/knowledge-watcher uses: this checkout's own
 # lib first (so this script and the library it was written against move
@@ -269,6 +392,8 @@ def _plist_fields(path: pathlib.Path) -> tuple[dict[str, str], str]:
             lint = subprocess.run([_PLUTIL, "-lint", str(path)],
                                   capture_output=True, text=True, timeout=10)
         except (OSError, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, OSError) and _is_fork_exhaustion(exc):
+                raise HostForkExhausted(str(exc)) from exc
             return {}, f"could not run plutil -lint: {exc}"
         if lint.returncode != 0:
             return {}, (lint.stderr.strip() or lint.stdout.strip()
@@ -278,7 +403,9 @@ def _plist_fields(path: pathlib.Path) -> tuple[dict[str, str], str]:
             try:
                 proc = subprocess.run([_PLUTIL, "-extract", key, "raw", str(path)],
                                       capture_output=True, text=True, timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                if isinstance(exc, OSError) and _is_fork_exhaustion(exc):
+                    raise HostForkExhausted(str(exc)) from exc
                 continue
             if proc.returncode == 0:
                 val = proc.stdout.strip()
@@ -373,6 +500,8 @@ def current_branch(repo_dir: pathlib.Path) -> tuple[str | None, str]:
             ["git", "-C", str(repo_dir), "symbolic-ref", "--short", "-q", "HEAD"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     except OSError as exc:
+        if _is_fork_exhaustion(exc):
+            raise HostForkExhausted(str(exc)) from exc
         return None, f"could not read HEAD: {exc}"
     try:
         out, err = proc.communicate(timeout=30)
@@ -407,6 +536,8 @@ def servable_dirty_paths(repo_dir: pathlib.Path) -> tuple[list[str], str]:
             ["git", "-C", str(repo_dir), "status", "--porcelain=v1", "--no-renames"],
             capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
+        if isinstance(exc, OSError) and _is_fork_exhaustion(exc):
+            raise HostForkExhausted(str(exc)) from exc
         return [], f"could not read status: {exc}"
     if proc.returncode != 0:
         return [], f"git status exited {proc.returncode}: {proc.stderr.strip()}"
@@ -429,6 +560,14 @@ def _utc_today() -> str:
     A named seam so a test can pin the day. main() reads it once per run and
     passes that one value to every finding key the run writes."""
     return datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+
+
+def _utc_now_iso() -> str:
+    """Now, UTC, seconds precision, ISO-8601 — the time recorded alongside
+    the last completed pass's checked-checkouts list, so the host-level
+    fork-exhaustion finding can say how stale that record is. A named seam,
+    same reason `_utc_today` is one: a test can pin it."""
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
 
 def _today() -> str:
@@ -478,6 +617,79 @@ def check(repo_dir: pathlib.Path) -> list[dict[str, Any]]:
     return findings
 
 
+def _skip_pass_for_fork_exhaustion(exc: HostForkExhausted, *, day: str, dry_run: bool) -> int:
+    """Record one skipped pass and exit 0 — the launchd job's own 900s
+    `StartInterval` is the retry, and a pass that could not even start a
+    `git`/`plutil` call has nothing to report about any repository.
+
+    Past `FORK_SKIP_FINDING_THRESHOLD` consecutive skips, also files ONE
+    host-level finding through `_post_signal` — the same path every other
+    finding in this script takes, with its own day-scoped dedup_key so it
+    logs once a day while the host keeps failing to fork, exactly like the
+    unparseable-plist finding above (see the module docstring's BEHAVIOUR).
+    That is deliberately a finding about the HOST, never about a repository:
+    this is the fix for the 2026-10-12 incident where the opposite happened.
+
+    NAMES WHAT WENT UNCHECKED (security-reviewer, PR #871 round 2). A skip
+    hides every serving checkout's branch/dirty state for that pass, not
+    only the one whose `git`/`plutil` call happened to raise `EAGAIN` — a
+    writer with access to just one checkout's `.git/config` or hooks, or any
+    unrelated process sharing the operator account's process ceiling, can
+    trigger it. The old per-repository path at least named each repository
+    it could not check; this finding must too, so it names every checkout
+    `_read_last_checked` recorded from the LAST PASS THAT ACTUALLY
+    COMPLETED, with the time of that pass — or says plainly that no pass has
+    ever completed, when there is no such record yet.
+
+    NEVER A PRIVATE CHECKOUT (security-reviewer, PR #871 round 3). `checked`
+    is already filtered to exclude any checkout `_is_private_checkout`
+    answers `True` for before `main` ever writes it to
+    `FORK_SKIP_STATE_PATH` (see the comment where `checked` is built) — this
+    function only reads back and renders what `main` already filtered, so
+    there is nothing left to filter here and nothing to forget. If every
+    checkout the last completed pass found was private, this correctly
+    collapses to the SAME "found no serving checkouts at all" message a
+    pass with genuinely nothing to check would give — a private crew's
+    presence is never disclosed by itself, the same rule this script
+    already applies to its per-repository findings.
+    """
+    print(f"[SKIP] check skipped: host resource exhaustion (EAGAIN on fork): {exc}",
+          file=sys.stderr)
+    skips = _read_consecutive_skips() + 1
+    checked, checked_at = _read_last_checked()
+    _write_state(consecutive_skips=skips, checked=checked, checked_at=checked_at)
+    if skips >= FORK_SKIP_FINDING_THRESHOLD:
+        if checked is None:
+            unchecked = ("No pass has ever completed, so there is no record of which "
+                        "serving checkouts this host has examined.")
+        elif checked:
+            listing = "\n".join(f"  - {c}" for c in checked)
+            unchecked = (f"Unchecked since the last completed pass, at {checked_at} UTC:\n\n"
+                        f"{listing}")
+        else:
+            unchecked = (f"The last completed pass, at {checked_at} UTC, found no serving "
+                        f"checkouts at all.")
+        title = "[serving-checkout] host cannot fork a new process"
+        body = (
+            f"**This host has failed to start a subprocess for {skips} consecutive "
+            f"check(s) in a row** (`EAGAIN`/`BlockingIOError`), roughly a "
+            f"`StartInterval` tick apart — the operator account is at its process "
+            f"limit, not any repository this check serves.\n\n"
+            f"{unchecked}\n\n"
+            f"On 2026-10-12 this exact condition was misreported as a finding "
+            f"against every repository this check happened to be checking instead "
+            f"of against the host; this is the host-level alert that replaced that.\n\n"
+            f"Fix: find and close whatever is holding processes open on this "
+            f"machine. This check resumes reporting on its own once a pass completes."
+        )
+        res = _post_signal("agent-platform", title, body,
+                           dedup_key=f"serving-checkout:host-fork-exhaustion:{day}",
+                           dry_run=dry_run)
+        print(f"[FINDING] host cannot fork ({skips} consecutive skips) → "
+              f"{res.get('status', '?')}", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="check-serving-checkouts", description=__doc__)
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -497,7 +709,10 @@ def main(argv: list[str] | None = None) -> int:
     launch_agents = pathlib.Path(opts.launch_agents)
     day = _utc_today()
 
-    checkouts, excluded, unparseable = serving_checkouts(launch_agents, convivy_root)
+    try:
+        checkouts, excluded, unparseable = serving_checkouts(launch_agents, convivy_root)
+    except HostForkExhausted as exc:
+        return _skip_pass_for_fork_exhaustion(exc, day=day, dry_run=opts.no_report)
     findings = 0
 
     if excluded:
@@ -512,6 +727,45 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[EXCLUDED] outside {convivy_root}, not checked: {excluded_desc}",
               file=sys.stderr)
 
+    # GATHERED, NOT POSTED, UNTIL THE WHOLE PASS COMPLETES — the unparseable-
+    # plist finding below included. A pass that finds a real problem (that
+    # finding, or a per-repository one) and then hits `HostForkExhausted` on
+    # a checkout later in `sorted(checkouts)` must not have already posted
+    # anything — that leaves the run's own exit status and what is posted
+    # (both decided below, only once the loop finishes without raising)
+    # silently disagreeing with what the shared store holds. An abandoned
+    # pass posts nothing at all; the same ground is checked again, and
+    # posted then, on the next completed pass (reviewer finding, PR #871
+    # round 1; the unparseable-plist finding was still posted eagerly here,
+    # ahead of this boundary, until reviewer finding, PR #871 round 2).
+    pending: list[dict[str, Any]] = []
+    try:
+        for repo_dir in sorted(checkouts):
+            labels = checkouts[repo_dir]
+            repo_findings = check(repo_dir)
+            if not repo_findings:
+                if opts.verbose:
+                    print(f"[OK] {repo_dir}: on main, clean ({len(labels)} service(s))")
+                continue
+            services = ", ".join(labels)
+            # CFO (and any future black-box crew) never reaches _post_signal — a
+            # finding's own EXISTENCE in the shared signal store is the leak
+            # ADR-0043 forbids, independent of the fact that this check never
+            # reads file content (security-reviewer, PR #423, run-0d72a1e3). The
+            # finding still counts (a real problem on a private checkout is
+            # still a real problem) and still prints locally — this machine's
+            # own log, not a shared multi-reader store — just never logs.
+            private = _is_private_checkout(repo_dir)
+            for f in repo_findings:
+                pending.append({"repo_dir": repo_dir, "services": services,
+                                "finding": f, "private": private})
+    except HostForkExhausted as exc:
+        return _skip_pass_for_fork_exhaustion(exc, day=day, dry_run=opts.no_report)
+
+    # Only now — the per-repository loop reached the end without the host
+    # ever refusing to fork — is it safe to post the unparseable-plist
+    # finding (see the GATHERED comment above) and to record what this pass
+    # examined.
     if unparseable:
         # Reported, not skipped — see `serving_checkouts`'s docstring. This
         # is a gap in this check's OWN coverage, not a claim about the
@@ -588,63 +842,71 @@ def main(argv: list[str] | None = None) -> int:
     elif opts.verbose:
         print("[OK] every plist under launch_agents was readable")
 
-    for repo_dir in sorted(checkouts):
-        labels = checkouts[repo_dir]
-        repo_findings = check(repo_dir)
-        if not repo_findings:
-            if opts.verbose:
-                print(f"[OK] {repo_dir}: on main, clean ({len(labels)} service(s))")
+    # The pass reached the end without the host ever refusing to fork — the
+    # outage (if there was one) is over, so the next one starts counting from
+    # zero rather than inheriting this run's unrelated streak. This is ALSO
+    # the only point that records which serving checkouts this pass actually
+    # examined — a skipped pass has no examination of its own to record
+    # (security-reviewer, PR #871 round 2) — so, unlike the skip counter
+    # alone in round 1, every completed pass writes this, not only the ones
+    # that are also resetting a nonzero streak.
+    #
+    # NEVER A PRIVATE CHECKOUT'S NAME (security-reviewer, PR #871 round 3).
+    # `_is_private_checkout` gates this list exactly as it already gates
+    # every per-repository finding below — a black-box crew's checkout name
+    # and plist labels must not reach `FORK_SKIP_STATE_PATH` on disk any more
+    # than they may reach `_post_signal`, since `_skip_pass_for_fork_exhaustion`
+    # reads this list straight back and renders it, unfiltered, into a
+    # finding body bound for the shared store. Filtered here, once, at the
+    # one point this list is ever written — not at render time — so the
+    # state file on disk never holds what the shared store must never see.
+    checked = [f"{repo_dir.name} ({', '.join(checkouts[repo_dir])})"
+              for repo_dir in sorted(checkouts) if not _is_private_checkout(repo_dir)]
+    _write_state(consecutive_skips=0, checked=checked, checked_at=_utc_now_iso())
+
+    for item in pending:
+        repo_dir, services, f, private = (
+            item["repo_dir"], item["services"], item["finding"], item["private"])
+        findings += 1
+        if private:
+            # Local log only — never signal_client, never the shared
+            # signal store. A black-box crew "files no issues and logs no
+            # signals" (platform/decisions/0043); this is the equivalent
+            # for a signal this script would otherwise log. The title/body
+            # this finding would have used are never even built —
+            # nothing here constructs text meant for a shared store.
+            print(f"[FINDING] {repo_dir.name} (private crew, not logged): "
+                  f"{f['reason']}", file=sys.stderr)
             continue
-        services = ", ".join(labels)
-        # CFO (and any future black-box crew) never reaches _post_signal — a
-        # finding's own EXISTENCE in the shared signal store is the leak
-        # ADR-0043 forbids, independent of the fact that this check never
-        # reads file content (security-reviewer, PR #423, run-0d72a1e3). The
-        # finding still counts (a real problem on a private checkout is
-        # still a real problem) and still prints locally — this machine's
-        # own log, not a shared multi-reader store — just never logs.
-        private = _is_private_checkout(repo_dir)
-        for f in repo_findings:
-            findings += 1
-            if private:
-                # Local log only — never signal_client, never the shared
-                # signal store. A black-box crew "files no issues and logs no
-                # signals" (platform/decisions/0043); this is the equivalent
-                # for a signal this script would otherwise log. The title/body
-                # this finding would have used are never even built —
-                # nothing here constructs text meant for a shared store.
-                print(f"[FINDING] {repo_dir.name} (private crew, not logged): "
-                      f"{f['reason']}", file=sys.stderr)
-                continue
-            title = f"[serving-checkout] {repo_dir.name} {f['reason']}"
-            paths_block = (
-                "\n\nFiles changed from the committed state, outside `.claude/`:\n"
-                + "\n".join(f"  - {p}" for p in f["paths"])
-            ) if f["paths"] else ""
-            body = (
-                f"**`{repo_dir}` {f['reason']}**, and this checkout is what "
-                f"the following launchd service(s) serve from directly:\n\n"
-                f"{services}\n\n"
-                f"Whatever this checkout sits on right now is what those services "
-                f"are running — not what merged, not what `main` says, what is "
-                f"literally on disk here.{paths_block}\n\n"
-                f"Fix:\n\n"
-                f"```\ncd {repo_dir}\ngit status\ngit switch main && git pull --ff-only\n```\n\n"
-                f"If there is work in progress here, move it to a worktree first — "
-                f"a live-serving checkout is not a place for feature work.\n\n"
-                f"This check reads git metadata only (branch name, changed paths) "
-                f"and never file contents."
-            )
-            # Each finding kind gets its own dedup_key — branch state and
-            # dirty-tree state start and resolve independently, and a checkout
-            # can be both off `main` AND dirty at once, so one key covering
-            # "something about this checkout is wrong" would let one signal
-            # silently swallow the other.
-            res = _post_signal(repo_dir.name, title, body,
-                               dedup_key=f"serving-checkout:{repo_dir.name}:{f['kind']}:{day}",
-                               dry_run=opts.no_report)
-            print(f"[FINDING] {repo_dir.name} ({services}): {f['reason']} → "
-                  f"{res.get('status', '?')}", file=sys.stderr)
+        title = f"[serving-checkout] {repo_dir.name} {f['reason']}"
+        paths_block = (
+            "\n\nFiles changed from the committed state, outside `.claude/`:\n"
+            + "\n".join(f"  - {p}" for p in f["paths"])
+        ) if f["paths"] else ""
+        body = (
+            f"**`{repo_dir}` {f['reason']}**, and this checkout is what "
+            f"the following launchd service(s) serve from directly:\n\n"
+            f"{services}\n\n"
+            f"Whatever this checkout sits on right now is what those services "
+            f"are running — not what merged, not what `main` says, what is "
+            f"literally on disk here.{paths_block}\n\n"
+            f"Fix:\n\n"
+            f"```\ncd {repo_dir}\ngit status\ngit switch main && git pull --ff-only\n```\n\n"
+            f"If there is work in progress here, move it to a worktree first — "
+            f"a live-serving checkout is not a place for feature work.\n\n"
+            f"This check reads git metadata only (branch name, changed paths) "
+            f"and never file contents."
+        )
+        # Each finding kind gets its own dedup_key — branch state and
+        # dirty-tree state start and resolve independently, and a checkout
+        # can be both off `main` AND dirty at once, so one key covering
+        # "something about this checkout is wrong" would let one signal
+        # silently swallow the other.
+        res = _post_signal(repo_dir.name, title, body,
+                           dedup_key=f"serving-checkout:{repo_dir.name}:{f['kind']}:{day}",
+                           dry_run=opts.no_report)
+        print(f"[FINDING] {repo_dir.name} ({services}): {f['reason']} → "
+              f"{res.get('status', '?')}", file=sys.stderr)
 
     if findings == 0:
         if opts.verbose:

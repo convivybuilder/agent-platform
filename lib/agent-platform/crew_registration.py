@@ -83,6 +83,7 @@ class CrewSpec:
     repos: list[str]
     crew: str | None = None
     owner: str = "convivy"
+    created_by: str | None = None
     cls: str = "project"
     kb: str = "central"
     kb_project: str | None = None
@@ -226,6 +227,10 @@ def build_row(spec: CrewSpec) -> dict[str, Any]:
     if spec.overnight not in (None, *_VALID_OVERNIGHT):
         raise RegistrationRefused(
             f"overnight must be true, false or 'own-drain', got {spec.overnight!r}")
+    if spec.created_by is not None and not projects.valid_person_id(spec.created_by):
+        raise RegistrationRefused(
+            f"created_by must be a Library person id (person_<ULID>), got "
+            f"{spec.created_by!r}")
 
     kb_project = spec.kb_project
     if spec.kb == "local":
@@ -242,6 +247,10 @@ def build_row(spec: CrewSpec) -> dict[str, Any]:
         "class": spec.cls,
         "display": spec.display,
         "owner": spec.owner,
+    }
+    if spec.created_by:
+        row["created_by"] = spec.created_by
+    row.update({
         "home_dir": home_dir,
         "dirs": list(spec.dirs),
         "repos": repos,
@@ -250,7 +259,7 @@ def build_row(spec: CrewSpec) -> dict[str, Any]:
         "lifecycle": spec.lifecycle,
         "products": list(spec.products),
         "kb": spec.kb,
-    }
+    })
     if kb_project:
         row["kb_project"] = kb_project
     # Written explicitly even when false — see CrewSpec's docstring on why

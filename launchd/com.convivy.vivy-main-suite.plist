@@ -37,7 +37,9 @@
          spend begins.
 
          The existing overnight schedule: 21:00 preflight, 01:00 overnight,
-         02:30 hollis, 03:30 issue-queue-drain, 05:00 healthcheck, 06:00 wrapup.
+         02:30 hollis, 05:00 healthcheck, 06:00 wrapup. (issue-queue-drain ran
+         at 03:30 in this slot too, until it was deleted 2026-10-09 — nothing
+         runs there now.)
          20:00 is the last gap before that cycle. A broken main discovered at 20:00
          is in the operator's hands before the preflight opens PRs against it; a broken main
          discovered at 06:00 has already burned a full overnight run and all its

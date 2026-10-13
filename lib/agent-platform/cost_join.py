@@ -1177,7 +1177,11 @@ def build_item_costs(start: datetime, end: datetime, items: list[dict]) -> dict:
 # (store.py 3511-3515), reproduced here so a run-record figure files under the
 # same key the ledger will one day be checked against: an epic counts as
 # itself, a child counts under its immediate parent (one hop, never walked
-# further), and a parentless non-epic goes under CORRECTIONS.
+# further), and a non-epic whose parent is null OR names its product's
+# corrections queue goes under CORRECTIONS (one-home-per-work-item,
+# library/specs/one-home-per-work-item). A queue is identified by looking its
+# id up against the Library's corrections-queues list, never by a `cq_`
+# prefix on the string — the plan rules the prefix out as a reader.
 
 CORRECTIONS = "corrections"  # mirrors the Library's LEDGER_EPIC_CORRECTIONS (store.py:3117)
 
@@ -1188,17 +1192,22 @@ CORRECTIONS = "corrections"  # mirrors the Library's LEDGER_EPIC_CORRECTIONS (st
 _FINISHED_STATES = frozenset({"fixed", "wontfix", "duplicate", "redirected"})
 
 
-def _epic_for_item(item: dict) -> str:
+def _epic_for_item(item: dict, queue_ids: set[str]) -> str:
     """The epic id an item's spend rolls up to, by the Library's own rule: an
     epic counts as itself; a non-epic with a parent counts under that parent,
     whether or not the parent itself resolves to a real row (the Library's rule
-    is syntactic on the item's own fields, not a walk of the parent chain); a
-    parentless non-epic counts under CORRECTIONS."""
+    is syntactic on the item's own fields, not a walk of the parent chain),
+    UNLESS the parent's id is in `queue_ids`, in which case it counts under
+    CORRECTIONS like a null parent does. `queue_ids` must be the Library's own
+    corrections-queue ids (`issue_client.list_corrections_queues`) — never
+    inferred from the string's shape, which the plan this mirrors rules out as
+    a way to tell a queue from an epic."""
     if item.get("type") == "epic":
         return item["id"]
-    if item.get("parent_id"):
-        return item["parent_id"]
-    return CORRECTIONS
+    parent_id = item.get("parent_id")
+    if not parent_id or parent_id in queue_ids:
+        return CORRECTIONS
+    return parent_id
 
 
 def _merge_lane_dicts(lane_dicts: list[dict[str, dict]]) -> dict[str, dict]:
@@ -1232,7 +1241,8 @@ def _merge_lane_dicts(lane_dicts: list[dict[str, dict]]) -> dict[str, dict]:
 
 
 def build_course_costs(start: datetime, end: datetime, items: list[dict],
-                       course: dict, epic_progress: dict[str, dict | None]) -> dict:
+                       course: dict, epic_progress: dict[str, dict | None],
+                       queue_ids: set[str] | None) -> dict:
     """Run cost grouped by epic and rolled up to one Course, from
     build_item_costs' per-item rows.
 
@@ -1244,6 +1254,19 @@ def build_course_costs(start: datetime, end: datetime, items: list[dict],
     entry id to the `progress` dict `issue_client.get_item` returned for it
     (or None where that read was skipped or carried none).
 
+    `queue_ids` is the Library's corrections-queue ids
+    (`issue_client.list_corrections_queues`), used by `_epic_for_item` to tell
+    a queue parent from an epic parent. Pass `set()` when the Library reports
+    none exist (a 404 from that route — the deploy that adds it has not
+    landed, so no item can carry a queue parent either). Pass `None` when the
+    lookup itself failed for any other reason: a parent id this function
+    cannot resolve might be a queue or might be an epic outside this Course's
+    entries, and telling those apart wrongly would misfile queue-parented
+    spend as an epic's (or drop it silently) instead of reporting the gap, so
+    `corrections` reports `cannot_be_measured` instead of a count that might
+    be wrong. Epics and totals are unaffected, since every entry id is
+    already known from `course` regardless of `queue_ids`.
+
     Returns:
       window        the run-cost window, as build_item_costs reports it
       epics         one row per Course entry, IN COURSE ORDER: id, title,
@@ -1254,7 +1277,10 @@ def build_course_costs(start: datetime, end: datetime, items: list[dict],
                     summed across lanes, and never collapsed into one
                     aggregate key on the row)
       corrections   the same `lanes` shape, for items that grouped under
-                    CORRECTIONS, plus the item ids that contributed
+                    CORRECTIONS, plus the item ids that contributed, and its
+                    own cannot_be_measured/reason pair (set when `queue_ids`
+                    was None; distinct from the top-level pair, which is
+                    about the Course's epics, not this bucket)
       totals        this Course's own epics' lanes, merged across epics but
                     never across lanes: billing_source -> totals/by_model
       unattributed  build_item_costs' own block, unchanged
@@ -1265,6 +1291,7 @@ def build_course_costs(start: datetime, end: datetime, items: list[dict],
     """
     item_costs = build_item_costs(start, end, items)
     rows_by_id = {row["id"]: row for row in item_costs["items"]}
+    resolved_queue_ids = queue_ids if queue_ids is not None else set()
 
     group_lanes: dict[str, list[dict]] = {}
     group_item_ids: dict[str, list[str]] = {}
@@ -1273,7 +1300,7 @@ def build_course_costs(start: datetime, end: datetime, items: list[dict],
         row = rows_by_id.get(it["id"])
         if not row or not row["run_count"]:
             continue
-        epic_id = _epic_for_item(it)
+        epic_id = _epic_for_item(it, resolved_queue_ids)
         group_lanes.setdefault(epic_id, []).append(row["by_billing_source"])
         group_item_ids.setdefault(epic_id, []).append(it["id"])
         group_runs[epic_id] = group_runs.get(epic_id, 0) + row["run_count"]
@@ -1307,11 +1334,22 @@ def build_course_costs(start: datetime, end: datetime, items: list[dict],
             "lanes": _merge_lane_dicts(group_lanes.get(eid, [])),
         })
 
-    corrections = {
-        "item_ids": sorted(group_item_ids.get(CORRECTIONS, [])),
-        "run_count": group_runs.get(CORRECTIONS, 0),
-        "lanes": _merge_lane_dicts(group_lanes.get(CORRECTIONS, [])),
-    }
+    if queue_ids is None:
+        corrections = {
+            "item_ids": [], "run_count": 0, "lanes": {},
+            "cannot_be_measured": True,
+            "reason": "the corrections-queue lookup failed, so a parent that "
+                      "names a queue cannot be told apart from one that names "
+                      "an epic outside this Course",
+        }
+    else:
+        corrections = {
+            "item_ids": sorted(group_item_ids.get(CORRECTIONS, [])),
+            "run_count": group_runs.get(CORRECTIONS, 0),
+            "lanes": _merge_lane_dicts(group_lanes.get(CORRECTIONS, [])),
+            "cannot_be_measured": False,
+            "reason": None,
+        }
 
     cannot_be_measured = not any(e["run_count"] for e in epics)
     reason = None
@@ -1331,6 +1369,184 @@ def build_course_costs(start: datetime, end: datetime, items: list[dict],
     }
 
 
+# --- ledger reconciliation (E16·5) -------------------------------------------
+#
+# The ledger's own total for an epic is read from `GET /ledger-entries`
+# (`issue_client.list_ledger_entries`), not reimplemented here — this module
+# never talks to the Library (see its module docstring), so the fetch itself
+# is the caller's job (`bin/work-item-cost`); what belongs here is comparing
+# what came back against the run records cost_join already built.
+#
+# model-scorecard's `cost_usd` and this module's per-run `usd` are NOT always
+# the same figure, by construction: `_usd_fields` nulls `usd` whenever a run
+# carries an unpriced model or a missing cost record (`cost_missing`), so a
+# ledger entry posted from a run's raw `cost.json` figure would read as a
+# false mismatch against a run-record `usd` of `None`. Both model-scorecard's
+# `cost_usd` and this module's `priced_usd` come from the exact same source,
+# though: `cost.json`'s own `usd` field, rounded to 6 decimals in both places
+# (`load_node`'s `cost.get("usd")`, `build_row`'s `cost.get("usd", 0.0)`). A
+# reconciliation compares the ledger's `usd` against `priced_usd`, never
+# against `usd`, for exactly this reason.
+#
+# A ledger entry's `lane` (`gateway`/`subscription`/null) and a run record's
+# `billing_source` (`subscription_credit`, `provider_api:openai`, ...) are two
+# different vocabularies describing the same underlying split, not one
+# shared key space — `post_ledger_entry` sends its own `lane` (E1·6), computed
+# by `model-scorecard` from the run's model string rather than read from
+# `billing_source`, so the two remain free to disagree in theory even though
+# they describe the same split. Per-run amount comparison does not need them
+# to agree; the per-lane totals below are reported side by side, one dict per
+# vocabulary, never merged into one.
+
+
+def build_epic_run_costs(start: datetime, end: datetime, items: list[dict],
+                         queue_ids: set[str] | None) -> dict[str, dict[str, dict]]:
+    """Run-level cost by epic: the same one-hop grouping `build_course_costs`
+    applies to `build_item_costs`' per-item lanes, kept at run-id granularity
+    instead of pre-summed into a lane. A ledger reconciliation compares one
+    run against one ledger entry, so it needs each run's own figure, not a
+    lane total that has already erased which run contributed what.
+
+    `queue_ids` is passed straight to `_epic_for_item`, same meaning as in
+    `build_course_costs`: the Library's corrections-queue ids, or `None` when
+    that lookup failed. Passing `None` here never miscounts an epic's own
+    run costs — a queue id, real or not, never collides with a real epic id
+    among a Course's entries — it only affects whether a queue-parented run
+    is grouped under its true queue or (wrongly, when `queue_ids` is `None`)
+    under its literal parent id, neither of which this function's callers
+    read.
+
+    Returns `{epic_id: {run_id: {"priced_usd": float, "billing_source": str}}}`.
+    """
+    item_costs = build_item_costs(start, end, items)
+    nodes = index_nodes(start, end)
+    by_item = {it["id"]: it for it in items}
+    resolved_queue_ids = queue_ids if queue_ids is not None else set()
+    out: dict[str, dict[str, dict]] = {}
+    for row in item_costs["items"]:
+        it = by_item.get(row["id"])
+        if it is None:
+            continue
+        epic_id = _epic_for_item(it, resolved_queue_ids)
+        bucket = out.setdefault(epic_id, {})
+        for rid in row["run_ids"]:
+            node = nodes.get(rid)
+            if node is None:
+                continue
+            bucket[rid] = {"priced_usd": node["priced_usd"],
+                          "billing_source": node["billing_source"]}
+    return out
+
+
+def reconcile_epic_cost(run_costs: dict[str, dict], ledger_entries: list[dict],
+                        run_epic_map: dict[str, str], epic_id: str) -> dict:
+    """Compare one epic's run-record figures (`run_costs`, i.e.
+    `build_epic_run_costs(...)[epic_id]`, or `{}` for an epic with none) against
+    the Library's own ledger rows for that epic (`ledger_entries`, every page of
+    `issue_client.list_ledger_entries(epic_id=epic_id)`).
+
+    `run_epic_map` is the GLOBAL run_id -> epic_id this Course's run records
+    attribute each run to — every epic's bucket from `build_epic_run_costs`
+    merged into one dict — used to tell "the ledger has no entry for this run"
+    apart from "the ledger filed this run under a DIFFERENT one of this
+    Course's epics than cost_join did."
+
+    The `"epic"` mismatch this produces compares two readings of the SAME
+    field: the Library's filed `item_id` (what `model-scorecard` sent it,
+    itself `meta.json`'s `"issue"` in the run's own directory) against
+    `run_epic_map`'s attribution (`load_node`'s own read of that same
+    `"issue"` field). It catches the two sides mapping one recorded item to
+    two different epics. It does NOT catch a run that rewrote its own
+    `meta.json` `"issue"` after dispatch — both sides would then read the
+    rewritten value and agree. `telemetry.py`'s trust-boundary note on
+    `cost.json` (a run's own directory is writable by the run it measures)
+    accepts the same posture here, for the same reason: no run has been
+    observed forging this field.
+
+    Voided entries (`voided_at` set) are dropped before anything else. A run
+    outside cost_join's `--days` window that the ledger still holds (ledger
+    history is not time-windowed) is reported under `ledger_only`, not as a
+    mismatch — and a run-record run with no ledger entry at all (every run
+    posted before this change, or to a product with no live ledger) is
+    reported under `run_only`, equally not a mismatch: `ok` is driven only by
+    `mismatches`.
+
+    Returns:
+      epic_id              echoed back, for a caller merging several of these
+      run_total_by_lane     `priced_usd` summed by `billing_source`, over the
+                           run_ids present on BOTH sides only
+      ledger_total_by_lane  the ledger's `usd` summed by its own `lane`, over
+                           the SAME run_ids — a different vocabulary (see the
+                           module note above), never merged with the former
+      both_run_ids          the run_ids the two totals above are computed over
+      run_only              {count, usd, run_ids}: in the run records, absent
+                           from this epic's ledger entries
+      ledger_only           {count, usd, run_ids}: in this epic's ledger
+                           entries, absent from the run records
+      mismatches            a list of {run_id, kind: "amount", run_usd,
+                           ledger_usd} for a run_id on both sides whose
+                           figures disagree, and {run_id, kind: "epic",
+                           cost_join_epic_id, ledger_epic_id} for a
+                           `ledger_only` run_id `run_epic_map` attributes to
+                           a DIFFERENT one of this Course's epics
+      ok                    `not mismatches` — never set from `run_only`,
+                           `ledger_only` or an unreachable Library; a caller
+                           that could not even fetch `ledger_entries` reports
+                           its own "unavailable" rather than calling this
+    """
+    live = [e for e in ledger_entries if not e.get("voided_at")]
+    ledger_by_run = {e["run_id"]: e for e in live if e.get("run_id")}
+
+    run_ids = set(run_costs)
+    ledger_ids = set(ledger_by_run)
+    both = sorted(run_ids & ledger_ids)
+    run_only_ids = sorted(run_ids - ledger_ids)
+    ledger_only_ids = sorted(ledger_ids - run_ids)
+
+    run_total_by_lane: dict[str, float] = {}
+    for rid in both:
+        lane = run_costs[rid]["billing_source"] or "unknown"
+        run_total_by_lane[lane] = round(
+            (run_total_by_lane.get(lane) or 0.0) + run_costs[rid]["priced_usd"], 6)
+
+    ledger_total_by_lane: dict[str, float] = {}
+    for rid in both:
+        lane = ledger_by_run[rid].get("lane") or "unknown"
+        ledger_total_by_lane[lane] = round(
+            (ledger_total_by_lane.get(lane) or 0.0)
+            + float(ledger_by_run[rid].get("usd") or 0.0), 6)
+
+    mismatches = []
+    for rid in both:
+        run_usd = round(float(run_costs[rid]["priced_usd"]), 6)
+        ledger_usd = round(float(ledger_by_run[rid].get("usd") or 0.0), 6)
+        if run_usd != ledger_usd:
+            mismatches.append({"run_id": rid, "kind": "amount",
+                               "run_usd": run_usd, "ledger_usd": ledger_usd})
+
+    for rid in ledger_only_ids:
+        actual_epic = run_epic_map.get(rid)
+        if actual_epic and actual_epic != epic_id:
+            mismatches.append({"run_id": rid, "kind": "epic",
+                               "cost_join_epic_id": actual_epic, "ledger_epic_id": epic_id})
+
+    run_only_usd = round(sum(run_costs[rid]["priced_usd"] for rid in run_only_ids), 6)
+    ledger_only_usd = round(
+        sum(float(ledger_by_run[rid].get("usd") or 0.0) for rid in ledger_only_ids), 6)
+
+    return {
+        "epic_id": epic_id,
+        "run_total_by_lane": run_total_by_lane,
+        "ledger_total_by_lane": ledger_total_by_lane,
+        "both_run_ids": both,
+        "run_only": {"count": len(run_only_ids), "usd": run_only_usd, "run_ids": run_only_ids},
+        "ledger_only": {"count": len(ledger_only_ids), "usd": ledger_only_usd,
+                       "run_ids": ledger_only_ids},
+        "mismatches": mismatches,
+        "ok": not mismatches,
+    }
+
+
 def _median(values: list[float]) -> float | None:
     if not values:
         return None
@@ -1341,46 +1557,104 @@ def _median(values: list[float]) -> float | None:
     return round((values[mid - 1] + values[mid]) / 2, 6)
 
 
-def build_persona_table(start: datetime, end: datetime, items: list[dict]) -> dict:
-    """Cost by persona (the dispatched agent) x model x work-item type — the
-    comparison E16's spec calls for: "a persona's cost is comparable across
-    models on the same class of work."
+# Resolved-but-abandoned states, apart from fixed: a FINISHED item (any
+# `_FINISHED_STATES` member) that did not land as working code. Mirrors the
+# Library's own split of its terminal states; fixed is the only one whose
+# cost is a success to compare across models.
+ABANDONED_STATES = frozenset(_FINISHED_STATES - {"fixed"})
+
+
+def build_outcome_table(start: datetime, end: datetime, items: list[dict],
+                        queue_ids: set[str] | None) -> dict:
+    """Cost per outcome: agent x model x work-item class — the comparison
+    E16's spec calls for: "a persona's cost is comparable across models on
+    the same class of work," with class now the item's PLACE (planned work
+    under an epic, or a correction from a corrections queue — `_epic_for_item`'s
+    own rule) rather than the item's `type` field. `type` is not a classifier:
+    the operator ruled on 2026-09-24 that work items are not typed, and
+    `issue_create` now refuses bug/improvement/task, so `type` empties out as
+    new items arrive.
 
     Reuses build_item_costs' own attribution (meta.issue first, then the run's
-    PR), so a run lands here exactly where the per-item report placed it; a run
-    that report left unattributed never enters this table either.
+    PR), so a run lands in a row exactly where the per-item report placed it; a
+    run that report left unattributed never enters a row, and neither does a
+    run whose item this function's own classification excludes below — both
+    are counted in `coverage` as unexplained, which is why coverage exists: a
+    row-only view cannot say what share of spend it explains.
 
-    Grouped at (agent, model, item type). Lanes are never summed within a
-    group: each carries `runs`, `usd`, `unpriced_models`, `cost_missing_runs`,
-    `finished_items` and `median_finished_item_usd`. A FINISHED item is one
-    whose work-item state is terminal (fixed, wontfix, duplicate, redirected).
-    The median is taken over THAT ITEM'S OWN total in this lane — summed
-    across all of its runs, not only this group's — so it answers "what did a
-    finished item like this end up costing", not "what did this group's slice
-    of it cost"; an item with no priced cost in the lane is left out of the
-    median rather than counted as $0, the same floor every total in this
-    module keeps.
+    `queue_ids` is passed straight to `_epic_for_item`, same meaning as
+    `build_course_costs`: the Library's corrections-queue ids, or `None` when
+    that lookup failed. When it is `None`, a non-epic item with a parent could
+    name either a queue or an epic, and telling those apart wrongly would
+    misclassify it, so such an item is left out of `rows` entirely (its runs
+    count as unexplained in `coverage`, since `rows` cannot explain them
+    either) rather than guessed into a class.
 
-    Returns {"window", "rows": [{"agent", "model", "item_type", "runs",
-    "lanes": {billing_source: {...}}}]}. A row exists only for a combination
-    some run actually produced — there is no zero-filled cross product."""
+    Grouped at (agent, model, class). Lanes are never summed within a group:
+    each carries `runs`, `usd`, `unpriced_models`, `cost_missing_runs`,
+    `fixed_items`, `median_fixed_item_usd`, `abandoned_items` and
+    `abandoned_usd`. FIXED is state "fixed"; ABANDONED is wontfix, duplicate or
+    redirected (`ABANDONED_STATES`) — apart from fixed, and the two are never
+    summed together. Both are taken over THAT ITEM'S OWN total in this lane —
+    summed across all of its runs, not only this group's — so they answer
+    "what did an item like this end up costing", not "what did this group's
+    slice of it cost"; an item with no priced cost in the lane is left out
+    rather than counted as $0, the same floor every total in this module
+    keeps. `abandoned_usd` is `0.0` when there are no abandoned items in the
+    lane (a true, measured zero), and `None` when there are abandoned items
+    but none of them priced in this lane (unmeasured, never a false $0).
+
+    `coverage` says, per agent and per model, how many runs in the window
+    landed in a row above and how many did not — the share of spend `rows`
+    can explain. It keys on the same join `rows` itself is built from (an
+    item's `meta.issue`, OR the run's own PR when meta carries none), not on
+    the raw `meta.issue` field alone, so a run `rows` explains through a PR
+    link is never also counted as unexplained. A run whose item this
+    function's own class/queue ambiguity check (above) left out of `rows` is
+    counted as unexplained too, for the same reason: `rows` cannot explain
+    its spend either way. It counts every run build_item_costs itself
+    counted (`run_count`), including one its own attribution left unjoined.
+
+    `cannot_be_measured` is set with a `reason` when there is no attributable
+    data — no run started in the window, every run that did start is
+    unattributed, or (when `queue_ids` is `None`) every attributed run landed
+    on an item the ambiguity check above left out of `rows` — distinct from a
+    `rows` entry whose lane totals a measured $0.
+
+    Returns {"window", "rows": [{"agent", "model", "class", "runs",
+    "lanes": {billing_source: {...}}}], "coverage": {"by_agent": {...},
+    "by_model": {...}}, "cannot_be_measured", "reason"}. A row exists only for
+    a combination some run actually produced — there is no zero-filled cross
+    product."""
     item_costs = build_item_costs(start, end, items)
     nodes = index_nodes(start, end)
     item_lane_totals = {row["id"]: row["by_billing_source"] for row in item_costs["items"]}
     by_item_id = {it["id"]: it for it in items}
+    resolved_queue_ids = queue_ids if queue_ids is not None else set()
 
     buckets: dict[tuple[str, str, str], dict] = {}
+    covered_run_ids: set[str] = set()
+    queue_ambiguous = False
     for row in item_costs["items"]:
-        item = by_item_id.get(row["id"]) or {}
-        item_type = item.get("type") or "?"
-        finished = item.get("state") in _FINISHED_STATES
+        item = by_item_id.get(row["id"])
+        if item is None or not row["run_count"]:
+            continue
+        if (queue_ids is None and item.get("type") != "epic"
+                and item.get("parent_id")):
+            queue_ambiguous = True
+            continue  # queue vs. epic parent can't be told apart; leave it out
+        item_class = _epic_for_item(item, resolved_queue_ids)
+        if item_class != CORRECTIONS:
+            item_class = "epic"
+        state = item.get("state")
         for rid in row["run_ids"]:
             node = nodes.get(rid)
             if node is None:
                 continue
+            covered_run_ids.add(rid)
             bucket = buckets.setdefault(
-                (node["agent"], node["model"], item_type),
-                {"runs": 0, "lanes": {}, "finished_item_ids": {}})
+                (node["agent"], node["model"], item_class),
+                {"runs": 0, "lanes": {}, "fixed_item_ids": {}, "abandoned_item_ids": {}})
             bucket["runs"] += 1
             lane = node["billing_source"]
             lb = bucket["lanes"].setdefault(lane, {
@@ -1389,24 +1663,72 @@ def build_persona_table(start: datetime, end: datetime, items: list[dict]) -> di
             lb["usd"] = _plus(lb["usd"], node["usd"])
             lb["cost_missing_runs"] += int(node["cost_missing"])
             lb["unpriced_models"].update(node["unpriced_models"])
-            if finished:
-                bucket["finished_item_ids"].setdefault(lane, set()).add(row["id"])
+            if state == "fixed":
+                bucket["fixed_item_ids"].setdefault(lane, set()).add(row["id"])
+            elif state in ABANDONED_STATES:
+                bucket["abandoned_item_ids"].setdefault(lane, set()).add(row["id"])
 
     rows = []
-    for (agent, model, item_type), bucket in sorted(buckets.items()):
+    for (agent, model, item_class), bucket in sorted(buckets.items()):
         lanes = {}
         for lane, lb in sorted(bucket["lanes"].items()):
-            finished_ids = bucket["finished_item_ids"].get(lane, set())
-            finished_totals = sorted(
-                usd for iid in finished_ids
+            fixed_ids = bucket["fixed_item_ids"].get(lane, set())
+            fixed_totals = sorted(
+                usd for iid in fixed_ids
                 if (usd := item_lane_totals.get(iid, {}).get(lane, {}).get("usd")) is not None)
+            abandoned_ids = bucket["abandoned_item_ids"].get(lane, set())
+            abandoned_totals = [
+                usd for iid in abandoned_ids
+                if (usd := item_lane_totals.get(iid, {}).get(lane, {}).get("usd")) is not None]
+            if not abandoned_ids:
+                abandoned_usd = 0.0
+            elif abandoned_totals:
+                abandoned_usd = round(sum(abandoned_totals), 6)
+            else:
+                abandoned_usd = None
             lanes[lane] = {
                 "runs": lb["runs"], "usd": lb["usd"],
                 "unpriced_models": sorted(lb["unpriced_models"]),
                 "cost_missing_runs": lb["cost_missing_runs"],
-                "finished_items": len(finished_ids),
-                "median_finished_item_usd": _median(finished_totals),
+                "fixed_items": len(fixed_ids),
+                "median_fixed_item_usd": _median(fixed_totals),
+                "abandoned_items": len(abandoned_ids),
+                "abandoned_usd": abandoned_usd,
             }
-        rows.append({"agent": agent, "model": model, "item_type": item_type,
+        rows.append({"agent": agent, "model": model, "class": item_class,
                     "runs": bucket["runs"], "lanes": lanes})
-    return {"window": item_costs["window"], "rows": rows}
+
+    coverage_by_agent: dict[str, dict] = {}
+    coverage_by_model: dict[str, dict] = {}
+    in_window_nodes = [n for n in nodes.values() if _in_window(n, start, end)]
+    for n in in_window_nodes:
+        in_a_row = n["run_id"] in covered_run_ids
+        for cov, key in ((coverage_by_agent, n["agent"]), (coverage_by_model, n["model"])):
+            c = cov.setdefault(key, {"runs_with_work_item": 0, "runs_without_work_item": 0})
+            if in_a_row:
+                c["runs_with_work_item"] += 1
+            else:
+                c["runs_without_work_item"] += 1
+
+    cannot_be_measured = not rows
+    reason = None
+    if cannot_be_measured:
+        if item_costs["run_count"] == 0:
+            reason = "no run started in this window"
+        elif queue_ids is None and queue_ambiguous:
+            reason = ("the corrections-queue lookup failed, so a parent that "
+                      "names a queue cannot be told apart from one that names "
+                      "an epic")
+        else:
+            reason = "no run in this window was attributed to a work item"
+
+    return {
+        "window": item_costs["window"],
+        "rows": rows,
+        "coverage": {
+            "by_agent": dict(sorted(coverage_by_agent.items())),
+            "by_model": dict(sorted(coverage_by_model.items())),
+        },
+        "cannot_be_measured": cannot_be_measured,
+        "reason": reason,
+    }

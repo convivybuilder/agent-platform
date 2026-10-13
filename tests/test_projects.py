@@ -46,6 +46,25 @@ def test_schema_wellformed():
         if "agent_prefix" in u:
             assert isinstance(u["agent_prefix"], str) and u["agent_prefix"], (
                 f"{slug} agent_prefix must be a non-empty string when present")
+        if "created_by" in u:
+            assert projects.valid_person_id(u["created_by"]), (
+                f"{slug} created_by {u['created_by']!r} is not a Library person id "
+                f"(person_<ULID>)")
+
+
+def test_created_by_backfill_did_not_touch_meta_products_or_scopes():
+    """The hazard comment 2963 names: a backfill that iterates the file's
+    top-level keys would write a creator onto `_meta`, `_products` or
+    `_scopes`, corrupting the schema metadata rather than failing visibly.
+    None of the three carries a `created_by` key."""
+    raw = json.loads(Path(projects.PROJECTS_JSON).read_text())
+    assert "created_by" not in raw["_meta"]
+    for slug, product in raw["_products"].items():
+        assert "created_by" not in product, f"_products.{slug} must not carry created_by"
+    for slug, scope in raw["_scopes"].items():
+        if slug.startswith("_"):
+            continue
+        assert "created_by" not in scope, f"_scopes.{slug} must not carry created_by"
 
 
 def test_crew_cockpit_dirs_matches_the_field(crafted_registry):
@@ -895,3 +914,68 @@ def test_project_for_repo_lowercases_the_registry_side_too(monkeypatch):
                         lambda: {"demo": {"repos": ["Demo-Repo"], "aliases": ["DemoAlias"]}})
     assert projects.project_for_repo("demo-repo") == "demo"
     assert projects.project_for_repo("demoalias") == "demo"
+
+
+# --- created_by: who made a project, for the per-person visibility default --
+# (issue_01M2QWFR8PCBPANF8Q5P460GHY) ------------------------------------------
+
+_PERSON_A = "person_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+_PERSON_B = "person_01BX5ZZKBKACTAV9WEVGEMMVRZ"
+
+
+@pytest.mark.parametrize("value,ok", [
+    (_PERSON_A, True),
+    (_PERSON_B, True),
+    ("Jane Doe", False),            # a display name, never recorded here
+    ("convivy", False),             # an organisation, what `owner` holds
+    ("", False),
+    ("person_short", False),        # not a 26-character ULID
+    ("person_01arz3ndektsv4rrffq69g5fav", False),  # lowercase: not Crockford
+    (None, False),
+])
+def test_valid_person_id(value, ok):
+    assert projects.valid_person_id(value) is ok
+
+
+def test_creator_of_a_recorded_project(monkeypatch):
+    monkeypatch.setattr(projects, "load", lambda: {"demo": {"created_by": _PERSON_A}})
+    assert projects.creator_of("demo") == _PERSON_A
+
+
+def test_creator_of_a_registered_project_with_no_created_by(monkeypatch):
+    """Unrecorded because the project predates the field — every project
+    registered before the 2026-09-18 backfill ruling is exactly this case."""
+    monkeypatch.setattr(projects, "load", lambda: {"demo": {"display": "Demo"}})
+    assert projects.creator_of("demo") is None
+
+
+def test_creator_of_an_unknown_slug(monkeypatch):
+    monkeypatch.setattr(projects, "load", lambda: {})
+    assert projects.creator_of("no-such-project") is None
+
+
+def test_slugs_created_by_finds_every_match_sorted(monkeypatch):
+    units = {
+        "zeta": {"created_by": _PERSON_A},
+        "alpha": {"created_by": _PERSON_A},
+        "other": {"created_by": _PERSON_B},
+        "unrecorded": {"display": "Unrecorded"},
+    }
+    monkeypatch.setattr(projects, "load", lambda: units)
+    assert projects.slugs_created_by(_PERSON_A) == ["alpha", "zeta"]
+    assert projects.slugs_created_by(_PERSON_B) == ["other"]
+
+
+def test_slugs_created_by_is_empty_for_a_person_nobody_created_anything_for(monkeypatch):
+    monkeypatch.setattr(projects, "load", lambda: {"demo": {"created_by": _PERSON_A}})
+    assert projects.slugs_created_by(_PERSON_B) == []
+
+
+def test_every_recorded_created_by_in_the_real_registry_is_well_formed():
+    """The live registry's own `created_by` values, read through the accessor
+    rather than the raw dict — the check this field's writer and the
+    Library's reader both need to hold."""
+    for slug in projects.load():
+        creator = projects.creator_of(slug)
+        if creator is not None:
+            assert projects.valid_person_id(creator), f"{slug}: {creator!r}"

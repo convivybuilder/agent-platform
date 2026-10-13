@@ -164,6 +164,21 @@ LIFECYCLES = ("active", "sunset", "archived")
 PRODUCTS_KEY = "_products"
 SCOPES_KEY = "_scopes"
 
+# A Library person id: `person_` and a 26-character ULID (Crockford base32,
+# uppercase) — the same shape bin/agentctl's `_ISSUE_ID_RE` validates for issue
+# ids, since both are minted by the Library's `store.new_ulid`.
+PERSON_ID_RE = re.compile(r"^person_[0-9A-HJKMNP-TV-Z]{26}$")
+
+
+def valid_person_id(value: Any) -> bool:
+    """Whether `value` has the shape of a Library person id (`person_<ULID>`).
+
+    A project's `created_by` field is checked against this both at write time
+    (`crew_registration.build_row`) and at read time
+    (`tests/test_projects.py::test_schema_wellformed`), so the two cannot
+    silently accept different shapes."""
+    return isinstance(value, str) and bool(PERSON_ID_RE.fullmatch(value))
+
 
 @lru_cache(maxsize=None)
 def _load_raw() -> dict[str, Any]:
@@ -989,6 +1004,29 @@ def crew_for(slug: str) -> str | None:
     several crews, and splitting it into three resolved that."""
     u = get(slug)
     return u.get("crew") if u else None
+
+
+def creator_of(slug: str) -> str | None:
+    """The Library person id (`person_<ULID>`) that created project `slug`, or
+    None when unrecorded.
+
+    Unrecorded covers two cases the Library's per-person project-visibility
+    default (issue_01M2QWFR8PCBPANF8Q5P460GHY) treats alike: `slug` is not
+    registered at all, and `slug` is registered but carries no `created_by` —
+    every project predating the field (backfilled 2026-09-18 to the operator's
+    own person id, the ruling in that issue's comment 3014), or one `agentctl crew
+    register` wrote before the operator config carried a `person_id`. A real
+    id, once recorded, is never confused with either: this returns the string
+    the registry holds, not a sentinel a caller could mistake for a name."""
+    u = get(slug)
+    return u.get("created_by") if u else None
+
+
+def slugs_created_by(person_id: str) -> list[str]:
+    """Project slugs whose `created_by` names `person_id`, sorted — the other
+    direction of `creator_of`, for a visibility default computed per person
+    rather than per project."""
+    return sorted(s for s, u in load().items() if u.get("created_by") == person_id)
 
 
 def projects_by_crew(crew: str | None) -> list[str]:

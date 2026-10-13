@@ -78,6 +78,7 @@ KNOWN_UNRESOLVABLE = {
     "com.convivy.ip-forwarding.plist": "/usr/sbin/sysctl, a system binary",
     "com.convivy.sshd-watchdog.plist": "/usr/local/sbin/sshd-watchdog, not in this repo",
     "com.convivy.agent-postgres.plist": "/opt/homebrew/opt/postgresql@15/bin/postgres, a system binary — see bin/agent-postgres-provision",
+    "com.convivy.individuator.plist": "/usr/local/libexec/individuator/individuator-daemon, a compiled Swift binary with no source under bin/ — see individuator/Sources/individuator-daemon; it never calls agentctl spawn",
 }
 
 KNOWN_UNFIXED = {
@@ -360,9 +361,11 @@ def test_every_agent_dispatching_job_sets_agent_run_origin():
         "neither the program nor the plist's EnvironmentVariables sets "
         "AGENT_RUN_ORIGIN, so every run they spawn is stamped `interactive` and "
         "the budget gate's CAPPED_ORIGINS never sees it — this is exactly how "
-        "com.convivy.issue-queue-drain went uncapped. Fix: add "
-        '`os.environ.setdefault("AGENT_RUN_ORIGIN", "scheduled")` near the top of '
-        f"the program, the way bin/issue-queue-drain now does: {offenders}"
+        "com.convivy.issue-queue-drain went uncapped (that script is since "
+        "deleted). Fix: add "
+        '`os.environ.setdefault("AGENT_RUN_ORIGIN", "scheduled")` near the top '
+        f"of the Python program, or `export AGENT_RUN_ORIGIN=scheduled` near "
+        f"the top of a shell one: {offenders}"
     )
 
 
@@ -394,14 +397,13 @@ def test_the_known_unfixed_allowlist_holds_no_stale_entry():
 #
 # WHAT WENT WITH IT, stated plainly rather than glossed: both the sweep and the
 # child-process runtime check build their targets by walking `_plists()`, so with
-# this plist gone NEITHER touches `bin/issue-queue-drain` any more. The only test
-# still reading that file is the dispatcher-classification one below, which does
-# not check that it sets AGENT_RUN_ORIGIN — the very thing the 2026-09-03 uncapped
-# firing in this file's docstring was about. An earlier version of this comment
-# claimed the env-handling tests still exercised it; they do not (reviewer,
-# PR #520). The script has no caller left in the tree either, so nothing runs it
-# today — but if it is ever wired to a trigger again, that coverage has to come
-# back with it.
+# this plist gone NEITHER ever touched `bin/issue-queue-drain` again. An earlier
+# version of this comment claimed the env-handling tests still exercised it; they
+# did not (reviewer, PR #520), and the script had no caller left in the tree
+# either. It was deleted outright on 2026-10-09 (work item
+# issue_01M4J3CQS16N6GX513M56ZSWPH) rather than left unwired, so
+# `test_prose_about_agentctl_spawn_is_not_a_dispatch`'s positive control below
+# was re-pointed at `bin/changelog-drain`, which now carries that role instead.
 def test_an_unresolvable_plist_must_be_NAMED_not_silently_skipped():
     """The hole this closes: `_resolve_program` returning None was treated
     everywhere as "nothing to check", so a plist the resolver could not classify
@@ -455,11 +457,14 @@ def test_prose_about_agentctl_spawn_is_not_a_dispatch():
     """bin/run-register-api discusses `agentctl spawn <cfo-agent>` in its module
     docstring and calls nothing. Stripping only `#` lines counted it as a
     dispatcher, which the widened resolver surfaced. Pins the fix, and pins the
-    other half too — bin/issue-queue-drain's real dispatch passes the subcommand
-    as the string literal "spawn", so a fix that stripped every string would
-    have hidden the one program this whole change is about."""
+    other half too — bin/changelog-drain's real dispatch (`cmd = [str(AGENTCTL),
+    "spawn", ...]`) passes the subcommand as the string literal "spawn", so a
+    fix that stripped every string would have hidden a program that really
+    dispatches. bin/issue-queue-drain carried this role until it was deleted
+    2026-10-09 (work item issue_01M4J3CQS16N6GX513M56ZSWPH); changelog-drain
+    took it over since its own dispatch is the same shape."""
     prose = BIN / "run-register-api"
-    real = BIN / "issue-queue-drain"
+    real = BIN / "changelog-drain"
     if not prose.exists() or not real.exists():
         pytest.skip("expected bin/ programs are absent")
     assert _dispatches_agents(prose) is False, "a docstring mention is not a call"

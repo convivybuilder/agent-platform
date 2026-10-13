@@ -851,10 +851,12 @@ def test_an_unparseable_next_link_makes_eligible_issues_fail_closed(monkeypatch,
     `eligible_issues` -> `branches_referencing_issues` -> `_github_api_get`
     path rather than a mocked `branches_referencing_issues` — confirming the
     new `BranchScanError` actually reaches `eligible_issues`'s own `except`
-    and holds back every issue, instead of escaping past it and aborting
-    `issue-queue-drain`'s whole per-product loop (bin/issue-queue-drain's
-    `_claimable`/`main` wrap no call in this module in any `try`/`except`
-    of their own)."""
+    and holds back every issue, instead of escaping past it and aborting the
+    caller's whole per-product loop the way it would have for
+    `bin/issue-queue-drain`'s `_claimable`/`main`, which wrapped no call in
+    this module in any `try`/`except` of their own (that script is since
+    deleted; `eligible_issues` has to stay defensive on its own regardless of
+    what today's caller, `bin/issue-eligible`, does around it)."""
     _stub_scan(monkeypatch, tmp_path, registry={"vivy": {"repos": ["vivy"]}},
               branches_error=(b"[]", '<https://[bad/x>; rel="next"'))
     eligible, skipped = issue_gate.eligible_issues("vivy", items=[_issue(), _issue("issue_02B")])
@@ -908,9 +910,8 @@ def test_an_incomplete_read_raises_branch_scan_error(monkeypatch):
     """`http.client.IncompleteRead` (a response truncated mid-body) comes
     from `resp.read()`, after `opener.open()` already returned a response
     object — also not an `OSError` subclass. A truncated response during the
-    nightly scan must not escape as an unhandled exception and abort
-    `issue-queue-drain`'s whole per-product loop (round-9 review, PR comment
-    on #736)."""
+    branch scan must not escape as an unhandled exception and abort a
+    caller's whole per-product loop (round-9 review, PR comment on #736)."""
     url = _branches_url("convivy/vivy")
     response = _FakeResponseThatFailsToRead(http.client.IncompleteRead(b"", 10))
     opener = _FakeOpener({url: response})

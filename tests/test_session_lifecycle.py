@@ -1440,10 +1440,17 @@ def test_the_kill_waits_for_the_agent_to_leave(SL, tmux, monkeypatch):
 
 def test_an_agent_that_will_not_leave_does_not_block_the_kill(SL, tmux, monkeypatch):
     """The user asked for the session gone. A wedged agent must not be able to
-    hold it open forever — the wait is bounded and the outcome is reported."""
+    hold it open forever — the wait is bounded and the outcome is reported.
+
+    The clock is driven rather than slept through: `_await_agent_exit`'s deadline
+    is `time.monotonic()`-based, so stubbing only `time.sleep` to a no-op (as this
+    test did before) left the loop busy-spinning on the real clock for the full
+    real `EXIT_WAIT_SECONDS` (8s) instead of actually resting."""
     monkeypatch.setattr(SL.SI, "send_message", lambda n, t: None)
     monkeypatch.setattr(SL.TT, "claude_pane", lambda name: ("%1", 4242))
     monkeypatch.setattr(SL.time, "sleep", lambda _s: None)
+    ticks = iter([0.0, 0.0] + [SL.EXIT_WAIT_SECONDS + 1.0] * 50)
+    monkeypatch.setattr(SL.time, "monotonic", lambda: next(ticks))
     tmux.existing.add("nyh")
 
     result = SL.stop("nyh", kill=True)

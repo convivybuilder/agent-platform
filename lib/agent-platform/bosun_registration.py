@@ -30,6 +30,16 @@ machine revoked in the Library keeps its live sessions until an operator runs
 `agentctl bosun revoke-machine <name>` or the machine's certificate is
 renewed. 0092 names this cost explicitly and accepts it.
 
+THE BOSUN REGISTERS A SESSION ONLY FOR A MACHINE WHOSE KEY CUSTODY IS
+EXACTLY "HARDWARE" (`REQUIRED_CUSTODY`, operator decision D2, 2026-10-12).
+This amends 0092 decision #4, which accepted a file-held key in stage one —
+a certificate plan now in progress will issue file-held clientAuth keys to
+agent-platform's own tools, and a key readable from inside a dispatched run
+must never be sufficient to register a session in the Individuator's place.
+`handle_registration` checks this after the registry lookup already finds
+the machine active and matching, and before `register_session` ever mints a
+token, refusing with `machine_custody_not_hardware` otherwise.
+
 THE PER-CALL AUTHORIZATION ENDPOINT (E12·3's endpoint half; E12·8's per-call
 half) lives on this same mTLS listener, at `POST /authorize` — never a second
 listener, because the binding this module already enforces for registration
@@ -314,13 +324,28 @@ def check_client_certificate(der: bytes) -> CertCheck:
 
 _LIBRARY_STATUSES = frozenset({"active", "revoked", "expired", "unknown"})
 
+# The custody the Bosun requires before it will register a session (operator
+# decision D2, 2026-10-12, amending 0092 decision #4 — 0092 itself accepted a
+# file-held key in stage one). A certificate plan now in progress will issue
+# file-held clientAuth keys to agent-platform's own tools, and a key readable
+# from inside a dispatched run must never be sufficient to register a
+# session in the Individuator's place. Compared for exact string equality
+# against the Library row's `custody` field in `handle_registration` — any
+# value other than this one, including a missing key, `None`, `""` and a
+# differently-cased spelling, refuses.
+REQUIRED_CUSTODY = "hardware"
+
 
 @dataclass(frozen=True)
 class LookupResult:
+    """`custody` is the Library row's own claim, forwarded for the caller to
+    decide on (`handle_registration`) — this dataclass does not itself judge
+    it, the same way `status` does not."""
     ok: bool
     reason: str | None = None
     status: str | None = None
     machine: str | None = None
+    custody: str | None = None
 
 
 def read_lookup_token(path: Path | None = None) -> str | None:
@@ -345,8 +370,11 @@ def library_machine_verify(fingerprint_sha256: str, expected_machine: str, *,
 
     Accepts only HTTP 200 with `active` exactly the JSON boolean `true` and
     `machine` equal to `expected_machine`. Every other shape refuses with one
-    of 0092's named reasons; `not_after` and `custody` are never read here —
-    they are recorded by the caller and never decide (0092 Handoff).
+    of 0092's named reasons; `not_after` is never read here — it is recorded
+    by the caller and never decides (0092 Handoff). `custody` IS read here,
+    on the active branch, and attached to the returned `LookupResult` — but
+    this function does not itself decide on it; `handle_registration` does
+    (operator decision D2, 2026-10-12, amending 0092 decision #4).
     """
     base_url = LIBRARY_LOOKUP_BASE_URL if base_url is None else base_url
     timeout = LIBRARY_LOOKUP_TIMEOUT_S if timeout is None else timeout
@@ -390,7 +418,9 @@ def library_machine_verify(fingerprint_sha256: str, expected_machine: str, *,
     if machine != expected_machine:
         return LookupResult(False, "machine_mismatch",
                             machine=machine if isinstance(machine, str) else None)
-    return LookupResult(True, status="active", machine=machine)
+    custody = body.get("custody")
+    return LookupResult(True, status="active", machine=machine,
+                        custody=custody if isinstance(custody, str) else None)
 
 
 # --- session store (SQLite; 0092 decision #2) -----------------------------
@@ -412,6 +442,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     availability_lever  TEXT NOT NULL
         CHECK (availability_lever IN ('strict', 'cached_grants', 'degraded_offline')),
     protocol_version    TEXT NOT NULL,
+    -- The custody the machine's key was held under when this session was
+    -- granted (D2, 2026-10-12; REQUIRED_CUSTODY above). NULL on a row
+    -- migrated in from before this column existed (`_migrate_sessions_
+    -- custody` below) — nothing here backfills a guess for those.
+    custody             TEXT,
     registered_at       TEXT NOT NULL,
     revoked_at          TEXT
 );
@@ -433,6 +468,45 @@ CREATE INDEX IF NOT EXISTS idx_authz_audit_session ON authorization_audit(sessio
 
 _db_ensured = False
 
+# Mirrors kb_writes.py's own ALTER-TABLE-migration idiom (see that module's
+# `_migrate_journal_author_kind`) — the repo's existing precedent for adding
+# a column to a SQLite store that may already have rows on disk.
+_MIGRATION_BUSY_TIMEOUT_MS = 5_000
+
+
+def _sessions_missing_custody(conn: sqlite3.Connection) -> bool:
+    """Whether `sessions` exists and still lacks `custody`. A plain read —
+    no lock — so this can be called before deciding whether a migration is
+    needed at all, and again inside the write lock to guard against a
+    concurrent migrator finishing first."""
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "sessions" not in tables:
+        return False
+    columns = {r[1] for r in conn.execute("PRAGMA table_info(sessions)")}
+    return "custody" not in columns
+
+
+def _migrate_sessions_custody(conn: sqlite3.Connection) -> None:
+    """Add `custody` to a `sessions` table created before D2 (2026-10-12)
+    existed. `_SCHEMA`'s `CREATE TABLE IF NOT EXISTS` below only reaches a
+    brand-new database, so an existing sessions.db needs its own ALTER
+    TABLE, run first so the schema step that follows is a no-op. Existing
+    rows get NULL — nothing here guesses the custody a session already live
+    was granted under.
+    """
+    conn.execute(f"PRAGMA busy_timeout={_MIGRATION_BUSY_TIMEOUT_MS}")
+    if not _sessions_missing_custody(conn):
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if _sessions_missing_custody(conn):
+            conn.execute("ALTER TABLE sessions ADD COLUMN custody TEXT")
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.execute("ROLLBACK")
+        raise
+
 
 def ensure_db() -> None:
     """Create the schema if it is not already there. Idempotent
@@ -441,6 +515,7 @@ def ensure_db() -> None:
     SESSIONS_DB.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(SESSIONS_DB))
     try:
+        _migrate_sessions_custody(conn)
         conn.executescript(_SCHEMA)
         conn.commit()
     finally:
@@ -478,7 +553,8 @@ def _token_sha256(token: str) -> str:
 
 
 def register_session(*, machine: str, fingerprint_sha256: str, account: str,
-                      caller_kind: str, ceiling: str, protocol_version: str) -> dict:
+                      caller_kind: str, ceiling: str, protocol_version: str,
+                      custody: str | None = None) -> dict:
     """Insert a new session row and mint its token.
 
     Only `token_sha256` is stored — never the plaintext — the same choice
@@ -486,6 +562,12 @@ def register_session(*, machine: str, fingerprint_sha256: str, account: str,
     (`deck_signature`, `kb_writes`'s lease holder tokens are the exception
     that proves the rule: they are not secrets). The plaintext is returned
     once, here, and nowhere else.
+
+    `custody` records the custody the row was granted under (D2); it
+    defaults to `None` rather than `REQUIRED_CUSTODY` because this function
+    itself makes no custody decision — `handle_registration` passes its own
+    already-verified value, and a direct caller (a test, an operator path
+    that bypasses the registry lookup entirely) is free to leave it unset.
 
     Returns `{"session_id", "session_token"}`.
     """
@@ -498,9 +580,9 @@ def register_session(*, machine: str, fingerprint_sha256: str, account: str,
         conn.execute(
             "INSERT INTO sessions (id, token_sha256, machine, fingerprint_sha256, "
             "account, caller_kind, ceiling, availability_lever, protocol_version, "
-            "registered_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'strict', ?, ?, NULL)",
+            "custody, registered_at, revoked_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'strict', ?, ?, ?, NULL)",
             (session_id, _token_sha256(token), machine, fingerprint_sha256, account,
-             caller_kind, ceiling, protocol_version, _now_iso()))
+             caller_kind, ceiling, protocol_version, custody, _now_iso()))
         conn.commit()
     finally:
         conn.close()
@@ -610,11 +692,19 @@ class RegistrationOutcome:
 
 def handle_registration(peer_cert_der: bytes, body: object) -> RegistrationOutcome:
     """The full registration flow: the client-certificate checks (0092
-    decision #1), the registry lookup (0092 decision #4), and — only once
-    both pass — the session record and its token (0092 decision #2).
+    decision #1), the registry lookup (0092 decision #4), the custody
+    refusal (D2, 2026-10-12), and — only once all three pass — the session
+    record and its token (0092 decision #2).
 
     The machine comes from the handshake. A `machine` key in `body` is
     ignored and logged, never read as identity (0092 decision #2).
+
+    The custody refusal runs after the registry lookup already found the
+    machine active and matching, and before `register_session` ever mints a
+    token, so a machine whose key custody is not exactly `REQUIRED_CUSTODY`
+    never gets a session row — fail closed: `result.custody` is compared for
+    exact equality, so a missing key, `None`, `""`, a differently-cased
+    spelling or any other value all refuse the same as `"file"` does.
     """
     check = check_client_certificate(peer_cert_der)
     if check.reason:
@@ -656,9 +746,13 @@ def handle_registration(peer_cert_der: bytes, body: object) -> RegistrationOutco
         detail = {"status": result.status} if result.status else {}
         return RegistrationOutcome(False, result.reason, detail=detail)
 
+    if result.custody != REQUIRED_CUSTODY:
+        return RegistrationOutcome(False, "machine_custody_not_hardware")
+
     created = register_session(
         machine=machine, fingerprint_sha256=fingerprint, account=account,
-        caller_kind=caller_kind, ceiling=ceiling, protocol_version=protocol_version)
+        caller_kind=caller_kind, ceiling=ceiling, protocol_version=protocol_version,
+        custody=result.custody)
     return RegistrationOutcome(True, session_id=created["session_id"],
                                session_token=created["session_token"])
 
@@ -815,6 +909,7 @@ _REFUSAL_HTTP_STATUS = {
     "machine_unknown": 403,
     "machine_inactive": 403,
     "machine_mismatch": 403,
+    "machine_custody_not_hardware": 403,
 }
 
 # HTTP statuses for `/authorize`'s pre-`decide()` refusals. 401 for a missing
@@ -1077,6 +1172,35 @@ class RegistrationServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
             self.handle_error(tls_request, client_address)
         finally:
             self.shutdown_request(tls_request)
+
+    def shutdown_request(self, request):
+        """Overrides `socketserver.BaseServer.shutdown_request`'s default,
+        which calls only `request.shutdown(socket.SHUT_WR)` — a raw TCP
+        half-close. `ssl.SSLSocket` does not override `shutdown()` with TLS
+        semantics, so that call never sends a TLS close_notify (round 4
+        finding). A peer whose TLS stack treats a ragged EOF — a TCP close
+        with no close_notify — as a failure (NIOSSL does: it discards
+        whatever plaintext it already read, even a complete, well-formed
+        response, the same way `channelInactive`'s default case always
+        raises `uncleanShutdown` for one) would see every one of the
+        Bosun's own correctly-served responses this way, registration
+        included. `unwrap()` performs the TLS-level close_notify exchange
+        before the connection closes.
+
+        `unwrap()` reads and writes the raw file descriptor directly, like
+        `do_handshake()` (see that method's own note above) — it never goes
+        through this class's Python-level `recv_into`/`send`. It still runs
+        under whatever timeout `recv_into` or `send` last left set on the
+        raw socket (`settimeout`, from whichever of the request-read or
+        response-write deadlines above most recently ran), rather than a
+        fresh, unbounded wait: a peer that never completes its own side of
+        the close times this out instead of hanging the thread.
+        """
+        try:
+            request.unwrap()
+        except (ssl.SSLError, OSError):
+            pass
+        super().shutdown_request(request)
 
 
 class _OperatorHandler(http.server.BaseHTTPRequestHandler):

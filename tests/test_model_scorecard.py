@@ -142,6 +142,17 @@ def test_build_row_merged_pr(model_scorecard):
     assert row["date"] == "2026-06-02" and row["cost_usd"] == 0.01
     assert row["survived"] is None  # Phase 2 fills this
     assert row["join_source"] == "linked"  # default — the only join path now
+    assert row["item_id"] is None  # _run() carries no meta.issue
+
+
+def test_build_row_carries_the_dispatched_work_item(model_scorecard):
+    """meta.issue (E16·5) rides the row through to report_to_ledger, so the
+    ledger can derive the entry's epic_id from the same item cost_join joins
+    the run to."""
+    run = _run()
+    run["meta"]["issue"] = "issue_01M35KJZVTYG4J1R3P88P839YY"
+    row = model_scorecard.build_row(run, None, ci_first_pass=None)
+    assert row["item_id"] == "issue_01M35KJZVTYG4J1R3P88P839YY"
 
 
 def test_build_row_respawn_flag(model_scorecard):
@@ -643,19 +654,109 @@ _LEDGER_ROW = {
 }
 
 
+# --- ledger_lane (E1·6) --------------------------------------------------------
+
+
+def test_ledger_lane_gateway_for_a_gateway_model(model_scorecard):
+    assert model_scorecard.ledger_lane("openai/gpt-5") == "gateway"
+    assert model_scorecard.ledger_lane("deepseek/deepseek-v4-flash") == "gateway"
+
+
+def test_ledger_lane_subscription_for_an_anthropic_model(model_scorecard):
+    assert model_scorecard.ledger_lane("claude-sonnet-5") == "subscription"
+
+
+def test_ledger_lane_none_for_no_model(model_scorecard):
+    assert model_scorecard.ledger_lane(None) is None
+    assert model_scorecard.ledger_lane("") is None
+
+
+def test_ledger_lane_none_for_a_codex_model(model_scorecard):
+    """Codex runs bill at OpenAI's API rates (telemetry.CODEX_BILLING_SOURCE),
+    neither the gateway's metered lane nor the Anthropic subscription — against
+    an implementation that falls through to "subscription" for anything that
+    isn't a gateway model, this would read "subscription" instead of None."""
+    assert model_scorecard.ledger_lane("codex-auto-review") is None
+    assert model_scorecard.ledger_lane("gpt-5.5") is None
+
+
 def test_report_to_ledger_posts_the_documented_fields_and_dedup_key(model_scorecard, monkeypatch):
     captured = []
 
-    def fake_post(product, usd, *, run_id, dedup_key, agent=None, model=None, tok=None, timeout=5):
+    def fake_post(product, usd, *, run_id, dedup_key, lane, agent=None, model=None,
+                 tok=None, timeout=5):
         captured.append({"product": product, "usd": usd, "run_id": run_id,
-                         "dedup_key": dedup_key, "agent": agent, "model": model})
+                         "dedup_key": dedup_key, "lane": lane, "agent": agent, "model": model})
         return {"status": "recorded", "entry": {"id": "e1"}}
 
     monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
     report = model_scorecard.report_to_ledger([_LEDGER_ROW])
     assert report == {"recorded": 1, "not_recorded": 0, "errors": []}
+    # _LEDGER_ROW's model ("claude-sonnet-5") is neither a gateway nor a Codex
+    # model, so ledger_lane resolves it to "subscription" — against the unfixed
+    # code (no `lane` kwarg on post_ledger_entry at all), this fails with a
+    # TypeError before the assertion is ever reached.
     assert captured == [{"product": "vivy", "usd": 0.1234, "run_id": "run-abc",
-                         "dedup_key": "run-abc", "agent": "coder", "model": "claude-sonnet-5"}]
+                         "dedup_key": "run-abc", "lane": "subscription",
+                         "agent": "coder", "model": "claude-sonnet-5"}]
+
+
+def test_report_to_ledger_sends_the_gateway_lane_for_a_gateway_model(model_scorecard, monkeypatch):
+    captured = []
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane, **kw):
+        captured.append(lane)
+        return {"status": "recorded", "entry": {}}
+
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+    model_scorecard.report_to_ledger([dict(_LEDGER_ROW, model="openai/gpt-5")])
+    assert captured == ["gateway"]
+
+
+def test_report_to_ledger_skips_a_row_with_no_determinable_lane(model_scorecard, monkeypatch):
+    """A Codex model (is_codex_model) has no ledger lane — it is billed at
+    OpenAI's API rates, neither the gateway's metered lane nor the Anthropic
+    subscription — so the row is never posted. Against the unfixed code
+    (which always calls post_ledger_entry), `calls` below would be non-empty."""
+    calls = []
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry",
+                        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+    row = dict(_LEDGER_ROW, run_id="run-codex", model="codex-auto-review")
+    report = model_scorecard.report_to_ledger([row])
+    assert calls == []
+    assert report["recorded"] == 0
+    assert report["errors"] == [("run-codex", "skip:no-lane",
+                                 "no ledger lane for model 'codex-auto-review'")]
+
+
+def test_report_to_ledger_skips_a_row_with_no_model(model_scorecard, monkeypatch):
+    calls = []
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry",
+                        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+    row = dict(_LEDGER_ROW, run_id="run-no-model", model=None)
+    report = model_scorecard.report_to_ledger([row])
+    assert calls == []
+    assert report["errors"] == [("run-no-model", "skip:no-lane", "no ledger lane for model None")]
+
+
+def test_report_to_ledger_sends_item_id_only_when_the_row_carries_one(model_scorecard, monkeypatch):
+    """`post_ledger_entry`'s `item_id` is omitted entirely for a row with none
+    (the pre-E16·5 shape, and any run with no dispatched work item) rather
+    than sent as `None` — against the unfixed code (which always passed
+    `item_id=r.get("item_id")`), the first captured call below would be
+    `{"item_id": None}`, not `{}`."""
+    captured = []
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane=None, agent=None, model=None,
+                 tok=None, timeout=5, **kw):
+        captured.append(kw)
+        return {"status": "recorded", "entry": {}}
+
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+    model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert captured == [{}]
+    model_scorecard.report_to_ledger([dict(_LEDGER_ROW, item_id="issue_E16_5")])
+    assert captured == [{}, {"item_id": "issue_E16_5"}]
 
 
 def test_report_to_ledger_a_rerun_sends_the_same_dedup_key(model_scorecard, monkeypatch):

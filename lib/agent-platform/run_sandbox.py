@@ -75,12 +75,17 @@ USER_CLAUDE_MD = Path(".claude") / "CLAUDE.md"
 # copy, but its absolute path is readable. Only the file is denied: its directory is ordinary.
 ORIENT_TOKEN_FILE = ("convivy-orient", "api-tokens.json")
 
-# Two more files under the account home that a run may not read (CQ·418): `.gitconfig`,
-# where the operator's `credential.https://github.com.helper` points at `gh`, and the
+# Three more files under the account home that a run may not read (CQ·418): `.gitconfig`,
+# where the operator's `credential.https://github.com.helper` points at `gh`; the
 # convivy-bosun App's own private key, which signs the JWT that mints every run's OWN
 # installation token — that minting happens in the dispatcher (`agentctl`), before this
-# run starts, and the key must never be reachable from inside one.
-DENIED_HOME_FILES = (".gitconfig", ".config/convivy/bosun-app.pem")
+# run starts, and the key must never be reachable from inside one; and the Library's
+# bosun-ledger-reporter credential, which `agentctl` will use to POST spend entries
+# (including subscription-lane ones) to the ledger — a run that could read it could
+# forge spend records. Denied ahead of the Library minting it, so there is never a
+# window where the file exists and is readable from inside a run.
+DENIED_HOME_FILES = (".gitconfig", ".config/convivy/bosun-app.pem",
+                      ".config/convivy/bosun-ledger-reporter.token")
 
 # Tools a dispatched run may call without a prompt. Under `dontAsk` anything not listed
 # here, or in a rule from this module, is refused. The list is what the run records show

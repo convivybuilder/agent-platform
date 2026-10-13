@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.individuator</string>
+
+    <!-- The Individuator's root daemon (platform/decisions/0092; CQ·447
+         slice 3): holds the machine's Secure Enclave key and registers this
+         machine's sessions with the Bosun over mutual TLS. Runs in the
+         SYSTEM domain, as root — the whole point of the design is that
+         nothing readable as a file from inside an operator-level process
+         (including a dispatched run) is sufficient to act as this key.
+
+         Deploy-pinned per platform/decisions/0059 rule 1: this plist and the
+         binary it execs both live outside the agent-platform checkout.
+         bin/install-individuator (run as root) builds the release binary
+         from a pinned git ref, installs a ROOT-OWNED COPY under
+         /usr/local/libexec/individuator (rules 2, 6, 7: a copy via `git
+         archive`, never a symlink into the checkout, never the working
+         tree), and copies this plist into /Library/LaunchDaemons (rule 8).
+         There is no __HOME__ substitution here: every path is root-owned
+         and machine-wide, not per-operator. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/libexec/individuator/individuator-daemon</string>
+    </array>
+
+    <key>UserName</key>
+    <string>root</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/individuator.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/individuator.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

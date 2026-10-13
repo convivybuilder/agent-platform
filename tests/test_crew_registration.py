@@ -278,8 +278,49 @@ def test_task_text_public_and_overnight_are_always_written_explicitly(tmp_path):
 def test_optional_fields_are_omitted_when_not_requested(tmp_path):
     path = _seed(tmp_path)
     _, row = CR.register(_spec(), registry_path=path)
-    for absent in ("private", "model_tier", "agent_prefix", "data_local", "note"):
+    for absent in ("private", "model_tier", "agent_prefix", "data_local", "note",
+                   "created_by"):
         assert absent not in row
+
+
+# --- created_by: who created the project (issue_01M2QWFR8PCBPANF8Q5P460GHY) --
+
+
+_PERSON_ID = "person_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+
+def test_created_by_is_written_when_well_formed(tmp_path):
+    path = _seed(tmp_path)
+    _, row = CR.register(_spec(created_by=_PERSON_ID), registry_path=path)
+    assert row["created_by"] == _PERSON_ID
+    assert projects.valid_person_id(row["created_by"])
+
+
+def test_registering_created_by_does_not_touch_meta_products_or_scopes(tmp_path):
+    """The hazard comment 2963 names: a writer that iterates the file's
+    top-level keys would write a creator onto `_meta`, `_products` or
+    `_scopes` too. `register()` only ever sets `data[spec.slug]`, so those
+    three must come out byte-identical to what `_seed` wrote."""
+    path = _seed(tmp_path)
+    before = json.loads(path.read_text())
+    CR.register(_spec(created_by=_PERSON_ID), registry_path=path)
+    after = json.loads(path.read_text())
+    for block in ("_meta", "_products", "_scopes"):
+        assert after[block] == before[block]
+
+
+@pytest.mark.parametrize("bad", [
+    "Jane Doe",              # a display name
+    "convivy",               # an organisation, what `owner` holds
+    "person_tooshort",
+    "",
+])
+def test_created_by_is_refused_when_malformed(tmp_path, bad):
+    path = _seed(tmp_path)
+    before = path.read_bytes()
+    with pytest.raises(CR.RegistrationRefused, match="created_by"):
+        CR.register(_spec(created_by=bad), registry_path=path)
+    assert path.read_bytes() == before
 
 
 # --- ADR-0043: a private row must come out internally consistent -------------
@@ -353,13 +394,27 @@ def test_cmd_crew_register_writes_the_row(agentctl, tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "registered 'recipe-units'" in out
-    assert "Library" in out and "restart" in out, (
-        "a running Library server keeps the pre-registration snapshot until "
-        "it restarts or reloads (library/projects.py's lru_cache) — the "
-        "success output must say so, not just the PR body")
+    assert "Library" in out and "next lookup" in out, (
+        "the Library's projects.py re-reads the registry when the file's "
+        "(st_mtime_ns, st_size, st_ino) changes, so the success output "
+        "must say the new row is picked up on the next lookup")
     data = json.loads(path.read_text())
     assert data["recipe-units"]["display"] == "Recipe Units"
     assert data["recipe-units"]["repos"] == ["recipe-units"]
+
+
+def test_cmd_crew_register_no_longer_tells_operator_to_restart_the_library(
+        agentctl, tmp_path, capsys):
+    """issue_01M4PGRW8SSE9GCHT919WKPFHB: the Library's `_snapshot()` stats
+    the registry on every lookup and re-reads it when the file changes, so
+    a just-registered slug resolves with no restart — the success output
+    must not tell the operator to restart or reload the Library."""
+    path = _seed(tmp_path)
+    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "restart" not in out
+    assert "reload" not in out
 
 
 def test_cmd_crew_register_dry_run_has_no_library_caveat(agentctl, tmp_path, capsys):
@@ -416,3 +471,51 @@ def test_cmd_crew_register_refusal_names_the_resolved_registry_path(
     assert "refused" in err
     assert str(path.resolve()) in err
     assert path.read_bytes() == before
+
+
+# --- `created_by`, read from the operator config's `person_id` --------------
+
+
+def test_cmd_crew_register_writes_created_by_from_operator_config(
+        agentctl, tmp_path, monkeypatch, capsys):
+    path = _seed(tmp_path)
+    config_path = tmp_path / "operator.json"
+    config_path.write_text(json.dumps({"person_id": _PERSON_ID}))
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(config_path))
+    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
+    assert rc == 0
+    data = json.loads(path.read_text())
+    assert data["recipe-units"]["created_by"] == _PERSON_ID
+
+
+def test_cmd_crew_register_without_person_id_omits_created_by_and_says_why(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """No `person_id` key at all — the fresh-install case, before the
+    Library's bootstrap has created anyone. The registration still succeeds;
+    it just records no creator, and says so rather than failing silently."""
+    path = _seed(tmp_path)
+    config_path = tmp_path / "operator.json"
+    config_path.write_text(json.dumps({"roster_crew": "operator-crew"}))
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(config_path))
+    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "did not record a creator" in err
+    assert "person_id" in err
+    data = json.loads(path.read_text())
+    assert "created_by" not in data["recipe-units"]
+
+
+def test_cmd_crew_register_with_unreadable_operator_config_still_registers(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """A missing operator config file entirely — not just a missing key — is
+    the same "don't refuse" case: a fresh machine may have no
+    `~/.config/convivy/operator.json` at all yet."""
+    path = _seed(tmp_path)
+    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(tmp_path / "no-such-file.json"))
+    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "did not record a creator" in err
+    data = json.loads(path.read_text())
+    assert "created_by" not in data["recipe-units"]

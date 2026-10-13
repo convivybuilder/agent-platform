@@ -11,6 +11,7 @@ import inspect
 import io
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 from pathlib import Path
@@ -497,6 +498,77 @@ def test_issue_create_posts_payload_and_returns_id(mcp_ops_server, monkeypatch):
     assert sent["product"] == "vivy" and sent["title"] == "crash"
     assert sent["severity"] == "high" and sent["once_key"] == "k:9"
     assert sent["refs"] == {"url": "https://github.com/x/9"}
+
+
+# --- work items are not typed (the operator, 2026-09-24) ---------------------
+
+
+def test_issue_create_sends_no_type_key_by_default(mcp_ops_server, monkeypatch):
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"id": "issue_a", "state": "open"})
+    mcp_ops_server.issue_create(product="vivy", title="t", severity="low")
+    assert "type" not in json.loads(seen[0].data)
+
+
+def test_issue_create_sends_type_epic_when_passed_epic(mcp_ops_server, monkeypatch):
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"id": "issue_a", "state": "open"})
+    mcp_ops_server.issue_create(product="vivy", title="t", severity="low", type="epic")
+    assert json.loads(seen[0].data)["type"] == "epic"
+
+
+def test_issue_create_refuses_a_non_epic_type_before_any_request(
+        mcp_ops_server, monkeypatch):
+    """The Library is moving to refuse any type other than `epic`; this route
+    gets there first rather than sending a value only to have it dropped or
+    bounced, so a caller still filing by the old convention learns immediately
+    rather than silently losing its `type`."""
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"id": "issue_a", "state": "open"})
+    out = json.loads(mcp_ops_server.issue_create(
+        product="vivy", title="t", severity="low", type="bug"))
+    assert "error" in out and "epic" in out["error"]
+    assert seen == [], "a refused type must not reach the Library"
+
+
+def test_bug_create_sends_no_type_key(mcp_ops_server, monkeypatch):
+    """The deprecated alias has no `type` parameter of its own and delegates
+    straight to `issue_create` with none given, so it inherits the same
+    no-type-by-default behavior with nothing further to change here."""
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"id": "bug_a", "state": "open"})
+    mcp_ops_server.bug_create(product="vivy", title="t", severity="low")
+    assert "type" not in json.loads(seen[0].data)
+
+
+def test_no_tool_description_names_a_retired_type_value(mcp_ops_server):
+    r"""`bug`, `nit`, `improvement` and `task` were the four non-epic values a
+    work item's `type` used to take; none of them may still be documented as a
+    valid value anywhere a caller reads what to pass. `\bnit\b` is the clean
+    marker — word-bounded so it does not fire on `definition_of_done`, and the
+    bare word never appears in this file for any other reason, so its absence
+    is enough to catch the old four-way enumeration however it was phrased.
+    `improvement` is checked on its own too, scoped away from `issue_list`'s
+    historical ARCH-403 paragraph (the one place it legitimately still names a
+    past migration, not a type a caller may set)."""
+    tools = ("issue_list", "issue_create", "issue_correct", "issue_revise",
+             "bug_create")
+    for name in tools:
+        doc = getattr(mcp_ops_server, name).__doc__ or ""
+        assert not re.search(r"\bnit\b", doc), (
+            f"{name}'s description still names a retired type")
+    for name in ("issue_create", "issue_correct", "issue_revise", "bug_create"):
+        doc = getattr(mcp_ops_server, name).__doc__ or ""
+        assert "improvement" not in doc, (
+            f"{name}'s description still names a retired type")
 
 
 # --- the co credential (item creation is the grant-only write) -------------------
@@ -1998,10 +2070,13 @@ def test_issue_correct_sends_only_the_fields_given(mcp_ops_server, monkeypatch):
 
 
 def test_issue_correct_sends_an_explicit_null_to_detach_the_parent(mcp_ops_server, monkeypatch):
-    """`""` on `parent_id` detaches to top level (app.py:2581-2583, "accept an
-    explicit null to reverse ... parent_id back to top level"). Same clearing
-    convention as `issue_revise`, tested independently because this route's
-    payload-building loop is a separate copy."""
+    """`""` on `parent_id` sends an explicit wire null (app.py:2581-2583,
+    "accept an explicit null to reverse ..."). On a work item (`_item`'s
+    default `type`) that null is how the Library records moving the item to
+    its product's corrections queue, before corrections queues are
+    backfilled with their own id; on an epic the same null detaches it to top
+    level. Same clearing convention as `issue_revise`, tested independently
+    because this route's payload-building loop is a separate copy."""
     _with_token(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload=_item(parent_id=None))
