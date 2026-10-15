@@ -165,6 +165,66 @@ def test_single_installation_refuses_by_name(installs, named):
     assert str(e.value).startswith(named + ":"), e.value
 
 
+def test_installation_for_owner_reads_the_org_endpoint_directly():
+    opener, seen = _routes({("GET", "/orgs/convivybuilder/installation"):
+                            (200, {"id": 7, "account": {"login": "convivybuilder"}})})
+    inst = GA.installation_for_owner("jwt.x.y", "convivybuilder", opener=opener)
+    assert inst == {"id": 7, "account": {"login": "convivybuilder"}}
+    assert seen == [("GET", seen[0][1], "Bearer jwt.x.y", None)]
+    assert "/orgs/convivybuilder/installation" in seen[0][1]
+
+
+def test_installation_for_owner_falls_back_to_the_user_endpoint_on_404():
+    opener, seen = _routes({
+        ("GET", "/orgs/someuser/installation"): (404, {"message": "Not Found"}),
+        ("GET", "/users/someuser/installation"): (200, {"id": 9, "account": {"login": "someuser"}}),
+    })
+    inst = GA.installation_for_owner("jwt.x.y", "someuser", opener=opener)
+    assert inst == {"id": 9, "account": {"login": "someuser"}}
+    assert len(seen) == 2
+
+
+def test_installation_for_owner_raises_not_installed_when_both_lookups_404():
+    """Both the org and the user endpoint answering 404 is GitHub's own
+    confirmation there is no installation — `GA.NotInstalled`, not a plain
+    `GA.Unreadable`, so `bin/pr-state-capture` can skip the owner rather
+    than fail the pass (operator's decision, 2026-10-15)."""
+    opener, _ = _routes({
+        ("GET", "/orgs/nobody/installation"): (404, {"message": "Not Found"}),
+        ("GET", "/users/nobody/installation"): (404, {"message": "Not Found"}),
+    })
+    with pytest.raises(GA.NotInstalled) as e:
+        GA.installation_for_owner("jwt.x.y", "nobody", label="the convivy-bosun App",
+                                  opener=opener)
+    assert "the convivy-bosun App is not installed on 'nobody'" in str(e.value)
+    assert isinstance(e.value, GA.Unreadable)  # every other caller still catches it as one
+
+
+def test_installation_for_owner_names_a_non_404_failure_without_guessing_user():
+    opener, seen = _routes({("GET", "/orgs/convivy/installation"): (500, {})})
+    with pytest.raises(GA.Unreadable) as e:
+        GA.installation_for_owner("jwt.x.y", "convivy", opener=opener)
+    assert "could not be read (500)" in str(e.value)
+    assert not isinstance(e.value, GA.NotInstalled)  # a failed read, not a confirmed absence
+    assert len(seen) == 1  # never falls back to /users on a non-404
+
+
+def test_installation_for_owner_a_non_404_on_the_second_lookup_is_unreadable_not_not_installed():
+    """A 404 on the org endpoint followed by a non-404 on the user endpoint
+    (a GitHub 500, say) must not be read as "not installed" — that would let
+    a transient GitHub failure be skipped under the new owner-skip rule as
+    though it were a confirmed absence."""
+    opener, seen = _routes({
+        ("GET", "/orgs/someuser/installation"): (404, {"message": "Not Found"}),
+        ("GET", "/users/someuser/installation"): (500, {}),
+    })
+    with pytest.raises(GA.Unreadable) as e:
+        GA.installation_for_owner("jwt.x.y", "someuser", opener=opener)
+    assert "could not be read (500)" in str(e.value)
+    assert not isinstance(e.value, GA.NotInstalled)
+    assert len(seen) == 2
+
+
 def test_installations_list_read_failure_is_unreadable():
     def opener(req, timeout=None):
         return _Resp(500, {})

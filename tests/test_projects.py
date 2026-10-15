@@ -124,11 +124,14 @@ def test_kb_scope_exceptions_wellformed():
 def test_kb_scope_exceptions_cover_exactly_the_recorded_crews():
     """The crew-creation epic's done-clause 1 names seven crews as recorded KEEP
     exceptions (epic comment 4425, issue_01M2NYBBY0FXCDHWWD8XBR9RR3); vivy-landing
-    is the eighth, by orchestrator ruling (2026-10-02). Pinned so a new entry, or a
-    missing one, surfaces here rather than only in the epic thread."""
+    is the eighth, by orchestrator ruling (2026-10-02), and homebrew-tap the ninth
+    (2026-10-13), on the same reasoning as shipwright's own entry — more public,
+    not less. Pinned so a new entry, or a missing one, surfaces here rather than
+    only in the epic thread."""
     expected = {
         "knowledge", "convivy-app-kit", "convivy-services", "www",
         "shipwright", "constance-landing", "constance-updates", "vivy-landing",
+        "homebrew-tap",
     }
     assert set(projects.kb_scope_exceptions()) == expected
 
@@ -914,6 +917,136 @@ def test_project_for_repo_lowercases_the_registry_side_too(monkeypatch):
                         lambda: {"demo": {"repos": ["Demo-Repo"], "aliases": ["DemoAlias"]}})
     assert projects.project_for_repo("demo-repo") == "demo"
     assert projects.project_for_repo("demoalias") == "demo"
+
+
+# --- repo_owners / repo_github_slug: a unit whose repos don't share one owner ----
+#
+# homebrew-tap (2026-10-13): Builder's public Homebrew formula, the first repo a
+# crew owns outside the convivy GitHub organization. `shipwright`'s own repo stays
+# under convivy; `homebrew-tap` lives under `convivybuilder`.
+
+
+def test_crew_for_repo_resolves_homebrew_tap_to_shipwright():
+    """On the unfixed registry (homebrew-tap absent from shipwright's `repos`)
+    this returned None, not `shipwright`."""
+    assert projects.crew_for_repo("homebrew-tap") == "shipwright"
+
+
+def test_resolve_project_resolves_homebrew_tap_to_shipwright():
+    """`resolve_project`, not `project_for_repo`, is what `default_profile` calls —
+    `EXPLICIT_PROJECT_BY_NAME` needs its own row for homebrew-tap even once the
+    registry lists it under shipwright's `repos`, because this function never
+    consults `repos`/`aliases` at all. On the unfixed table this returned None."""
+    assert projects.resolve_project("homebrew-tap") == "shipwright"
+
+
+def test_repo_github_slug_uses_the_per_repo_owner_when_registered():
+    """The behaviour this function exists for: a repo owner, else the function
+    did not exist at all on the unfixed module (AttributeError)."""
+    assert projects.repo_github_slug("homebrew-tap") == "convivybuilder/homebrew-tap"
+
+
+def test_repo_github_slug_keeps_convivy_for_a_repo_with_no_override():
+    """shipwright's own repo carries no `repo_owners` entry, so it still resolves
+    under convivy — behaviour for an already-registered repo must not change."""
+    assert projects.repo_github_slug("shipwright") == "convivy/shipwright"
+
+
+def test_repo_github_slug_uses_the_unit_github_owner_for_nyh_repos():
+    """Round-1 review (PR #881, comment 6150937461): the three NYH units each
+    set the unit's github_owner, but before every call site routed through
+    this function, all seven inline `convivy/<repo>` builds ignored that field
+    and read `convivy/<repo>` — the wrong, 404ing owner. Each NYH unit's
+    `repos` holds exactly one bare name, matching the unit's own key."""
+    for repo in NYH_PROJECTS:
+        owner = projects.get(repo)["github_owner"]
+        assert owner and owner != "convivy"
+        assert projects.repo_github_slug(repo) == f"{owner}/{repo}"
+
+
+def test_repo_github_slug_defaults_unregistered_repos_to_convivy():
+    assert projects.repo_github_slug("no-such-repo-anywhere") == "convivy/no-such-repo-anywhere"
+
+
+def test_repo_github_slug_returns_an_already_qualified_slug_unchanged():
+    assert projects.repo_github_slug("someowner/somerepo") == "someowner/somerepo"
+
+
+def test_repo_github_slug_accepts_a_caller_supplied_unit():
+    """issue_gate.py resolves its own unit from a registry snapshot fetched over
+    the network, never from `load()` — passing that unit in must skip the
+    `load()` search entirely and still find the per-repo owner."""
+    unit = {"repos": ["homebrew-tap"], "repo_owners": {"homebrew-tap": "someoneelse"}}
+    assert projects.repo_github_slug("homebrew-tap", unit=unit) == "someoneelse/homebrew-tap"
+
+
+# --- registered_repo_github_slug: the strict form for a run-writable `repo` ----
+#
+# PR #881 round 2 (security-reviewer, comment 6152094447): the three scorecards'
+# `gh` joins read `repo` from a run's own meta.json, which the dispatched run can
+# write, and built `convivy/<repo>` (or, after round 1, `repo_github_slug(repo)`)
+# unconditionally — a `/`-qualified forgery pointed their queries at any
+# repository. This is the bound those sites call instead.
+
+
+def test_registered_repo_github_slug_resolves_a_registered_bare_name():
+    assert projects.registered_repo_github_slug("homebrew-tap") == "convivybuilder/homebrew-tap"
+
+
+def test_registered_repo_github_slug_accepts_its_own_matching_qualified_slug():
+    assert (projects.registered_repo_github_slug("convivybuilder/homebrew-tap")
+            == "convivybuilder/homebrew-tap")
+
+
+def test_registered_repo_github_slug_refuses_a_mismatched_owner():
+    """homebrew-tap's registered owner is convivybuilder — a `/`-qualified value
+    naming a different owner for the same bare repo must come back None rather
+    than pass through unchanged."""
+    assert projects.registered_repo_github_slug("acme-attacker/homebrew-tap") is None
+    assert projects.registered_repo_github_slug("convivy/homebrew-tap") is None
+
+
+def test_registered_repo_github_slug_refuses_an_unregistered_qualified_owner():
+    """An unregistered bare name still defaults to convivy (matching
+    repo_github_slug, and carrying none of that function's risk — it never
+    leaves the convivy org), but a forged `/`-qualified value naming some OTHER
+    owner for that same unregistered name is refused."""
+    assert (projects.registered_repo_github_slug("no-such-repo-anywhere")
+            == "convivy/no-such-repo-anywhere")
+    assert projects.registered_repo_github_slug("acme-attacker/no-such-repo-anywhere") is None
+
+
+def test_registered_repo_github_slug_refuses_empty_and_none():
+    assert projects.registered_repo_github_slug(None) is None
+    assert projects.registered_repo_github_slug("") is None
+
+
+def test_repo_owners_wellformed():
+    """Schema for the optional `repo_owners` field: a dict keyed by one of the
+    unit's own `repos`, each value a non-empty owner string."""
+    for slug, u in projects.load().items():
+        owners = u.get("repo_owners")
+        if owners is None:
+            continue
+        assert isinstance(owners, dict), f"{slug} repo_owners must be a dict"
+        for repo, owner in owners.items():
+            assert repo in u.get("repos", []), (
+                f"{slug} repo_owners names {repo!r}, not one of its own repos")
+            assert isinstance(owner, str) and owner, (
+                f"{slug}.{repo} repo_owners needs a non-empty owner string")
+
+
+def test_no_repo_claims_two_different_owners_via_two_units():
+    """`test_no_repo_or_alias_claimed_twice` already refuses the same repo name
+    under two units at all; this confirms a `repo_owners` entry can't sidestep
+    that by being the only disagreement between two hypothetical claims — a repo
+    appears in exactly one unit's `repos`, so it can carry exactly one owner."""
+    seen: dict[str, str] = {}
+    for slug, u in projects.load().items():
+        owners = u.get("repo_owners") or {}
+        for repo in owners:
+            assert repo not in seen, f"{repo!r} owner claimed by both {seen[repo]} and {slug}"
+            seen[repo] = slug
 
 
 # --- created_by: who made a project, for the per-person visibility default --

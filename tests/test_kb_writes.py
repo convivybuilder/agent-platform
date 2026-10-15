@@ -363,9 +363,59 @@ def test_ordinary_holder_identities_are_accepted(holder):
     assert kw.valid_holder(holder) is True
 
 
-@pytest.mark.parametrize("holder", ["", " ", "run 1", "run;1", "x" * 65, "-leading"])
+@pytest.mark.parametrize("holder", ["", " ", "\t", "x" * 201, "a\nb", "a\rb", "a\x1bb",
+                                     "a\x85b", "a\u2028b", "a\u2029b"])
 def test_malformed_holder_identities_are_rejected(holder):
     assert kw.valid_holder(holder) is False
+
+
+# --- the Library's own acceptance rule (ARCH-408, issue_01M0YAS4S64P5TXN7S2C17GHF6) -----
+
+
+def test_an_email_address_is_accepted():
+    """The Library's own `_claim_owner` stores a holder as given — Orient's editor
+    holds checkouts under the user's raw email address — so agentctl's cage must
+    accept the same string rather than refuse the one holder the Library sends."""
+    assert kw.valid_holder("person@example.com") is True
+    assert kw.normalize_holder("person@example.com") == "person@example.com"
+
+
+def test_a_holder_with_spaces_is_accepted_and_unaltered():
+    holder = "Pat Holder"
+    assert kw.valid_holder(holder) is True
+    assert kw.normalize_holder(holder) == holder
+    assert kw.write_trailer("update", "projects/vivy/x.md", "in-session", holder) == (
+        f"KB-Write: update projects/vivy/x.md in-session {holder}")
+
+
+def test_a_200_character_holder_is_accepted():
+    holder = "a" * 200
+    assert kw.valid_holder(holder) is True
+    assert kw.normalize_holder(holder) == holder
+
+
+def test_a_201_character_holder_is_rejected():
+    assert kw.valid_holder("a" * 201) is False
+
+
+def test_surrounding_whitespace_is_stripped_by_normalize_holder():
+    padded = "  person@example.com  "
+    assert kw.valid_holder(padded) is True
+    assert kw.normalize_holder(padded) == "person@example.com"
+
+
+@pytest.mark.parametrize("ch", ["\n", "\r", "\v", "\f", "\x00", "\x1b", "\x85",
+                                 "\u2028", "\u2029"])
+def test_a_control_or_line_separator_character_is_rejected(ch):
+    assert kw.valid_holder(f"a{ch}b") is False
+
+
+def test_every_character_splitlines_breaks_on_is_rejected():
+    breaks_splitlines = [chr(c) for c in range(0x110000)
+                          if len(("a" + chr(c) + "b").splitlines()) > 1]
+    assert len(breaks_splitlines) == 10
+    for ch in breaks_splitlines:
+        assert kw.valid_holder(f"a{ch}b") is False
 
 
 def test_a_message_cannot_smuggle_its_own_trailer():

@@ -389,12 +389,20 @@ def test_a_codex_coder_dispatch_is_refused(agentctl, CP, home, monkeypatch, caps
 
 # --- a Claude dispatch is unchanged ------------------------------------------------
 
+@pytest.mark.usefixtures("_tool_session_scratch_dir_off_the_real_account_home")
 def test_a_claude_dispatch_never_reaches_the_codex_branch(
         agentctl, tmp_path, runs_root, monkeypatch):
     """`is_codex_model` on an Anthropic slug is False, so `_run_session` falls
     through to the unchanged `claude -p` launch — `tests/test_spawn_sandbox.py`'s
     full suite is the byte-for-byte argv/env pin; this is the direct check that
-    the new branch this change adds cannot divert a Claude dispatch into it."""
+    the new branch this change adds cannot divert a Claude dispatch into it.
+
+    The only test in this file that drives the real (non-codex) `_run_session`
+    branch, so it alone needs the shared fixture (conftest.py, CQ·138) that
+    keeps a real dispatch's tool-session scratch directory off the real
+    account's home (round 6, reviewer, PR #879, comment 6166526636) — every
+    other test here dispatches a Codex model, which `_run_session` routes to
+    `_run_codex_review_session` before it ever reaches that code."""
     import telemetry as T
     monkeypatch.setattr(T, "RUNS_ROOT", runs_root)
     run_dir = tmp_path / "run"

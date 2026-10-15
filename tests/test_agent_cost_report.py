@@ -164,6 +164,160 @@ def test_ccusage_by_model_allowlists_claude_only(agent_cost_report, monkeypatch)
     assert "qwen-3-max" not in out  # the allowlist closes the denylist leak
 
 
+# --- ccusage pinned version + fail-loud (2026-10-14/15 $0 incident) ----------
+#
+# npx's cache for ccusage@latest was two minutes old and missing its
+# darwin-arm64 native binary, so every run exited 1 and the old code turned
+# that into a silent $0 — $445.28 (2026-10-14) and $146.92 (2026-10-15) of real
+# spend went unrecorded with no error anywhere. ccusage is now pinned (a bump
+# is an ordinary reviewed PR) and a ccusage failure is a failure, not a $0.
+
+
+class _CP:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _stub_ccusage(acr, monkeypatch, cp, capture=None):
+    def fake_run(argv, **kw):
+        if capture is not None:
+            capture.append(argv)
+        return cp
+    monkeypatch.setattr(acr.subprocess, "run", fake_run)
+    monkeypatch.setattr(acr, "_resolve_npx", lambda: "npx")
+
+
+def test_ccusage_argv_carries_the_pinned_version_never_latest(agent_cost_report, monkeypatch):
+    acr = agent_cost_report
+    calls = []
+    _stub_ccusage(acr, monkeypatch, _CP(stdout=json.dumps({"daily": []})), capture=calls)
+    acr.ccusage_by_model(date(2026, 10, 14))
+    assert calls[0][1] == f"ccusage@{acr.CCUSAGE_VERSION}"
+    assert acr.CCUSAGE_VERSION == "20.0.33"
+    assert "latest" not in calls[0][1]
+    assert "latest" not in " ".join(calls[0])
+
+
+def test_ccusage_nonzero_exit_raises_with_stderr(agent_cost_report, monkeypatch):
+    acr = agent_cost_report
+    _stub_ccusage(acr, monkeypatch, _CP(
+        returncode=1,
+        stderr="Error: ccusage native binary is not available for darwin-arm64\n"))
+    with pytest.raises(acr.CcusageError, match="darwin-arm64"):
+        acr.ccusage_by_model(date(2026, 10, 14))
+
+
+def test_ccusage_empty_stdout_on_exit_zero_raises(agent_cost_report, monkeypatch):
+    acr = agent_cost_report
+    _stub_ccusage(acr, monkeypatch, _CP(returncode=0, stdout=""))
+    with pytest.raises(acr.CcusageError):
+        acr.ccusage_by_model(date(2026, 10, 14))
+
+
+def test_ccusage_unparseable_stdout_raises(agent_cost_report, monkeypatch):
+    acr = agent_cost_report
+    _stub_ccusage(acr, monkeypatch, _CP(returncode=0, stdout="not json"))
+    with pytest.raises(acr.CcusageError):
+        acr.ccusage_by_model(date(2026, 10, 14))
+
+
+def test_ccusage_valid_empty_daily_list_still_returns_empty_not_an_error(
+        agent_cost_report, monkeypatch):
+    # A day with genuinely no usage is a valid answer, not a failure — it still
+    # records $0, as before.
+    acr = agent_cost_report
+    _stub_ccusage(acr, monkeypatch, _CP(returncode=0, stdout=json.dumps({"daily": []})))
+    assert acr.ccusage_by_model(date(2026, 10, 14)) == {}
+
+
+def _fixed_now(acr, monkeypatch, moment="2026-10-14T15:30:00"):
+    """Pin datetime.now() so main()'s auto-close-at-hour-0 branch can't flip the
+    test's behaviour depending on when it happens to run."""
+    import datetime as _dt
+
+    class _FixedDatetime(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _dt.datetime.fromisoformat(moment)
+
+    monkeypatch.setattr(acr, "datetime", _FixedDatetime)
+
+
+def _seed_cost_dir(tmp_path):
+    cost_dir = tmp_path / "cost-report"
+    cost_dir.mkdir(parents=True)
+    hist = '{"date": "2026-10-13", "total": 12.0}\n'
+    latest = '{"date": "2026-10-13", "total": 12.0}'
+    (cost_dir / "history.jsonl").write_text(hist)
+    (cost_dir / "latest.json").write_text(latest)
+    return cost_dir, hist, latest
+
+
+def _assert_cost_dir_untouched(cost_dir, hist, latest):
+    assert (cost_dir / "history.jsonl").read_text() == hist
+    assert (cost_dir / "latest.json").read_text() == latest
+
+
+@pytest.mark.parametrize("cp_kwargs,needle", [
+    ({"returncode": 1,
+      "stderr": "Error: ccusage native binary is not available for darwin-arm64\n"},
+     "darwin-arm64"),
+    ({"returncode": 0, "stdout": ""}, "no output"),
+    ({"returncode": 0, "stdout": "not json"}, "unparseable"),
+])
+def test_main_on_ccusage_failure_writes_nothing_and_exits_nonzero(
+        agent_cost_report, monkeypatch, tmp_path, capsys, cp_kwargs, needle):
+    acr = agent_cost_report
+    cost_dir, hist, latest = _seed_cost_dir(tmp_path)
+    monkeypatch.setattr(acr, "COST_DIR", cost_dir)
+    _stub_ccusage(acr, monkeypatch, _CP(**cp_kwargs))
+    _fixed_now(acr, monkeypatch)
+    monkeypatch.setattr("sys.argv", ["agent-cost-report"])
+
+    rc = acr.main()
+
+    assert rc != 0
+    assert needle in capsys.readouterr().err
+    _assert_cost_dir_untouched(cost_dir, hist, latest)
+
+
+def test_backfill_stops_at_first_failing_day_and_exits_nonzero(
+        agent_cost_report, monkeypatch, tmp_path, capsys):
+    acr = agent_cost_report
+    cost_dir, hist, latest = _seed_cost_dir(tmp_path)
+    monkeypatch.setattr(acr, "COST_DIR", cost_dir)
+    monkeypatch.setattr(acr, "gateway_by_model", lambda day: {})
+    monkeypatch.setattr(acr, "apps_by_app", lambda day: {})
+    _stub_ccusage(acr, monkeypatch, _CP(returncode=1, stderr="boom\n"))
+    _fixed_now(acr, monkeypatch)
+    monkeypatch.setattr("sys.argv", ["agent-cost-report", "--backfill", "3"])
+
+    rc = acr.main()
+
+    assert rc != 0
+    assert "boom" in capsys.readouterr().err
+    _assert_cost_dir_untouched(cost_dir, hist, latest)
+
+
+def test_main_records_zero_on_a_genuinely_empty_day(agent_cost_report, monkeypatch, tmp_path):
+    acr = agent_cost_report
+    cost_dir = tmp_path / "cost-report"
+    monkeypatch.setattr(acr, "COST_DIR", cost_dir)
+    monkeypatch.setattr(acr, "gateway_by_model", lambda day: {})
+    monkeypatch.setattr(acr, "apps_by_app", lambda day: {})
+    _stub_ccusage(acr, monkeypatch, _CP(returncode=0, stdout=json.dumps({"daily": []})))
+    _fixed_now(acr, monkeypatch)
+    monkeypatch.setattr("sys.argv", ["agent-cost-report"])
+
+    rc = acr.main()
+
+    assert rc == 0
+    latest = json.loads((cost_dir / "latest.json").read_text())
+    assert latest["total"] == 0.0
+
+
 def _write_spend(path, rows):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(r) + "\n" for r in rows))

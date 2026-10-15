@@ -157,6 +157,7 @@ from typing import Any, Iterable
 
 import branch_naming as BN
 import issue_client
+import projects
 import safe_path as SP
 
 # The branch prefix every dispatched worker's branch actually has
@@ -535,16 +536,20 @@ def _github_repo_for(product: str, *, token: str | None = None,
     referencing_issues`) avoid doing so twice; a caller with none resolves
     its own via `_resolve_token`.
 
-    The GitHub owner comes from the unit's `github_owner` field, defaulting
-    to `"convivy"` when absent — NOT from `owner`, which `config/
-    projects.json`'s own `_meta.fields` documents as "pure metadata", not a
-    GitHub account, and which reads `"nyh"` for the three NYH projects even
-    though their repositories live under the operator's personal account (round-7 security
-    review, PR comment 5939963599). Mirrors the old `repo_path_for`'s
-    assumption (rounds 1-6) that a product's primary repo shares the
-    product's own slug — true for every product this gate runs against
-    today (`vivy`, `constance`, `sous-chef` each list their own slug first
-    under `repos` in the registry).
+    The GitHub owner comes from `projects.repo_github_slug`, given this
+    already-resolved `unit` so it never has to search `load()` (which reads
+    this process's OWN tree, the thing this function's registry-at-origin-
+    read exists to avoid): the repo's own entry in the unit's `repo_owners`
+    map, else the unit's `github_owner` field, else `"convivy"` — NOT from
+    `owner`, which `config/projects.json`'s own `_meta.fields` documents as
+    "pure metadata", not a GitHub account, and which reads `"nyh"` for the
+    three NYH projects even though their repositories live under the
+    operator's personal account (round-7 security review, PR comment
+    5939963599). Mirrors the old `repo_path_for`'s assumption (rounds 1-6)
+    that a product's primary repo shares the product's own slug — true for
+    every product this gate runs against today (`vivy`, `constance`,
+    `sous-chef` each list their own slug first under `repos` in the
+    registry).
     """
     if token is None:
         token = _resolve_token()
@@ -556,8 +561,7 @@ def _github_repo_for(product: str, *, token: str | None = None,
     repos = unit.get("repos") or []
     if not repos:
         raise BranchScanError(f"{product!r} has no repos listed in the project registry")
-    github_owner = unit.get("github_owner") or "convivy"
-    return f"{github_owner}/{repos[0]}"
+    return projects.repo_github_slug(repos[0], unit=unit)
 
 
 def _issue_id_fragment(issue_id: str) -> str | None:

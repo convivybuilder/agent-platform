@@ -47,6 +47,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import projects         # noqa: E402
 import review_protocol as RP  # noqa: E402
 
 import builder_root as BR
@@ -111,7 +112,13 @@ def agent_prs(days: int) -> dict[str, dict[int, dict]]:
     for r in load_ledger(SCORECARD_LEDGER):
         pr = r.get("pr_number")
         repo = r.get("repo")
-        if not pr or not repo or (r.get("date") or "") < cutoff:
+        # `repo` reached this ledger row from a run's own meta.json, a file the
+        # dispatched run itself can write — refuse an owner-qualified forgery
+        # here, at the same attribution-failure check `not pr or not repo`
+        # already makes, rather than let it reach harvest_pr's gh query
+        # (security-reviewer, PR #881 round 2).
+        if (not pr or not repo or (r.get("date") or "") < cutoff
+                or projects.registered_repo_github_slug(repo) is None):
             continue
         # A PR can have several producer runs (cycle-N fixes); keep the most
         # informative model attribution (last writer wins on the newest date).
@@ -166,7 +173,7 @@ def _count_findings(body: str) -> tuple[int, int]:
 
 def harvest_pr(repo: str, pr: int, ctx: dict) -> list[dict]:
     """Rows for one PR: one per security-reviewer review round, chronological."""
-    view = _gh_json(["pr", "view", str(pr), "--repo", f"convivy/{repo}", "--json",
+    view = _gh_json(["pr", "view", str(pr), "--repo", projects.repo_github_slug(repo), "--json",
                      "additions,deletions,createdAt,mergedAt,state,comments"])
     if not view:
         return []

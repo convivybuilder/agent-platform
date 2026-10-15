@@ -34,6 +34,14 @@ GitHub App token mint (`github_app.installation_token`, a POST to
 `/access_tokens`) and the Library's own `POST /signals` — no `/repos/...`
 write of any kind.
 
+`main()` does not always walk `TRACKED` starting at index 0: one shared
+posting deadline covers the whole pass, so a pair late in the list could
+starve every pass under a sustained backlog
+(issue_01M4XNWSQTKYM42Z7YEG70RFQE, measured 2026-10-14). Each pass instead
+starts where the LAST pass's last-delivering pair left off, persisted in
+`rotation.json` beside `cursor.json`, so a backlog pair gets the front of
+the deadline on a later pass instead of always the tail.
+
 THE SIGNAL CONTRACT MATCHES `ci_result_fetch.py`'s `signal_from_run` BYTE FOR
 BYTE, SO BOTH CAN RUN DURING CHANGEOVER WITH NO DUPLICATE ROW: `source: ci`,
 `kind: test-result`, `actor: github-actions`, `stream` the workflow's slug
@@ -67,12 +75,33 @@ that file's own transport (`gh api` there, this module's own
     watermark and logged loudly as `stale_pending`, not dropped silently —
     so one run that never legitimately finishes cannot freeze that pair's
     cursor and grow its refetch window forever.
-  - A pair's cursor advances only once its whole window is fetched AND
-    posted with zero errors (`capture_workflow`'s own `errors` tally) — a
-    fetch failure or one failed post leaves the cursor exactly where it was,
-    so the next run re-covers the whole window rather than skipping over
-    data this run never actually wrote; `dedup_key` absorbs the re-covered
-    rows that already landed.
+  - A pair's cursor advances once its whole window is fetched AND posted
+    with zero errors (`capture_workflow`'s own `errors` tally) — a fetch
+    failure or an ordinary failed post leaves the cursor exactly where it
+    was, so the next run re-covers the whole window rather than skipping
+    over data this run never actually wrote; `dedup_key` absorbs the
+    re-covered rows that already landed.
+  - THE ONE EXCEPTION: a pair that stops on a SUSTAINED 429 still advances,
+    through what it delivered before stopping — carried over from the
+    production measurement of 2026-10-14 (CQ-455): a pair that runs out of
+    the Library's per-minute budget partway through a large window hit the
+    same 429 at the same point every 900s pass, so its cursor never moved
+    and every later pass re-posted the same already-delivered runs as
+    duplicates instead of reaching the ones after them. `capture_workflow`
+    posts a pair's completed runs oldest-`created_at`-first (`gh_runs`
+    doesn't promise an order; this module sorts explicitly), so the FIRST
+    run a sustained 429 leaves unposted is also the OLDEST unposted run in
+    the batch, and its `created_at` is a safe next cursor: every run this
+    pass did not post, posted or not yet tried, is at or after it. The
+    watermark `main()` persists for a 429-stopped pair is the min of that
+    run's `created_at` and the ordinary watermark candidates below (the
+    overlap margin, any in-flight run) — never later than either, so the
+    existing invariants below still hold. An ORDINARY post failure (a
+    `post_signal` result that is neither `created`/`duplicate` nor
+    `error:429`) does not get this exception even when a 429 also occurs
+    later in the same batch: `main()` advances a pair's cursor past a
+    sustained 429 alone, never past a batch that also had an ordinary
+    failure in it.
   - GitHub caps a `created`-filtered run list at `GITHUB_CREATED_FILTER_CAP`
     results and never errors on the page past it — it returns empty, the
     same silent truncation `ci_result_fetch.py` measured in production
@@ -164,6 +193,11 @@ SIGNAL_TOKEN_FILE = Path.home() / ".orient-control" / "ci-result-capture-token"
 STATE_DIR = Path.home() / ".local" / "state" / "agent-platform" / "ci-result-capture"
 CURSOR_FILE_NAME = "cursor.json"
 
+# Which TRACKED key the next pass should start walking from — see the
+# module docstring's rotation paragraph. Lives beside CURSOR_FILE_NAME, same
+# STATE_DIR, same atomic-write shape.
+ROTATION_FILE_NAME = "rotation.json"
+
 # GitHub's own eventual-consistency margin: a run that concluded moments
 # before this process read "now" might not yet be visible to the API, so the
 # next cursor sits a little behind "now" rather than exactly at it.
@@ -211,6 +245,18 @@ GITHUB_CREATED_FILTER_CAP = 1000
 # than `GITHUB_CREATED_FILTER_CAP` results for one `created`-filtered query
 # no matter how many pages this loop asks for.
 _MAX_PAGES = GITHUB_CREATED_FILTER_CAP // _PAGE_SIZE + 1
+
+# A page that comes back 502, 503 or 504 is retried rather than discarded —
+# issue_01M4XKXB63T8B4RJNAKFPQN7HF (2026-10-14): one transient 502 anywhere
+# in convivy-deck's 34-request split-window fetch threw away every page
+# already read, and the next pass started the whole 90-day window over.
+# Replays of the same request sequence, both under the job's own App token
+# and under the operator's `gh` login, returned 200 for every request, so
+# the 5xx is transient rather than caused by the token or the request
+# shape. A 4xx (and any other non-200) still raises at once, as before.
+_GH_RETRYABLE_STATUSES = (502, 503, 504)
+_GH_5XX_RETRY_ATTEMPTS = 3
+_GH_5XX_RETRY_BACKOFF_SECONDS = 2.0
 
 _CONCLUSION_TO_META_STATUS = {"success": "pass", "failure": "fail"}
 
@@ -283,6 +329,29 @@ def signal_from_run(run: dict, product: str, workflow: str) -> dict:
 # --- I/O: GitHub fetch, signal post, cursor and token files -----------------
 
 
+def _gh_runs_request(repo: str, workflow_file: str, url: str, token: str, opener,
+                     page: int, created_filter: str) -> list[dict]:
+    """One page's GET, retried up to `_GH_5XX_RETRY_ATTEMPTS` times in total
+    when GitHub answers 502/503/504 — see `_GH_RETRYABLE_STATUSES`'s own
+    comment for the occurrence this answers. Any other non-200, or a
+    malformed body, still raises on the first attempt, with no retry."""
+    for attempt in range(1, _GH_5XX_RETRY_ATTEMPTS + 1):
+        code, payload = GA.request("GET", url, token, None, opener=opener)
+        runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+        if code == 200 and isinstance(runs, list):
+            return runs
+        if code not in _GH_RETRYABLE_STATUSES or attempt == _GH_5XX_RETRY_ATTEMPTS:
+            raise CaptureError(
+                f"{repo}/{workflow_file}: workflow runs could not be read "
+                f"({code}) on page {page} (created={created_filter})"
+                + (f" after {attempt} attempts" if attempt > 1 else ""))
+        print(f"ci-result-capture: {repo}/{workflow_file}: page {page} "
+             f"(created={created_filter}) returned {code}; retrying "
+             f"(attempt {attempt + 1}/{_GH_5XX_RETRY_ATTEMPTS})", file=sys.stderr)
+        time.sleep(_GH_5XX_RETRY_BACKOFF_SECONDS)
+    raise AssertionError("unreachable: the loop above always returns or raises")
+
+
 def _gh_runs_page(repo: str, workflow_file: str, created_filter: str, token: str, *,
                   opener=urllib.request.urlopen) -> list[dict]:
     """Every run GitHub returns for this exact `created` filter value,
@@ -297,16 +366,14 @@ def _gh_runs_page(repo: str, workflow_file: str, created_filter: str, token: str
     longer loop that was never tried" — but it never returns more than the
     cap for one `created` filter value either way, which `gh_runs`/
     `_gh_runs_window` are what detect and answer. Raises `CaptureError` on
-    any non-200 or malformed response — never returns a partial list
-    silently."""
+    any non-200 or malformed response that retrying does not resolve (see
+    `_gh_runs_request`) — never returns a partial list silently."""
     out: list[dict] = []
     for page in range(1, _MAX_PAGES + 1):
         url = (f"{GA.API}/repos/{repo}/actions/workflows/{workflow_file}/runs"
               f"?per_page={_PAGE_SIZE}&page={page}&created={created_filter}")
-        code, payload = GA.request("GET", url, token, None, opener=opener)
-        runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
-        if code != 200 or not isinstance(runs, list):
-            raise CaptureError(f"{repo}/{workflow_file}: workflow runs could not be read ({code})")
+        runs = _gh_runs_request(repo, workflow_file, url, token, opener, page,
+                                created_filter)
         out.extend(runs)
         if len(runs) < _PAGE_SIZE:
             return out
@@ -383,8 +450,9 @@ def gh_runs(repo: str, workflow_file: str, since: str, token: str, *,
     to make; only a pair whose window holds more than the cap pays for the
     extra queries the split needs.
 
-    Raises `CaptureError` on any non-200 or malformed response — never
-    returns a partial list silently."""
+    Raises `CaptureError` on any non-200 or malformed response that retrying
+    does not resolve (`_GH_RETRYABLE_STATUSES`) — never returns a partial
+    list silently."""
     created_filter = f"%3E%3D{urllib.parse.quote(since, safe='')}"
     runs = _gh_runs_page(repo, workflow_file, created_filter, token, opener=opener)
     if len(runs) < GITHUB_CREATED_FILTER_CAP:
@@ -407,8 +475,44 @@ def signal_token() -> str | None:
         return None
 
 
+def _pair_key(entry: dict) -> str:
+    return f"{entry['repo']}#{entry['workflow_file']}"
+
+
+def rotation_order(tracked: tuple[dict, ...], start_key: str | None) -> tuple[dict, ...]:
+    """`tracked`, rotated so the walk starts at `start_key` and wraps —
+    every pair still runs exactly once per pass, just not always starting
+    at index 0 (see the module docstring's rotation paragraph).
+
+    `start_key` not a string, or naming a key no longer in `tracked`
+    (`TRACKED` can change between deploys), both fall back to starting at
+    `tracked[0]` — this is ordering only, never a reason to refuse the
+    run."""
+    if not tracked:
+        return tracked
+    start_idx = 0
+    if isinstance(start_key, str):
+        for i, entry in enumerate(tracked):
+            if _pair_key(entry) == start_key:
+                start_idx = i
+                break
+    return tracked[start_idx:] + tracked[:start_idx]
+
+
+def _delivered(tally: dict) -> bool:
+    """Whether a pair's batch put at least one signal in the Library's
+    Archives this pass — `created` and `duplicate` both count (a duplicate
+    still spent a `POST /signals` slot and proves the pair got its turn
+    this pass), a 429 or any other post failure does not."""
+    return tally["created"] + tally["duplicate"] >= 1
+
+
 def _cursor_path() -> Path:
     return STATE_DIR / CURSOR_FILE_NAME
+
+
+def _rotation_path() -> Path:
+    return STATE_DIR / ROTATION_FILE_NAME
 
 
 def load_cursor() -> dict:
@@ -449,6 +553,44 @@ def save_cursor(cursor: dict) -> None:
     os.replace(tmp, path)
 
 
+def load_rotation_start() -> str | None:
+    """The TRACKED key the next pass should start walking from, or `None`
+    when nothing has been recorded yet, the file cannot be read, its
+    content isn't valid JSON, or the recorded value isn't a string — all of
+    which mean "start this pass at TRACKED[0]" to `rotation_order`."""
+    try:
+        raw = _rotation_path().read_text()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        print(f"ci-result-capture: rotation file at {_rotation_path()} is "
+             f"corrupt; starting this pass at the top of TRACKED",
+             file=sys.stderr)
+        return None
+    start = data.get("start") if isinstance(data, dict) else None
+    return start if isinstance(start, str) else None
+
+
+def save_rotation_start(start_key: str) -> None:
+    """Atomic write: a pid-unique temp file in the same directory, then
+    `os.replace` — same shape as `save_cursor`, so a process killed
+    mid-write never leaves this file holding a truncated JSON fragment."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)  # mkdir's mode is a no-op on an already-existing dir
+    path = _rotation_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps({"start": start_key}))
+    os.replace(tmp, path)
+
+
 # --- the capture run ---------------------------------------------------------
 
 
@@ -460,14 +602,17 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
     """One tracked (repo, workflow_file) pair. Returns a tally dict with keys
     `created`/`duplicate`/`errors`/`stale_pending`, plus `next_since` — the
     cursor value `main()` should persist for this pair when `errors == 0`
-    (`None` whenever it isn't safe to advance at all) — and `reason`, the
-    first failure's text (`None` on a clean run).
+    OR `rate_limited` is true (`None` whenever it isn't safe to advance at
+    all) — `rate_limited`, true only when the batch stopped on a sustained
+    429 and had no OTHER post failure — and `reason`, the first failure's
+    text (`None` on a clean run).
 
     See the module docstring's cursor-invariants section for why an
     incomplete run holds `next_since` back to its own `created_at`, why a
     run stuck past `stale_pending_after` is excluded from that watermark
-    instead, and why `errors` is what gates whether `main()` advances this
-    pair's cursor at all.
+    instead, why `errors` is what gates whether `main()` advances this
+    pair's cursor at all, and why a sustained 429 alone is the one
+    exception.
 
     `fetcher`/`poster` default to the module-level `gh_runs`/
     `signal_client.post_signal`, resolved at call time so a caller going
@@ -479,13 +624,24 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
     cannot be computed safely without it, so the whole window aborts rather
     than guessing.
 
+    Completed runs are posted OLDEST `created_at` FIRST, not in whatever
+    order `fetcher` returned them (GitHub's own API returns newest first;
+    `gh_runs` makes no promise either way) — this is what makes "the first
+    unposted run" also "the oldest unposted run" once a sustained 429 stops
+    the loop, which is what `next_since` needs below.
+
     A signal reporting `'error:429'` (`post_signal`'s own retry-to-deadline
     exhausted) stops the posting loop for the REST of this pair's batch: the
     deadline it was retried against is shared across every payload in this
     run, so a further payload would retry into an already-expired budget for
-    no gain. Any other post failure is tallied as an ordinary error and the
-    loop continues — only a sustained 429 is a case where trying the next
-    payload is already known to be pointless."""
+    no gain. `rate_limited` is set and `next_since` is pulled back to include
+    this stopping point's own run's `created_at`, so `main()` can still
+    advance the cursor through whatever was delivered before the 429. Any
+    other post failure is tallied as an ordinary error, clears the
+    `rate_limited` exception for the whole batch (even one that also hits a
+    429 later), and the loop continues — only a sustained 429, and nothing
+    else wrong in the same batch, is a case where the already-delivered
+    prefix is still trustworthy enough to advance past."""
     fetcher = fetcher if fetcher is not None else gh_runs
     poster = poster if poster is not None else SC.post_signal
     run_started = run_started if run_started is not None else dt.datetime.now(dt.timezone.utc)
@@ -493,7 +649,7 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
                            else STALE_PENDING_AFTER)
     workflow = workflow_slug(workflow_file)
     tally = {"created": 0, "duplicate": 0, "errors": 0, "stale_pending": 0,
-            "next_since": None, "reason": None}
+            "next_since": None, "reason": None, "rate_limited": False}
     try:
         runs = fetcher(repo, workflow_file, since, gh_token)
     except CaptureError as ex:
@@ -505,7 +661,9 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
     completed_runs = [r for r in runs if r.get("status") == "completed"]
     incomplete_runs = [r for r in runs if r.get("status") != "completed"]
     try:
-        payloads = [signal_from_run(r, product, workflow) for r in completed_runs]
+        payloads = sorted(
+            (signal_from_run(r, product, workflow) for r in completed_runs),
+            key=lambda p: p["produced_at"])
         in_flight_created_ats = []
         for r in incomplete_runs:
             created_at = r.get("created_at")
@@ -527,8 +685,8 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
                 print(f"ci-result-capture: {repo}/{workflow_file}: STALE_PENDING "
                      f"(still {r.get('status')!r} after {age}, past the "
                      f"{stale_pending_after} ceiling — treated as abandoned, "
-                     f"cursor advances past it): run {r.get('id')}, created "
-                     f"{created_at}", file=sys.stderr)
+                     f"excluded from this pair's watermark): run {r.get('id')}, "
+                     f"created {created_at}", file=sys.stderr)
                 tally["stale_pending"] += 1
             else:
                 in_flight_created_ats.append(created_dt)
@@ -538,6 +696,9 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
         tally["reason"] = str(ex)
         return tally
 
+    rate_limited = False
+    ordinary_post_failure = False
+    first_unposted_dt = None
     for payload in payloads:
         result = poster(payload, tok=sig_tok, timeout=_SIGNAL_TIMEOUT,
                         deadline=deadline, sleep=sleep)
@@ -546,13 +707,22 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
         elif result == "duplicate":
             tally["duplicate"] += 1
         elif result == "error:429":
-            print(f"ci-result-capture: {repo}/{workflow_file}: sustained 429 "
-                 f"on {payload['dedup_key']}; stopping this pair's batch "
-                 f"here, cursor held, all of it re-asked for next poll",
-                 file=sys.stderr)
+            if ordinary_post_failure:
+                print(f"ci-result-capture: {repo}/{workflow_file}: sustained "
+                     f"429 on {payload['dedup_key']}; stopping this pair's "
+                     f"batch here, cursor stays where it was — an earlier "
+                     f"post in this batch already failed", file=sys.stderr)
+            else:
+                print(f"ci-result-capture: {repo}/{workflow_file}: sustained "
+                     f"429 on {payload['dedup_key']}; stopping this pair's "
+                     f"batch here, cursor advanced through what was "
+                     f"delivered, the rest re-asked for next poll",
+                     file=sys.stderr)
             tally["errors"] += 1
             if tally["reason"] is None:
                 tally["reason"] = f"sustained 429 on {payload['dedup_key']}"
+            rate_limited = True
+            first_unposted_dt = _parse_timestamp(payload["produced_at"])
             break
         else:
             print(f"ci-result-capture: {repo}/{workflow_file}: post failed: "
@@ -560,9 +730,13 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
             tally["errors"] += 1
             if tally["reason"] is None:
                 tally["reason"] = f"post failed: {result} ({payload['dedup_key']})"
+            ordinary_post_failure = True
 
     watermark_candidates = [run_started - OVERLAP, *in_flight_created_ats]
+    if rate_limited and first_unposted_dt is not None:
+        watermark_candidates.append(first_unposted_dt)
     tally["next_since"] = min(watermark_candidates).strftime("%Y-%m-%dT%H:%M:%SZ")
+    tally["rate_limited"] = rate_limited and not ordinary_post_failure
     return tally
 
 
@@ -577,7 +751,7 @@ def main() -> int:
         return 1
     try:
         jwt = GA.app_jwt(KEY_PATH, APP_ID)
-        inst = GA.single_installation(jwt, OWNER)
+        inst = GA.installation_for_owner(jwt, OWNER, label="the convivy-bosun App")
         inst_id = str(inst.get("id") or "")
         if not inst_id:
             raise GA.Unreadable("the installation carries no id")
@@ -603,8 +777,14 @@ def main() -> int:
 
     exit_code = 0
     grand = {"created": 0, "duplicate": 0, "errors": 0, "stale_pending": 0}
-    for entry in TRACKED:
-        key = f"{entry['repo']}#{entry['workflow_file']}"
+    order = rotation_order(TRACKED, load_rotation_start())
+    # The start this pass actually used, after `rotation_order`'s own
+    # fallback to the top — the pass-didn't-deliver-anything default below
+    # is this, not whatever (possibly stale or absent) value the rotation
+    # file held coming in.
+    next_start = _pair_key(order[0]) if order else None
+    for i, entry in enumerate(order):
+        key = _pair_key(entry)
         since = cursor.get(key) or no_cursor_since
         try:
             t = capture_workflow(entry["repo"], entry["workflow_file"], entry["product"],
@@ -621,11 +801,15 @@ def main() -> int:
             print(f"ci-result-capture: {key}: unexpected failure: "
                  f"{type(ex).__name__}: {ex}", file=sys.stderr)
             t = {"created": 0, "duplicate": 0, "errors": 1, "stale_pending": 0,
-                "next_since": None, "reason": f"{type(ex).__name__}: {ex}"}
+                "next_since": None, "reason": f"{type(ex).__name__}: {ex}",
+                "rate_limited": False}
         print(f"{key}: {t}")
         for k in grand:
             grand[k] += t[k]
-        if t["errors"] == 0:
+        # `rate_limited` is the one exception to "only a clean pair
+        # advances" — see `capture_workflow`'s own docstring and the module
+        # docstring's cursor-invariants section (CQ-455).
+        if t["errors"] == 0 or t["rate_limited"]:
             cursor[key] = t["next_since"]
         # Saved every iteration, not once after the loop — mirrors
         # `pr-state-capture`'s own per-repo save, for the same reason: a
@@ -634,6 +818,14 @@ def main() -> int:
         # and (now the above `try` catches it) never a later pair's own turn
         # either.
         save_cursor(cursor)
+        # The next pass starts after the LAST pair THIS pass delivered at
+        # least one signal for (see the module docstring's rotation
+        # paragraph) — recomputed and saved after every pair, same reason
+        # as `save_cursor` above, so a crash mid-pass keeps the rotation
+        # progress this pass already made.
+        if _delivered(t):
+            next_start = _pair_key(order[(i + 1) % len(order)])
+        save_rotation_start(next_start)
         if t["errors"]:
             exit_code = 1
     print(f"total: {grand}")

@@ -445,6 +445,22 @@ def test_github_owner_field_overrides_the_default(monkeypatch, tmp_path):
     assert issue_gate._github_repo_for("nyh-arch-tools") == "operator-account/nyh-arch-tools"
 
 
+def test_repo_owners_entry_overrides_github_owner_for_that_one_repo(monkeypatch, tmp_path):
+    """shipwright's own repo stays under convivy; its `homebrew-tap` entry in
+    `repo_owners` names convivybuilder instead, and this reads it for repos[0]
+    without touching `github_owner`. Before `_github_repo_for` read
+    `repo_owners` at all (it only read `github_owner`, which is unit-wide),
+    this returned convivy/homebrew-tap."""
+    gh, _ = _fake_gh(tmp_path, "repoowner")
+    monkeypatch.setattr(issue_gate.SP, "safe_which",
+                        lambda name: str(gh) if name == "gh" else None)
+    _stub_registry(monkeypatch, registry={
+        "shipwright": {"repos": ["homebrew-tap", "shipwright"],
+                       "repo_owners": {"homebrew-tap": "convivybuilder"}},
+    })
+    assert issue_gate._github_repo_for("shipwright") == "convivybuilder/homebrew-tap"
+
+
 def test_a_product_with_no_repos_fails_closed(monkeypatch, tmp_path):
     gh, _ = _fake_gh(tmp_path, "norepos")
     monkeypatch.setattr(issue_gate.SP, "safe_which",

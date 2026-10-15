@@ -431,6 +431,290 @@ def test_without_a_runs_root_no_runs_rule_is_added(tmp_path):
     assert not any("agent-runs" in p for p in fs["denyWrite"])
 
 
+# --- CQ·138: a dispatch's tool-session scratch directory must live outside
+# `runs_root`, which is denied for writing by every dispatched run's Bash,
+# and outside every root any dispatch's `allowWrite` holds. Only the MARKER
+# FILE inside that directory is ever granted by `settings()`'s
+# `tool_session_marker` parameter — never the directory itself. Measured
+# directly against a real dispatch: a run can append to and delete its own
+# marker, but cannot create a file in its own scratch directory, rename that
+# directory, or reach a SIBLING dispatch's marker or directory at all — see
+# `settings()`'s own `tool_session_marker` docstring for the full reasoning,
+# and `RS.tool_session_scratch_root`'s own docstring for why the directory
+# lives under a per-account state path rather than the shared system temp
+# root. ---
+
+def test_create_tool_session_scratch_dir_makes_an_owner_only_directory(tmp_path):
+    """Mirrors `test_create_eval_scratch_dir_makes_an_owner_only_directory`: mode
+    0700 is `mkdtemp`'s own default, and the directory sits under this
+    account's own `tool_session_scratch_root`, not the shared system temp
+    root."""
+    d = RS.create_tool_session_scratch_dir(tmp_path)
+    try:
+        assert d.is_dir()
+        assert d.is_relative_to(RS.tool_session_scratch_root(tmp_path))
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+        assert d.name.startswith(RS.TOOL_SESSION_SCRATCH_PREFIX)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_two_tool_session_scratch_dirs_are_distinct_and_unguessable_from_each_other(
+        tmp_path):
+    """Mirrors `test_two_eval_scratch_dirs_are_distinct_and_unguessable_from_each_other`:
+    two concurrent dispatches must never land on the same directory."""
+    a = RS.create_tool_session_scratch_dir(tmp_path)
+    b = RS.create_tool_session_scratch_dir(tmp_path)
+    try:
+        assert a != b
+        assert a.name != b.name
+    finally:
+        shutil.rmtree(a, ignore_errors=True)
+        shutil.rmtree(b, ignore_errors=True)
+
+
+def _fake_account_home() -> Path:
+    """A directory for one test's own synthetic account home, created under
+    the current working directory (the worktree) rather than under
+    `tmp_path`: in THIS test environment `tmp_path` itself sits under the
+    system temp root (`tempfile.gettempdir()`), which would make a check that
+    something sits OUTSIDE the temp roots pass or fail on the fixture, not on
+    this code — the same caveat
+    `test_the_agent_postgres_socket_sits_under_the_account_home_not_tmp`
+    already notes for `tmp_path`. The caller must remove it."""
+    return Path(tempfile.mkdtemp(prefix="cq138-fakehome-", dir="."))
+
+
+def test_create_tool_session_scratch_dir_lives_outside_the_shared_temp_roots():
+    """CQ·138: the scratch directory's parent must not be the shared system
+    temp root — that root sits inside an ordinary dispatch's own
+    `allowWrite`, which would let one dispatch reach a sibling's scratch
+    directory through it (see this module's own `TOOL_SESSION_SCRATCH_RELDIR`
+    comment). Fails against 84c9aa93, whose
+    `create_tool_session_scratch_dir` takes no `home` argument at all and
+    creates its directory directly under `tempfile.gettempdir()`."""
+    home = _fake_account_home()
+    try:
+        d = RS.create_tool_session_scratch_dir(home)
+        root = RS.tool_session_scratch_root(home)
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+        tmp_roots = [os.path.realpath(tempfile.gettempdir()), "/tmp", os.path.realpath("/tmp")]
+        for t in tmp_roots:
+            assert not root.is_relative_to(t), f"the scratch root must not sit under {t}"
+            assert not d.is_relative_to(t), f"the scratch directory must not sit under {t}"
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_create_tool_session_marker_makes_an_owner_only_file_inside_the_scratch_dir(
+        tmp_path):
+    """The marker is a FILE, created directly inside its own
+    `create_tool_session_scratch_dir` directory, mode 0600 (owner read/write,
+    nobody else — tighter than the directory's own 0700, since this is the
+    one path a run is actually granted write access to)."""
+    scratch_dir = tmp_path / "scratch"
+    scratch_dir.mkdir(mode=0o700)
+    marker = RS.create_tool_session_marker(scratch_dir)
+    try:
+        assert marker.parent == scratch_dir
+        assert marker.is_file()
+        assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+        assert marker.name == RS.TOOL_SESSION_MARKER_NAME
+    finally:
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def test_a_dispatchs_settings_grant_its_tool_session_marker_on_top_of_the_shared_root(
+        tmp_path):
+    """An ordinary (non-eval) dispatch's `allowWrite` must gain exactly this
+    dispatch's own marker FILE — on TOP of the shared temp root it already had,
+    never in place of it (contrast `eval_scratch_dir`, which replaces that
+    root) — while `runs_root` stays denied exactly as it is for every other
+    dispatch, AND the marker's own parent directory is never granted by THIS
+    parameter as a separate entry: the directory itself lives outside the
+    shared root so nothing else covers it either — see `settings()`'s own
+    `tool_session_marker` docstring. Fails against b362c5d2: the parameter
+    still takes a directory, not this file, so the directory itself would
+    appear in `allowWrite` instead of being absent from it."""
+    runs = tmp_path / "agent-runs"
+    scratch_dir = tmp_path / "scratch-dir" / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}xyz"
+    scratch_dir.mkdir(parents=True)
+    marker = scratch_dir / RS.TOOL_SESSION_MARKER_NAME
+    marker.touch()
+    settings = RS.settings(home=tmp_path, worktree=tmp_path / "wt", runs_root=runs,
+                           tool_session_marker=marker)
+    fs = settings["sandbox"]["filesystem"]
+    assert str(marker) in fs["allowWrite"]
+    assert str(scratch_dir) not in fs["allowWrite"], \
+        "the directory must never be granted — only the marker file inside it"
+    assert "/tmp" in fs["allowWrite"]
+    assert os.path.realpath("/tmp") in fs["allowWrite"]
+    assert str(runs) in fs["denyWrite"]
+    assert str(runs) not in fs["allowWrite"]
+
+
+def test_two_tool_session_dispatches_settings_do_not_cover_each_others_marker(
+        tmp_path):
+    """Neither dispatch's allow-list may reach the other's marker — the same
+    isolation `test_two_eval_dispatches_settings_do_not_cover_each_others_directory`
+    requires of `eval_scratch_dir`."""
+    dir_a = tmp_path / "scratch" / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}a"
+    dir_b = tmp_path / "scratch" / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}b"
+    dir_a.mkdir(parents=True)
+    dir_b.mkdir(parents=True)
+    marker_a = dir_a / RS.TOOL_SESSION_MARKER_NAME
+    marker_b = dir_b / RS.TOOL_SESSION_MARKER_NAME
+    marker_a.touch()
+    marker_b.touch()
+    settings_a = RS.settings(home=tmp_path, worktree=tmp_path / "wt",
+                             tool_session_marker=marker_a)
+    settings_b = RS.settings(home=tmp_path, worktree=tmp_path / "wt",
+                             tool_session_marker=marker_b)
+    assert str(marker_b) not in settings_a["sandbox"]["filesystem"]["allowWrite"]
+    assert str(marker_a) not in settings_b["sandbox"]["filesystem"]["allowWrite"]
+
+
+def _assert_allow_write_never_covers(allow_write: list[str], target: Path) -> None:
+    """`target` (a directory) must not be reachable through any entry in
+    `allow_write`: no entry may equal it, nor be an ancestor of it, since
+    `allowWrite` on a directory grants write on everything inside it,
+    recursively."""
+    target_str = str(target)
+    for p in allow_write:
+        assert p != target_str, f"{p!r} is exactly the scratch root/directory"
+        assert not target_str.startswith(p.rstrip("/") + os.sep), \
+            f"{p!r} is an ancestor of {target_str!r} and so covers it"
+
+
+def test_an_ordinary_dispatchs_settings_never_grant_the_tool_session_scratch_root(
+        tmp_path):
+    """CQ·138: an ORDINARY dispatch's `allowWrite` holds the shared temp
+    roots, so a scratch directory created directly under one of them would be
+    reachable by every OTHER dispatch too — `allowWrite` on a directory grants
+    removing or renaming anything inside it, so any dispatch could reach ANY
+    sibling's scratch directory this way, not only its own. This asserts the
+    actual fix: neither the
+    scratch root (`RS.tool_session_scratch_root`) nor the one dispatch's own
+    scratch directory inside it is ever covered by any `allowWrite` entry —
+    only the marker file is. `home` is a synthetic account home under the
+    current working directory, not `tmp_path` — see `_fake_account_home`'s
+    own docstring for why. Fails against 84c9aa93, whose `allowWrite`
+    includes `tempfile.gettempdir()`, the literal parent every scratch
+    directory was created under."""
+    home = _fake_account_home()
+    try:
+        scratch_root = RS.tool_session_scratch_root(home)
+        scratch_dir = scratch_root / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}xyz"
+        scratch_dir.mkdir(parents=True)
+        marker = scratch_dir / RS.TOOL_SESSION_MARKER_NAME
+        marker.touch()
+        settings = RS.settings(home=home, worktree=tmp_path / "wt",
+                               tool_session_marker=marker)
+        allow_write = settings["sandbox"]["filesystem"]["allowWrite"]
+        assert str(marker) in allow_write
+        _assert_allow_write_never_covers(allow_write, scratch_root)
+        _assert_allow_write_never_covers(allow_write, scratch_dir)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_an_eval_dispatchs_settings_never_grant_the_tool_session_scratch_root(
+        tmp_path):
+    """The same check as
+    `test_an_ordinary_dispatchs_settings_never_grant_the_tool_session_scratch_root`,
+    for an `--eval-mode` dispatch: its `allowWrite` is narrowed to
+    `eval_scratch_dir` alone, which must not happen to cover the tool-session
+    scratch root either."""
+    home = _fake_account_home()
+    try:
+        scratch_root = RS.tool_session_scratch_root(home)
+        scratch_dir = scratch_root / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}xyz"
+        scratch_dir.mkdir(parents=True)
+        marker = scratch_dir / RS.TOOL_SESSION_MARKER_NAME
+        marker.touch()
+        eval_dir = tmp_path / "eval-scratch" / f"{RS.EVAL_SCRATCH_PREFIX}e"
+        eval_dir.mkdir(parents=True)
+        settings = RS.settings(home=home, worktree=tmp_path / "wt",
+                               eval_scratch_dir=eval_dir, tool_session_marker=marker)
+        allow_write = settings["sandbox"]["filesystem"]["allowWrite"]
+        assert str(marker) in allow_write
+        _assert_allow_write_never_covers(allow_write, scratch_root)
+        _assert_allow_write_never_covers(allow_write, scratch_dir)
+    finally:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def test_an_eval_dispatch_still_gets_its_tool_session_marker_added_on_top(
+        tmp_path):
+    """The blocking finding's own edge case: an `--eval-mode` dispatch's
+    `allowWrite` is narrowed to `eval_scratch_dir` ALONE (no shared root) —
+    without this parameter's explicit, unconditional addition, that narrowing
+    would silently drop the tool-session mechanism for every eval dispatch,
+    the same way omitting `runs_root` drops it for every dispatch today. Both
+    paths must be present, and the shared root must still be absent."""
+    eval_dir = tmp_path / "eval-scratch" / f"{RS.EVAL_SCRATCH_PREFIX}e"
+    tool_dir = tmp_path / "tool-scratch" / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}t"
+    eval_dir.mkdir(parents=True)
+    tool_dir.mkdir(parents=True)
+    marker = tool_dir / RS.TOOL_SESSION_MARKER_NAME
+    marker.touch()
+    settings = RS.settings(home=tmp_path, worktree=tmp_path / "wt",
+                           eval_scratch_dir=eval_dir,
+                           tool_session_marker=marker)
+    fs = settings["sandbox"]["filesystem"]
+    assert str(eval_dir) in fs["allowWrite"]
+    assert str(marker) in fs["allowWrite"]
+    assert str(tool_dir) not in fs["allowWrite"]
+    assert "/tmp" not in fs["allowWrite"]
+    assert os.path.realpath("/tmp") not in fs["allowWrite"]
+
+
+def test_without_tool_session_marker_settings_are_unchanged(tmp_path):
+    """Adding the `tool_session_marker` parameter must not perturb a dispatch
+    that omits it: byte-identical to before this parameter existed (the same
+    contract `test_a_non_eval_dispatchs_settings_are_unchanged_by_eval_scratch_dir_support`
+    holds for `eval_scratch_dir`)."""
+    runs = tmp_path / "agent-runs"
+    with_param = RS.settings(home=tmp_path, worktree=tmp_path / "wt", runs_root=runs,
+                             tool_session_marker=None)
+    without_param = RS.settings(home=tmp_path, worktree=tmp_path / "wt", runs_root=runs)
+    assert with_param == without_param
+
+
+def test_the_agent_runs_root_still_denies_writing_with_a_tool_session_marker_set(
+        tmp_path):
+    """The blocking finding's own guarantee, restated against the real pinning
+    test's own assertions (`test_the_agent_runs_root_is_denied_for_writing_by_a_run`):
+    granting this dispatch's own marker must never loosen `runs_root`'s deny
+    rule one inch — the fix adds a path OUTSIDE `runs_root`, it does not touch
+    the rule that denies `runs_root` itself."""
+    runs = tmp_path / "agent-runs"
+    scratch_dir = tmp_path / "scratch-dir" / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}xyz"
+    scratch_dir.mkdir(parents=True)
+    marker = scratch_dir / RS.TOOL_SESSION_MARKER_NAME
+    marker.touch()
+    settings = RS.settings(home=tmp_path, worktree=tmp_path / "wt", runs_root=runs,
+                           tool_session_marker=marker)
+    fs = settings["sandbox"]["filesystem"]
+    assert str(runs) in fs["denyWrite"]
+    assert f"Edit({_rule(runs)}/**)" in settings["permissions"]["deny"]
+    assert str(runs) not in fs["allowWrite"]
+
+
+def test_settings_json_includes_the_tool_session_marker(tmp_path):
+    """`settings_json` must thread the new parameter through to `settings`,
+    not just accept and drop it."""
+    import json as _json
+
+    scratch_dir = tmp_path / "scratch-dir" / f"{RS.TOOL_SESSION_SCRATCH_PREFIX}xyz"
+    scratch_dir.mkdir(parents=True)
+    marker = scratch_dir / RS.TOOL_SESSION_MARKER_NAME
+    marker.touch()
+    rendered = RS.settings_json(home=tmp_path, worktree=tmp_path / "wt",
+                                tool_session_marker=marker)
+    assert str(marker) in _json.loads(rendered)["sandbox"]["filesystem"]["allowWrite"]
+
+
 def _linked_checkout(tmp_path: Path) -> Path:
     """A primary repository with one commit, and a linked worktree of it. Returns the worktree."""
     primary = tmp_path / "primary"

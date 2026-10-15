@@ -177,6 +177,137 @@ def eval_verdict_path(scratch_dir: Path) -> Path:
     return Path(scratch_dir) / EVAL_VERDICT_FILENAME
 
 
+# The `mkdtemp` prefix every `create_tool_session_scratch_dir` directory is
+# named with (CQ·138). Distinct from `EVAL_SCRATCH_PREFIX`: the two serve
+# unrelated purposes and nothing here needs them to share a glob.
+TOOL_SESSION_SCRATCH_PREFIX = "agentctl-toolsession-"
+
+# Where every dispatch's tool-session scratch directory is created, relative
+# to the account home (CQ·138). Never the resolved system temp root
+# (`tempfile.gettempdir()`): that root sits inside `allowWrite` for every
+# ORDINARY (non-eval) dispatch (`settings()`'s own `allow_write = [Path(t) for
+# t in tmp_roots]` branch), and `allowWrite` on a directory grants write on
+# the directory ENTRY, not merely on files already inside it — so a dispatch
+# whose scratch directory sat there could list that shared root, find a
+# SIBLING dispatch's `TOOL_SESSION_SCRATCH_PREFIX` directory, and remove or
+# rename it, including a name it did not create. Removing a sibling's scratch
+# directory makes that sibling's own finalize find no marker to verify
+# (`_verified_tool_session_marker`'s own device/inode check fails closed) and
+# skip its own sweep, leaving that sibling's leftover tool-shell processes
+# alive.
+#
+# `tool_session_scratch_root`, below, moves the parent outside every root any
+# dispatch's `allowWrite` holds: the temp roots, `runs_root`, the worktree,
+# the git directory, and the account-home subdirectories `DENIED_DIRS` names.
+# Chosen under the account's own per-user state directory, the same
+# `.local/state/agent-platform` tree `agent_postgres_socket_dir` already uses
+# for this platform's own state outside any dispatch's reach — neither
+# function's directory is ever granted to a run, by design. Named as ONE
+# constant, read by both `create_tool_session_scratch_dir` (the dispatcher,
+# before a run's claude ever starts) and by this module's own tests, so the
+# two can never name different locations.
+TOOL_SESSION_SCRATCH_RELDIR = Path(".local/state/agent-platform/tool-sessions")
+
+
+def tool_session_scratch_root(home: Path) -> Path:
+    """Where `create_tool_session_scratch_dir` creates one dispatch's scratch
+    directory, under the given account home — never `Path.home()` or `$HOME`,
+    which a caller's environment can point elsewhere (the same reasoning as
+    `passwd_home()`, below). This is a FIXED, PREDICTABLE path, shared by every
+    dispatch on the machine: what keeps one dispatch's scratch directory apart
+    from another's is the unguessable `mkdtemp` suffix `create_tool_session_
+    scratch_dir` creates inside it. What matters is that THIS parent is
+    outside every `allowWrite` root any dispatch holds (see
+    `TOOL_SESSION_SCRATCH_RELDIR`'s own comment), so a run that can list or
+    write under this path at all is a run that was granted something it
+    should never have — see this module's own `settings()` docstring on
+    `tool_session_marker` for why nothing here adds that grant. This whole
+    guarantee rests on that parent staying outside `allowWrite`: a future
+    change that adds this path, or an ancestor of it, to any dispatch's
+    `allowWrite` would let that dispatch reach every OTHER dispatch's scratch
+    directory and marker, not only its own."""
+    return Path(home) / TOOL_SESSION_SCRATCH_RELDIR
+
+
+def create_tool_session_scratch_dir(home: Path) -> Path:
+    """Creates and returns a fresh directory, outside `runs_root` AND outside
+    every root any dispatch's `allowWrite` holds, to hold one dispatch's
+    tool-session marker (the marker itself is `create_tool_session_marker`,
+    below).
+
+    Outside `runs_root`: `run_dir` sits under `runs_root`, which `settings()`
+    denies for writing by every dispatched run's Bash, on purpose
+    (`test_the_agent_runs_root_is_denied_for_writing_by_a_run`) — a run that
+    could write under `runs_root` could rewrite the `meta.json` a verdict is
+    checked against, so a marker mechanism that wrote there would always be
+    refused in a real dispatch.
+
+    Outside the shared system temp root: that root sits inside every
+    ORDINARY dispatch's own `allowWrite`, so a dispatch whose scratch
+    directory lived there could reach and remove or rename a SIBLING
+    dispatch's scratch directory (see `TOOL_SESSION_SCRATCH_RELDIR`'s own
+    comment for the mechanics). This directory lives under
+    `tool_session_scratch_root(home)` instead — a per-account state path no
+    dispatch's `allowWrite` ever names — created 0700 if missing (never
+    trusting whatever mode a pre-existing directory there happens to have),
+    with `tempfile.mkdtemp` inside it (mode 0700, `mkdtemp`'s own random
+    suffix). It holds the one file (`create_tool_session_marker`'s return
+    value) `settings()`'s `tool_session_marker` parameter actually grants
+    this dispatch write access to. The directory itself is never granted —
+    see `settings()`'s own docstring for what that file-only grant does and
+    does not let the run do. Created once per dispatch, by the dispatcher,
+    before that run's claude process ever starts — never by the sandboxed
+    run itself."""
+    root = tool_session_scratch_root(home)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    return Path(tempfile.mkdtemp(prefix=TOOL_SESSION_SCRATCH_PREFIX, dir=str(root)))
+
+
+# The marker's fixed filename inside its `create_tool_session_scratch_dir`
+# directory (CQ·138). Fixed, not keyed by run id: the directory itself is
+# already this dispatch's own unguessable, owner-only scratch space, so the
+# filename inside it carries no isolation job of its own.
+TOOL_SESSION_MARKER_NAME = "marker"
+
+
+def create_tool_session_marker(scratch_dir: Path) -> Path:
+    """Creates and returns an empty, owner-only file inside `scratch_dir` (this
+    dispatch's own `create_tool_session_scratch_dir` directory) — the ONE path
+    `settings()`'s `tool_session_marker` parameter grants this dispatch write
+    access to (CQ·138).
+
+    An earlier design recorded each Bash-tool shell's OWN REPORTED pid — a
+    value the run writes about itself, with no OS-verified link to any
+    process at all — and the finalize-time sweep trusted that a live process
+    whose pgid and sid both happened to equal a recorded number WAS the tool
+    shell. Every other run's own Bash-tool shell is under the same uid and is
+    exactly such a process (a brand-new zsh session, pgid == sid == pid) — so
+    a run could write ANOTHER run's tool-shell pid into its own record and
+    have this run's trusted supervisor kill that shell at finalize. The
+    content was the attack surface, and the run could always write it, an
+    `allowWrite` grant on the record file notwithstanding.
+
+    This file replaces that record with a liveness mechanism the run cannot
+    forge: nothing is ever written into it or read back from it. A tool
+    shell's `.zshenv` (`_write_tool_session_zdotdir` in `bin/agentctl`) opens
+    it for append on a file descriptor that stays open for the lifetime of
+    that shell and everything it backgrounds or disowns, including a
+    descendant reparented to pid 1 — so "who currently holds this file open"
+    (`lsof -t <path>`, queried by the supervisor against the device and inode
+    recorded for THIS exact file, never content read from it) IS this
+    dispatch's own tool-session tree, with no run-reported identifier
+    anywhere in the path. The content a run writes into the file (it can:
+    `settings()` grants the file itself) is never consulted by anything."""
+    path = scratch_dir / TOOL_SESSION_MARKER_NAME
+    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+    finally:
+        os.close(fd)
+    return path
+
+
 # Bash may reach these hosts. `strictAllowlist` makes any other host a refusal
 # rather than a prompt, which a bypassPermissions run would otherwise pass.
 # A loopback Library (127.0.0.1) is unreachable from Bash without
@@ -611,6 +742,7 @@ EXTRA_DENY_HOME_ENV = "AGENTCTL_SANDBOX_EXTRA_DENY_HOME"
 def settings(*, home: Path, worktree: Path, runs_root: Path | None = None,
              git_dir: Path | None = None, exclude_user_claude_md: bool = False,
              eval_scratch_dir: Path | None = None,
+             tool_session_marker: Path | None = None,
              repo: str | None = None) -> dict:
     """The sandbox and permission settings for one run.
 
@@ -665,6 +797,41 @@ def settings(*, home: Path, worktree: Path, runs_root: Path | None = None,
     exception to that rule, which does not apply here). `None` (every non-eval
     dispatch) leaves this function's output exactly as it was before this
     parameter existed.
+
+    `tool_session_marker` (CQ·138) is one dispatch's own
+    `create_tool_session_marker` FILE — never the scratch directory that
+    holds it (an earlier design granted the whole directory, which also let
+    a run rename, delete or symlink over the marker itself; the run-reported
+    pid it also let a run write is the forgery `create_tool_session_marker`'s
+    own docstring describes closing a different way).
+
+    Measured directly against a real dispatch (2026-10-13), for both an
+    ordinary and an `--eval-mode` dispatch alike: a write grant on the
+    marker FILE alone lets a tool shell's `.zshenv` open it for append, and
+    also lets the run delete the file outright with `rm` (exit 0 — a
+    single-file `allowWrite` grant permits unlinking the file it names). It
+    does NOT let the run create a new file in the marker's own directory,
+    rename that directory, or rename/replace the marker with another file —
+    every one of those needs write permission on the directory entry, not
+    the file's own contents, and this grant never includes the directory
+    (the same distinction `_protect_rest_of_git_dir`'s docstring makes about
+    a loose object's mode). A run that deletes its own marker only defeats
+    its own finalize-time sweep (`_verified_tool_session_marker` fails to
+    open a missing file and signals nothing for that run); it gains no
+    access to any OTHER dispatch's marker or directory, since
+    `tool_session_scratch_root` keeps every dispatch's directory outside
+    every dispatch's `allowWrite` — see that function's own docstring for
+    what would reopen that.
+
+    Added to `allowWrite` UNCONDITIONALLY — unlike `eval_scratch_dir`, which
+    replaces the shared temp root in `allowWrite` for an eval dispatch, this
+    file is added on top of whatever `allowWrite` already holds, eval
+    dispatch or not: an eval dispatch's `allowWrite` is narrowed to its own
+    `eval_scratch_dir` alone, and without this explicit addition that
+    narrowing would silently drop the tool-session mechanism for every eval
+    dispatch, the same way omitting `runs_root` drops it for every dispatch
+    today. `runs_root` itself is unaffected either way — this parameter only
+    ever adds a path outside it, never changes `denyWrite`.
 
     Round 9 (agent-platform#813 round 8 finding, security-reviewer): round 8 confined
     the WRITE but not the READ — several eval arms run against the same corpus entry
@@ -732,6 +899,13 @@ def settings(*, home: Path, worktree: Path, runs_root: Path | None = None,
         allow_write = [Path(eval_scratch_dir)]
     else:
         allow_write = [Path(t) for t in tmp_roots]
+    # CQ·138: added on top, not folded into the eval/non-eval branch above —
+    # see this function's own docstring for why an eval dispatch needs this addition
+    # even though its `allowWrite` is otherwise narrowed to `eval_scratch_dir` alone.
+    # The FILE, never its parent directory — see this function's own docstring
+    # for what a file-only grant does and does not let the run do.
+    if tool_session_marker is not None:
+        allow_write.append(Path(tool_session_marker))
     tmux_dirs = _unique(tmux_socket_dir(Path(t)) for t in tmp_roots)
     deny_write = [worktree / f for f in WORKTREE_EDIT_DENIED] + tmux_dirs
     if git_dir:
@@ -837,10 +1011,12 @@ def settings(*, home: Path, worktree: Path, runs_root: Path | None = None,
 def settings_json(*, home: Path, worktree: Path, runs_root: Path | None = None,
                   git_dir: Path | None = None, exclude_user_claude_md: bool = False,
                   eval_scratch_dir: Path | None = None,
+                  tool_session_marker: Path | None = None,
                   repo: str | None = None) -> str:
     return json.dumps(settings(home=home, worktree=worktree, runs_root=runs_root, git_dir=git_dir,
                                exclude_user_claude_md=exclude_user_claude_md,
-                               eval_scratch_dir=eval_scratch_dir, repo=repo),
+                               eval_scratch_dir=eval_scratch_dir,
+                               tool_session_marker=tool_session_marker, repo=repo),
                       sort_keys=True, separators=(",", ":"))
 
 

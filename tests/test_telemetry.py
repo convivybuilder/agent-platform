@@ -491,6 +491,20 @@ def test_write_meta_stamps_and_validates_cost_cap_source(tmp_path):
         T.write_meta(tmp_path, **_META_REQUIRED, cost_cap_source="sneaky")
 
 
+def test_write_meta_stamps_and_validates_persona_source(tmp_path):
+    """persona_source (agentctl `_agent_from_grant`/`resolve_agent_from_grant`)
+    defaults to None (every meta.json predating this field, and a refusal
+    recorded with no agent ever materialized), accepts each of
+    VALID_PERSONA_SOURCES, and rejects junk the same way cost_cap_source does."""
+    T.write_meta(tmp_path, **_META_REQUIRED)
+    assert json.loads((tmp_path / "meta.json").read_text())["persona_source"] is None
+    for source in T.VALID_PERSONA_SOURCES:
+        T.write_meta(tmp_path, **_META_REQUIRED, persona_source=source)
+        assert json.loads((tmp_path / "meta.json").read_text())["persona_source"] == source
+    with pytest.raises(ValueError, match="invalid persona_source"):
+        T.write_meta(tmp_path, **_META_REQUIRED, persona_source="sneaky")
+
+
 def test_update_meta_validates_cost_cap_source(tmp_path):
     """An ARCH-131 fail-over respawn writes cost_cap_source through update_meta
     (via `_respawn_in_place`), not write_meta — same field discipline as

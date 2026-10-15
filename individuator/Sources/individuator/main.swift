@@ -186,8 +186,7 @@ func runFingerprint(_ args: [String]) -> Int32 {
     let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.keyFileName)
     do {
         let key = try SecureEnclaveMachineKey.load(store: store)
-        let digest = SHA256.hash(data: key.publicKey.x963Representation)
-        print(digest.map { String(format: "%02x", $0) }.joined())
+        print(CertificateSigningRequest.publicKeyFingerprintHex(key.publicKey))
         return 0
     } catch {
         printErr("fingerprint refused: \(error)")

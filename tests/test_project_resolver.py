@@ -40,6 +40,7 @@ EXPECTED = {
     'substrate': 'platform',
     'EA': 'platform',
     'shipwright': 'shipwright',
+    'homebrew-tap': 'shipwright',
     'signals': 'signals',
     'write-better': 'write-better',
     'library': 'library',
@@ -170,6 +171,7 @@ def test_every_registered_name_resolves_as_before_in_both_clis(
 _RECORDED_EXCEPTION_REPOS = sorted({
     "knowledge", "convivy-app-kit", "convivy-services", "www",
     "shipwright", "constance-landing", "constance-updates", "vivy-landing",
+    "homebrew-tap",
 })
 
 

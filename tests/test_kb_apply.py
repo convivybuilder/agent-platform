@@ -183,6 +183,61 @@ def test_a_document_the_indexer_would_drop_is_refused_and_nothing_reaches_main(
     assert not (cage.tmp / "cage-wt" / rel).exists(), "the cage is restored"
 
 
+# --- `kb checkout --sha-only` (CQ·96) -----------------------------------------
+
+
+def _checkout_args(doc=SEEDED, holder="run-test", sha_only=False):
+    return Namespace(doc=doc, holder=holder, note=None, sha_only=sha_only)
+
+
+def test_sha_only_matches_the_leased_sha_and_takes_no_lease(cage, agentctl, capsys):
+    """A caller that already holds the Library's own checkout only needs the
+    content-sha, not a second, unrelated lease in agentctl's own store."""
+    rc = agentctl.cmd_kb_checkout(_checkout_args(sha_only=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["content_sha"] == _sha_on_origin(cage, SEEDED)
+    assert payload["lease"] is None
+    assert kw.lease_for(SEEDED) is None
+
+
+def test_the_default_checkout_still_takes_the_lease(cage, agentctl):
+    rc = agentctl.cmd_kb_checkout(_checkout_args(sha_only=False))
+    assert rc == 0
+    assert kw.lease_for(SEEDED)["holder"] == "run-test"
+
+
+def test_sha_only_reports_a_doc_absent_on_origin_and_takes_no_lease(cage, agentctl, capsys):
+    """A doc not yet on main is a legitimate sha-only checkout too (`kb_create`
+    reserves its path this way): `exists: false`, empty content, and still the
+    sha of the empty string to pass as `--base-sha` — with no lease taken."""
+    new = "projects/platform/reference/not-yet.md"
+    rc = agentctl.cmd_kb_checkout(_checkout_args(doc=new, sha_only=True))
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["exists"] is False and payload["content"] == ""
+    assert payload["content_sha"] == kw.content_sha("")
+    assert payload["lease"] is None
+    assert kw.lease_for(new) is None
+
+
+def test_sha_only_that_could_not_read_main_holds_no_lease_and_fails(
+        cage, agentctl, library_identity, monkeypatch, capsys):
+    """The branch `--sha-only` takes when origin/main cannot be read: its own
+    stderr message, a journal row with result `unreadable`, and — since it never
+    calls `kw.acquire` at all — no lease, not even a provisional one to release."""
+    monkeypatch.setattr(agentctl, "_kb_library", library_identity.real)
+    rc = agentctl.cmd_kb_checkout(_checkout_args(sha_only=True))
+    assert rc == 1
+    out, err = capsys.readouterr()
+    assert out == "", "a payload was printed for a read that did not happen"
+    assert f"could not read {SEEDED} from origin/main, so no sha was returned" in err
+    assert "App key:" in err
+    assert kw.lease_for(SEEDED) is None
+    unreadable = [j for j in kw.recent_journal() if j["result"] == "unreadable"]
+    assert len(unreadable) == 1
+
+
 # --- the indexer's shape rule ------------------------------------------------
 
 def test_a_path_outside_projects_is_refused_before_any_commit(cage, agentctl, capsys):
@@ -410,6 +465,49 @@ def test_a_message_forging_a_trailer_is_refused(cage, agentctl, capsys):
         edits='[{"old": "Original body.", "new": "x"}]'))
     assert rc == 1
     assert "forge the audit trailer" in capsys.readouterr().err
+
+
+# --- a holder shaped the way the Library's own checkout records one ----------
+# (ARCH-408, issue_01M0YAS4S64P5TXN7S2C17GHF6): the Library's `_claim_owner`
+# accepts any non-empty string up to 200 characters, stripped of surrounding
+# whitespace, with no character whitelist — an email address, a holder with
+# spaces, or one right at the 200-character ceiling. agentctl's cage must
+# accept the same string and record it unaltered, so the two stores never
+# disagree on who holds a document.
+
+
+@pytest.mark.parametrize("holder", ["person@example.com", "Pat Holder", "a" * 200])
+def test_a_holder_the_librarys_checkout_accepts_is_recorded_unaltered(
+        cage, agentctl, holder):
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = agentctl.cmd_kb_apply(_args(
+        SEEDED, sha, holder=holder,
+        edits='[{"old": "Original body.", "new": "Edited."}]'))
+    assert rc == 0
+    _git(cage.checkout, "fetch", "--quiet", "origin", "main")
+    msg = _git(cage.checkout, "log", "-1", "--format=%B", "origin/main").stdout
+    assert f"KB-Write: update {SEEDED} in-session {holder}" in msg
+
+
+def test_a_holder_with_surrounding_whitespace_is_recorded_stripped(cage, agentctl):
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = agentctl.cmd_kb_apply(_args(
+        SEEDED, sha, holder="  person@example.com  ",
+        edits='[{"old": "Original body.", "new": "Edited."}]'))
+    assert rc == 0
+    _git(cage.checkout, "fetch", "--quiet", "origin", "main")
+    msg = _git(cage.checkout, "log", "-1", "--format=%B", "origin/main").stdout
+    assert f"KB-Write: update {SEEDED} in-session person@example.com" in msg
+
+
+def test_a_201_character_holder_is_refused_before_any_write(cage, agentctl, capsys):
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = agentctl.cmd_kb_apply(_args(
+        SEEDED, sha, holder="a" * 201,
+        edits='[{"old": "Original body.", "new": "x"}]'))
+    assert rc == 1
+    assert "not a valid identity" in capsys.readouterr().err
+    assert "Original body." in _origin_content(cage, SEEDED)
 
 
 def test_proposal_provenance_never_reaches_main(cage, agentctl):

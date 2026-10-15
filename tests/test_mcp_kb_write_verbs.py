@@ -18,11 +18,45 @@ import pytest
 
 @pytest.fixture
 def srv(mcp_kb_server, monkeypatch):
-    """The server module with its cage calls intercepted."""
+    """The server module with its cage calls AND its Library calls intercepted.
+
+    `fake_run` answers a `kb checkout --sha-only` call (the resolution step
+    `kb_update`/`kb_create` now run before a write) with a synthetic payload
+    derived from the id it was given, independently of `fake_run.payload`/
+    `.rc` — those two control the FINAL subcommand's own result, exactly as
+    every test below already assumes, so a test that never touches the
+    Library side keeps working unchanged.
+
+    `fake_library` defaults to admitting every write: no checkout ever held,
+    every take succeeds and echoes the owner it was sent — the same default
+    neutrality `fake_run` already gives the cage side. A test exercising the
+    Library's own refusal paths overrides `fake_library.respond`.
+
+    `kb leases --json` is its own branch too (`leases_payload`/`leases_rc`,
+    defaulting to an empty list) — `kb_checkout` now reads it BEFORE its own
+    real checkout call, to tell a lease that call is about to take from one
+    the holder already had; sharing `.payload` with the checkout call itself
+    would make the two calls answer each other's requests.
+    """
     calls = []
 
     def fake_run(cmd, *a, **kw_):
         calls.append(cmd)
+        if "--sha-only" in cmd:
+            payload = getattr(fake_run, "sha_only_payload", None)
+            rc = getattr(fake_run, "sha_only_rc", 0)
+            if payload is None:
+                doc = cmd[-1]
+                source_ref = doc if doc.endswith((".md", ".yaml", ".yml")) \
+                    else f"projects/{doc}.md"
+                payload = json.dumps({"source_ref": source_ref, "exists": True,
+                                      "content": "", "content_sha": "deadbeef",
+                                      "lease": None})
+            return subprocess.CompletedProcess(cmd, rc, payload, "" if rc == 0 else "refused")
+        if cmd[1:3] == ["kb", "leases"]:
+            payload = getattr(fake_run, "leases_payload", "[]")
+            rc = getattr(fake_run, "leases_rc", 0)
+            return subprocess.CompletedProcess(cmd, rc, payload, "" if rc == 0 else "refused")
         payload = getattr(fake_run, "payload", "")
         rc = getattr(fake_run, "rc", 0)
         return subprocess.CompletedProcess(cmd, rc, payload, "" if rc == 0 else "refused")
@@ -30,6 +64,26 @@ def srv(mcp_kb_server, monkeypatch):
     monkeypatch.setattr(mcp_kb_server.subprocess, "run", fake_run)
     mcp_kb_server._calls = calls
     mcp_kb_server._fake = fake_run
+
+    library_calls = []
+
+    def fake_library(method, path, body=None):
+        library_calls.append((method, path, body))
+        return fake_library.respond(method, path, body)
+
+    def _admit(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": None}
+        if method == "POST" and path.endswith("/checkout"):
+            owner = (body or {}).get("owner")
+            return 200, {"checkout": {"id": "co-test", "doc_id": "x", "holder": owner,
+                                      "run_id": None, "expires_at": "later"}}
+        return 200, {"checkout": None}
+
+    fake_library.respond = _admit
+    monkeypatch.setattr(mcp_kb_server, "_library_request", fake_library)
+    mcp_kb_server._library_calls = library_calls
+    mcp_kb_server._fake_library = fake_library
     return mcp_kb_server
 
 
@@ -283,3 +337,389 @@ def test_the_tool_descriptions_say_person_is_refused(srv):
 def test_in_session_still_reaches_the_cage(srv):
     _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
     assert srv._calls[-1][srv._calls[-1].index("--provenance") + 1] == "in-session"
+
+
+# --- the Library's checkout (CQ·96, issue_01M0YAS4S64P5TXN7S2C17GHF6) -------
+#
+# `kb_update`/`kb_create` go through `_apply_through_library`: resolve via
+# `kb checkout --sha-only`, take-or-reuse the Library's checkout, call `kb
+# apply`, release only what was newly taken. Each pairing below isolates one
+# branch by comparing it against its twin, so the delta — not either case
+# alone — is what proves the behaviour (per the issue's own test discipline).
+
+
+def _apply_call(srv):
+    """The `kb apply` subcommand call, found among everything `fake_run` saw —
+    not assumed to be `_calls[-1]`, since a release goes through
+    `_library_request`, not `subprocess.run`, but a resolution step
+    (`--sha-only`) does share the list."""
+    applies = [c for c in srv._calls if c[1:3] == ["kb", "apply"]]
+    assert len(applies) == 1, srv._calls
+    return applies[0]
+
+
+def test_update_with_no_checkout_held_takes_one_writes_and_releases_it(srv):
+    _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    cmd = _apply_call(srv)
+    holder = cmd[cmd.index("--holder") + 1]
+    assert holder  # the session's own computed identity
+    posts = [p for m, p, b in srv._library_calls if m == "POST"]
+    assert any(p.endswith("/checkout") for p in posts), srv._library_calls
+    assert any(p.endswith("/checkin") for p in posts), srv._library_calls
+    checkin = next((b for m, p, b in srv._library_calls if p.endswith("/checkin")), None)
+    assert checkin == {"owner": holder}
+
+
+def test_update_with_a_checkout_the_caller_already_holds_does_not_release_it(srv):
+    held = {"id": "co1", "holder": None, "expires_at": "later"}
+
+    def respond(method, path, body):
+        if method == "GET":
+            held["holder"] = held["holder"] or srv._fake_holder
+            return 200, {"checkout": dict(held)}
+        raise AssertionError(f"no POST expected once a live checkout is already held: {method} {path}")
+
+    # Discover this session's own holder the same way the server does, so the
+    # stub can report a checkout already held BY it (not by someone else).
+    srv._fake_holder = srv._session_holder()
+    srv._fake_library.respond = respond
+    _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    cmd = _apply_call(srv)
+    assert cmd[cmd.index("--holder") + 1] == srv._fake_holder
+    # No POST at all: `respond` would have raised. The GET alone establishes reuse.
+    assert all(m == "GET" for m, _p, _b in srv._library_calls)
+
+
+def test_update_refused_by_another_holders_checkout_makes_no_commit(srv):
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "later"}}
+        raise AssertionError("no POST expected: the GET already found a live, foreign checkout")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    assert out["ok"] is False
+    assert out["error"] == "leased"
+    assert "session:other" in out["stderr"]
+    assert not any(c[1:3] == ["kb", "apply"] for c in srv._calls)
+
+
+def test_the_same_call_with_the_checkout_free_commits(srv):
+    """The twin of the refusal above: identical call, only the Library's
+    answer differs, and only that difference flips the outcome."""
+    out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    assert out["ok"] is True
+    assert _apply_call(srv)  # raises if no apply call landed
+
+
+def test_library_returns_a_differing_holder_kb_apply_receives_the_returned_value(srv):
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": None}
+        if method == "POST" and path.endswith("/checkout"):
+            # The Library strips/clips; simulate it returning something other
+            # than what was sent.
+            return 200, {"checkout": {"id": "co1", "holder": "session:normalized",
+                                      "expires_at": "later"}}
+        if method == "POST" and path.endswith("/checkin"):
+            return 200, {"checkout": {}}
+        raise AssertionError(f"unexpected call: {method} {path}")
+
+    srv._fake_library.respond = respond
+    _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    cmd = _apply_call(srv)
+    assert cmd[cmd.index("--holder") + 1] == "session:normalized"
+    checkin = next((b for m, p, b in srv._library_calls if p.endswith("/checkin")), None)
+    assert checkin == {"owner": "session:normalized"}
+
+
+def test_library_unreachable_refuses_with_its_own_message(srv):
+    def respond(method, path, body):
+        raise srv._LibraryUnreachable("unreachable (URLError)")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    assert out["ok"] is False
+    assert out["error"] == "library-unreachable"
+    assert "unreachable" in out["stderr"]
+    assert not any(c[1:3] == ["kb", "apply"] for c in srv._calls)
+    # Distinct from a foreign-holder refusal (test_update_refused_by_another_
+    # holders_checkout_makes_no_commit): a reader needs to know whether to
+    # wait for a holder or retry once the Library answers again.
+    assert out["error"] != "leased"
+
+
+def test_kb_checkout_with_a_caller_passed_owner_records_it_in_both_stores(srv):
+    srv._fake.payload = json.dumps({"source_ref": "projects/x/a.md", "exists": True,
+                                    "content": "body", "content_sha": "abc",
+                                    "lease": {"holder": "co-library-0251"}})
+    out = _fn(srv.kb_checkout)("x/a", owner="co-library-0251")
+    cage_call = srv._calls[-1]
+    assert cage_call[cage_call.index("--holder") + 1] == "co-library-0251"
+    checkout_post = next((b for m, p, b in srv._library_calls
+                          if m == "POST" and p.endswith("/checkout")), None)
+    assert checkout_post == {"owner": "co-library-0251"}
+    assert out["library_checkout"]["holder"] == "co-library-0251"
+
+
+# --- one holder across calls (CQ·96 revise, defect 1) ------------------------
+
+
+def test_kb_checkout_owner_then_kb_update_same_owner_reuses_the_checkout(srv):
+    """A caller who passed `owner` to kb_checkout must pass the SAME value to
+    kb_update, or `_apply_through_library` resolves a different holder (its
+    own session's) and finds the Library checkout held by the first — this is
+    the Library's own usage (comment 5320: owner "co-library-0251")."""
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1",
+                                    "lease": {"holder": "co-library-0251"}})
+    checkout_out = _fn(srv.kb_checkout)("shared/reference/a", owner="co-library-0251")
+    assert checkout_out["ok"] is True
+
+    srv._calls.clear()
+    srv._library_calls.clear()
+
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": "co-library-0251",
+                                      "expires_at": "later"}}
+        raise AssertionError(f"no POST expected once a live checkout is already "
+                             f"held: {method} {path}")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_update)("shared/reference/a", "sha1", "in-session", content="x",
+                             owner="co-library-0251")
+    assert out["ok"] is True
+    cmd = _apply_call(srv)
+    assert cmd[cmd.index("--holder") + 1] == "co-library-0251"
+    # Reused, not released: a POST would have raised in `respond` above.
+    assert all(m == "GET" for m, _p, _b in srv._library_calls)
+
+
+def test_kb_update_without_owner_after_kb_checkout_with_owner_is_refused_as_leased(srv):
+    """Twin: the identical pairing, but kb_update omits `owner` and falls back
+    to this session's own holder — which the Library's checkout (still held
+    by the owner kb_checkout passed) refuses as leased."""
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1",
+                                    "lease": {"holder": "co-library-0251"}})
+    _fn(srv.kb_checkout)("shared/reference/a", owner="co-library-0251")
+
+    srv._calls.clear()
+    srv._library_calls.clear()
+
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": "co-library-0251",
+                                      "expires_at": "later"}}
+        raise AssertionError("no POST expected: the GET already found a live, "
+                             "foreign checkout")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_update)("shared/reference/a", "sha1", "in-session", content="x")
+    assert out["ok"] is False
+    assert out["error"] == "leased"
+    assert "co-library-0251" in out["stderr"]
+    assert not any(c[1:3] == ["kb", "apply"] for c in srv._calls)
+
+
+# --- a refused checkout must not leave agentctl's lease behind (defect 2) ----
+
+
+def test_kb_checkout_refused_by_another_holder_releases_the_lease_it_took(srv):
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1", "lease": {}})
+    srv._fake.leases_payload = "[]"  # nothing held before this call
+
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "later"}}
+        raise AssertionError("no POST expected: the GET found a live, foreign checkout")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_checkout)("shared/reference/a")
+    assert out["ok"] is False and out["error"] == "leased"
+    releases = [c for c in srv._calls if c[1:3] == ["kb", "release"]]
+    assert len(releases) == 1, srv._calls
+
+
+def test_kb_checkout_refused_leaves_a_pre_existing_lease_alone(srv):
+    """Twin: the identical refusal, but this holder's agentctl lease predates
+    the call — already listed in `kb leases` — so the refusal must not
+    release a lease this call did not take."""
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1", "lease": {}})
+    holder = srv._session_holder()
+    srv._fake.leases_payload = json.dumps(
+        [{"source_ref": "projects/shared/reference/a.md", "holder": holder,
+          "expires_at": "later"}])
+
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "later"}}
+        raise AssertionError("no POST expected: the GET found a live, foreign checkout")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_checkout)("shared/reference/a")
+    assert out["ok"] is False and out["error"] == "leased"
+    assert not any(c[1:3] == ["kb", "release"] for c in srv._calls)
+
+
+def test_kb_checkout_refused_as_unreachable_releases_the_lease_it_took(srv):
+    """The unreachable refusal releases likewise — a distinct code path from
+    the foreign-holder refusal above, with the same obligation."""
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1", "lease": {}})
+    srv._fake.leases_payload = "[]"
+
+    def respond(method, path, body):
+        raise srv._LibraryUnreachable("unreachable (URLError)")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_checkout)("shared/reference/a")
+    assert out["ok"] is False and out["error"] == "library-unreachable"
+    releases = [c for c in srv._calls if c[1:3] == ["kb", "release"]]
+    assert len(releases) == 1, srv._calls
+
+
+# --- an unreadable `kb leases --json` must not be read as a pre-existing ----
+# --- lease (reviewer, round 1): it still has to release what it took --------
+
+
+def _foreign_holder_checkout_respond(method, path, body):
+    if method == "GET":
+        return 200, {"checkout": {"id": "co1", "holder": "session:other",
+                                  "expires_at": "later"}}
+    raise AssertionError("no POST expected: the GET found a live, foreign checkout")
+
+
+def test_kb_checkout_releases_the_lease_when_leases_exits_nonzero(srv):
+    """`agentctl kb leases --json` can itself fail — concretely, a concurrent
+    lease write can leave `cmd_kb_leases` hitting a locked sqlite db (no
+    `busy_timeout` set on that connection) while the checkout call right after
+    it succeeds normally. `_leased_source_refs` must still read as 'nothing
+    held before', so the refusal below releases the lease this call took."""
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1", "lease": {}})
+    srv._fake.leases_rc = 1
+    srv._fake.leases_payload = ""
+
+    srv._fake_library.respond = _foreign_holder_checkout_respond
+    out = _fn(srv.kb_checkout)("shared/reference/a")
+    assert out["ok"] is False and out["error"] == "leased"
+    releases = [c for c in srv._calls if c[1:3] == ["kb", "release"]]
+    assert len(releases) == 1, srv._calls
+
+
+def test_kb_checkout_releases_the_lease_when_leases_output_is_not_json(srv):
+    """Twin: the subcommand exits 0 but its stdout is not JSON at all."""
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1", "lease": {}})
+    srv._fake.leases_rc = 0
+    srv._fake.leases_payload = "not json"
+
+    srv._fake_library.respond = _foreign_holder_checkout_respond
+    out = _fn(srv.kb_checkout)("shared/reference/a")
+    assert out["ok"] is False and out["error"] == "leased"
+    releases = [c for c in srv._calls if c[1:3] == ["kb", "release"]]
+    assert len(releases) == 1, srv._calls
+
+
+def test_kb_checkout_releases_the_lease_when_leases_output_is_not_a_list(srv):
+    """Twin: the stdout parses as JSON but is not a list — e.g. an object,
+    which has no meaning as a set of leases."""
+    srv._fake.payload = json.dumps({"source_ref": "projects/shared/reference/a.md",
+                                    "exists": True, "content": "body",
+                                    "content_sha": "sha1", "lease": {}})
+    srv._fake.leases_rc = 0
+    srv._fake.leases_payload = json.dumps({"not": "a list"})
+
+    srv._fake_library.respond = _foreign_holder_checkout_respond
+    out = _fn(srv.kb_checkout)("shared/reference/a")
+    assert out["ok"] is False and out["error"] == "leased"
+    releases = [c for c in srv._calls if c[1:3] == ["kb", "release"]]
+    assert len(releases) == 1, srv._calls
+
+
+# --- a checkout record with no holder is unparseable, not a crash -----------
+
+
+def test_a_taken_checkout_with_no_holder_refuses_as_unreachable_not_a_crash(srv):
+    """`checkout["holder"]` further down would raise KeyError on a checkout
+    the Library answers with no `holder` at all. This must read as the
+    Library answering something unparseable instead."""
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": None}
+        if method == "POST" and path.endswith("/checkout"):
+            return 200, {"checkout": {"id": "co1", "expires_at": "later"}}  # no "holder"
+        raise AssertionError(f"unexpected call: {method} {path}")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    assert out["ok"] is False
+    assert out["error"] == "library-unreachable"
+    assert not any(c[1:3] == ["kb", "apply"] for c in srv._calls)
+
+
+def test_an_already_held_checkout_with_no_holder_refuses_as_unreachable_not_a_crash(srv):
+    """Twin: the same malformed record, found already live via GET rather
+    than just taken via POST."""
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "expires_at": "later"}}  # no "holder"
+        raise AssertionError(f"no POST expected: the GET already found a live "
+                             f"checkout: {method} {path}")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    assert out["ok"] is False
+    assert out["error"] == "library-unreachable"
+    assert not any(c[1:3] == ["kb", "apply"] for c in srv._calls)
+
+
+# --- kb_release must release the Library checkout kb_checkout took (defect 3) -
+
+
+def test_kb_release_checks_in_the_library_checkout_this_holder_holds(srv):
+    holder = srv._session_holder()
+    checkins = []
+
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": holder, "expires_at": "later"}}
+        if method == "POST" and path.endswith("/checkin"):
+            checkins.append(body)
+            return 200, {"checkout": {}}
+        raise AssertionError(f"unexpected call: {method} {path}")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_release)("shared/reference/a")
+    assert out["ok"] is True
+    assert out["library_release"] == {"released": True}
+    assert checkins == [{"owner": holder}]
+
+
+def test_kb_release_leaves_another_holders_library_checkout_alone(srv):
+    """Twin: a live Library checkout held by someone else must not be checked
+    in by this holder's release."""
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "later"}}
+        raise AssertionError("no checkin expected: the checkout is held by someone else")
+
+    srv._fake_library.respond = respond
+    out = _fn(srv.kb_release)("shared/reference/a")
+    assert out["ok"] is True
+    assert out["library_release"]["released"] is False

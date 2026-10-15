@@ -117,6 +117,12 @@ def test_checkout_release_and_leases_parse(parsed):
     assert parsed(["kb", "leases", "--json"])["json"] is True
 
 
+def test_checkout_sha_only_parses_and_defaults_false(parsed):
+    assert parsed(["kb", "checkout", "agent-platform/agents/architect"])["sha_only"] is False
+    ns = parsed(["kb", "checkout", "--sha-only", "agent-platform/agents/architect"])
+    assert ns["sha_only"] is True
+
+
 def test_sync_flags_parse(parsed):
     ns = parsed(["kb", "sync", "--verify-only", "--no-heal"])
     assert ns["verify_only"] is True and ns["no_heal"] is True

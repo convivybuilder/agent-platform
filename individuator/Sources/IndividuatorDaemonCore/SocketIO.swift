@@ -10,6 +10,24 @@ import Glibc
 /// of a real `socketpair(AF_UNIX, SOCK_STREAM, ...)` without Foundation
 /// ever taking ownership of (and auto-closing) the descriptor.
 enum SocketIO {
+    /// Makes a write to `fileDescriptor` return `EPIPE` when the peer has
+    /// closed its end, rather than raising `SIGPIPE` — which, unhandled,
+    /// terminates the whole process (this is what killed
+    /// `individuatorPackageTests` under the Swift Testing parallel runner
+    /// on GitHub-hosted macos-latest runners: a refused peer that
+    /// disconnects before this socket's response write lands). Darwin has
+    /// no process-wide "ignore SIGPIPE for this fd" option; `SO_NOSIGPIPE`
+    /// is the per-descriptor equivalent, and is set once here rather than
+    /// via `signal(SIGPIPE, SIG_IGN)` at process start, since the latter
+    /// would silence a captured-and-reported write failure from any other,
+    /// unrelated descriptor the process ever touches.
+    static func setNoSIGPIPE(fileDescriptor: Int32) {
+        #if canImport(Darwin)
+        var value: Int32 = 1
+        setsockopt(fileDescriptor, SOL_SOCKET, SO_NOSIGPIPE, &value, socklen_t(MemoryLayout<Int32>.size))
+        #endif
+    }
+
     /// Reads up to `maxBytes` one byte at a time, stopping at the first
     /// `\n` (not included in the result) or at EOF. Bounded so a peer that
     /// never sends a newline cannot hold this read open indefinitely —

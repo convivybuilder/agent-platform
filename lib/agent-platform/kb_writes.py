@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sqlite3
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -632,14 +633,49 @@ def policy_for(source_ref: str, provenance: str) -> tuple[bool, str]:
     return True, ""
 
 
-# A holder identity is a run-id or `session:<user>`. Constrained so it cannot
-# carry a newline into the commit message and forge a second trailer line — the
-# audit surface must not be corruptible by the thing it audits.
-HOLDER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._-]{0,63}$")
+# A holder identity is a run-id, `session:<user>`, or — now that the Library's
+# own document checkout can hand agentctl a holder it never shaped — the raw
+# string the Library's `_claim_owner` already accepts: non-empty, stripped of
+# surrounding whitespace, at most MAX_HOLDER_LEN characters, with no Cc, Zl or
+# Zp character (see `_HOLDER_FORBIDDEN_CATEGORIES` below). That rule, not a
+# character whitelist, is what keeps the holder from starting a new line in
+# the commit message and forging a second trailer line, and from carrying any
+# other control character into it — the audit surface must not be corruptible
+# by the thing it audits. `valid_holder` is the one place this rule lives;
+# every caller that accepts a holder — agentctl's kb verbs, the lease store,
+# the commit trailer — calls it rather than re-stating any part of it.
+MAX_HOLDER_LEN = 200
+
+# Cc is every C0 control (U+0000-U+001F), DEL (U+007F) and every C1 control
+# (U+0080-U+009F); Zl is the line separator U+2028; Zp is the paragraph
+# separator U+2029. That set contains the ten characters `str.splitlines()`
+# breaks on — U+000A, U+000B, U+000C, U+000D, U+001C, U+001D, U+001E,
+# U+0085, U+2028, U+2029 — plus Cc characters splitlines() does not break
+# on, such as tab (U+0009), NUL (U+0000), ESC (U+001B) and DEL (U+007F).
+_HOLDER_FORBIDDEN_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
 
 
-def valid_holder(holder: str) -> bool:
-    return bool(HOLDER_RE.match(holder or ""))
+def valid_holder(holder: str | None) -> bool:
+    """True when `holder`, stripped of surrounding whitespace, is non-empty,
+    at most `MAX_HOLDER_LEN` characters, and carries no Cc, Zl or Zp
+    character — a wider ban than the characters `str.splitlines()` breaks on;
+    see `_HOLDER_FORBIDDEN_CATEGORIES`. Call `normalize_holder` on the same
+    value afterwards — never re-derive the stripped form some other way — so
+    every store records the exact string this function judged."""
+    if not holder:
+        return False
+    s = holder.strip()
+    if not s or len(s) > MAX_HOLDER_LEN:
+        return False
+    return not any(unicodedata.category(ch) in _HOLDER_FORBIDDEN_CATEGORIES for ch in s)
+
+
+def normalize_holder(holder: str) -> str:
+    """The canonical form of a holder `valid_holder` has already accepted:
+    stripped of surrounding whitespace, and nothing else — the same string
+    the Library's checkout records, so a lease, a journal row and a commit
+    trailer all name the same holder it does."""
+    return holder.strip()
 
 
 def message_is_trailer_safe(message: str | None) -> bool:

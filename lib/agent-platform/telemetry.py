@@ -106,7 +106,13 @@ VALID_EXIT_STATUSES = {"completed", "killed", "errored", "budget_refused", "runn
                        # checkout it doesn't own, or stranded commits needing
                        # `agentctl publish --run <id>` are the more serious facts, and
                        # the cap's reason still lands in error_reason either way.
-                       "cost_stopped"}
+                       "cost_stopped",
+                       # the Library refused `POST /items/{id}/checkout` over the
+                       # dispatched project's ledger (E1·8, soft cap, or hard cap
+                       # until revocation exists) before any agent was materialized —
+                       # distinct from `budget_refused`, which is agentctl's own
+                       # daily scheduled-pool gate against a different ledger.
+                       "project_cap_refused"}
 # Subscription rate-limit states, in SEVERITY ORDER — the list is the ordering,
 # so `RATE_LIMIT_SEVERITY.index()` is what compares two of them and there is no
 # second copy to drift. Values observed across every transcript on the box:
@@ -249,6 +255,14 @@ VALID_MODEL_CHOICES = {
 # checkout yet). `none` is a subscription model with no grant — no dollar cap
 # applies; the daily budget gate covers it instead.
 VALID_COST_CAP_SOURCES = {"grant", "default", "env", "none"}
+
+# Where a run's agent BODY (system prompt) came from (agentctl `_agent_from_grant`/
+# `resolve_agent_from_grant`). `grant` is the Library checkout grant's own
+# `persona_md`. `roster` is `resolve_agent`'s roster render — either the ordinary
+# non-grant dispatch path, or the grant path's one fallback, when the grant's
+# `persona_md` was the Library's own placeholder (no persona storage exists yet)
+# and the dispatched role resolved through the roster instead.
+VALID_PERSONA_SOURCES = {"grant", "roster"}
 
 
 def now_iso() -> str:
@@ -467,6 +481,11 @@ def write_meta(d: Path, **fields: Any) -> None:
         # `agentctl status` can show which applied. None for every meta.json
         # predating this field (optional, like agent_source/model_choice above).
         "cost_cap_source": fields.get("cost_cap_source"),
+        # Which of VALID_PERSONA_SOURCES supplied this run's agent body — see
+        # that constant for what each value means. None for every meta.json
+        # predating this field, and for a refusal recorded with no agent ever
+        # materialized (e.g. `_ledger_cap_refuse_and_record`).
+        "persona_source": fields.get("persona_source"),
     }
     if payload["billing_source"] not in VALID_BILLING_SOURCES:
         raise ValueError(f"invalid billing_source: {payload['billing_source']}")
@@ -477,6 +496,9 @@ def write_meta(d: Path, **fields: Any) -> None:
     if (payload["cost_cap_source"] is not None
             and payload["cost_cap_source"] not in VALID_COST_CAP_SOURCES):
         raise ValueError(f"invalid cost_cap_source: {payload['cost_cap_source']}")
+    if (payload["persona_source"] is not None
+            and payload["persona_source"] not in VALID_PERSONA_SOURCES):
+        raise ValueError(f"invalid persona_source: {payload['persona_source']}")
     write_owner_only(d / "meta.json", json.dumps(payload, indent=2) + "\n")
 
 

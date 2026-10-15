@@ -698,7 +698,7 @@ def test_a_profile_path_resolves_as_a_path(agentctl):
 
 def test_a_profile_can_be_checked_out(cage, agentctl):
     """A delete needs the caller's own lease, so a profile has to be leasable."""
-    rc = agentctl.cmd_kb_checkout(Namespace(doc=PROFILE, holder="run-test", note=None))
+    rc = agentctl.cmd_kb_checkout(Namespace(doc=PROFILE, holder="run-test", note=None, sha_only=False))
     assert rc == 0
     assert kw.lease_for(PROFILE)["holder"] == "run-test"
 
@@ -1103,7 +1103,7 @@ def test_reading_main_without_the_identity_raises_rather_than_reporting_a_missin
 
 
 def _checkout(agentctl, doc=SEEDED, holder="run-test"):
-    return agentctl.cmd_kb_checkout(Namespace(doc=doc, holder=holder, note=None))
+    return agentctl.cmd_kb_checkout(Namespace(doc=doc, holder=holder, note=None, sha_only=False))
 
 
 def _unreadable_journal():

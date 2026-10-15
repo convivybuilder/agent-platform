@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.bosun-server</string>
+
+    <!-- The Bosun's mTLS registration listener (platform/decisions/0092)
+         and its loopback operator listener (`agentctl bosun revoke-machine`),
+         run as one process (bin/bosun-server). A supervised KeepAlive job,
+         like com.convivy.run-register-api: an Individuator's session
+         registration depends on this listener being reachable at any time,
+         not only when an operator happens to have started it by hand, and a
+         foreground process dies with its terminal window or a reboot.
+
+         Deploy-pinned per platform/decisions/0059 rule 1: this plist and the
+         code it execs both live outside the agent-platform checkout. The
+         plist itself is a COPY landed in ~/Library/LaunchAgents by
+         bin/install-bosun-server (rule 8) — this file in the repo is only
+         the versioned template, never what launchd loads. ProgramArguments
+         names the venv's own interpreter explicitly (rule 4) and the code
+         path is a copy installed from `main` (rules 2, 6, 7), never a
+         symlink into the checkout.
+
+         GUI domain, not system: this listener runs as the operator, the
+         same per-user service shape as run-register-api — unlike the
+         Individuator's root daemon, which owns a Secure Enclave key and
+         runs as a LaunchDaemon in the system domain instead.
+
+         BOSUN_TLS_CERT/BOSUN_TLS_KEY/BOSUN_REGISTRATION_HOST carry NO
+         EnvironmentVariables entry here (ARCH-342): they are values the
+         operator chooses at install time (which certificate and key the
+         listener serves, which address it binds), and install.sh copies
+         this template OVER the live plist, so a value baked in here is a
+         value the next install silently reverts. bin/install-bosun-server
+         writes them instead to ~/.config/convivy/bosun-server.env, mode
+         0600 — the same idiom as ~/.config/convivy/llm-gateway.env — and
+         bin/bosun-server sources that file before importing
+         bosun_registration, whose BOSUN_TLS_CERT/BOSUN_TLS_KEY have no
+         defaults (build_server_ssl_context's PreflightError refuses to
+         start without both) and whose own REGISTRATION_HOST default
+         (0.0.0.0) also listens on the LAN and the tailnet, which the
+         installer deliberately does not default to — see its help text. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/bosun-server/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/bosun-server/bin/bosun-server</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/bosun-server</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/bosun-server.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/bosun-server.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

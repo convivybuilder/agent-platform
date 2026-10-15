@@ -53,6 +53,18 @@ class Unreadable(Exception):
     """A fact this call depends on could not be read, so the caller should refuse."""
 
 
+class NotInstalled(Unreadable):
+    """The App has no installation on this owner at all — GitHub's own
+    confirmation (`installation_for_owner`'s org lookup AND its user-endpoint
+    fallback both answered 404), not merely a lookup that failed to read.
+    A subclass of `Unreadable` so every caller that does not distinguish the
+    two (bin/agentctl, bin/ci-result-capture, bin/ci1-heartbeat, kb_audit.py)
+    keeps behaving exactly as before; `bin/pr-state-capture` is the one
+    caller that catches this ahead of `Unreadable` to treat a confirmed
+    absence differently from a failed read (operator's decision, 2026-10-15
+    — see that script's module docstring)."""
+
+
 def key_problem(path: Path, *, label: str = "the App") -> str | None:
     """Why the App key cannot be used, or None. Refuses a key another user could
     read or that another user owns, as ssh refuses a loose private key."""
@@ -134,6 +146,30 @@ def single_installation(jwt: str, owner: str, opener=urllib.request.urlopen) -> 
     if got_owner != owner:
         raise Unreadable(f"owner: the installation belongs to {got_owner!r}, not {owner!r}")
     return inst
+
+
+def installation_for_owner(jwt: str, owner: str, *, label: str = "the App",
+                           opener=urllib.request.urlopen) -> dict:
+    """The App's installation on `owner` directly, by GitHub's per-owner lookup
+    (`GET /orgs/{owner}/installation`, falling back to `GET /users/{owner}/installation`
+    on a 404 — an owner is one or the other) — the right call for an App that may be
+    installed on more than one owner, where `single_installation`'s "exactly one
+    installation total" count would refuse every owner the moment a second one exists.
+    Raises `NotInstalled` naming `owner` and `label` only when BOTH lookups answer
+    404 — GitHub's own confirmation there is no installation. Any other status on
+    either lookup is a plain `Unreadable` naming the code, since that is a failed
+    read, not a confirmed absence, and must not be mistaken for one."""
+    code, payload = request("GET", f"{API}/orgs/{owner}/installation", jwt, None, opener=opener)
+    if code == 200:
+        return payload
+    if code != 404:
+        raise Unreadable(f"{label}'s installation on {owner!r} could not be read ({code})")
+    code, payload = request("GET", f"{API}/users/{owner}/installation", jwt, None, opener=opener)
+    if code == 200:
+        return payload
+    if code != 404:
+        raise Unreadable(f"{label}'s installation on {owner!r} could not be read ({code})")
+    raise NotInstalled(f"{label} is not installed on {owner!r}")
 
 
 def installation_token(jwt: str, installation_id: str, *, repositories: list[str] | None = None,

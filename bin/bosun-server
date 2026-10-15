@@ -1,21 +1,47 @@
 #!/usr/bin/env python3.11
-"""bosun-server — run the Bosun's session-registration listeners by hand.
+"""bosun-server — run the Bosun's session-registration listeners.
 
 Starts two listeners in one process: the mTLS registration listener
 Individuators register against (platform/decisions/0092), and the plain
-loopback operator listener `agentctl bosun revoke-machine` calls. There is
-no launchd job for this yet — deployment waits on the Library issuing
-the macstudio's server certificate (0092 decision #6) — so this is for running the
-service by hand during development only.
+loopback operator listener `agentctl bosun revoke-machine` calls.
+
+Installed as a supervised launchd job (GUI domain, KeepAlive) by
+bin/install-bosun-server, which deploy-pins this script and its
+lib/agent-platform/ dependencies into ~/.local/deploy/bosun-server
+(platform/decisions/0059) and copies
+launchd/com.convivy.bosun-server.plist into ~/Library/LaunchAgents. Run
+directly like this only for development, or still waiting on the Library's
+ceremony with the operator to issue the macstudio's server certificate
+(0092 decision #6) — install-bosun-server refuses to install without one.
 
 Refuses to start, naming why, when the TLS preflight fails: see
 `bosun_registration.build_server_ssl_context` and `PreflightError`.
+
+Before importing bosun_registration, sources
+~/.config/convivy/bosun-server.env if present — BOSUN_TLS_CERT, BOSUN_TLS_KEY
+and BOSUN_REGISTRATION_HOST live there, written by bin/install-bosun-server,
+never in the launchd plist (ARCH-342: the plist template is copied OVER the
+live plist on every install, so an operator-chosen value baked into it is a
+value the next install silently reverts).
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 from pathlib import Path
+
+_ENV_FILE = Path(os.environ.get(
+    "BOSUN_SERVER_ENV_FILE", str(Path.home() / ".config" / "convivy" / "bosun-server.env")))
+if _ENV_FILE.is_file():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _key, _, _value = _line.partition("=")
+        # setdefault, not assignment: a variable already set in the invoking
+        # shell (development, tests) is never overridden by the config file.
+        os.environ.setdefault(_key.strip(), _value.strip())
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import bosun_registration as BRG  # noqa: E402

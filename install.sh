@@ -273,19 +273,18 @@ mkdir -p "$LOCAL_BIN" "$LOCAL_LIB/agent-platform" "$LOCAL_LIB/knowledge"
 # bin/
 #
 # DEPLOY-PINNED daemon binaries are carved out of this loop (platform/decisions/
-# 0059 rules 1, 2). run-register-api's actual production entry point is its own
-# deploy area (bin/install-run-register-api, agent-platform#468) — its plist
-# names a venv inside ~/.local/deploy/run-register-api/, never
-# ~/.local/bin/run-register-api. Nothing legitimate types a daemon's name at a
-# prompt the way it does agent-cost-report or model-scorecard, so unlike THOSE
-# (which stay symlinked here on purpose — ADR-0059 rule 5, a person re-invoking
-# one while working on it is still testing), a symlink at
-# ~/.local/bin/run-register-api serves no interactive use and is only a stale
-# trap: a plist edited by hand later could be re-pointed at the easy, wrong
-# path. The gateway has this same carve-out in phase 3 below, for daemon code
-# that was never in bin/ to begin with; this is that carve-out for the one
-# daemon binary that IS.
-DEPLOY_PINNED_BINS="run-register-api"
+# 0059 rules 1, 2). Each one's actual production entry point is its own deploy
+# area (bin/install-run-register-api / bin/install-bosun-server, agent-platform#468) —
+# its plist names a venv inside ~/.local/deploy/<name>/, never
+# ~/.local/bin/<name>. Nothing legitimate types a daemon's name at a prompt the
+# way it does agent-cost-report or model-scorecard, so unlike THOSE (which stay
+# symlinked here on purpose — ADR-0059 rule 5, a person re-invoking one while
+# working on it is still testing), a symlink at ~/.local/bin/<name> serves no
+# interactive use and is only a stale trap: a plist edited by hand later could
+# be re-pointed at the easy, wrong path. The gateway has this same carve-out in
+# phase 3 below, for daemon code that was never in bin/ to begin with; this is
+# that carve-out for the daemon binaries that ARE.
+DEPLOY_PINNED_BINS="run-register-api bosun-server"
 for src in "$REPO"/bin/*; do
   name="$(basename "$src")"
   case " $DEPLOY_PINNED_BINS " in

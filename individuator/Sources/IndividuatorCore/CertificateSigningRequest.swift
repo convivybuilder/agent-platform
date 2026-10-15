@@ -61,10 +61,26 @@ public enum MachineName {
 /// work item means here. Built entirely with this package's own `DER`
 /// encoder: neither Security nor CryptoKit exposes a public PKCS#10 API.
 public enum CertificateSigningRequest {
-    private static func subjectPublicKeyInfo(_ publicKey: P256.Signing.PublicKey) -> [UInt8] {
+    /// The DER `SubjectPublicKeyInfo` this CSR's own `subjectPublicKeyInfo`
+    /// field carries.
+    public static func subjectPublicKeyInfo(_ publicKey: P256.Signing.PublicKey) -> [UInt8] {
         let algorithm = DER.sequence([DER.oid(OID.ecPublicKey), DER.oid(OID.prime256v1)])
         let subjectPublicKey = DER.bitString(Array(publicKey.x963Representation))
         return DER.sequence([algorithm, subjectPublicKey])
+    }
+
+    /// SHA-256 over `subjectPublicKeyInfo`'s DER, hex-encoded — what
+    /// `individuator fingerprint` (CQ·447 slice 3, `Sources/individuator/main.swift`)
+    /// prints, the input it hashes now the same SPKI DER the Library's
+    /// `root-ca sign` hashes (`root-ca`'s own `Fingerprint.publicKey`), fixing
+    /// the defect where `fingerprint` hashed the raw 65-byte public point
+    /// instead and so could never match `root-ca sign`'s output for the same
+    /// key. This is the exact comparison the signing ceremony's operator
+    /// makes before the Touch ID gesture (platform/decisions/0066, issuance
+    /// step 3).
+    public static func publicKeyFingerprintHex(_ publicKey: P256.Signing.PublicKey) -> String {
+        let der = Data(subjectPublicKeyInfo(publicKey))
+        return SHA256.hash(data: der).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func subjectName(commonName: String) -> [UInt8] {

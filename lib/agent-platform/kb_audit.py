@@ -136,9 +136,15 @@ EXPECTED_INSTALLATIONS = {
               "permissions": {"contents": "write"}},
 }
 
-# The machine-readable trailer the ARCH-408 cage writes.
+# The machine-readable trailer the ARCH-408 cage writes. `holder` is the LAST
+# field and captures the rest of the line rather than `\S+`: `kb_writes.valid_holder`
+# now accepts a holder containing spaces (the Library's own checkout can hand
+# agentctl an email or a display name), and the trailer records that holder
+# unaltered. Nothing after it on the line, and `.` does not match the newline
+# that would start a second trailer, so a holder containing one still cannot
+# reach past this field.
 TRAILER_RE = re.compile(
-    r"^KB-Write:\s+(?P<verb>\S+)\s+(?P<ref>\S+)\s+(?P<provenance>\S+)\s+(?P<holder>\S+)\s*$",
+    r"^KB-Write:\s+(?P<verb>\S+)\s+(?P<ref>\S+)\s+(?P<provenance>\S+)\s+(?P<holder>.+)$",
     re.MULTILINE)
 
 # The second line a `person` write carries, naming the email the cage verified.
@@ -684,7 +690,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         jwt = GA.app_jwt(key_path, app_id)
-        inst = GA.single_installation(jwt, owner)
+        inst = GA.installation_for_owner(jwt, owner, label="the convivy-bosun App")
         inst_id = str(inst.get("id") or "")
         if not inst_id:
             raise GA.Unreadable("the installation carries no id")

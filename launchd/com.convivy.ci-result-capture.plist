@@ -8,10 +8,7 @@
     <!-- Every tracked repository's CI results, posted to the Library's Archives
          (CQ-455, issue_01M4J1ASMSFFPC6S0RQ6VVVT57), authenticating as the
          convivy-bosun GitHub App rather than `gh` under the operator's personal
-         account — the same cadence `com.convivy.pr-state-capture` already uses
-         for the same reason: this reader is fine lagging one capture interval,
-         and a tighter cadence buys nothing a reader needs while multiplying
-         calls against every tracked pair for no visible gain. -->
+         account: this reader is fine lagging one capture interval. -->
     <key>StartInterval</key>
     <integer>900</integer>
 

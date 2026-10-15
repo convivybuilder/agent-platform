@@ -50,6 +50,7 @@ if __name__ == "__main__":
     venv_bootstrap.ensure(__file__, requires=("yaml",))
 import builder_root as BR  # noqa: E402
 import dispatch_env as DE  # noqa: E402
+import projects  # noqa: E402
 import review_eval_corpus as REC  # noqa: E402
 import review_eval_replay as RER  # noqa: E402
 import review_eval_scoring as RSC  # noqa: E402
@@ -107,7 +108,7 @@ SUBSET_DEFAULT_KEYS = {"kimi", "kimi-code", "glm", "sonnet-noise-a", "sonnet-noi
 
 
 def _merged_head_via_gh(repo: str, pr: str) -> str | None:
-    slug = repo if "/" in repo else f"convivy/{repo}"
+    slug = projects.repo_github_slug(repo)
     try:
         out = subprocess.run(
             ["gh", "pr", "view", pr, "--repo", slug, "--json", "state,headRefOid"],

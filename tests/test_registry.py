@@ -312,6 +312,16 @@ def test_cost_stopped_exit_status_is_valid():
     assert "cost_stopped" in T.VALID_EXIT_STATUSES
 
 
+def test_project_cap_refused_exit_status_is_valid():
+    """project_cap_refused (E1·8) must be a recognised exit_status so
+    write_outcome doesn't raise when the Library refuses a checkout over the
+    dispatched project's ledger soft/hard cap — and it must be distinct from
+    budget_refused, agentctl's own daily-pool gate against a different ledger."""
+    import telemetry as T
+    assert "project_cap_refused" in T.VALID_EXIT_STATUSES
+    assert "project_cap_refused" != "budget_refused"
+
+
 def test_write_outcome_records_error_reason(tmp_path):
     """write_outcome persists error_reason in outcome.json when provided."""
     import json

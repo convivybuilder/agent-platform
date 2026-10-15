@@ -21,6 +21,7 @@ import posixpath
 import fcntl
 import pwd
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -34,7 +35,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 # Resolved from THIS FILE, not `~/.local/lib/agent-platform` (ARCH-229): `.local/bin`
 # and `.local/lib` are themselves symlinks into the primary checkout, so a bare
@@ -770,7 +771,33 @@ def _library_post(path: str, name: str, body: dict) -> tuple[int, dict]:
     return status, parsed
 
 
-def _checkout_item_grant(issue_id: str, *, owner: str | None, run_id: str | None) -> dict:
+class _LedgerCapRefused(Exception):
+    """`POST /items/{id}/checkout` refused the dispatch over the dispatched
+    project's ledger (E1·8, issue_01M35KSM0KFKJ4P3DN1G19KYBD): the Library's
+    `_refuse_on_capped_ledger` (app.py) answers 409 with a `ledger` dict
+    (`id`, `scope_id`, `day`, `state`, `cap`, `cap_usd`, `total_usd`) when
+    today's spend has reached the project's soft cap, or — until revocation
+    exists — its hard cap. Distinct from the generic non-200 case
+    `_checkout_item_grant` still raises bare `SystemExit` for (an
+    already-claimed item, a malformed response): only a 409 carrying this
+    exact `ledger` shape is a money refusal, not a routing one.
+
+    Raised before any lease is taken — the Library checks the ledger ahead of
+    the item lock — so there is nothing for `resolve_agent_from_grant`'s
+    `finally` to release here. Caught in `_spawn_dispatch`, which records the
+    refusal under its own `exit_status` (`project_cap_refused`), distinct
+    from `budget_refused`: that name is reserved for `agentctl`'s own daily
+    scheduled-pool gate (`_budget_gate`), a different ledger than the
+    Library's per-project one, and a run can be refused by either
+    independently of the other."""
+    def __init__(self, issue_id: str, body: dict):
+        self.issue_id = issue_id
+        self.body = body
+        super().__init__(body.get("error") or f"ledger capped for {issue_id!r}")
+
+
+def _checkout_item_grant(issue_id: str, *, owner: str | None, run_id: str | None,
+                         persona: str | None = None, profile: str | None = None) -> dict:
     """`POST /items/{id}/checkout` on the Library's fixed address, returning
     the full response (item, lease, policy, claimed, adjacency, plus the
     call-slip grant's own fields).
@@ -780,18 +807,36 @@ def _checkout_item_grant(issue_id: str, *, owner: str | None, run_id: str | None
     epic's lease, then mints the slip, atomically. `resolve_agent_from_grant`
     releases what this takes, in a `finally` — see its docstring for how long
     it is held. A held item (409) and an unreachable Library both refuse the
-    dispatch; neither falls back to the roster render."""
+    dispatch; neither falls back to the roster render.
+
+    `persona` and `profile` (issue_01M35KSS8E603FE0EPYR0M5SBN): which role and
+    which dispatch profile the checkout is for, so the Library's call-slip
+    grant resolves `persona_md`/`model` for the dispatched role instead of its
+    own default persona. Both optional and sent only when given, matching the
+    Library's contract (`POST /items/{id}/checkout`, protocol version 1).
+
+    A project-ledger cap refusal (also 409) is a THIRD case, raised as
+    `_LedgerCapRefused` instead — see its docstring for why it is kept apart
+    from the bare `SystemExit` the other two give."""
     import urllib.parse
     body: dict = {}
     if owner:
         body["owner"] = owner
     if run_id:
         body["run_id"] = run_id
+    if persona:
+        body["persona"] = persona
+    if profile:
+        body["profile"] = profile
     status, parsed = _library_post(
         f"/items/{urllib.parse.quote(issue_id, safe='')}/checkout",
         f"check out {issue_id!r} for its materialization grant", body)
     if status != 200:
         error = parsed.get("error") if isinstance(parsed.get("error"), str) else str(parsed)
+        ledger = parsed.get("ledger")
+        if status == 409 and isinstance(ledger, dict) and ledger.get("cap") in (
+                "soft_cap", "hard_cap"):
+            raise _LedgerCapRefused(issue_id, parsed)
         raise SystemExit(f"dispatch refused: the Library refused to check out {issue_id!r} "
                          f"for its materialization grant (HTTP {status} {error})")
     return parsed
@@ -840,7 +885,39 @@ def _verify_grant_document(doc_id: str, expected_sha256: str, issue_id: str) -> 
     return doc
 
 
-def _agent_from_grant(issue_id: str, response: dict, *, repo: str | None) -> dict:
+# The Library sends this literal string as a checkout grant's `model` when it
+# could not resolve one (no model_choice, no persona agent-definition pin
+# inside the caller's bound dispatch profile) — a deliberate sentinel, not a
+# model id, confirmed by the Library's crew on 2026-10-14.
+_LIBRARY_MODEL_UNRESOLVED_SENTINEL = "model-resolution-not-implemented"
+
+# The sentence the Library's `_persona_md` (app.py, about line 7310) puts in a
+# checkout grant's `persona_md` when it has no persona storage or registry to
+# resolve one from — a placeholder pinning the call slip's shape ahead of it,
+# not real persona content, confirmed by the Library's crew on 2026-10-14. The
+# Library builds the full placeholder body as `f"# {heading}\n\n" + ` this
+# sentence, where `heading` is the persona name the caller sent (since PR #893)
+# or `"default"`.
+_LIBRARY_PERSONA_PLACEHOLDER_SENTENCE = (
+    "Persona content is not resolved yet — no persona storage or registry "
+    "exists. This is a placeholder pinning the call slip's shape ahead of it."
+)
+
+
+def _is_library_persona_placeholder(persona_md: str) -> bool:
+    """True when `persona_md` is exactly the Library's placeholder body: a
+    one-line `# <heading>` line, a blank line, then
+    `_LIBRARY_PERSONA_PLACEHOLDER_SENTENCE` and nothing else. Compared after
+    stripping surrounding whitespace, so a trailing newline the wire adds
+    doesn't defeat the match. Any other body — including one that merely
+    mentions "placeholder" — is real persona content."""
+    parts = persona_md.strip().split("\n", 2)
+    return (len(parts) == 3 and parts[0].startswith("# ") and parts[0][2:].strip()
+            and parts[1] == "" and parts[2].strip() == _LIBRARY_PERSONA_PLACEHOLDER_SENTENCE)
+
+
+def _agent_from_grant(issue_id: str, response: dict, *, repo: str | None,
+                      roster_agent: dict | None = None) -> dict:
     """Build a `resolve_agent`-shaped dict from one checkout response's
     call-slip grant (ADR-0062; Library app.py `_call_slip_grant`):
     `{slip_id, persona_md, docs, bundle, model, budget, limits}` alongside
@@ -856,8 +933,17 @@ def _agent_from_grant(issue_id: str, response: dict, *, repo: str | None) -> dic
 
     Every field below is read raw and checked by hand, the same posture
     `_library_agent` takes for a served agent record: a missing or malformed
-    field refuses the dispatch by name. There is no fallback to the roster
-    render on this path."""
+    field refuses the dispatch by name. The one fallback on this path (run-
+    60cafe23, 2026-10-14, platform-coder dispatch for work item CQ·480, steward
+    ruling): when `persona_md` IS the Library's own placeholder body
+    (`_is_library_persona_placeholder` — the Library has no persona storage
+    yet and always sends it), the dispatched role's roster render supplies the
+    body instead, via `roster_agent` (the same `resolve_agent` lookup
+    `resolve_agent_from_grant` already runs for its `builtins:` carry-through,
+    passed through here rather than re-resolved). `None` — no role was named,
+    or none resolved — refuses by name rather than running the placeholder as
+    a system prompt. Only `body` is taken from `roster_agent`; model, docs,
+    budget, limits and the slip stay the grant's own, read below unchanged."""
     record = f"the Library's checkout grant for {issue_id!r}"
     if response.get("claimed") is False:
         raise SystemExit(
@@ -866,9 +952,25 @@ def _agent_from_grant(issue_id: str, response: dict, *, repo: str | None) -> dic
     persona_md = response.get("persona_md")
     if not isinstance(persona_md, str) or not persona_md.strip():
         raise SystemExit(f"dispatch refused: {record} has no non-empty 'persona_md'")
+    persona_source = "grant"
+    if _is_library_persona_placeholder(persona_md):
+        if roster_agent is None:
+            raise SystemExit(
+                f"dispatch refused: {record} carried only the Library's placeholder "
+                f"persona (no persona storage or registry exists yet there) and no "
+                f"role resolved through the roster to fall back to; dispatch with a "
+                f"role that resolves (`resolve_agent`), or wait for the Library to "
+                f"serve real persona content")
+        persona_md = roster_agent["body"]
+        persona_source = "roster"
     model = response.get("model")
     if not isinstance(model, str) or not model.strip():
         raise SystemExit(f"dispatch refused: {record} has no non-empty 'model'")
+    if model.strip() == _LIBRARY_MODEL_UNRESOLVED_SENTINEL:
+        raise SystemExit(
+            f"dispatch refused: {record} resolved no model "
+            f"({_LIBRARY_MODEL_UNRESOLVED_SENTINEL}); set the item's model_choice or "
+            f"check the persona's agent definition and its dispatch profile")
     docs = response.get("docs")
     if not isinstance(docs, list):
         raise SystemExit(f"dispatch refused: {record} has no 'docs' list")
@@ -897,7 +999,7 @@ def _agent_from_grant(issue_id: str, response: dict, *, repo: str | None) -> dic
         documents.append(_verify_grant_document(doc_id, doc_sha, issue_id))
     return {
         "id": f"grant/{issue_id}", "name": issue_id, "project": repo or "local",
-        "source": None, "body": persona_md,
+        "source": None, "body": persona_md, "persona_source": persona_source,
         "frontmatter": {"model": model, "tools": [], "model_floor": None},
         "model_alias": model, "tools": [], "status": "current", "local": False,
         "grant": {"slip_id": response.get("slip_id"), "budget": budget, "limits": limits,
@@ -909,7 +1011,8 @@ def resolve_agent_from_grant(issue_id: str, *, repo: str | None = None,
                              owner: str | None = None,
                              run_id: str | None = None,
                              agent_name: str | None = None,
-                             agents_dir: str | None = None) -> dict:
+                             agents_dir: str | None = None,
+                             profile: str | None = None) -> dict:
     """Materialize a dispatched agent from a Library checkout grant, instead
     of `resolve_agent`'s roster render (issue_01M4AEY9RGJVTCBNEY3YN49DCG).
 
@@ -941,31 +1044,43 @@ def resolve_agent_from_grant(issue_id: str, *, repo: str | None = None,
     there must not claim the work item and then fail on it). A role that
     does not resolve writes one line to stderr and the dispatch proceeds
     with no builtins override, the same "every built-in tool loads"
-    behaviour as `None`.
+    behaviour as `None` — UNLESS the grant's own `persona_md` turns out to be
+    the Library's placeholder body (`_agent_from_grant`'s one fallback, see
+    its docstring): then the same unresolved role is fatal, because there is
+    no body left to fall back to either.
+
+    This same lookup's full result (not just `builtins`) is what
+    `_agent_from_grant` reads as `roster_agent` for that fallback — resolved
+    here, before the checkout, rather than a second time inside it.
+
+    `profile` (issue_01M35KSS8E603FE0EPYR0M5SBN): the dispatch profile the
+    run executes under, named to the checkout the same way `agent_name` is —
+    `None` sends no `profile` field, same as before this change.
+    `agent_name` doubles as the checkout's `persona`: it is the dispatched
+    ROLE, independent of whether it resolves in the builtins lookup above, so
+    it is sent to `_checkout_item_grant` even when that lookup found nothing.
 
     Does not redeem the slip or hold a library card — that is E15·2
     (issue_01M35KR8VAC656WMQTY9D8SJ1H), gated on the Library's client
     authentication."""
     import issue_client as IC
-    have_builtins_override = False
-    builtins_override = None
+    roster_agent: dict | None = None
     if agent_name:
         try:
-            builtins_override = resolve_agent(
-                agent_name, repo=repo, agents_dir=agents_dir).get("builtins")
-            have_builtins_override = True
+            roster_agent = resolve_agent(agent_name, repo=repo, agents_dir=agents_dir)
         except SystemExit as e:
             print(f"  grant materialization: role {agent_name!r} does not "
                   f"resolve ({e}); dispatching with no builtins override "
                   f"(every built-in tool loads)", file=sys.stderr)
     owner = owner or IC.session_owner()
-    response = _checkout_item_grant(issue_id, owner=owner, run_id=run_id)
+    response = _checkout_item_grant(issue_id, owner=owner, run_id=run_id,
+                                    persona=agent_name, profile=profile)
     try:
-        agent = _agent_from_grant(issue_id, response, repo=repo)
+        agent = _agent_from_grant(issue_id, response, repo=repo, roster_agent=roster_agent)
     finally:
         _release_item_grant(issue_id, owner=owner)
-    if have_builtins_override:
-        agent["builtins"] = builtins_override
+    if roster_agent is not None:
+        agent["builtins"] = roster_agent.get("builtins")
     return agent
 
 
@@ -2708,7 +2823,7 @@ def _review_launch_cmd(launcher: Path, *, repo: str, pr, role: str, run_id: str)
     (`review_launch.ROLES`) knows only the two product role names — the crew
     a dispatch came from is an `agentctl` deployment detail the launcher has
     no reason to see."""
-    slug = repo if "/" in repo else f"convivy/{repo}"
+    slug = projects.repo_github_slug(repo)
     return ["sudo", str(launcher), "--repo", slug, "--pr", str(pr),
             "--role", _strip_app_prefix(role), "--run-id", run_id]
 
@@ -5132,7 +5247,6 @@ def _changed_files_fallback(wt: Path) -> tuple[list[str], list[str], list[str]]:
 # helper could otherwise reach (CQ·418: two security-reviewer runs printed that token into
 # their transcripts by running `git credential fill`).
 _BOSUN_APP_ID = "4666673"
-_BOSUN_APP_OWNER = "convivy"
 _BOSUN_APP_KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
 # metadata:read is implicit on every GitHub App installation token and is not named here.
 # Every key must be one the installation itself grants, or GitHub refuses the whole token
@@ -5152,20 +5266,29 @@ def _mint_run_github_token(repo: str) -> tuple[str | None, str | None]:
     run is dispatched against — the same narrowing `kb_audit.py` applies for its own
     read, reviewer + security-reviewer PR #803 round 1) and to `_RUN_TOKEN_PERMISSIONS`.
 
+    The installation is looked up for `repo`'s OWN GitHub owner (`projects.
+    repo_github_slug`) — a repo can live under a different owner
+    (`config/projects.json`'s `repo_owners`; homebrew-tap under convivybuilder, PR
+    #881). `GA.installation_for_owner` asks GitHub for that owner's installation
+    directly, so it still works once the App is installed on more than one owner,
+    unlike `single_installation`'s "exactly one installation total" count.
+
     The App's private key is read HERE, in the dispatcher process, by `GA.app_jwt` —
     it goes no further than this function's own stack. Only the token this function
     returns is ever passed into a run's environment."""
     problem = GA.key_problem(_BOSUN_APP_KEY_PATH, label="the convivy-bosun App")
     if problem:
         return None, problem
+    slug = projects.repo_github_slug(repo)
+    owner, _, repo_name = slug.partition("/")
     try:
         jwt = GA.app_jwt(_BOSUN_APP_KEY_PATH, _BOSUN_APP_ID)
-        inst = GA.single_installation(jwt, _BOSUN_APP_OWNER)
+        inst = GA.installation_for_owner(jwt, owner, label="the convivy-bosun App")
         inst_id = str(inst.get("id") or "")
         if not inst_id:
             raise GA.Unreadable("the installation carries no id")
         token = GA.installation_token(
-            jwt, inst_id, repositories=[repo], permissions=_RUN_TOKEN_PERMISSIONS)
+            jwt, inst_id, repositories=[repo_name], permissions=_RUN_TOKEN_PERMISSIONS)
     except GA.Unreadable as e:
         return None, str(e)
     return token, None
@@ -5260,16 +5383,27 @@ def _spawn_dispatch(args: argparse.Namespace) -> tuple[int, str | None]:
                   "whose checkout grant supplies the agent's materialization",
                   file=sys.stderr)
             return 2, run_id
-        agent = resolve_agent_from_grant(
-            args.issue, repo=repo, agent_name=args.agent,
-            agents_dir=getattr(args, "agents_dir", None))
+        # A grant-materialized agent is never local (`_agent_from_grant` hardcodes
+        # `"local": False` — there is no repo-local checkout grant), so the profile
+        # this run executes under is always this, unlike the roster branch below.
+        # Computed here, before the checkout, so the Library is told the same
+        # profile the run uses (issue_01M35KSS8E603FE0EPYR0M5SBN) rather than one
+        # recomputed afterward.
+        profile = args.profile or default_profile(repo, args.agent)
+        try:
+            agent = resolve_agent_from_grant(
+                args.issue, repo=repo, agent_name=args.agent,
+                agents_dir=getattr(args, "agents_dir", None), profile=profile)
+        except _LedgerCapRefused as e:
+            return _ledger_cap_refuse_and_record(args, repo, e, profile), run_id
+        is_local = agent.get("local", False)
     else:
         agent = resolve_agent(args.agent, repo=repo, agents_dir=getattr(args, "agents_dir", None))
-    is_local = agent.get("local", False)
-    # A repo-local (internal-app) agent has no knowledge-ctx profile: use a sentinel
-    # and skip individuation (ARCH-177). Skipping also sidesteps the ARCH-080/135
-    # live-process collision that profile individuation can hit.
-    profile = args.profile or (f"{repo}/none" if is_local else default_profile(repo, args.agent))
+        is_local = agent.get("local", False)
+        # A repo-local (internal-app) agent has no knowledge-ctx profile: use a sentinel
+        # and skip individuation (ARCH-177). Skipping also sidesteps the ARCH-080/135
+        # live-process collision that profile individuation can hit.
+        profile = args.profile or (f"{repo}/none" if is_local else default_profile(repo, args.agent))
     purpose = derive_purpose(args.agent, args.task, pr=getattr(args, "pr", None))
     # A repo-local agent (CFO's) or a black-box crew's dispatch (ADR-0043) takes no
     # render, and its working files (cfo.db, statements/, taxes/, yearend/) are
@@ -5510,7 +5644,7 @@ def _spawn_dispatch(args: argparse.Namespace) -> tuple[int, str | None]:
         return 2, run_id
 
     if pr_number:
-        slug = repo if "/" in repo else f"convivy/{repo}"
+        slug = projects.repo_github_slug(repo)
         try:
             pr_view = _gh_pr_json(str(pr_number),
                                   ["headRefName", "headRefOid", "state"], repo=slug)
@@ -6005,6 +6139,7 @@ def _run_codex_review_session(*, args: argparse.Namespace, agent: dict, run_id: 
                      origin=_run_origin(args.parent), review_sha=review_sha,
                      co_session=co_session, overnight_wave=overnight_wave, pr=pr,
                      model_resolved=model_resolved, agent_source=agent.get("source"),
+                     persona_source=agent.get("persona_source", "roster"),
                      model_choice=model_choice, issue=issue_val,
                      held_until=None, hold_reason=None, cost_cap_source="none")
         _record_item_override_meta(run_dir, args)
@@ -6055,6 +6190,7 @@ def _run_codex_review_session(*, args: argparse.Namespace, agent: dict, run_id: 
                  origin=_run_origin(args.parent), review_sha=review_sha,
                  co_session=co_session, overnight_wave=overnight_wave, pr=pr,
                  model_resolved=model_resolved, agent_source=agent.get("source"),
+                 persona_source=agent.get("persona_source", "roster"),
                  model_choice=model_choice, issue=issue_val,
                  held_until=None, hold_reason=None, cost_cap_source="none")
     _record_item_override_meta(run_dir, args)
@@ -6369,6 +6505,10 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
     # the end of this `if`/`else` — and a dry run never spawns a subprocess, so
     # the cap can never fire.
     cost_stop_reason: str | None = None
+    # Same reason (CQ·138 round 2): a dry run never reaches the `else` branch
+    # below, where a real dispatch's own scratch directory is created, but the
+    # cleanup past the end of this `if`/`else` still runs either way.
+    tool_session_scratch_dir: Path | None = None
     if args.dry_run:
         dry_run_now = datetime.now(timezone.utc)
         decision = _usage_hold_decision(dry_run_now, pr_round_fix=pr is not None)
@@ -6385,6 +6525,7 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                      origin=_run_origin(args.parent), review_sha=review_sha, co_session=co_session,
                      overnight_wave=overnight_wave, pr=pr,
                      model_resolved=model_resolved, agent_source=agent.get("source"),
+                     persona_source=agent.get("persona_source", "roster"),
                      model_choice=model_choice, issue=issue_val,
                      held_until=held_until, hold_reason=hold_reason,
                      cost_cap_source=_run_cost_cap_for_agent(model, agent)[1])
@@ -6444,6 +6585,31 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
         eval_scratch_dir = (RS.create_eval_scratch_dir()
                             if getattr(args, "eval_mode", False) else None)
 
+        # Created once per dispatch (CQ·138), before this run's claude ever
+        # starts — same shape as `eval_scratch_dir` just above, but for EVERY
+        # real dispatch, not only an eval one. The directory itself is never
+        # granted to the run, recorded for it to find, or writable by it in
+        # any way (see `RS.create_tool_session_scratch_dir`'s docstring for
+        # why it lives where it does); only the marker FILE inside it
+        # (`RS.create_tool_session_marker`) is granted, and that marker's
+        # identity (path, device, inode), not the directory's, is what
+        # `_record_tool_session_marker` writes under `run_dir` for a later,
+        # separate `agentctl kill <run_id>` invocation to resolve the same way
+        # (`_tool_session_marker_record`/`_verified_tool_session_marker`). See
+        # `RS.settings`'s own docstring on `tool_session_marker` for what that
+        # file grant does and does not let the run do. `_spawn_claude` reads
+        # this same local on every call, so an ARCH-131 fail-over respawn
+        # reuses the one marker this dispatch was given. `RS.passwd_home()`,
+        # not `Path.home()` or `$HOME`: this is the same account-home value
+        # `settings()` below is given, so `RS.create_tool_session_scratch_dir`
+        # and `settings()` can never disagree about which account's state
+        # tree the scratch directory and its `allowWrite` grant both key off
+        # (see `RS.tool_session_scratch_root`'s own comment for why the
+        # directory lives there and not under the shared temp root).
+        tool_session_scratch_dir = RS.create_tool_session_scratch_dir(RS.passwd_home())
+        tool_session_marker = RS.create_tool_session_marker(tool_session_scratch_dir)
+        _record_tool_session_marker(run_dir, tool_session_marker)
+
         # Fleet-block decision (round 3 of #823, reviewer): taken exactly ONCE,
         # before any subprocess exists, and reused — never recomputed — by
         # every spawn AND respawn below. `_spawn_claude` used to call
@@ -6495,13 +6661,21 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                 # there into `claude -p` if its adapter did not also close it
                 # (see `bin/review-launch`'s `ClaudeSession.run`). Closed here
                 # too so the chain holds even if that adapter regresses.
-                return subprocess.Popen(
+                return _tag_agent_pgid(subprocess.Popen(
                     cmd, cwd=str(worktree),
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=T.open_owner_only(stderr_path, append=True),
                     env={"AGENTCTL_RUN_ID": run_id},
-                )
+                    # CQ·138: its own new process group (pgid == its own pid —
+                    # `process_group=0` sets that without also starting a new
+                    # SESSION, which `start_new_session` would, and which this
+                    # sudo-launched child has no use for). See
+                    # `_tag_agent_pgid`/`_own_pgid_if_isolated` for why the
+                    # group id is captured here, immediately, rather than
+                    # looked up again later.
+                    process_group=0,
+                ))
             # ARCH-346 + knowledge#793 round 6: the permission MODE is the enforcement
             # lever, not a flag on top of it, and every run is now `dontAsk` — a
             # file-write scope (run_sandbox's `permissions.allow`, below) can bind only
@@ -6539,7 +6713,8 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
             sandbox_json = RS.settings_json(
                 home=RS.passwd_home(), worktree=worktree, runs_root=RUNS_ROOT,
                 git_dir=git_dir, exclude_user_claude_md=fleet_delivered,
-                eval_scratch_dir=eval_scratch_dir, repo=repo)
+                eval_scratch_dir=eval_scratch_dir,
+                tool_session_marker=tool_session_marker, repo=repo)
             # The verdict server (knowledge#793): Claude starts it outside the sandbox with
             # this run's id in its launch environment. The run's Bash cannot read the
             # review-record credential, so its verdict goes through this server. Folded
@@ -6765,6 +6940,23 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
             # same kind of relocation, and nothing here sets it, so it is dropped.
             proc_env["HOME"] = str(RS.passwd_home())
             proc_env.pop("CLAUDE_CONFIG_DIR", None)
+            # CQ·138: give every zsh invocation this run's Bash tool starts a
+            # way to be found at finalize, reaching what the agent's own
+            # process group (process_group=0, above) cannot — see
+            # `_write_tool_session_zdotdir`'s docstring for the mechanism, an
+            # open file descriptor on the marker, never a self-reported id,
+            # and why it's needed at all. Set after HOME (not before): the
+            # zdotdir written below lives under `run_dir`, independent of
+            # whatever HOME resolves to, but ordered here to read as "the run's
+            # own env, finalized" in one place. `tool_session_marker` is this
+            # dispatch's own marker file, created once above and reused on
+            # every respawn — never `run_dir` itself, which is denied for
+            # writing by this run's own sandbox, and never the scratch
+            # directory that holds the marker: the run is granted write
+            # access to the marker file alone (`RS.settings`'s own docstring
+            # on `tool_session_marker` says what that does and does not
+            # allow), never to the directory around it.
+            proc_env["ZDOTDIR"] = str(_write_tool_session_zdotdir(run_dir, tool_session_marker))
             if eval_scratch_dir is not None:
                 # Round 8: eval mode's `allowWrite` no longer covers the shared temp
                 # root at all (run_sandbox.settings's `eval_scratch_dir` parameter), so
@@ -6811,12 +7003,22 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                 ])
             # stderr appends so a fallback respawn (ARCH-131) keeps the first
             # attempt's failure evidence.
-            return subprocess.Popen(
+            return _tag_agent_pgid(subprocess.Popen(
                 cmd, cwd=str(worktree),
                 stdout=subprocess.PIPE,
                 stderr=T.open_owner_only(stderr_path, append=True),
                 env=proc_env,
-            )
+                # CQ·138: its own new process group (pgid == its own pid),
+                # distinct from the supervisor's own (set by `_detach_and_run`'s
+                # `os.setsid()`) — so a descendant claude backgrounds (a
+                # `swift test`, a stray write) can be signaled as a unit at
+                # every point this run ends, without that signal ever
+                # reaching the supervisor itself. `process_group=0` only
+                # creates the new group; it does not also start a new
+                # SESSION the way `start_new_session=True` would, which this
+                # already-detached child has no use for.
+                process_group=0,
+            ))
 
         def _respawn_in_place(spawn_model: str, **meta_updates
                               ) -> tuple[dict | None, int, str | None]:
@@ -6878,14 +7080,21 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                     cost_cap=respawn_cost_cap,
                     token_cap=_run_token_cap(spawn_model),
                     git_dir=git_dir,
-                    private_objects_dir=private_objects_dir)
+                    private_objects_dir=private_objects_dir,
+                    repo=repo)
             except KeyboardInterrupt:
-                p.terminate()
-                try: p.wait(timeout=5)
-                except subprocess.TimeoutExpired: p.kill()
+                _terminate_proc_and_group(p, grace_s=5.0)
+                # CQ·138 round 1: the group kill above never reaches a Bash-tool
+                # descendant (see the section comment on _sweep_tool_session_holders).
+                _sweep_tool_session_holders(run_dir, grace_s=5.0)
             except (BrokenPipeError, OSError) as exc:
                 _on_broken_stream(run_id, run_dir, exc)  # ARCH-253 (OSError-scoped)
             p.wait()
+            # CQ·138: p's leader is reaped (the wait above); sweep whatever it
+            # backgrounded and left behind before this attempt is treated as over.
+            _cleanup_process_group(getattr(p, "agent_pgid", None),
+                                   grace_s=_POST_EXIT_CLEANUP_GRACE_S)
+            _sweep_tool_session_holders(run_dir, grace_s=_POST_EXIT_CLEANUP_GRACE_S)
             return ev, p.returncode, respawn_cost_stop_reason
 
         # Python preflight (worktree interpreter guard): assert the worktree
@@ -6905,6 +7114,7 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                      origin=_run_origin(args.parent), review_sha=review_sha, co_session=co_session,
                      overnight_wave=overnight_wave, pr=pr,
                      model_resolved=model_resolved, agent_source=agent.get("source"),
+                     persona_source=agent.get("persona_source", "roster"),
                      model_choice=model_choice, issue=issue_val,
                      held_until=None, hold_reason=None,
                      cost_cap_source=_run_cost_cap_for_agent(model, agent)[1])
@@ -7070,12 +7280,14 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
                 proc, run_dir, cost_cap=cost_cap,
                 token_cap=token_cap,
                 git_dir=git_dir,
-                private_objects_dir=private_objects_dir)
+                private_objects_dir=private_objects_dir,
+                repo=repo)
         except KeyboardInterrupt:
             interrupted = True
-            proc.terminate()
-            try: proc.wait(timeout=5)
-            except subprocess.TimeoutExpired: proc.kill()
+            _terminate_proc_and_group(proc, grace_s=5.0)
+            # CQ·138 round 1: the group kill above never reaches a Bash-tool
+            # descendant (see the section comment on _sweep_tool_session_holders).
+            _sweep_tool_session_holders(run_dir, grace_s=5.0)
         except (BrokenPipeError, OSError) as exc:
             # ARCH-253: a broken stdout pipe (inline spawn + `| head`) must not
             # propagate past _finalize_run. Scoped to OSError (BrokenPipeError is
@@ -7085,6 +7297,14 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
             _on_broken_stream(run_id, run_dir, exc)
         proc.wait()
         exit_code = proc.returncode
+        # CQ·138: proc's leader is reaped (the wait above); sweep whatever it
+        # backgrounded and left behind — the run directory write and the
+        # xctest class of descendant — before this attempt is treated as over
+        # (the fail-over/retry logic below may still respawn, each attempt's
+        # own leftovers swept here the same way before the next one starts).
+        _cleanup_process_group(getattr(proc, "agent_pgid", None),
+                               grace_s=_POST_EXIT_CLEANUP_GRACE_S)
+        _sweep_tool_session_holders(run_dir, grace_s=_POST_EXIT_CLEANUP_GRACE_S)
 
         # A transient API death retries ONCE, on the SAME model, before the
         # cross-provider fail-over below is even considered. "Connection closed
@@ -7271,6 +7491,18 @@ def _run_session(*, args: argparse.Namespace, agent: dict, run_id: str,
             (run_dir / "eval-review.json").write_text(json.dumps(eval_verdict))
         if eval_scratch_dir is not None:
             shutil.rmtree(eval_scratch_dir, ignore_errors=True)
+
+    # CQ·138 round 2: this run's own tool-session scratch directory
+    # (`RS.create_tool_session_scratch_dir`, holding the marker
+    # `_record_tool_session_marker` recorded under `run_dir`) is removed here,
+    # once the run is finalized — every termination path above (the original
+    # spawn, every ARCH-131 respawn, a cost-cap or broken-stream kill,
+    # `agentctl kill` from its own separate invocation) has already run its
+    # own `_sweep_tool_session_holders(run_dir, ...)` by the time execution
+    # reaches this point, so nothing after this still needs the directory to
+    # exist. `None` for a dry run, which never creates one.
+    if tool_session_scratch_dir is not None:
+        shutil.rmtree(tool_session_scratch_dir, ignore_errors=True)
 
     # The private-object import (round 6, knowledge#793) moved INSIDE
     # `_finalize_run` — the first thing it now does, before `_commits_since` and
@@ -7473,7 +7705,8 @@ def _budget_refuse_and_record(args, agent: dict, repo: str, profile: str,
                  profile=profile, model=_model,
                  pid=None, parent_run=args.parent, label=args.label,
                  billing_source=_billing_source_for(_model),
-                 origin=_run_origin(args.parent), overnight_wave=_overnight_wave())
+                 origin=_run_origin(args.parent), overnight_wave=_overnight_wave(),
+                 persona_source=agent.get("persona_source", "roster"))
     T.update_meta(run_dir, ended_at=T.now_iso())
     T.write_cost(run_dir, by_model={})
     T.write_outcome(run_dir, exit_status="budget_refused")
@@ -7489,6 +7722,70 @@ def _budget_refuse_and_record(args, agent: dict, repo: str, profile: str,
     return 3
 
 
+def _ledger_cap_refuse_and_record(args, repo: str, refusal: _LedgerCapRefused,
+                                  profile: str) -> int:
+    """Write a telemetry record for an item-bound dispatch the LIBRARY refused at
+    checkout over the dispatched project's ledger (`_LedgerCapRefused` — soft cap,
+    or hard cap until revocation exists), and return exit code 3 — the same code
+    `_budget_refuse_and_record` returns for `agentctl`'s own daily gate, since both
+    mean "refused on money, nothing started".
+
+    `profile` is the caller's already-computed value (the one named to the
+    checkout that raised `refusal`), not recomputed here — `default_profile`
+    makes its own Library call and can print its "using default profile"
+    notice, so calling it twice for one refused dispatch would do both twice.
+
+    exit_status is `project_cap_refused`, distinct from `budget_refused`: a reader
+    can tell the Library's per-project ledger refused this dispatch apart from
+    agentctl's own scheduled-pool gate refusing a different one.
+
+    No agent was ever materialized — the Library refuses before `persona_md` or
+    `model` are read (`_refuse_on_capped_ledger` runs ahead of the item lock) — so
+    unlike `_budget_refuse_and_record`, which already has a resolved `agent` to pull
+    `body`/`model_alias` from, this writes placeholders for both: there is nothing
+    real to carry forward, and recomputing one locally would just be a guess dressed
+    up as a value the Library never sent. `meta.json`'s `persona_source` is left
+    unset (None) for the same reason — there is no agent body of either source to
+    name."""
+    ledger = refusal.body.get("ledger") if isinstance(refusal.body.get("ledger"), dict) else {}
+    purpose = derive_purpose(args.agent, args.task, pr=getattr(args, "pr", None))
+    try:
+        desired = W.desired_path(repo, purpose)
+    except ValueError:
+        desired = Path(f"(unknown:{repo})")
+    if not R.ACTIVE_PATH.exists():
+        R.bootstrap()
+    run_id = T.new_run_id()
+    run_dir = T.create_run_dir(run_id)
+    started = T.now_iso()
+    reviewer = getattr(args, "reviewer", None)
+    user_prompt = args.task + (f"\n\n(reviewer: {reviewer})" if reviewer else "")
+    T.write_prompt(run_dir,
+                   system="(not materialized: the Library refused the checkout "
+                          "before persona_md could be read)",
+                   user=user_prompt)
+    _model = model_id(None)
+    T.write_meta(run_dir, run_id=run_id, agent=args.agent, task=args.task,
+                 started_at=started, repo=repo, worktree=str(desired),
+                 profile=profile, model=_model,
+                 pid=None, parent_run=args.parent, label=getattr(args, "label", None),
+                 billing_source=_billing_source_for(_model),
+                 origin=_run_origin(args.parent), overnight_wave=_overnight_wave(),
+                 issue=refusal.issue_id)
+    T.update_meta(run_dir, ended_at=T.now_iso())
+    T.write_cost(run_dir, by_model={})
+    reason = (f"the Library refused to check out {refusal.issue_id!r}: "
+              f"{refusal.body.get('error') or refusal}"
+              f" (cap={ledger.get('cap')}, total_usd={ledger.get('total_usd')}, "
+              f"day={ledger.get('day')})")
+    T.write_outcome(run_dir, exit_status="project_cap_refused", error_reason=reason)
+    T.write_docs_consulted(run_dir, profile=profile,
+                           individuated_agents=[], individuated_skills=[],
+                           queried_at_runtime=[], materialized_documents=[])
+    print(f"error: {reason} (run_id={run_id})", file=sys.stderr)
+    return 3
+
+
 # Grace period after the terminal `result` event before we reap a subprocess
 # that hasn't exited (ARCH-069). A `claude -p` that ends its turn with
 # background tasks still pending emits its `result` but never closes stdout, so
@@ -7497,22 +7794,493 @@ def _budget_refuse_and_record(args, agent: dict, repo: str, profile: str,
 REAP_GRACE_SECONDS = float(os.environ.get("AGENTCTL_REAP_GRACE_SECONDS", "60"))
 
 
+# CQ·138: process-group cleanup, so a descendant the agent backgrounds (a
+# disowned write, a `swift test` left running) never outlives the run that
+# started it. Every one of these helpers treats a group or pid that's
+# already gone (ProcessLookupError) as success, not failure — there being
+# nothing left to stop is the goal, not an error.
+
+_GROUP_KILL_POLL_S = 0.2  # polling cadence while waiting for a signaled group to empty
+
+# Grace for the post-exit descendant sweep (_cleanup_process_group) — no
+# pre-existing call site to match, since this cleanup didn't exist before
+# this fix; set equal to the cost-cap stop's own grace below.
+_POST_EXIT_CLEANUP_GRACE_S = 5.0
+
+
+def _pgid_is_signalable(pgid: int, pid: int) -> bool:
+    """Whether `pgid` is a process group this code may `killpg`: `pid`'s own
+    (`pgid == pid` — what `process_group=0` guarantees at the moment
+    `_spawn_claude` creates `pid`) and not 0, 1, or THIS process's own group
+    (`os.getpgrp()`). Refusing all three matters for a different reason
+    each: `killpg(0, ...)` means "my own group" in POSIX, not "none";
+    `killpg(1, ...)` is never a real spawned child's group; and this
+    process's own group is the supervisor's (or, for `agentctl kill`, that
+    CLI invocation's own) — signaling any of them would reach processes
+    this run never started.
+
+    Pure and lookup-free on purpose, so a guard that must refuse 0 and 1 is
+    testable directly against those exact values, which no real spawned
+    process ever has as its own pgid."""
+    return pgid == pid and pgid not in (0, 1, os.getpgrp())
+
+
+def _own_pgid_if_isolated(pid: int) -> int | None:
+    """`pid`'s own process-group id if `_pgid_is_signalable` for it, else
+    `None` — `pid` already gone (ProcessLookupError), or its group is
+    shared with something this code did not isolate when it started `pid`
+    (a plain `claude`/`codex` spawn with no `process_group=0`, most often
+    sharing the supervisor's own group). Callers never killpg what this
+    returns `None` for.
+
+    Call this ONLY while `pid` is known still alive — right after `Popen`
+    returns (`_tag_agent_pgid`) or while about to signal a run that's still
+    running (`_terminate_proc_and_group`, `_terminate_run`). A lookup made
+    AFTER `pid` has been reaped would risk describing a just-recycled,
+    unrelated process's group instead of the one `pid` actually owned —
+    which is why `_cleanup_process_group` (the post-exit sweep) is always
+    fed a value captured before that reap, never one looked up after."""
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return None
+    return pgid if _pgid_is_signalable(pgid, pid) else None
+
+
+def _tag_agent_pgid(proc: subprocess.Popen) -> subprocess.Popen:
+    """Stamp `proc.agent_pgid` with `_own_pgid_if_isolated(proc.pid)`,
+    captured right now while `proc` is certainly still alive, for
+    `_cleanup_process_group` to use once `proc` has exited and its pid may
+    already have been recycled. Every `_spawn_claude` Popen call is wrapped
+    in this; nothing else needs to compute it."""
+    proc.agent_pgid = _own_pgid_if_isolated(proc.pid)
+    return proc
+
+
+def _terminate_proc_and_group(proc: subprocess.Popen, *, grace_s: float) -> None:
+    """Stop `proc`, and — when it leads its own process group
+    (`proc.agent_pgid`/`_own_pgid_if_isolated`, not 0/1/this process's own) —
+    everything it backgrounded too, not merely `proc` itself: SIGTERM the
+    group, poll for up to `grace_s`, SIGKILL whatever is still there.
+
+    Falls back to signaling `proc` alone (`.terminate()`/`.wait()`/`.kill()`,
+    unchanged) when `proc` isn't isolated — a plain `codex`/`sudo
+    review-launch` spawn, or a test double with no real `.pid` at all —
+    exactly what every one of these call sites did before this existed.
+
+    `proc.poll()` is called every iteration so the leader (a real child of
+    THIS process) is reaped the moment it exits, rather than sitting as a
+    zombie that would make the group-wide liveness check below
+    (`os.killpg(pgid, 0)`) read "still here" for the rest of the window even
+    once every real descendant has exited."""
+    pid = getattr(proc, "pid", None)
+    pgid = _own_pgid_if_isolated(pid) if pid is not None else None
+    if pgid is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=grace_s)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        proc.wait()
+        return
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        proc.poll()
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return  # whole group, leader included, has exited
+        time.sleep(_GROUP_KILL_POLL_S)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=grace_s)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _cleanup_process_group(pgid: int | None, *, grace_s: float) -> None:
+    """After the run's leader has ALREADY been reaped (the caller's own
+    `proc.wait()` already returned), SIGTERM then SIGKILL whatever it still
+    left behind in `pgid` — the disowned background write and the xctest
+    descendants this fix exists for (CQ·138).
+
+    `pgid` must be a value `_tag_agent_pgid` captured before that reap;
+    `None` means `proc` was never isolated, so there is nothing of ITS OWN
+    left to sweep here (it was signaled, if it needed to be, while it was
+    still alive)."""
+    if pgid is None:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(_GROUP_KILL_POLL_S)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
+# CQ·138: the agent's own process group (above) is not enough. Claude Code
+# starts every Bash-tool command as `/bin/zsh -c 'source <snapshot> ... &&
+# eval ...'`, and that invocation is a brand-new SESSION (pid == pgid == sid —
+# measured 2026-10-13), never a member of the group `process_group=0`
+# isolated at spawn. A `killpg` on that group at finalize never reaches what
+# the agent runs or backgrounds through its Bash tool — the shape of both
+# incidents CQ·138 cites (a disowned background write; ten xctest processes
+# alive five hours after their run).
+#
+# A run's tool shells are identified by a FILE THEY HOLD OPEN, never by an id
+# anything reports: a self-reported pid has no OS-verified link to any
+# process, and every run's own Bash-tool shell looks identical by the same
+# measurement above (a brand-new zsh session, pgid == sid == pid, same uid)
+# — so a run could write another run's tool-shell pid into its own record
+# and have this run's trusted supervisor kill that shell at finalize.
+# `RS.create_tool_session_marker` makes one empty, owner-only file per
+# dispatch; `_write_tool_session_zdotdir`'s `.zshenv` opens it for append on a
+# file descriptor that stays open for the life of that shell and everything
+# it backgrounds or disowns, descendants included, since every fork inherits
+# open descriptors unless a process explicitly closes them (the one escape
+# this mechanism cannot see — see `_sweep_tool_session_holders`'s own
+# docstring). At finalize, `_verified_tool_session_marker` confirms the
+# recorded path, device and inode under `run_dir` (which the run cannot
+# write) still match the live file — an `O_NOFOLLOW` open plus a device/inode
+# comparison — so a replaced or symlinked-over marker fails that check and
+# nothing is signalled on its behalf.
+#
+# Measured directly against a real dispatch (2026-10-13): the run can append
+# to its own marker, and can delete it outright with `rm` (exit 0 — a
+# single-file `allowWrite` grant permits unlinking that file); it cannot
+# create a file in its own scratch directory or rename that directory
+# (denied, "Operation not permitted"), and — ordinary or `--eval-mode`
+# dispatch alike — it cannot touch a SIBLING dispatch's marker or scratch
+# directory at all. Deleting its own marker does not let a run rename or
+# replace it with another file: that needs a write grant on the directory
+# entry, which this grant never includes. It does defeat this run's own
+# finalize-time sweep, though: `_verified_tool_session_marker` fails to open
+# a deleted marker, logs why, and returns `None`, so no holders are signalled
+# for that run — the sweep silently has nothing left to confirm, not nothing
+# wrong to report. This all depends on `RS.tool_session_scratch_root`'s
+# parent staying outside every dispatch's `allowWrite` — see that function's
+# own comment for what would reopen sibling access. `lsof -t <path>` lists
+# every live process still holding the verified marker open. Nothing a run
+# writes INTO the marker, or anywhere else it can write, is ever read by any
+# of this.
+#
+# ZSH ONLY: scoped to zsh because Claude Code runs its Bash tool through
+# /bin/zsh -c, and ZDOTDIR is the one thing such an invocation reads
+# unconditionally before running anything else. A bash equivalent of this
+# mechanism would use BASH_ENV, which bash DOES read for `bash -c` too; this
+# module has no such equivalent to build because Claude Code's Bash tool
+# never invokes bash in place of zsh today.
+
+TOOL_SESSION_DIR_NAME = "zdotdir"
+# The file descriptor every tool shell's `.zshenv` opens the marker on and
+# keeps open (CQ·138 round 3). 9: above the three standard streams (0-2) and
+# outside the 3-8 range scripts conventionally borrow for a here-string or a
+# process substitution's own temporary fd, and confirmed clear of anything the
+# installed Claude Code snapshot script this shell goes on to `source` uses
+# (it redirects only to fd 2). A SPECIFIC multi-digit descriptor cannot be
+# targeted this way in zsh at all — `exec 99>>file` with no preceding command
+# word is parsed as a command named `99`, not a bare redirection (measured:
+# `zsh: command not found: 99`); only a single digit works as a bare `exec
+# N>>file` redirection, which is the real reason this is 9 and not some
+# higher, more conventionally "private" number. The exact number is not
+# load-bearing for `lsof -t <path>` either way: it finds a holder by which
+# file is open, never which fd it is open on.
+TOOL_SESSION_MARKER_FD = 9
+# Under `run_dir` (CQ·138): the scratch directory (created by
+# `RS.create_tool_session_scratch_dir`) and its marker file
+# (`RS.create_tool_session_marker`) must live outside `runs_root`, since
+# `runs_root` is denied for writing by the run — but the one-line record of
+# the marker's identity can live right here, under `run_dir`, because nothing
+# reads or writes this file except the dispatcher itself: `runs_root` is
+# denied for writing by the sandboxed run exactly as `meta.json` already is,
+# and this is a separate name from `meta.json` on purpose, so a future
+# mechanism that does let a run touch its own `meta.json` can never collide
+# with it. `agentctl kill` reads it from its own, separate process
+# invocation — the in-process `_spawn_claude` closure that creates the marker
+# has no need to read this file back itself. Holds the marker's path, device
+# and inode (JSON), not merely a directory's path — see
+# `_record_tool_session_marker`'s own docstring for why the device/inode pair
+# is what makes the later read trustworthy.
+TOOL_SESSION_MARKER_RECORD_NAME = "tool-session-marker"
+
+
+def _record_tool_session_marker(run_dir: Path, marker_path: Path) -> None:
+    """Record `marker_path` (this dispatch's own `RS.create_tool_session_marker`
+    file) and its device/inode under `run_dir`, so `_verified_tool_session_marker`
+    can later confirm — from a LATER, SEPARATE process (`agentctl kill <run_id>`,
+    or this same dispatcher at finalize) — that the path it is about to query
+    with `lsof` is still the EXACT file created before this run's claude process
+    ever started, not a same-named replacement. `marker_path.stat()` is called
+    here, immediately after `RS.create_tool_session_marker` creates the file and
+    before the claude process starts, so the recorded identity can never race
+    the run's own first write to it."""
+    st = marker_path.stat()
+    T.write_owner_only(run_dir / TOOL_SESSION_MARKER_RECORD_NAME,
+                       json.dumps({"path": str(marker_path),
+                                  "dev": st.st_dev, "ino": st.st_ino}))
+
+
+def _tool_session_marker_record(run_dir: Path) -> tuple[Path, int, int] | None:
+    """The `(path, device, inode)` `_record_tool_session_marker` recorded for
+    this dispatch, or None when the record is missing, unreadable or
+    malformed — a run dispatched before this mechanism existed, a dry run
+    (which never creates one), or the review-launch path (which never calls
+    `_write_tool_session_zdotdir` at all). Returns the record UNVERIFIED: a
+    caller that is about to signal anything must go through
+    `_verified_tool_session_marker` instead, which confirms the path on disk
+    still IS this exact file before using it for anything."""
+    try:
+        record = json.loads((run_dir / TOOL_SESSION_MARKER_RECORD_NAME).read_text())
+        return Path(record["path"]), int(record["dev"]), int(record["ino"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _tool_session_scratch_dir_from_record(run_dir: Path) -> Path | None:
+    """This dispatch's own `RS.create_tool_session_scratch_dir` directory —
+    the marker's parent, since `RS.create_tool_session_marker` always creates
+    the marker directly inside it — derived from `_tool_session_marker_record`.
+    Used ONLY to remove the directory once every termination path's sweep has
+    already run; a caller that is about to SIGNAL anything must go through
+    `_verified_tool_session_marker` instead, never this. Trusting the raw
+    record for a deletion target (no device/inode re-check) is safe here in a
+    way it would not be for a signal: `run_dir` itself is denied for writing by
+    the sandboxed run (the same `runs_root` deny rule `meta.json` relies on),
+    so nothing this run did can have changed what the dispatcher wrote here
+    before that run's claude process ever started."""
+    record = _tool_session_marker_record(run_dir)
+    return record[0].parent if record else None
+
+
+def _verified_tool_session_marker(run_dir: Path) -> Path | None:
+    """The marker path `_tool_session_marker_record` recorded for this
+    dispatch, confirmed still to BE that exact file — opened with
+    `O_NOFOLLOW` and its live device/inode compared against what was recorded
+    before this run's claude process ever started. The record file under
+    `run_dir` existing and being well-formed is not, on its own, proof that
+    the path it names is still that same file; this is the check that makes
+    it one — no dispatch, eval or ordinary, holds a write grant anywhere near
+    the marker's own parent directory any more (`RS.tool_session_scratch_root`
+    moved it outside every root any dispatch's `allowWrite` holds — see
+    `RS.settings`'s own docstring on `tool_session_marker`), but a device/inode
+    mismatch here would still catch a replaced file even if that stopped
+    being true.
+
+    Returns None, and logs why to stderr, on a missing or malformed record, a
+    missing file, an open that fails (`O_NOFOLLOW` refusing to follow a
+    symlink at the final path component), or a device/inode mismatch. Every
+    one of those means: do not signal anything on this dispatch's behalf —
+    the identity this would act on cannot be confirmed."""
+    record = _tool_session_marker_record(run_dir)
+    if record is None:
+        return None
+    path, dev, ino = record
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        print(f"agentctl: tool-session marker {path} unreadable ({exc}); "
+              f"not sweeping its holders", file=sys.stderr)
+        return None
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if st.st_dev != dev or st.st_ino != ino:
+        print(f"agentctl: tool-session marker {path} no longer matches its "
+              f"recorded device/inode; not sweeping its holders", file=sys.stderr)
+        return None
+    return path
+
+
+def _write_tool_session_zdotdir(run_dir: Path, marker_path: Path) -> Path:
+    """Prepare `<run_dir>/zdotdir` as this run's ZDOTDIR and return it.
+
+    The `.zshenv` written there is the ONLY startup file a non-interactive,
+    non-login `zsh -c` invocation sources — so it runs first, before the
+    `source <snapshot>` the Bash tool's own command line then does — and it:
+
+    1. Opens `marker_path` (this dispatch's own `RS.create_tool_session_marker`
+       file) for append on fd `TOOL_SESSION_MARKER_FD`, with `exec`, so the
+       descriptor stays open for the life of this shell and everything it
+       execs, forks, backgrounds or disowns — every descendant inherits an
+       open file descriptor unless it explicitly closes it, which is what
+       lets `_sweep_tool_session_holders` find the whole tree later via
+       `lsof -t marker_path`, with no id this shell has to self-report at
+       all. Nothing is ever written to the marker; the open fd alone is the
+       mechanism. A failed open (a marker already removed by a finalize that
+       races a slow-starting shell) is silent and must not stop the Bash-tool
+       command that follows — wrapped in a brace group, not a bare trailing
+       `2>/dev/null`, for the reason the inline comment on this method gives.
+    2. `unset`s ZDOTDIR immediately after, restoring it to the user's own
+       (unset means `$HOME`) — so nothing later in this invocation goes
+       looking for `.zprofile`/`.zshrc`/`.zlogin` under this run's private
+       directory instead of the real one.
+    3. Sources `$HOME/.zshenv` itself when one exists, since restoring
+       ZDOTDIR after the fact means zsh's own startup sequence will never go
+       back and source it — this is the one file that restoring ZDOTDIR,
+       alone, would silently drop.
+
+    `zdir` itself stays under `run_dir`, not the marker's own scratch
+    directory: every tool shell only ever needs to READ `.zshenv` there,
+    never write it, and `runs_root`'s deny rule only covers writing — the
+    run's Bash can read anything under its own `run_dir` that isn't one of
+    the credential paths `settings()` separately denies for reading.
+
+    Idempotent: a respawn's second `_spawn_claude` call overwrites the same
+    `.zshenv` content with the SAME marker path, so a later sweep still finds
+    every live holder regardless of which attempt started it."""
+    zdir = run_dir / TOOL_SESSION_DIR_NAME
+    zdir.mkdir(exist_ok=True)
+    os.chmod(zdir, 0o700)
+    T.write_owner_only(zdir / ".zshenv", (
+        # Round 4 (reviewer finding, verified): `exec N>>file 2>/dev/null` sets
+        # up its redirections LEFT TO RIGHT, so a failed open on fd
+        # TOOL_SESSION_MARKER_FD prints zsh's own diagnostic to the still-live
+        # original stderr before `2>/dev/null` ever takes effect — measured:
+        # `zsh:1: no such file or directory: ...`. A brace group redirects
+        # stderr FIRST, so a failure inside it (the marker already removed by a
+        # finalize that raced a slow-starting shell) is silent, the same way a
+        # successful open already was.
+        f'{{ exec {TOOL_SESSION_MARKER_FD}>>{shlex.quote(str(marker_path))}; }} 2>/dev/null\n'
+        'unset ZDOTDIR\n'
+        '[[ -r "$HOME/.zshenv" ]] && source "$HOME/.zshenv"\n'
+    ))
+    return zdir
+
+
+def _tool_session_holders(path: Path) -> list[int] | None:
+    """Live pids holding `path` open, via `lsof -t path` — queried by WHICH
+    FILE is open, never by any id read from its content (nothing is ever
+    written into a tool-session marker for this to read back). Returns the
+    pids found; an EMPTY list is a real, confirmed answer ("nobody holds this
+    open right now"), never confused with None.
+
+    None means the query itself failed — `lsof` missing, timing out, or
+    exiting with a status other than 0 (holders found) or 1 (none found) —
+    and a caller must then signal NOTHING rather than guess: an unreadable
+    answer is not evidence of an empty one. `lsof -t /dev/fd/<n>` was measured
+    to fail with "Bad file descriptor" even with the descriptor itself
+    passed, which is why this always queries the verified ON-DISK path, never
+    a descriptor number."""
+    try:
+        cp = subprocess.run(["lsof", "-t", str(path)],
+                            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        print(f"agentctl: lsof on {path} failed to run; not sweeping its holders",
+              file=sys.stderr)
+        return None
+    if cp.returncode not in (0, 1):
+        print(f"agentctl: lsof on {path} exited {cp.returncode}; "
+              f"not sweeping its holders", file=sys.stderr)
+        return None
+    pids: list[int] = []
+    for line in cp.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pids.append(int(line))
+        except ValueError:
+            continue
+    return pids
+
+
+def _sweep_tool_session_holders(run_dir: Path, *, grace_s: float) -> None:
+    """SIGTERM then SIGKILL every LIVE process holding this dispatch's own
+    tool-session marker open (CQ·138 round 3) — the Bash-tool descendants
+    `_terminate_proc_and_group`/`_cleanup_process_group`'s own group-kill
+    cannot reach (see the section comment above). Identifies holders by
+    `_verified_tool_session_marker` (confirms the marker's identity) and
+    `_tool_session_holders` (`lsof -t`, confirms who currently has it open) —
+    never by anything a run reported about itself, which is exactly what
+    rounds 1-2 trusted and what the round-3 security finding broke.
+
+    Excludes this process's own pid, the same way the agent's own group-kill
+    refuses 0, 1 and its own group (`_pgid_is_signalable`) — this supervisor
+    has no reason to hold a run's marker open, but excluding it is the cheap,
+    certain guard against ever self-signaling if it somehow did. Also
+    excludes pid 1 (launchd): a descendant reparented to it is still a real,
+    signalable holder by its OWN pid, which `lsof` reports — pid 1 itself is
+    never what gets returned as a holder of a file it does not have open.
+
+    Either `_verified_tool_session_marker` or `_tool_session_holders` returning
+    None (a missing/mismatched record, or a failed `lsof`) stops this
+    silently — both already log why. No live holders is not an error either;
+    nothing of this run's tool-session tree is left to stop.
+
+    THE ESCAPE THIS CANNOT SEE: a process that closes every inherited file
+    descriptor before doing anything else (a daemon that sanitizes its own
+    fds) is no longer a holder of the marker and so is invisible to
+    `lsof -t` — there is no fallback for that case here; a process built to
+    detach this thoroughly is already past what an inherited-fd mechanism can
+    observe."""
+    my_pid = os.getpid()
+
+    def _live_holders() -> list[int] | None:
+        path = _verified_tool_session_marker(run_dir)
+        if path is None:
+            return None
+        holders = _tool_session_holders(path)
+        if holders is None:
+            return None
+        return [p for p in holders if p != my_pid and p > 1]
+
+    holders = _live_holders()
+    if not holders:
+        return
+    for pid in holders:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        remaining = _live_holders()
+        if remaining is None or not remaining:
+            return
+        time.sleep(_GROUP_KILL_POLL_S)
+    remaining = _live_holders()
+    if remaining is None:
+        return
+    for pid in remaining:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def _reap_lingering(proc: subprocess.Popen, run_dir: Path) -> None:
     """Timer callback, fired REAP_GRACE_SECONDS after the terminal `result`.
     If the subprocess is still alive it emitted its result but won't exit on its
-    own — terminate it so stdout closes, the drain loop ends, and the normal
-    _finalize_run path runs. Escalate to SIGKILL if SIGTERM doesn't take."""
+    own — terminate it (and, now, its whole process group — CQ·138) so stdout
+    closes, the drain loop ends, and the normal _finalize_run path runs.
+    Escalate to SIGKILL if SIGTERM doesn't take."""
     if proc.poll() is not None:
         return  # exited on its own within the grace window — nothing to do
     sys.stderr.write(
         f"reaper: {run_dir.name} emitted result but did not exit within "
         f"{REAP_GRACE_SECONDS:.0f}s — terminating pid {proc.pid}\n")
     sys.stderr.flush()
-    proc.terminate()
-    try:
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+    _terminate_proc_and_group(proc, grace_s=10.0)
+    # CQ·138 round 1: the group kill above never reaches a Bash-tool
+    # descendant (see the section comment on _sweep_tool_session_holders).
+    _sweep_tool_session_holders(run_dir, grace_s=10.0)
 
 
 # The operator's 2026-10-07 ruling (slate a-1ommg6): this default, and the
@@ -7618,6 +8386,142 @@ def _cap_breach_reason(gw_usd: float, gw_tokens: int, gw_has: bool,
     return None
 
 
+# How often a live run polls the Library for its PROJECT's hard-cap crossing
+# (budget-enforcement epic clause 4, work item E1·7). Sits beside
+# `_COST_CHECK_INTERVAL_S` rather than its own cadence — reusing the same
+# constant rather than inventing a second number for the same "how fast does a
+# live run need to notice" question.
+#
+# The global concurrency ceiling this poll load scales with is not a constant
+# in this tree: `registry.limits().max_concurrent` is read from the policy
+# file at origin/main of the knowledge repository (`registry.MAX_CONCURRENT_DEFAULT`,
+# 16, is only the fallback used when that read fails) and is 48 today. Every
+# live run polls on its own, and every one presents the same credential at
+# `signal_client.TOKEN_FILE`, so a full house is 48 runs / 20s ≈ 2.4 req/s,
+# 144 requests a minute against the Library's 120-per-minute-per-submitter
+# gate (signal_client's own comment on library#176) — over it, not negligible
+# next to it. Going over does not misfire a stop: a 429 makes
+# `_read_hard_cap_signal` return None like any other unreachable-Library case,
+# so the run keeps going and the next poll tries again; a full house only
+# delays noticing a hard-cap crossing by an interval or more, it never trips
+# one that didn't happen.
+_HARD_CAP_CHECK_INTERVAL_S = _COST_CHECK_INTERVAL_S
+# Short, like signal_client's tee budget: this read sits inline in the
+# per-line drain loop, so a slow or hung Library must not stall draining the
+# run's own subprocess for long. Best-effort — see `_read_hard_cap_signal`.
+_LIBRARY_HARD_CAP_TIMEOUT_S = 3.0
+# Bounds the `GET /signals` page this poll reads (below): the newest
+# `kind=ledger.threshold-crossed` rows, across EVERY project — comfortably
+# more than the handful of projects that could cross a threshold in one day.
+# No `since` bound (round 4 finding on #880): the Library's producer writes
+# these rows with `produced_at: None`, and the route's `since` filter is
+# `AND produced_at >= ?`, which a NULL never satisfies — a `since`-bounded
+# request would read zero rows forever. Leaving `order` at its default
+# (`ingested_at DESC, id` — newest first) and `meta.day == day` below, rather
+# than a server-side bound, is what finds today's crossing inside this page.
+_HARD_CAP_SIGNAL_LIMIT = 200
+
+
+def _read_hard_cap_signal(project: str | None, day: str) -> dict | None:
+    """The `hard_cap` `ledger.threshold-crossed` signal meta for `day` (the
+    Library's own publication, `_signal_ledger_threshold_crossed` in its
+    app.py) whose `product` equals this run's registry PROJECT, or None.
+
+    Matched on the project alone: the Library's ledger fold (library#270,
+    live 2026-10-13 20:35Z) normalized every ledger, ledger entry and
+    `ledger.threshold-crossed` signal to name the registry project, and `GET
+    /ledgers` now serves only project ledgers — a repo-name leg of the match
+    would never see a row published against it again.
+
+    None covers every case alike: no such signal exists yet, the Library is
+    unreachable, it answered a non-2xx, or its body is malformed — clause 3
+    of this work item (E1·7): a Library read that fails never stops a run,
+    it is simply retried at the next poll. Only a definite hard_cap signal
+    for THIS project and THIS day, published by the Library itself, is ever
+    returned.
+
+    Reads the Library's FIXED address (`vault_plane.fixed_library_url`),
+    like `_library_get` above, for the same reason: this result decides
+    whether a live run gets killed, so its source must not be something the
+    dispatched run's own environment could repoint."""
+    import http.client
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    import issue_client as IC
+    import vault_plane as VP
+    if not project:
+        return None
+    try:
+        tok = SC.TOKEN_FILE.read_text().strip()
+    except OSError:
+        return None
+    if not tok:
+        return None
+    qs_params = {"kind": "ledger.threshold-crossed", "limit": str(_HARD_CAP_SIGNAL_LIMIT)}
+    qs = urllib.parse.urlencode(qs_params)
+    req = urllib.request.Request(VP.fixed_library_url(f"/signals?{qs}"),
+                                 headers=VP.library_headers(token=tok))
+    try:
+        with IC.pinned_opener().open(req, timeout=_LIBRARY_HARD_CAP_TIMEOUT_S) as resp:
+            raw = resp.read()
+    except (urllib.error.URLError, OSError, http.client.HTTPException):
+        return None
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return None
+    signals = body.get("signals") if isinstance(body, dict) else None
+    if not isinstance(signals, list):
+        return None
+    for sig in signals:
+        if not isinstance(sig, dict):
+            continue
+        meta = sig.get("meta")
+        if not (isinstance(meta, dict) and meta.get("threshold") == "hard_cap"
+                and meta.get("day") == day):
+            continue
+        # `ingested_by`, not `source`: POST /signals lets any credential holding
+        # signal.create post a ledger.threshold-crossed row naming any product
+        # and any `source` it likes — `source` is caller-supplied and proves
+        # nothing. The route itself sets `ingested_by` to the posting
+        # credential's actor, which the caller cannot choose, and no issued
+        # credential's actor is "library" — only the Library's own publication
+        # (`_signal_ledger_threshold_crossed` in its app.py) carries it.
+        if sig.get("ingested_by") != "library":
+            continue
+        if sig.get("product") == project:
+            return meta
+    return None
+
+
+def _fmt_signal_usd(value: Any) -> str:
+    """A signal meta USD field as `$N.NN`, or `"unknown"` for anything that
+    doesn't coerce to a number — the Library's own publication is trusted
+    today, but the reason string built from it must not raise regardless."""
+    try:
+        return f"${float(value):.2f}"
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _hard_cap_breach_reason(project: str) -> tuple[str, str] | None:
+    """(kind, reason) when the Library has published a hard-cap crossing for
+    `project` (see `_read_hard_cap_signal`) for TODAY (`T.platform_day()`
+    — the same local-day bucket the Library's own `local_day()` computes, by
+    design: see either function's docstring), else None. `kind` is
+    `"hard-cap"`, alongside `_cap_breach_reason`'s `"cost-cap"`/`"token-cap"` —
+    the one termination call downstream treats all three alike."""
+    day = T.platform_day()
+    meta = _read_hard_cap_signal(project, day)
+    if meta is None:
+        return None
+    return ("hard-cap",
+            f"the Library's ledger for {project!r} crossed its hard cap "
+            f"({_fmt_signal_usd(meta.get('cap_usd'))}) for {day}, at a total of "
+            f"{_fmt_signal_usd(meta.get('total_usd'))}")
+
+
 def _run_token_cap(model: str) -> int | None:
     """Per-run token ceiling (ARCH-245) — the pricing-independent backstop to the
     dollar cap. Only gateway runs get it (same scope as _run_cost_cap; subscription
@@ -7655,13 +8559,31 @@ def _stream_transcript(proc: subprocess.Popen, run_dir: Path,
                        cost_cap: float | None = None,
                        token_cap: int | None = None,
                        git_dir: Path | None = None,
-                       private_objects_dir: Path | None = None
+                       private_objects_dir: Path | None = None,
+                       repo: str | None = None
                        ) -> tuple[dict | None, str | None]:
     """Drain claude's stdout. Each line is one stream-json event. Tees verbatim
     to transcript.jsonl + stdout, derives tool_calls.jsonl from matched
     tool_use/tool_result pairs by id. Returns `(final_event, cost_stop_reason)`:
     the final 'result' event if any, and the cap's own human-readable reason
-    if the per-run cost/token cap fired and killed the process, else `None`.
+    if the per-run cost/token cap, or its project's Library hard cap, fired
+    and killed the process, else `None`.
+
+    `repo` (the dispatch's own `--on` value, every call site's existing
+    local — work item E1·7) is how this run's PROJECT is found:
+    `projects.project_for_repo(repo)`, the same mapping the Library's own
+    `projects.resolve` gives a bare repo name (that module's own docstring).
+    A grant-based dispatch carries no separate project field of its own —
+    `_agent_from_grant` sets `agent["project"]` to the same `repo` the
+    roster path does — so `repo` is the one signal both dispatch paths
+    agree on. The poll matches a hard-cap signal against that resolved
+    project alone (the Library's ledger fold keys every ledger and signal by
+    registry project — `_read_hard_cap_signal`'s own docstring), so a `repo`
+    the registry does not map to any project is never polled — only a
+    `repo` that resolves to a project starts the poll; `repo=None` (every
+    call site before this feature, and a dispatch with no `--on`) and a
+    `repo` with no project mapping both mean this run is never polled for a
+    hard-cap stop.
 
     That second value is this function's own in-memory record of the breach —
     the SAME fact `cost-killed.txt` (below) is written for, but returned
@@ -7730,6 +8652,16 @@ def _stream_transcript(proc: subprocess.Popen, run_dir: Path,
     # that passes neither `git_dir` nor `private_objects_dir` (every existing call site
     # and test before this one) gets zero extra `time.monotonic()` calls, same as before.
     last_live_import = time.monotonic() if private_objects_dir is not None else None
+    # Resolved once, not per-poll: project_for_repo reads+parses the registry file
+    # every call, and a project's mapping cannot change mid-run. None when `repo`
+    # is unmapped or absent. The poll itself is gated on THIS value, not on `repo` —
+    # a repo that maps to no project is never polled (the Library's ledgers are
+    # keyed by project only, since its 2026-10-13 ledger fold — `_read_hard_cap_signal`'s
+    # own docstring — so there is no product left to match an unmapped repo
+    # against), same zero-extra-`time.monotonic()`-calls shape as `last_live_import`
+    # above when the poll is skipped.
+    hard_cap_project = projects.project_for_repo(repo) if repo else None
+    last_hard_cap_check = time.monotonic() if hard_cap_project is not None else None
     usage_by_model: dict[str, dict[str, int]] = {}
     usage_dedup = T.UsageDedup()
     with transcript_path.open("a") as tf:
@@ -7743,27 +8675,39 @@ def _stream_transcript(proc: subprocess.Popen, run_dir: Path,
             # fast; kill it once cumulative spend crosses the dollar cap (ARCH-185)
             # OR cumulative tokens cross the token cap (ARCH-245 — the backstop
             # that still fires when an unpriced model logs spend as $0).
+            breach = None
             if ((cost_cap is not None or token_cap is not None)
                     and (time.monotonic() - last_cost_check) >= _COST_CHECK_INTERVAL_S):
                 last_cost_check = time.monotonic()
                 gw_usd, gw_ti, gw_to, gw_has = _read_gateway_spend(spend_log)
                 breach = _cap_breach_reason(gw_usd, gw_ti + gw_to, gw_has,
                                             cost_cap, token_cap)
-                if breach:
-                    kind, reason = breach
-                    cost_stop_reason = reason
-                    T.write_owner_only(run_dir / "cost-killed.txt", reason + "\n")
-                    # don't respawn a runaway; marker names which cap fired (the
-                    # respawn gate only existence-checks this, but keep audit honest)
-                    T.write_owner_only(run_dir / "no-fallback", kind + "\n")
-                    print(f"{run_dir.name}: COST CAP — {reason}; terminating.",
-                          file=sys.stderr)
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    break
+            # Independent of either cap above, and of billing source: the
+            # Library's hard cap stops a project's run on ANY model (budget-
+            # enforcement epic clause 4, work item E1·7). Checked only once the
+            # per-run breaker above has NOT already found a breach this line —
+            # either is sufficient reason to stop, and there is exactly one
+            # termination call below for both, so CQ·138's process-group change
+            # only has to touch that one call.
+            if (breach is None and hard_cap_project is not None
+                    and (time.monotonic() - last_hard_cap_check) >= _HARD_CAP_CHECK_INTERVAL_S):
+                last_hard_cap_check = time.monotonic()
+                breach = _hard_cap_breach_reason(hard_cap_project)
+            if breach:
+                kind, reason = breach
+                cost_stop_reason = reason
+                T.write_owner_only(run_dir / "cost-killed.txt", reason + "\n")
+                # don't respawn a runaway; marker names which cap fired (the
+                # respawn gate only existence-checks this, but keep audit honest)
+                T.write_owner_only(run_dir / "no-fallback", kind + "\n")
+                print(f"{run_dir.name}: {kind.upper()} — {reason}; terminating.",
+                      file=sys.stderr)
+                _terminate_proc_and_group(proc, grace_s=5.0)
+                # CQ·138 round 1: the group kill above never reaches a
+                # Bash-tool descendant (see the section comment on
+                # _sweep_tool_session_holders).
+                _sweep_tool_session_holders(run_dir, grace_s=5.0)
+                break
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
@@ -8523,7 +9467,7 @@ def _review_run_posted_stamp(*, repo: str, pr: str, run_id: str) -> bool | None:
     """
     if not repo or not pr or not run_id:
         return None
-    slug = repo if "/" in repo else f"convivy/{repo}"
+    slug = projects.repo_github_slug(repo)
     try:
         view = _gh_pr_json(str(pr), ["comments"], repo=slug)
     except (RuntimeError, json.JSONDecodeError, OSError):
@@ -9737,7 +10681,7 @@ def _finalize_run(*, run_dir: Path, worktree: Path, run_id: str, exit_code: int,
                 # command hits review-post's OWN "no owner/repo slug is known" refusal
                 # and posts nothing (reviewer, PR #722 round 2).
                 _repo = meta.get("repo") or ""
-                repo_slug = _repo if "/" in _repo else f"convivy/{_repo}"
+                repo_slug = projects.repo_github_slug(_repo)
                 if attempted is True and library_refusal is not None and rescued:
                     where = (f" Its review was written and is saved at {rescued_path}. "
                              + (f"Re-post it with `agentctl review-post --pr "
@@ -10572,6 +11516,9 @@ def cmd_status(args) -> int:
     if meta.get("held_until"):
         print(f"usage_hold:   held until {meta['held_until']} "
               f"({meta.get('hold_reason') or 'reason unrecorded'})")
+    if meta.get("ledger_report_refused_usd") is not None:
+        print(f"ledger_report: REFUSED ${meta['ledger_report_refused_usd']:.4f} — "
+              f"{meta.get('ledger_report_refused_reason') or 'reason unrecorded'}")
     print(f"started:      {meta['started_at']}")
     # Derive done-state from ground truth, not just meta.ended_at (P1b, 2026-07-04):
     # a run killed before _finalize_run (e.g. a foreground parent SIGTERM'd at a
@@ -10745,9 +11692,12 @@ EXIT_RUN_FAILED = 4
 #   - `cost_stopped` IS in the set: the run's per-run cost/token cap fired and the
 #     turn never finished, same as `killed`/`errored` — the cap stopping it on
 #     purpose is still the work not happening.
+#   - `project_cap_refused` (E1·8) IS in the set: the Library refused the checkout
+#     over the dispatched project's ledger before any work started, the same
+#     "never happened" shape as `budget_refused`/`capacity_refused`.
 WAIT_FAILURE_STATUSES = frozenset(
     {"errored", "killed", "budget_refused", "capacity_refused", "primary_mutated",
-     "committed_private_only", "cost_stopped"})
+     "committed_private_only", "cost_stopped", "project_cap_refused"})
 
 # What a terminal_reason means for an operator. Each entry states only what is known
 # of the reason; a value without an entry prints as the bare token.
@@ -11103,6 +12053,12 @@ def _wait_for_runs(run_ids: list[str], *, timeout: float | None, poll: float,
     nightly sweep takes to reach the same conclusion. The sweep still exists and
     is still worth having — it catches runs nobody was waiting on — but it is the
     backstop, and this is the mechanism. A postmortem is not detection.
+
+    A vanished run's own tool-session holders and scratch directory (CQ·138)
+    are also swept and removed here, once, right where `vanished` is reported —
+    the dispatcher that died before `_finalize_run` ran never got to do either,
+    and nothing else outside that dead process is watching for this run
+    specifically. See the `vanished` print loop's own comment.
     """
     dirs: dict[str, Path] = {}
     for rid in run_ids:
@@ -11191,6 +12147,25 @@ def _wait_for_runs(run_ids: list[str], *, timeout: float | None, poll: float,
             # most expensive thing the waiter could say here: it sends the caller
             # back to poll a run whose process has already gone.
             print(f"{rid}  died-unfinalized  $0.0000")
+            # CQ·138: a dispatcher that died before `_finalize_run` ran never
+            # swept this run's own tool-session holders or removed its
+            # scratch directory — every OTHER termination path does (the
+            # in-process finalize, and now `_terminate_run`'s own path too),
+            # but nothing ran either one for THIS run at all.
+            # `_died_without_finalizing`'s own docstring
+            # records this as a recurring occurrence (twenty runs over
+            # July-August 2026), and `agentctl wait` is the one place, outside
+            # the dead dispatcher itself, that already identifies exactly this
+            # condition from a separate, live process — so it is the sweep's
+            # other home, alongside `_terminate_run`. Does not touch the run's
+            # worktree, branch or any post it may have made — `run-observer`'s
+            # own "report only, never recover" choice is about THAT kind of
+            # recovery, not about reaping a leftover background process this
+            # run never gets to reap itself.
+            _sweep_tool_session_holders(dirs[rid], grace_s=5.0)
+            _vanished_scratch = _tool_session_scratch_dir_from_record(dirs[rid])
+            if _vanished_scratch is not None:
+                shutil.rmtree(_vanished_scratch, ignore_errors=True)
         else:
             print(f"{rid}  (still running)")
 
@@ -11864,8 +12839,32 @@ def _terminate_run(run_id: str, final: bool) -> int:
                           file=sys.stderr)
         except (OSError, json.JSONDecodeError):
             pass
+    # CQ·138 round 1 (non-blocking, security review): corroborate the
+    # registry's pid against recycling BEFORE trusting it enough to compute a
+    # pgid from it — the same guard `_run_process_gone` already applies to a
+    # meta-recorded pid (`cmd_status`, `_died_without_finalizing`). A bare
+    # `os.kill(pid, 0)`/`os.getpgid(pid)` reads a pid the OS has reused for an
+    # unrelated process as this run's own, and `process_group=0` raises the
+    # cost of that mistake here specifically: `killpg` on the recycled pid's
+    # group reaches every process in THAT unrelated group, not just the one
+    # pid `agentctl kill` meant to stop.
+    already_gone = _run_process_gone({"pid": pid, "run_id": run_id})
+    # CQ·138: killpg the whole process group when `pid` leads its own
+    # (`process_group=0` at spawn — `_spawn_claude`/`_own_pgid_if_isolated`),
+    # so a descendant it backgrounded dies with it instead of outliving this
+    # kill. `pgid is None` (not isolated — a `codex` run, or any run spawned
+    # before this fix shipped) falls back to signaling `pid` alone, exactly
+    # what this did before: `agentctl kill` must still stop the agent either
+    # way (requirement #3 — killpg on an isolated group reaches `pid` too,
+    # since `pid` is a member of its own group).
+    pgid = None if already_gone else _own_pgid_if_isolated(pid)
     try:
-        os.kill(pid, signal.SIGTERM)
+        if already_gone:
+            raise ProcessLookupError
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
         print(f"pid {pid} already gone; clearing registry", file=sys.stderr)
         # ARCH-253: close out the run before the early return — mirror the
@@ -11878,18 +12877,39 @@ def _terminate_run(run_id: str, final: bool) -> int:
         if kdir and not (kdir / "outcome.json").exists():
             T.write_outcome(kdir, exit_status="killed")
             T.update_meta(kdir, ended_at=T.now_iso())
+        # CQ·138: the agent pid is already gone, but a Bash-tool descendant it
+        # backgrounded is a member of its OWN session, not the agent's
+        # pid/group — sweep it too (see the section comment on
+        # _sweep_tool_session_holders).
+        if kdir:
+            _sweep_tool_session_holders(kdir, grace_s=5.0)
+            # This path never removes the scratch directory the in-process
+            # finalize always has — `agentctl kill` ends the run from a
+            # wholly separate invocation that never reaches that code at
+            # all. Only after the sweep above: removing it first could drop
+            # the marker out from under a holder `lsof` had not yet reported.
+            scratch = _tool_session_scratch_dir_from_record(kdir)
+            if scratch is not None:
+                shutil.rmtree(scratch, ignore_errors=True)
         R.remove_run(run_id)
         return 0
-    print(f"sent SIGTERM to pid {pid} ({run_id})")
+    print(f"sent SIGTERM to {'process group' if pgid is not None else 'pid'} "
+          f"{pgid if pgid is not None else pid} ({run_id})")
     for _ in range(20):
         time.sleep(0.5)
         try:
-            os.kill(pid, 0)
+            if pgid is not None:
+                os.killpg(pgid, 0)
+            else:
+                os.kill(pid, 0)
         except ProcessLookupError:
             break
     else:
         try:
-            os.kill(pid, signal.SIGKILL)
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
             print("escalated to SIGKILL", file=sys.stderr)
         except ProcessLookupError:
             pass
@@ -11897,6 +12917,16 @@ def _terminate_run(run_id: str, final: bool) -> int:
     if run_dir and not (run_dir / "outcome.json").exists():
         T.write_outcome(run_dir, exit_status="killed")
         T.update_meta(run_dir, ended_at=T.now_iso())
+    # CQ·138: the group kill above never reaches a Bash-tool descendant (see
+    # the section comment on _sweep_tool_session_holders).
+    if run_dir:
+        _sweep_tool_session_holders(run_dir, grace_s=5.0)
+        # Same reason as the already-gone branch above — this invocation
+        # never reaches the in-process finalize that would otherwise remove
+        # this.
+        scratch = _tool_session_scratch_dir_from_record(run_dir)
+        if scratch is not None:
+            shutil.rmtree(scratch, ignore_errors=True)
     R.remove_run(run_id)
     return 0
 
@@ -12658,7 +13688,15 @@ def _kb_refuse_foreign_lease(kbw, verb: str, source_ref: str, holder: str,
 
 
 def cmd_kb_checkout(args) -> int:
-    """Take a lease on a doc and return its current content plus the sha to write against."""
+    """Take a lease on a doc and return its current content plus the sha to write against.
+
+    `--sha-only` skips the lease entirely: a caller that already holds the
+    Library's own checkout (`POST /reference/documents/{id}/checkout`) needs
+    `--base-sha` without taking a second, unrelated lock in agentctl's own
+    store (CQ·96, issue_01M0YAS4S64P5TXN7S2C17GHF6). The two stores still
+    know nothing of each other — this only removes the forced second lease,
+    it does not make `kb apply` honour the Library's checkout. The default
+    path, with no flag, is unchanged."""
     kbw = _kb_writes()
     source_ref, err = _kb_resolve_ref(args.doc)
     if err:
@@ -12671,8 +13709,29 @@ def cmd_kb_checkout(args) -> int:
     # a malformed one to come from (security review, PR 532).
     if not kbw.valid_holder(holder):
         print(f"kb checkout: refused — holder {holder!r} is not a valid identity "
-              f"(letters, digits, and : . _ - only, max 64).", file=sys.stderr)
+              f"(non-empty, at most {kbw.MAX_HOLDER_LEN} characters after stripping, "
+              f"no newline or other control character).", file=sys.stderr)
         return 1
+    holder = kbw.normalize_holder(holder)
+
+    if args.sha_only:
+        try:
+            content, blob_err = _kb_blob_at_origin(source_ref)
+        except _KbOriginUnreadable as e:
+            print(f"kb checkout: could not read {source_ref} from origin/main, so "
+                  f"no sha was returned — {e}", file=sys.stderr)
+            kbw.journal("checkout", source_ref=source_ref, holder=holder,
+                        result="unreadable", detail=str(e))
+            return 1
+        if blob_err:
+            content = ""
+        payload = {"source_ref": source_ref, "exists": not blob_err,
+                   "content": content, "content_sha": kbw.content_sha(content),
+                   "lease": None}
+        kbw.journal("checkout", source_ref=source_ref, holder=holder, result="sha-only")
+        print(kbw.as_json(payload))
+        return 0
+
     held_before = (kbw.lease_for(source_ref) or {}).get("holder") == holder
     lease, conflict = kbw.acquire(source_ref, holder, note=args.note)
     if conflict:
@@ -12721,8 +13780,10 @@ def cmd_kb_release(args) -> int:
     holder = _kb_holder(args.holder)
     if not kbw.valid_holder(holder):
         print(f"kb release: refused — holder {holder!r} is not a valid identity "
-              f"(letters, digits, and : . _ - only, max 64).", file=sys.stderr)
+              f"(non-empty, at most {kbw.MAX_HOLDER_LEN} characters after stripping, "
+              f"no newline or other control character).", file=sys.stderr)
         return 1
+    holder = kbw.normalize_holder(holder)
     if kbw.release(source_ref, holder):
         kbw.journal("release", source_ref=source_ref, holder=holder, result="ok")
         print(f"kb release: released {source_ref}")
@@ -13177,9 +14238,11 @@ def cmd_kb_propose(args) -> int:
     kbw = _kb_writes()
     holder = _kb_holder(args.holder)
     if not kbw.valid_holder(holder):
-        print(f"kb propose: refused — holder {holder!r} is not a valid identity.",
-              file=sys.stderr)
+        print(f"kb propose: refused — holder {holder!r} is not a valid identity "
+              f"(non-empty, at most {kbw.MAX_HOLDER_LEN} characters after stripping, "
+              f"no newline or other control character).", file=sys.stderr)
         return 1
+    holder = kbw.normalize_holder(holder)
 
     delete = args.delete
     batch_arg = getattr(args, "batch", None)
@@ -14430,8 +15493,11 @@ def cmd_kb_apply(args) -> int:
     that the sha precondition protects the content. The sha stops a lost update;
     it does not stop a second session rewriting a document its holder is midway
     through, which is the disruption the rule names. A write with no lease on
-    the document at all is still accepted here: the base sha still comes from
-    `kb checkout`, which takes one.
+    the document at all is still accepted here: `_kb_refuse_foreign_lease`
+    refuses only a live lease held by someone else, and this function reads
+    `current_sha` straight from the content on the freshly-reset worktree and
+    refuses any `--base-sha` that does not match it, regardless of where that
+    sha came from or whether the caller ever held a lease.
     """
     # First action, before the holder or the message is even validated, and
     # above all before `--provenance person` reads its assertion off stdin
@@ -14472,8 +15538,10 @@ def cmd_kb_apply(args) -> int:
     # a second trailer that the bypass audit would read in place of the real one.
     if not kbw.valid_holder(holder):
         print(f"kb apply: refused — holder {holder!r} is not a valid identity "
-              f"(letters, digits, and : . _ - only, max 64).", file=sys.stderr)
+              f"(non-empty, at most {kbw.MAX_HOLDER_LEN} characters after stripping, "
+              f"no newline or other control character).", file=sys.stderr)
         return 1
+    holder = kbw.normalize_holder(holder)
     if not kbw.message_is_trailer_safe(args.message):
         print("kb apply: refused — the commit message contains a `KB-Write:` or "
               "`KB-Person:` line, which would forge the audit trailer.", file=sys.stderr)
@@ -17529,7 +18597,7 @@ def _head_advanced_beyond_pin(pin: str, head: str, repo: str) -> bool | None:
     fails closed and keeps the stale-replay rejection."""
     if not pin or not head or not repo:
         return None
-    slug = repo if "/" in repo else f"convivy/{repo}"
+    slug = projects.repo_github_slug(repo)
     try:
         r = subprocess.run(
             ["gh", "api", f"repos/{slug}/compare/{pin}...{head}", "--jq", ".status"],
@@ -18261,6 +19329,10 @@ def main(argv=None) -> int:
     sp_kb_co.add_argument("--holder", default=None,
                           help="lease holder (default: this run-id, else session:<user>)")
     sp_kb_co.add_argument("--note", default=None, help="what you intend to change")
+    sp_kb_co.add_argument("--sha-only", dest="sha_only", action="store_true",
+                          help="return content + content-sha without taking agentctl's "
+                               "lease — for a caller that already holds the Library's "
+                               "own checkout on the document")
     sp_kb_co.set_defaults(func=cmd_kb_checkout)
 
     sp_kb_rel = kb_sub.add_parser("release", help="drop a lease early")

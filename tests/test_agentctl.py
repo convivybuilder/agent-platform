@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -73,6 +74,17 @@ def _stub_review_record_write_ok(monkeypatch):
     import issue_client
     monkeypatch.setattr(issue_client, "post_review_record",
                         lambda *a, **kw: {"status": "ok", "record": {"id": "rec_test"}})
+
+
+# `_tool_session_scratch_dir_off_the_real_account_home` (CQ·138) now lives in
+# conftest.py, shared by every file that drives `_run_session`/`_spawn_claude`
+# for real — this `pytestmark` applies it to every test in this file, the same
+# way the fixture used to apply itself here via its own `autouse=True` (round 6,
+# reviewer, PR #879, comment 6166526636: `tests/test_spawn_sandbox.py`'s 11 call
+# sites and one test in `tests/test_codex_review_dispatch.py` drove the same
+# real dispatch code unstubbed, writing under the real account's own
+# `~/.local/state/agent-platform/tool-sessions`).
+pytestmark = pytest.mark.usefixtures("_tool_session_scratch_dir_off_the_real_account_home")
 
 
 def test_model_id_aliases_and_passthrough(agentctl):
@@ -1240,6 +1252,41 @@ def test_cmd_status_shows_a_usage_hold(agentctl, tmp_path, monkeypatch, capsys):
     agentctl.cmd_status(SimpleNamespace(run_id="run-unheld"))
     out = capsys.readouterr().out
     assert "usage_hold:" not in out
+
+
+def test_cmd_status_shows_a_disproportionate_ledger_refusal(agentctl, tmp_path, monkeypatch, capsys):
+    """E1·9: a spend report the Library refused as disproportionate is surfaced
+    against the run that produced it — against the unfixed code (no
+    `ledger_report_refused_usd`/`_reason` read at all), neither assertion below
+    is ever printed."""
+    from types import SimpleNamespace
+    run_dirs_root = tmp_path / "agent-runs"
+    day = run_dirs_root / "2026-10-13"
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", run_dirs_root)
+
+    def make_run(rid, *, meta_extra=None):
+        rd = day / rid
+        rd.mkdir(parents=True)
+        meta = {"run_id": rid, "agent": "coder", "task": "t", "repo": "agent-platform",
+                "worktree": "/wt", "profile": "p", "model": "m",
+                "started_at": "2026-10-13T00:00:00Z", "pid": None}
+        meta.update(meta_extra or {})
+        (rd / "meta.json").write_text(json.dumps(meta))
+
+    make_run("run-refused", meta_extra={
+        "ledger_report_refused_usd": 999.0,
+        "ledger_report_refused_reason": "this report exceeds 10x the scope's soft cap",
+    })
+    agentctl.cmd_status(SimpleNamespace(run_id="run-refused"))
+    out = capsys.readouterr().out
+    assert "ledger_report:" in out and "REFUSED" in out
+    assert "999.0000" in out
+    assert "exceeds 10x the scope's soft cap" in out
+
+    make_run("run-clean-ledger")
+    agentctl.cmd_status(SimpleNamespace(run_id="run-clean-ledger"))
+    out = capsys.readouterr().out
+    assert "ledger_report:" not in out
 
 
 def test_cmd_status_shows_error_reason_for_a_committed_private_only_run(
@@ -5149,6 +5196,71 @@ def test_dispatch_tool_surface_grant_materialized_coder_with_builtins_adds_tools
     assert set(config["mcpServers"]) == {"kb", "ops"}
 
 
+# --- `meta.json`'s `persona_source` names where a run's agent BODY came from -----
+# (occurrence run-60cafe23, 2026-10-14): "grant" for the Library checkout grant's
+# own `persona_md`, "roster" for `resolve_agent`'s roster render, whether that's
+# the ordinary non-grant dispatch or the grant path's one placeholder fallback.
+# Built from the literal placeholder text, not `agentctl`'s own sentinel constant.
+
+
+_PLACEHOLDER_SENTENCE = (
+    "Persona content is not resolved yet — no persona storage or registry "
+    "exists. This is a placeholder pinning the call slip's shape ahead of it."
+)
+
+
+def test_grant_dispatch_with_a_placeholder_persona_records_persona_source_roster(
+        agentctl, tmp_path, monkeypatch):
+    """Fails against the unfixed code: there, `meta.json["persona_source"]`
+    does not exist as a field at all, and the run's actual system prompt
+    would be the Library's placeholder sentence rather than the roster
+    definition's body."""
+    _stub_grant_checkout(agentctl, monkeypatch,
+                         persona_md=f"# platform-coder\n\n{_PLACEHOLDER_SENTENCE}")
+    agents_dir = tmp_path / "agents"
+    agents_dir.mkdir()
+    (agents_dir / "coder.md").write_text(
+        "---\nmodel: sonnet\n---\nYou are the real coder persona.\n")
+    grant_agent = agentctl.resolve_agent_from_grant(
+        "issue_test", repo="agent-platform", agent_name="coder",
+        agents_dir=str(agents_dir))
+    assert grant_agent["body"] == "You are the real coder persona.\n"
+
+    _run_repo_session_full(agentctl, tmp_path, monkeypatch, repo="agent-platform",
+                           agent_name="coder", agent=grant_agent,
+                           label="grant-placeholder-roster")
+
+    meta = json.loads((tmp_path / "run-grant-placeholder-roster" / "meta.json").read_text())
+    assert meta["persona_source"] == "roster"
+
+
+def test_grant_dispatch_with_real_persona_records_persona_source_grant(
+        agentctl, tmp_path, monkeypatch):
+    """The twin of the test above: a grant carrying real persona content (not
+    the Library's placeholder) records "grant", not "roster"."""
+    _stub_grant_checkout(agentctl, monkeypatch, persona_md="# grant persona\n\nreal body.")
+    grant_agent = agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+    assert grant_agent["persona_source"] == "grant"
+
+    _run_repo_session_full(agentctl, tmp_path, monkeypatch, repo="agent-platform",
+                           agent_name="reviewer", agent=grant_agent,
+                           label="grant-real-persona")
+
+    meta = json.loads((tmp_path / "run-grant-real-persona" / "meta.json").read_text())
+    assert meta["persona_source"] == "grant"
+
+
+def test_roster_path_dispatch_records_persona_source_roster(agentctl, tmp_path, monkeypatch):
+    """The ordinary (non-`--materialize-from-grant`) dispatch path never sets
+    `persona_source` on the agent dict it builds; meta.json still records
+    "roster" for it, not None."""
+    _run_repo_session_full(agentctl, tmp_path, monkeypatch, repo="agent-platform",
+                           label="roster-persona-source")
+
+    meta = json.loads((tmp_path / "run-roster-persona-source" / "meta.json").read_text())
+    assert meta["persona_source"] == "roster"
+
+
 # --- repo-local agent resolution (ARCH-177) ----------------------------------
 
 
@@ -6765,6 +6877,473 @@ def test_cap_breach_reason(agentctl):
     assert R(0.0, 150, True, None, 100)[0] == "token-cap"
 
 
+# --- the Library's hard-cap crossing stops a project's live runs (work item E1·7,
+# budget-enforcement epic clause 4) -------------------------------------------------
+
+
+class _FakeSignalsLibrary:
+    """Stands in for the Library's fixed-address opener for `GET /signals`, the
+    same shape `_FakeLibrary` above gives `/reference/documents`. `hard_cap_for`
+    maps a PRODUCT key (the registry project, since the Library's ledger fold —
+    library#270, live 2026-10-13 20:35Z — keys every ledger and signal by it)
+    to the `meta` dict its `ledger.threshold-crossed` signal carries (so a
+    test can also hand it a `threshold: "soft_cap"`/`"warn"` row to prove
+    those never stop a run); an empty `hard_cap_for` serves an empty `signals`
+    list. `unreachable` fails every call the way a refused connection does,
+    and `malformed` serves a 200 with a body that is not the documented shape
+    — both must read as "no signal", never raise.
+
+    Filters by `product` the same way the real route's `_signal_filters` does
+    — ONLY when the request names one; the poll itself never sends one (see
+    `test_hard_cap_poll_does_not_filter_the_request_by_product` below), so
+    this fake stays faithful to the real route rather than hiding a scoping
+    bug an actual server-side filter would still catch.
+
+    Every served row carries `produced_at: None`, the way the Library's own
+    producer (`_signal_ledger_threshold_crossed` in its app.py) writes a
+    `ledger.threshold-crossed` row, and `since` is applied the way `GET
+    /signals`'s `_since_clause` applies it server-side — `AND produced_at >=
+    ?`, which a NULL `produced_at` never satisfies. Round 4 finding on #880:
+    the real poll sent `since`, so it read zero rows in production even
+    though this fake, before this fix, ignored `since` entirely and let the
+    poll pass anyway.
+
+    `ingested_by_for` maps a product key to the `ingested_by` a test wants
+    that row to carry; a product with no entry gets `"library"`, matching
+    `POST /signals` setting it to the posting credential's actor for the
+    Library's own publication (security-reviewer finding on #880, rounds 1
+    and 4). `None` omits the field entirely, for the row a forged signal
+    with no `ingested_by` would be served as."""
+
+    def __init__(self):
+        self.hard_cap_for: dict[str, dict] = {}
+        self.ingested_by_for: dict[str, str | None] = {}
+        self.unreachable = False
+        self.malformed = False
+        self.requests: list[str] = []
+
+    def open(self, req, timeout=None):
+        import urllib.error
+        import urllib.parse
+        self.requests.append(req.full_url)
+        if self.unreachable:
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+        if self.malformed:
+            return _Served(b"not json")
+        parts = urllib.parse.urlsplit(req.full_url)
+        query = urllib.parse.parse_qs(parts.query)
+        wanted_product = (query.get("product") or [None])[0]
+        since = (query.get("since") or [None])[0]
+        items = self.hard_cap_for.items()
+        if wanted_product is not None:
+            items = [(p, m) for p, m in items if p == wanted_product]
+        signals = []
+        for product, meta in items:
+            row = {"id": f"sig_{product}", "source": "library",
+                   "kind": "ledger.threshold-crossed", "product": product,
+                   "produced_at": None, "meta": meta}
+            ingested_by = self.ingested_by_for.get(product, "library")
+            if ingested_by is not None:
+                row["ingested_by"] = ingested_by
+            signals.append(row)
+        if since is not None:
+            signals = [s for s in signals
+                      if s["produced_at"] is not None and s["produced_at"] >= since]
+        body = {"signals": signals, "count": len(signals), "total": len(signals),
+               "offset": 0, "truncated": False}
+        return _Served(json.dumps(body).encode())
+
+
+@pytest.fixture
+def signals_library(agentctl, tmp_path, monkeypatch):
+    """Points the Library's fixed-address opener at a `_FakeSignalsLibrary`,
+    the same wiring the `library` fixture above does for `_library_get`."""
+    import issue_client
+    token = tmp_path / "agent-platform-token"
+    token.write_text("test-token\n")
+    monkeypatch.setattr(agentctl.SC, "TOKEN_FILE", token)
+    fake = _FakeSignalsLibrary()
+    monkeypatch.setattr(issue_client, "pinned_opener", lambda: fake)
+    return fake
+
+
+def _hard_cap_meta(cap_usd=50.0, total_usd=63.21, day=None, threshold="hard_cap"):
+    import telemetry as T
+    return {"threshold": threshold, "day": day or T.platform_day(),
+            "cap_usd": cap_usd, "total_usd": total_usd}
+
+
+def test_hard_cap_breach_reason_is_none_with_no_signal(agentctl, signals_library):
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+    assert signals_library.requests  # the read was attempted
+
+
+def test_hard_cap_breach_reason_names_the_cap_project_total_and_day(
+        agentctl, signals_library, monkeypatch):
+    """Pins `_hard_cap_breach_reason`'s day to a fixed string rather than
+    relying on today's real calendar date — `_hard_cap_breach_reason` reads
+    `T.platform_day()` to pick which day's signal counts, so without this the
+    assertion on the day below only held on 2026-10-13 itself (CI run
+    38490358153, the first run after the day rolled over)."""
+    monkeypatch.setattr(agentctl.T, "platform_day", lambda: "2026-10-13")
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(
+        cap_usd=50.0, total_usd=63.21, day="2026-10-13")
+    kind, reason = agentctl._hard_cap_breach_reason("agent-platform")
+    assert kind == "hard-cap"
+    assert "agent-platform" in reason
+    assert "$50.00" in reason
+    assert "$63.21" in reason
+    assert "2026-10-13" in reason
+
+
+def test_hard_cap_breach_reason_ignores_a_soft_cap_signal(agentctl, signals_library):
+    """Clause 4: only a definite hard_cap signal stops a run — warn and
+    soft_cap never do, even though the Library publishes the same
+    `ledger.threshold-crossed` kind for all three."""
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(threshold="soft_cap")
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+
+
+def test_hard_cap_breach_reason_ignores_a_warn_signal(agentctl, signals_library):
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(threshold="warn")
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+
+
+def test_hard_cap_breach_reason_ignores_a_different_days_crossing(
+        agentctl, signals_library):
+    """A stale hard_cap row (yesterday's, before the day rolled over) must not
+    stop today's run — only TODAY's crossing (`T.platform_day()`) counts."""
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(day="2020-01-01")
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+
+
+def test_hard_cap_breach_reason_is_none_when_the_library_is_unreachable(
+        agentctl, signals_library):
+    """Clause 3: a Library read that fails never stops a run."""
+    signals_library.unreachable = True
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+
+
+def test_hard_cap_breach_reason_is_none_on_a_malformed_body(agentctl, signals_library):
+    signals_library.malformed = True
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+
+
+def test_hard_cap_breach_reason_is_none_without_a_token(
+        agentctl, signals_library, tmp_path, monkeypatch):
+    """No credential on disk (every box before the Library's token lands, or a
+    disabled deploy) degrades to "no signal", matching `signal_client.token()`'s
+    own no-op posture — never a crash, never a stop."""
+    monkeypatch.setattr(agentctl.SC, "TOKEN_FILE", tmp_path / "no-such-token")
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+    assert signals_library.requests == []  # never even reached the opener
+
+
+def test_hard_cap_breach_reason_scopes_the_read_to_its_own_project(
+        agentctl, signals_library):
+    """A hard cap on a DIFFERENT project never answers for this one. The
+    match is client-side (see `test_hard_cap_poll_does_not_filter_the_request_by_product`
+    below), but the scoping property is the same one `_refuse_unbookable_product`
+    gives the Library's own ledger lookup."""
+    signals_library.hard_cap_for["other-project"] = _hard_cap_meta()
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+
+
+def test_hard_cap_poll_does_not_filter_the_request_by_product(
+        agentctl, signals_library):
+    """The request carries `kind` only; matching happens client-side against
+    this run's own project — proven here by a signal filed under a
+    different project still reaching this read (and still not matching,
+    `test_hard_cap_breach_reason_scopes_the_read_to_its_own_project` above)
+    and by the request itself naming no `product`."""
+    signals_library.hard_cap_for["other-project"] = _hard_cap_meta()
+    agentctl._hard_cap_breach_reason("agent-platform")
+    assert signals_library.requests
+    assert "product=" not in signals_library.requests[0]
+    assert "kind=ledger.threshold-crossed" in signals_library.requests[0]
+
+
+def test_hard_cap_poll_does_not_send_since(agentctl, signals_library):
+    """Round 4 finding on #880: the Library's producer writes a
+    `ledger.threshold-crossed` row with `produced_at: None`, and `GET
+    /signals`'s `since` filter is `AND produced_at >= ?`, which a NULL
+    `produced_at` never satisfies — a `since`-bounded request reads zero of
+    these rows forever, in production. The poll must not send `since` at
+    all; `meta.day` is the day filter (`_read_hard_cap_signal` below), and
+    the route's default order (newest first) is what keeps today's crossing
+    inside the one page this poll reads."""
+    agentctl._hard_cap_breach_reason("agent-platform")
+    assert signals_library.requests
+    assert "since=" not in signals_library.requests[0]
+
+
+@pytest.mark.parametrize("ingested_by", ["some-other-actor", None])
+def test_hard_cap_breach_reason_ignores_a_signal_not_ingested_by_the_library(
+        agentctl, signals_library, ingested_by):
+    """Security-reviewer finding on #880, rounds 1 and 4: `POST /signals`
+    lets any credential holding `signal.create` post a
+    `ledger.threshold-crossed` signal naming any product, so a matching
+    `meta`/`day`/`product` alone is not evidence the Library itself
+    published it. Only `ingested_by` — which the route sets server-side to
+    the posting credential's actor, not the caller's choice, and which no
+    issued credential's actor equals `"library"` — tells the Library's own
+    publication apart from one forged by any other credential; `source` is
+    caller-supplied and proves nothing. Covers both a forged actor and a
+    signal with no `ingested_by` at all."""
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=12.34)
+    signals_library.ingested_by_for["agent-platform"] = ingested_by
+    assert agentctl._hard_cap_breach_reason("agent-platform") is None
+
+
+# --- the same decision, wired into _stream_transcript's poll loop ------------------
+
+
+def test_stream_transcript_stops_a_run_on_its_projects_hard_cap(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "agent-platform"}.get(repo))
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=12.34)
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    final_event, cost_stop_reason = agentctl._stream_transcript(
+        proc, run_dir, repo="agent-platform")
+    assert terminated == [True]
+    assert cost_stop_reason is not None and "hard cap" in cost_stop_reason
+    assert (run_dir / "no-fallback").read_text().strip() == "hard-cap"
+    assert "hard cap" in (run_dir / "cost-killed.txt").read_text()
+
+
+def test_stream_transcript_stops_a_run_on_a_signal_with_no_produced_at(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """Round 4 finding on #880: every `ledger.threshold-crossed` row the
+    Library's producer writes carries `produced_at: None` — `_FakeSignalsLibrary`
+    gives one to every row it serves, matching that. A poll that still sent
+    `since` would read zero rows here and never stop the run; this fails on
+    its `terminated == [True]` assertion against 79483d2f, before the fix
+    stopped sending `since`."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "agent-platform"}.get(repo))
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=12.34, day=agentctl.T.platform_day())
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    agentctl._stream_transcript(proc, run_dir, repo="agent-platform")
+    assert terminated == [True]
+
+
+def test_stream_transcript_does_not_stop_on_a_soft_cap_signal(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """Clause 4: a soft_cap signal for this run's own project never stops it —
+    the soft cap's job is refusing new admission, not ending a live run."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "agent-platform"}.get(repo))
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=10.5, threshold="soft_cap")
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    final_event, cost_stop_reason = agentctl._stream_transcript(
+        proc, run_dir, repo="agent-platform")
+    assert terminated == []
+    assert cost_stop_reason is None
+    assert not (run_dir / "cost-killed.txt").exists()
+
+
+def test_stream_transcript_does_not_stop_when_the_library_is_unreachable(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "agent-platform"}.get(repo))
+    signals_library.unreachable = True
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    final_event, cost_stop_reason = agentctl._stream_transcript(
+        proc, run_dir, repo="agent-platform")
+    assert terminated == []
+    assert cost_stop_reason is None
+
+
+def test_stream_transcript_makes_no_request_for_an_unmapped_repo(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """A `repo` the registry does not map to any project is not polled at
+    all — there is no project to match a signal's `product` against, so the
+    poll never reaches the Library, even when a signal happens to be filed
+    under the repo's own name."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo", lambda repo: None)
+    signals_library.hard_cap_for["some-unmapped-repo"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=11.0)
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    _final, reason = agentctl._stream_transcript(proc, run_dir, repo="some-unmapped-repo")
+    assert signals_library.requests == []
+    assert terminated == []
+    assert reason is None
+
+
+def test_stream_transcript_skips_the_hard_cap_poll_with_no_repo(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """`repo=None` (the default — every call site before this feature) must
+    cost zero extra polling, the same `None`-means-skip shape
+    `_LIVE_IMPORT_INTERVAL_S` already gives a caller with no private store."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    agentctl._stream_transcript(
+        _FakeStreamProc([{"type": "system", "subtype": "init"}]), run_dir)
+    assert signals_library.requests == []
+
+
+def test_stream_transcript_does_not_poll_before_the_hard_cap_interval_elapses(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """At the real (un-monkeypatched) interval, pins that the poll really is
+    interval-gated, not per-line — same pin as the cost-partial checkpoint's
+    and the live-import's own versions of this test."""
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "agent-platform"}.get(repo))
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta()
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    agentctl._stream_transcript(
+        _FakeStreamProc([{"type": "system", "subtype": "init"}]), run_dir,
+        repo="agent-platform")
+    assert signals_library.requests == []
+
+
+def test_stream_transcript_stops_only_the_projects_matching_runs(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """The scenario named in the work item's own test plan: a hard_cap
+    crossing for project P stops every live run dispatched against P and
+    none dispatched against project Q — each `_stream_transcript` call here
+    stands in for one of P's two concurrent runs plus Q's one, against the
+    SAME fake Library serving the one hard-cap signal for P alone."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"repo-p": "P", "repo-q": "Q"}.get(repo))
+    signals_library.hard_cap_for["P"] = _hard_cap_meta(cap_usd=10.0, total_usd=11.0)
+
+    def _run(repo, n):
+        run_dir = tmp_path / f"run-{repo}-{n}"
+        run_dir.mkdir()
+        terminated = []
+        proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+        proc.terminate = lambda: terminated.append(True)
+        _final, reason = agentctl._stream_transcript(proc, run_dir, repo=repo)
+        return bool(terminated), reason
+
+    p_run_1 = _run("repo-p", 1)
+    p_run_2 = _run("repo-p", 2)
+    q_run = _run("repo-q", 1)
+    assert p_run_1[0] is True and "hard cap" in p_run_1[1]
+    assert p_run_2[0] is True and "hard cap" in p_run_2[1]
+    assert q_run == (False, None)
+
+
+# --- the Library's ledger fold (library#270, live 2026-10-13 20:35Z) keys every
+# ledger and `ledger.threshold-crossed` signal by registry project; the poll
+# matches that key alone, never the run's bare repo name ---------------------------
+
+
+def test_stream_transcript_does_not_stop_on_a_hard_cap_signal_keyed_by_repo_name(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """A signal whose `product` is only the run's REPO name — never the
+    registry project `project_for_repo` resolves it to — does not stop the
+    run. The repo-name match this covers was removed once the Library's
+    ledger fold made it dead weight (every ledger and signal names the
+    project now)."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "bosun"}.get(repo))
+    signals_library.hard_cap_for["agent-platform"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=12.34)
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    _final, reason = agentctl._stream_transcript(proc, run_dir, repo="agent-platform")
+    assert terminated == []
+    assert reason is None
+
+
+def test_stream_transcript_stops_on_a_hard_cap_signal_keyed_by_project(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """A signal whose `product` is the registry PROJECT stops the run, even
+    though the run's own repo name (`"agent-platform"`) is a different
+    string entirely."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "bosun"}.get(repo))
+    signals_library.hard_cap_for["bosun"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=12.34)
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    _final, reason = agentctl._stream_transcript(proc, run_dir, repo="agent-platform")
+    assert terminated == [True]
+    assert reason is not None and "hard cap" in reason
+
+
+def test_stream_transcript_ignores_a_hard_cap_for_another_project(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """A signal keyed by a different project never stops this run, even
+    though the request no longer filters by `product` server-side and so
+    the Library hands back this row too."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    monkeypatch.setattr(agentctl.projects, "project_for_repo",
+                        lambda repo: {"agent-platform": "bosun"}.get(repo))
+    signals_library.hard_cap_for["other-project"] = _hard_cap_meta()
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    _final, reason = agentctl._stream_transcript(proc, run_dir, repo="agent-platform")
+    assert terminated == []
+    assert reason is None
+
+
+def test_stream_transcript_stops_an_agent_platform_run_on_the_real_bosun_mapping(
+        agentctl, tmp_path, monkeypatch, signals_library):
+    """Uses the REAL registry (`config/projects.json`) rather than stubbing
+    `project_for_repo`: `agent-platform` resolves to project `bosun` there,
+    so a signal published under `bosun` has to stop a run dispatched `--on
+    agent-platform`."""
+    monkeypatch.setattr(agentctl, "_HARD_CAP_CHECK_INTERVAL_S", 0.0)
+    assert agentctl.projects.project_for_repo("agent-platform") == "bosun"
+    signals_library.hard_cap_for["bosun"] = _hard_cap_meta(
+        cap_usd=10.0, total_usd=12.34)
+    run_dir = tmp_path / "run-test"
+    run_dir.mkdir()
+    terminated = []
+    proc = _FakeStreamProc([{"type": "system", "subtype": "init"}])
+    proc.terminate = lambda: terminated.append(True)
+    _final, reason = agentctl._stream_transcript(proc, run_dir, repo="agent-platform")
+    assert terminated == [True]
+    assert reason is not None and "hard cap" in reason
+
+
 # --- _run_cost_cap_for_agent: the Library's grant cap vs the ordinary default/env
 # (issue_01M174CABDWSEP2EEVY6JXZ5VB, the operator's 2026-10-07 ruling, slate a-1ommg6) -------
 
@@ -8377,6 +8956,17 @@ def test_head_advanced_beyond_pin_normalizes_short_repo(agentctl, monkeypatch):
     assert calls and "repos/convivy/x/compare/" in calls[0][2]
 
 
+def test_head_advanced_beyond_pin_uses_the_registered_owner(agentctl, monkeypatch):
+    """homebrew-tap's registry entry names convivybuilder, not convivy — before
+    that entry was read here, this built repos/convivy/homebrew-tap/compare/."""
+    calls = []
+    monkeypatch.setattr(agentctl.subprocess, "run", lambda cmd, **kw: (
+        calls.append(cmd), type("R", (), {"returncode": 0, "stdout": "ahead",
+                                          "stderr": ""})())[1])
+    assert agentctl._head_advanced_beyond_pin("a" * 40, "f" * 40, "homebrew-tap") is True
+    assert calls and "repos/convivybuilder/homebrew-tap/compare/" in calls[0][2]
+
+
 def test_review_status_allow_unverified_admits_runidless_steward_stamp(agentctl, monkeypatch, capsys):
     # The steward's Agent-tool reviewers have no run dir → run-id-less stamps.
     # Default drops them; --allow-unverified (human-supervised) admits them.
@@ -8905,8 +9495,12 @@ def test_mint_run_github_token_scopes_to_the_repo_and_read_only_permissions(agen
     monkeypatch.setattr(agentctl, "_mint_run_github_token", agentctl._real_mint_run_github_token)
     monkeypatch.setattr(agentctl.GA, "key_problem", lambda path, label=None: None)
     monkeypatch.setattr(agentctl.GA, "app_jwt", lambda path, app_id: "jwt.x.y")
-    monkeypatch.setattr(agentctl.GA, "single_installation",
-                        lambda jwt, owner: {"id": 161212648, "account": {"login": owner}})
+    seen_owner = {}
+
+    def _installation_for_owner(jwt, owner, *, label=None):
+        seen_owner["owner"] = owner
+        return {"id": 161212648, "account": {"login": owner}}
+    monkeypatch.setattr(agentctl.GA, "installation_for_owner", _installation_for_owner)
     seen = {}
 
     def _installation_token(jwt, installation_id, *, repositories=None, permissions=None):
@@ -8918,11 +9512,68 @@ def test_mint_run_github_token_scopes_to_the_repo_and_read_only_permissions(agen
     token, problem = agentctl._mint_run_github_token("agent-platform")
 
     assert token == "ghs_run_token" and problem is None
+    assert seen_owner["owner"] == "convivy"
     assert seen["repositories"] == ["agent-platform"]
     assert seen["permissions"] == {
         "contents": "read", "pull_requests": "read",
         "checks": "read", "actions": "read",
     }
+
+
+def test_mint_run_github_token_resolves_a_non_convivy_owner_from_repo_owners(
+        agentctl, monkeypatch):
+    """homebrew-tap lives under convivybuilder (`config/projects.json`'s
+    `repo_owners`, PR #881) — the installation looked up, and the token scoped,
+    must follow the repo's OWN owner, not `convivy`. At a600a356 (before this
+    change) this minted from `single_installation(jwt, "convivy")` regardless of
+    the repo, so a homebrew-tap dispatch asked the convivy installation for a
+    repository it does not hold and GitHub refused with a 422 — this test's
+    `seen_owner` assertion is what catches that regression."""
+    monkeypatch.setattr(agentctl, "_mint_run_github_token", agentctl._real_mint_run_github_token)
+    monkeypatch.setattr(agentctl.GA, "key_problem", lambda path, label=None: None)
+    monkeypatch.setattr(agentctl.GA, "app_jwt", lambda path, app_id: "jwt.x.y")
+    seen_owner = {}
+
+    def _installation_for_owner(jwt, owner, *, label=None):
+        seen_owner["owner"] = owner
+        return {"id": 999111, "account": {"login": owner}}
+    monkeypatch.setattr(agentctl.GA, "installation_for_owner", _installation_for_owner)
+    seen = {}
+
+    def _installation_token(jwt, installation_id, *, repositories=None, permissions=None):
+        seen.update(installation_id=installation_id, repositories=repositories)
+        return "ghs_builder_token"
+    monkeypatch.setattr(agentctl.GA, "installation_token", _installation_token)
+
+    token, problem = agentctl._mint_run_github_token("homebrew-tap")
+
+    assert token == "ghs_builder_token" and problem is None
+    assert seen_owner["owner"] == "convivybuilder"
+    assert seen["installation_id"] == "999111"
+    assert seen["repositories"] == ["homebrew-tap"]
+
+
+def test_mint_run_github_token_refuses_cleanly_when_the_owner_has_no_installation(
+        agentctl, monkeypatch):
+    """An owner the App is not installed on must be refused by name, before any
+    token request — at a600a356 this surfaced only as GitHub's bare 422 from a
+    token request scoped to a repo the wrong installation does not hold."""
+    monkeypatch.setattr(agentctl, "_mint_run_github_token", agentctl._real_mint_run_github_token)
+    monkeypatch.setattr(agentctl.GA, "key_problem", lambda path, label=None: None)
+    monkeypatch.setattr(agentctl.GA, "app_jwt", lambda path, app_id: "jwt.x.y")
+
+    def _refused(jwt, owner, *, label=None):
+        raise agentctl.GA.Unreadable(f"{label} is not installed on {owner!r}")
+    monkeypatch.setattr(agentctl.GA, "installation_for_owner", _refused)
+
+    def _boom(*a, **kw):
+        raise AssertionError("no installation means no token request either")
+    monkeypatch.setattr(agentctl.GA, "installation_token", _boom)
+
+    token, problem = agentctl._mint_run_github_token("homebrew-tap")
+
+    assert token is None
+    assert "not installed on 'convivybuilder'" in problem
 
 
 def test_mint_run_github_token_refuses_on_an_unreadable_key_without_contacting_github(
@@ -8933,7 +9584,7 @@ def test_mint_run_github_token_refuses_on_an_unreadable_key_without_contacting_g
     monkeypatch.setattr(agentctl.GA, "key_problem",
                         lambda path, label=None: "no App key at /nonexistent/bosun-app.pem")
     monkeypatch.setattr(agentctl.GA, "app_jwt", _boom)
-    monkeypatch.setattr(agentctl.GA, "single_installation", _boom)
+    monkeypatch.setattr(agentctl.GA, "installation_for_owner", _boom)
     monkeypatch.setattr(agentctl.GA, "installation_token", _boom)
 
     token, problem = agentctl._mint_run_github_token("agent-platform")
@@ -8947,14 +9598,14 @@ def test_mint_run_github_token_translates_an_unreadable_github_response(agentctl
     monkeypatch.setattr(agentctl.GA, "key_problem", lambda path, label=None: None)
     monkeypatch.setattr(agentctl.GA, "app_jwt", lambda path, app_id: "jwt.x.y")
 
-    def _refused(jwt, owner):
-        raise agentctl.GA.Unreadable("count: the App has 0 installations, not exactly one")
-    monkeypatch.setattr(agentctl.GA, "single_installation", _refused)
+    def _refused(jwt, owner, *, label=None):
+        raise agentctl.GA.Unreadable(f"{label}'s installation on {owner!r} could not be read (500)")
+    monkeypatch.setattr(agentctl.GA, "installation_for_owner", _refused)
 
     token, problem = agentctl._mint_run_github_token("agent-platform")
 
     assert token is None
-    assert "0 installations" in problem
+    assert "could not be read (500)" in problem
 
 
 # --- CQ·418: a per-run GitHub credential, minted before any side effect --------------
@@ -9094,6 +9745,41 @@ def test_pr_with_explicit_on_looks_up_that_repos_pr(agentctl, monkeypatch):
     assert captured["repo"] == "convivy/agent-platform", (
         f"--pr 488 --on agent-platform must read agent-platform's PR 488, "
         f"not {captured['repo']!r}")
+
+
+def test_pr_with_explicit_on_uses_the_registered_owner_for_homebrew_tap(agentctl, monkeypatch):
+    """Round-1 review (PR #881, comment 6150937461): the exact headline scenario
+    `agentctl spawn reviewer --on homebrew-tap --pr 1` reaches this `--pr` resolve
+    site (`slug = projects.repo_github_slug(repo)`) first. Of the five inline
+    copies the PR names as fixed, this one had no dedicated homebrew-tap test —
+    `test_pr_with_explicit_on_looks_up_that_repos_pr` above only exercises
+    agent-platform, whose owner is unchanged. Fails against a build that still
+    reads `f"convivy/{repo}"` literally."""
+    captured = {}
+
+    def fake_pr_json(pr, fields, repo=None):
+        captured["pr"] = pr
+        captured["repo"] = repo
+        raise _StoppedAtPrLookup()
+
+    monkeypatch.setattr(agentctl, "_gh_pr_json", fake_pr_json)
+    monkeypatch.setattr(agentctl, "_warn_deployed_tree", lambda: None)
+    monkeypatch.setattr(agentctl, "_spawn_lib_gate", lambda: None)
+    monkeypatch.setattr(agentctl, "resolve_agent",
+                        lambda name, repo=None, agents_dir=None:
+                        {"model_alias": "sonnet", "body": "sys"})
+    monkeypatch.setattr(agentctl, "default_profile", lambda repo, name: f"{repo}/daytime")
+    monkeypatch.setattr(agentctl, "_is_private_dispatch", lambda repo, agent: False)
+    monkeypatch.setattr(agentctl.R, "can_spawn", lambda parent, agent: (True, [], ""))
+    monkeypatch.setattr(agentctl, "_budget_gate", lambda *a, **kw: None)
+
+    args = _spawn_args(agent="reviewer", pr="1", on="homebrew-tap")
+    with pytest.raises(_StoppedAtPrLookup):
+        agentctl._spawn_dispatch(args)
+
+    assert captured["repo"] == "convivybuilder/homebrew-tap", (
+        f"--pr 1 --on homebrew-tap must read homebrew-tap's PR 1 from "
+        f"convivybuilder, not {captured['repo']!r}")
 
 
 def test_eval_mode_and_pr_refuse_before_any_gh_lookup(agentctl, monkeypatch, capsys):
@@ -13104,6 +13790,768 @@ def test_kill_still_signals_when_the_agent_cannot_be_resolved(agentctl, tmp_path
         "resolve_agent's SystemExit escaped and the signal was never sent"
 
 
+# --- CQ·138: a run's whole process group ends with it -----------------------
+
+def test_the_group_guard_refuses_pgid_0_1_and_the_callers_own_pgid(agentctl):
+    """`_pgid_is_signalable` must refuse the three degenerate groups a
+    `killpg` must never reach: 0 (POSIX's own meaning for "my own group",
+    not "none"), 1 (never a real spawned child's), and this process's own
+    (the supervisor's, or `agentctl kill`'s own CLI invocation's). None of
+    these reaches an `os.killpg` call — the function is pure and refuses
+    before any signal would be sent.
+
+    A real, isolated child's own pgid is the one shape this must NOT
+    refuse — spawned here with `process_group=0`, the same primitive
+    `_spawn_claude` uses, and killed in `finally` either way."""
+    mine = os.getpgrp()
+    assert agentctl._pgid_is_signalable(0, 0) is False
+    assert agentctl._pgid_is_signalable(1, 1) is False
+    assert agentctl._pgid_is_signalable(mine, mine) is False
+
+    proc = subprocess.Popen(["sleep", "5"], process_group=0)
+    try:
+        pgid = os.getpgid(proc.pid)
+        assert pgid == proc.pid, "process_group=0 did not make the child its own leader"
+        assert agentctl._pgid_is_signalable(pgid, proc.pid) is True
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def _cq138_stub_with_background_child(tmp_path, marker: Path, *, hang: bool) -> Path:
+    """A `claude` stand-in that backgrounds a child writing `marker` after a
+    1s delay, then either exits immediately (`hang=False`, the normal-exit
+    path) or emits its result and sleeps 30s without exiting on its own
+    (`hang=True`, the ARCH-069 shape `_reap_lingering` exists for).
+
+    The backgrounded child's stdio is redirected to `/dev/null`, not left on
+    the pipe it inherited from this script — a REAL disowned background
+    process does the same (that's what makes it disowned). Without this,
+    the read loop that drains the leader's stdout can't see EOF until the
+    very write this test is checking for already happened, since the
+    child would still hold that pipe's write end open — collapsing the two
+    independent questions ("did the leader's stdout close promptly" and
+    "is the descendant dead") this test needs to tell apart."""
+    stub = tmp_path / "claude-stub"
+    tail = "sleep 30\n" if hang else "exit 0\n"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"(sleep 1; touch '{marker}') >/dev/null 2>&1 &\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"model\":\"x\"}'\n"
+        + tail
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def test_a_backgrounded_child_is_dead_after_the_run_ends_normally(
+        agentctl, tmp_path, monkeypatch):
+    """CQ·138, occurrence 1 (security review, PR #477): a disowned
+    background write must not land in the run directory after finalize.
+    Drives the REAL `_run_session` normal-exit path with a claude stand-in
+    that backgrounds a child before exiting — exactly the shape
+    `_spawn_claude`'s `process_group=0` and the post-exit sweep
+    (`_cleanup_process_group`) exist to catch.
+
+    Verified against the unfixed code: before this change, `_spawn_claude`
+    passed no `process_group`, so the backgrounded child shared this test
+    process's own group, nothing in `_run_session` ever signaled it, and
+    `marker.exists()` read True after the `time.sleep(1.5)` below."""
+    import time
+    import types
+
+    run_dir = tmp_path / "run-bgtest"
+    run_dir.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    marker = tmp_path / "late-write.txt"
+    stub = _cq138_stub_with_background_child(tmp_path, marker, hang=False)
+
+    monkeypatch.setattr(agentctl, "CLAUDE_BIN", str(stub))
+    monkeypatch.setattr(agentctl, "_pid_start_time", lambda pid: None)
+    monkeypatch.setattr(agentctl, "_finalize_run", lambda **kw: None)
+    monkeypatch.setattr(agentctl, "_preflight_python_worktree", lambda wt: None)
+    monkeypatch.setattr(agentctl, "_run_origin", lambda parent=None: "scheduled")
+    monkeypatch.setattr(agentctl.R, "reserve_slot", lambda entry: None)
+    monkeypatch.setattr(agentctl.R, "attach_pid",
+                        lambda run_id, pid, pid_started_at=None, **_kw: None)
+    monkeypatch.setattr(agentctl.R, "remove_run", lambda rid: True)
+    args = types.SimpleNamespace(agent="coder", task="t", parent=None,
+                                 dry_run=False, label=None)
+    rc = agentctl._run_session(
+        args=args, agent={"body": "sys", "model_alias": "opus"},
+        run_id="run-bgtest", run_dir=run_dir, worktree=worktree,
+        profile="p", repo="agent-platform",
+        started_at="2026-10-12T00:00:00Z", user_prompt="u")
+
+    assert rc == 0
+    assert not marker.exists(), \
+        "the backgrounded child had already written by the time the run returned"
+    time.sleep(1.5)
+    assert not marker.exists(), \
+        "the backgrounded child outlived _run_session's return (CQ·138)"
+
+
+def test_a_backgrounded_child_is_dead_after_the_reaper_fires(agentctl, tmp_path):
+    """CQ·138 through `_reap_lingering`: a claude that emits its result but
+    never exits on its own (ARCH-069's own hang case) must not leave a
+    backgrounded descendant alive once the reaper terminates it.
+
+    Drives `_reap_lingering` directly on a real, `process_group=0`-isolated
+    child this test spawns and owns — the real async `Timer` only fires
+    `REAP_GRACE_SECONDS` (60s by default) after the result event, too slow
+    for a test.
+
+    Verified against the unfixed code: `_reap_lingering` used to
+    `proc.terminate()` the stub alone, never its group, so the backgrounded
+    `(sleep 1; touch marker)` outlived it and `marker.exists()` read True
+    after the `time.sleep(1.5)` below."""
+    import time
+
+    run_dir = tmp_path / "run-reaptest"
+    run_dir.mkdir()
+    marker = tmp_path / "late-write.txt"
+    stub = _cq138_stub_with_background_child(tmp_path, marker, hang=True)
+
+    proc = subprocess.Popen([str(stub)], stdout=subprocess.PIPE, process_group=0)
+    try:
+        # Synchronize with the script having actually reached — and
+        # backgrounded its child past — the "emits its result" point: the
+        # real Timer this stands in for only ever fires AFTER that line is
+        # read in `_stream_transcript`'s drain loop, never before it.
+        proc.stdout.readline()
+        agentctl._reap_lingering(proc, run_dir)
+        assert proc.poll() is not None, "the reaper left the leader itself alive"
+        assert not marker.exists(), \
+            "the backgrounded child had already written by the time the reaper returned"
+        time.sleep(1.5)
+        assert not marker.exists(), \
+            "the reaper left a backgrounded descendant alive past the run (CQ·138)"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+# --- CQ·138: a Bash-tool descendant is not in the agent's own group ---------
+#
+# Claude Code starts every Bash-tool command as `/bin/zsh -c 'source <snapshot>
+# ... && eval ...'`, and that invocation is a brand-new SESSION (pid == pgid
+# == sid, measured 2026-10-13) — never a member of the group
+# `process_group=0` isolates at spawn. These tests drive the REAL zsh
+# mechanism (`_write_tool_session_zdotdir`'s `.zshenv`, read via a real
+# `ZDOTDIR`-pointed `/bin/zsh -c` this test spawns with
+# `start_new_session=True` — the same "own session leader" shape the
+# incident measured) rather than asserting against a stand-in.
+#
+# A tool shell is identified by a FILE IT HOLDS OPEN, never by an id it
+# reports: an earlier design had the shell report its own pid into a file,
+# and trusted a live process whose pgid and sid both happened to equal a
+# recorded number to BE that shell — but every OTHER run's own Bash-tool
+# shell is, by that same measurement, exactly such a process, so a run could
+# forge another run's tool-shell pid into its own record. These tests drive
+# the marker-file mechanism instead: a `.zshenv` that opens a file for append
+# and never writes anything into it, and a sweep that asks the OS who
+# currently holds that file open (`lsof -t`) rather than reading any content
+# back.
+#
+# None of the functions these tests drive (`RS.create_tool_session_marker`,
+# `agentctl._record_tool_session_marker`, `agentctl._sweep_tool_session_holders`,
+# `agentctl._tool_session_holders`, `agentctl._verified_tool_session_marker`)
+# existed before this change, so every one of them fails against b362c5d2
+# with an `AttributeError` on the first call — there is no partial prior
+# behaviour for a wrong assertion to hide behind. Where a test below exercises
+# a real behavioral property (not merely "the function exists"), its own
+# docstring names the specific assertion that would catch a regression once
+# these names exist but the property they test does not hold.
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+# Resolved via PATH rather than hardcoded as "/bin/zsh": CI's Linux runner
+# installs the zsh package, which may land it at /usr/bin/zsh with no /bin
+# symlink. A missing zsh must fail these tests, not skip them — they are the
+# only check that the real tool-session mechanism works.
+_ZSH = shutil.which("zsh")
+
+
+def _wait_for_holder(agentctl, marker: Path, *, timeout: float = 5.0) -> list[int]:
+    """Poll `_tool_session_holders(marker)` until it reports at least one live
+    holder, or the timeout elapses — the real `lsof -t` mechanism needs the
+    child to have actually opened the file before it can be seen, which is
+    not guaranteed the instant `Popen` returns."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    holders: list[int] = []
+    while time.monotonic() < deadline:
+        holders = agentctl._tool_session_holders(marker) or []
+        if holders:
+            return holders
+        time.sleep(0.05)
+    return holders
+
+
+def test_a_tool_shells_zshenv_opens_the_marker_and_the_sweep_kills_its_orphan(
+        agentctl, tmp_path):
+    """The `.zshenv` `_write_tool_session_zdotdir` writes must open the marker
+    file on a descriptor that a backgrounded, disowned child still holds
+    after its own shell exits (the orphan shape the round-1 finding
+    describes, ppid 1), and `_sweep_tool_session_holders` must find and kill
+    it via `lsof -t` on that marker — while leaving a `sleep` this test
+    starts in a wholly separate session of its own, never holding the
+    marker, alone. Fails against b362c5d2 with an `AttributeError` on
+    `RS.create_tool_session_marker`; once the new names exist but the
+    mechanism does nothing, the assertion that catches it is
+    `assert not _alive(orphan_pid)`."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    run_dir = tmp_path / "run-zdotdir-sweep"
+    run_dir.mkdir()
+    # CQ·138: the marker lives in a dedicated scratch directory
+    # outside `run_dir` (which a real dispatch's sandbox denies for writing —
+    # see `RS.create_tool_session_scratch_dir`'s docstring), with only its
+    # identity (never the directory) recorded under `run_dir` so
+    # `_verified_tool_session_marker`/`_sweep_tool_session_holders` can resolve
+    # it back exactly the way a later, separate `agentctl kill` would.
+    scratch_dir = tmp_path / "toolsession-scratch"
+    scratch_dir.mkdir()
+    marker = agentctl.RS.create_tool_session_marker(scratch_dir)
+    agentctl._record_tool_session_marker(run_dir, marker)
+    zdir = agentctl._write_tool_session_zdotdir(run_dir, marker)
+
+    pidfile = tmp_path / "orphan.pid"
+    home = tmp_path / "home-unused"
+    home.mkdir()
+    # `$!` is zsh's own last-background-job pid — ground truth independent of
+    # anything `_tool_session_holders`/`_sweep_tool_session_holders` compute,
+    # so the orphan's real pid here never depends on the code under test.
+    cmd = f'sleep 100 & echo $! > {pidfile}'
+    env = {**os.environ, "ZDOTDIR": str(zdir), "HOME": str(home)}
+    shell = subprocess.Popen([_ZSH, "-c", cmd], env=env,
+                             start_new_session=True)
+    shell.wait(timeout=5)
+
+    orphan_pid = int(pidfile.read_text().strip())
+    assert _alive(orphan_pid), \
+        "the backgrounded sleep was not alive right after the shell exited"
+    assert orphan_pid in _wait_for_holder(agentctl, marker), \
+        "the orphaned descendant never showed up as a holder of the marker"
+
+    survivor = subprocess.Popen(["sleep", "100"], start_new_session=True)
+    try:
+        agentctl._sweep_tool_session_holders(run_dir, grace_s=2.0)
+
+        assert not _alive(orphan_pid), \
+            "the sweep left the tool shell's orphaned descendant alive"
+        assert _alive(survivor.pid), \
+            "the sweep killed a sleep that never held this run's own marker"
+    finally:
+        if survivor.poll() is None:
+            survivor.kill()
+        survivor.wait()
+        if _alive(orphan_pid):
+            os.kill(orphan_pid, signal.SIGKILL)
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def test_the_zshenv_restores_zdotdir_and_still_sources_the_real_home_zshenv(
+        agentctl, tmp_path):
+    """`_write_tool_session_zdotdir`'s `.zshenv` must not leave `ZDOTDIR`
+    pointed at the run's own private directory for the rest of the
+    invocation (every subsequent zsh startup file, and the Claude Code
+    snapshot sourcing that follows, must read the user's own) — and
+    restoring it must not silently drop the real `$HOME/.zshenv` that would
+    otherwise have run."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    run_dir = tmp_path / "run-zdotdir-restore"
+    run_dir.mkdir()
+    scratch_dir = tmp_path / "toolsession-scratch"
+    scratch_dir.mkdir()
+    marker_path = agentctl.RS.create_tool_session_marker(scratch_dir)
+    zdir = agentctl._write_tool_session_zdotdir(run_dir, marker_path)
+
+    home = tmp_path / "home"
+    home.mkdir()
+    home_zshenv_ran = tmp_path / "home-zshenv-ran.txt"
+    (home / ".zshenv").write_text(f"touch {home_zshenv_ran}\n")
+
+    out_file = tmp_path / "zdotdir-after.txt"
+    cmd = f'printf "%s" "$ZDOTDIR" > {out_file}'
+    env = {**os.environ, "ZDOTDIR": str(zdir), "HOME": str(home)}
+    proc = subprocess.Popen([_ZSH, "-c", cmd], env=env,
+                            start_new_session=True)
+    proc.wait(timeout=5)
+
+    assert home_zshenv_ran.exists(), \
+        "the real $HOME/.zshenv was never sourced after ZDOTDIR was restored"
+    assert out_file.read_text() == "", \
+        ("ZDOTDIR was not restored before the rest of the invocation ran: "
+         f"{out_file.read_text()!r}")
+
+
+def test_a_failed_marker_open_in_the_zshenv_is_silent_and_non_fatal(
+        agentctl, tmp_path):
+    """CQ·138 round 4, reviewer finding (verified against a real
+    `/bin/zsh -c`): a bare trailing `2>/dev/null` on `exec N>>file` does not
+    suppress zsh's own diagnostic when the open fails — same-command
+    redirections are set up LEFT TO RIGHT, so the failing one fires and
+    prints to the still-live original stderr before `2>/dev/null` ever takes
+    effect. Measured: `zsh:1: no such file or directory: ...`. Here the
+    marker's own directory never exists — the shape a finalize racing a
+    slow-starting shell leaves — so the open inside
+    `_write_tool_session_zdotdir`'s `.zshenv` fails every time; wrapping it in
+    a brace group redirects stderr BEFORE the open runs, so the same failure
+    is silent. Fails against 8b45d29a with a non-empty `proc.stderr`."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    run_dir = tmp_path / "run-zdotdir-failed-open"
+    run_dir.mkdir()
+    home = tmp_path / "home-failed-open"
+    home.mkdir()
+    # The parent directory is never created, so the `.zshenv`'s own `exec`
+    # fails to open it every time this runs.
+    marker_path = tmp_path / "gone-scratch" / "marker"
+    zdir = agentctl._write_tool_session_zdotdir(run_dir, marker_path)
+
+    out_file = tmp_path / "after-failed-open.txt"
+    cmd = f'printf done > {out_file}'
+    proc = subprocess.run([_ZSH, "-c", cmd],
+                          env={**os.environ, "ZDOTDIR": str(zdir), "HOME": str(home)},
+                          capture_output=True, text=True, timeout=5)
+
+    assert proc.stderr == "", (
+        f"a failed marker open must leave no diagnostic on stderr; got: {proc.stderr!r}")
+    assert out_file.read_text() == "done", \
+        "a failed marker open must not stop the Bash-tool command that follows"
+
+
+# --- CQ·138: the tool-session marker must live outside runs_root -----------
+#
+# An earlier design's `.zshenv` appended into `<run_dir>/tool-sessions`, but
+# `run_dir` sits under `runs_root`, which `settings()` denies for writing by
+# every dispatched run's Bash on purpose — so in a real dispatch the append
+# was always refused, the record stayed empty, and nothing was ever swept.
+# The tests above never caught it because they start zsh outside the
+# sandbox. These tests drive the dispatcher's own `_run_session` (no real
+# sandbox here either — see each test's own note on what it does and does
+# not show).
+
+def test_a_real_dispatchs_tool_shells_zdotdir_targets_its_own_marker_not_run_dir(
+        agentctl, tmp_path, monkeypatch):
+    """The `.zshenv` must target THIS dispatch's own marker — created
+    inside `RS.create_tool_session_scratch_dir`'s directory, the one
+    `settings()` actually grants write access to — never anything under
+    `run_dir`, which a real dispatch's sandbox denies for writing. Drives
+    the real `_write_tool_session_zdotdir`/
+    `_record_tool_session_marker` wiring through `_run_session` itself: no
+    sandbox runs in this test, so it does not show the sandbox itself permits
+    the write — only that the path this dispatch's own `.zshenv` targets, and
+    the path recorded under `run_dir`, both name the scratch directory's
+    marker and never `run_dir`. Fails against b362c5d2, where this parameter
+    and the marker file do not exist at all."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    import types
+
+    run_dir = tmp_path / "run-toolsession-e2e"
+    run_dir.mkdir()
+    worktree = tmp_path / "wt-toolsession-e2e"
+    worktree.mkdir()
+    scratch_dir = tmp_path / "toolsession-scratch-e2e"
+    scratch_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(agentctl.RS, "create_tool_session_scratch_dir", lambda home: scratch_dir)
+    stub = tmp_path / "claude-stub-toolsession-e2e"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"{_ZSH} -c 'true'\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"model\":\"x\"}'\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setattr(agentctl, "CLAUDE_BIN", str(stub))
+    monkeypatch.setattr(agentctl, "_run_origin", lambda parent=None: "interactive")
+    monkeypatch.setattr(agentctl, "_gateway_virtual_key", lambda: "vk-test")
+    monkeypatch.setattr(agentctl, "_gateway_url", lambda: "http://127.0.0.1:9")
+    monkeypatch.setattr(agentctl, "_preflight_python_worktree", lambda wt: None)
+    monkeypatch.setattr(agentctl, "_finalize_run", lambda **kw: None)
+    monkeypatch.setattr(agentctl, "_review_launch_path", lambda: None)
+    monkeypatch.setattr(agentctl.R, "reserve_slot", lambda entry: None)
+    monkeypatch.setattr(agentctl.R, "attach_pid",
+                        lambda run_id, pid, pid_started_at=None, **_kw: None)
+    monkeypatch.setattr(agentctl.R, "remove_run", lambda rid: True)
+    args = types.SimpleNamespace(agent="reviewer", task="t", parent=None,
+                                 dry_run=False, label=None, model=None,
+                                 review_sha=None)
+
+    agentctl._run_session(
+        args=args, agent={"body": "sys", "model_alias": "sonnet"},
+        run_id="run-toolsession-e2e", run_dir=run_dir, worktree=worktree, profile="p",
+        repo="agent-platform", started_at="2026-10-13T00:00:00Z", user_prompt="u")
+
+    record = json.loads((run_dir / agentctl.TOOL_SESSION_MARKER_RECORD_NAME).read_text())
+    marker_path = Path(record["path"])
+    assert marker_path.is_relative_to(scratch_dir), \
+        "the record under run_dir must name a marker inside this dispatch's own scratch directory"
+    assert not marker_path.is_relative_to(run_dir), \
+        "round 1's defect: the marker must never live under run_dir"
+    zshenv = (run_dir / agentctl.TOOL_SESSION_DIR_NAME / ".zshenv").read_text()
+    assert str(marker_path) in zshenv, \
+        "the .zshenv never targets this dispatch's own recorded marker"
+    assert str(run_dir) not in zshenv, \
+        "the .zshenv must never reference run_dir itself"
+
+
+def test_the_tool_session_scratch_dir_is_removed_once_the_run_is_finalized(
+        agentctl, tmp_path, monkeypatch):
+    """CQ·138: the scratch directory this dispatch's own `settings()`
+    call grants write access to must not outlive the run — left behind, it is
+    a stray writable directory under the shared system temp root forever
+    (the same leak `create_eval_scratch_dir`'s own cleanup avoids). Fails
+    against 14d6667b, which has no such directory to clean up at all
+    (`AttributeError` on `agentctl.RS.create_tool_session_scratch_dir`)."""
+    import types
+
+    run_dir = tmp_path / "run-toolsession-cleanup"
+    run_dir.mkdir()
+    worktree = tmp_path / "wt-toolsession-cleanup"
+    worktree.mkdir()
+    scratch_dir = tmp_path / "toolsession-scratch-cleanup"
+    scratch_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(agentctl.RS, "create_tool_session_scratch_dir", lambda home: scratch_dir)
+    stub = tmp_path / "claude-stub-toolsession-cleanup"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"model\":\"x\"}'\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    monkeypatch.setattr(agentctl, "CLAUDE_BIN", str(stub))
+    monkeypatch.setattr(agentctl, "_run_origin", lambda parent=None: "interactive")
+    monkeypatch.setattr(agentctl, "_gateway_virtual_key", lambda: "vk-test")
+    monkeypatch.setattr(agentctl, "_gateway_url", lambda: "http://127.0.0.1:9")
+    monkeypatch.setattr(agentctl, "_preflight_python_worktree", lambda wt: None)
+    monkeypatch.setattr(agentctl, "_finalize_run", lambda **kw: None)
+    monkeypatch.setattr(agentctl, "_review_launch_path", lambda: None)
+    monkeypatch.setattr(agentctl.R, "reserve_slot", lambda entry: None)
+    monkeypatch.setattr(agentctl.R, "attach_pid",
+                        lambda run_id, pid, pid_started_at=None, **_kw: None)
+    monkeypatch.setattr(agentctl.R, "remove_run", lambda rid: True)
+    args = types.SimpleNamespace(agent="reviewer", task="t", parent=None,
+                                 dry_run=False, label=None, model=None,
+                                 review_sha=None)
+
+    assert scratch_dir.exists()
+    agentctl._run_session(
+        args=args, agent={"body": "sys", "model_alias": "sonnet"},
+        run_id="run-toolsession-cleanup", run_dir=run_dir, worktree=worktree, profile="p",
+        repo="agent-platform", started_at="2026-10-13T00:00:00Z", user_prompt="u")
+
+    assert not scratch_dir.exists(), "the scratch directory must be removed once finalized"
+
+
+def test_a_dry_run_never_creates_a_tool_session_scratch_dir(
+        agentctl, tmp_path, monkeypatch):
+    """A dry run never spawns a subprocess at all, so there is nothing for a
+    tool shell to register — `create_tool_session_scratch_dir` must not be
+    called, mirroring the same contract `eval_scratch_dir` already has for a
+    dry run."""
+    import types
+
+    run_dir = tmp_path / "run-toolsession-dry"
+    run_dir.mkdir()
+    worktree = tmp_path / "wt-toolsession-dry"
+    worktree.mkdir()
+    calls = []
+    monkeypatch.setattr(agentctl.RS, "create_tool_session_scratch_dir",
+                        lambda home: calls.append(1) or tmp_path / "unused")
+    monkeypatch.setattr(agentctl, "_finalize_run", lambda **kw: None)
+    monkeypatch.setattr(agentctl.R, "add_run", lambda entry: None)
+    args = types.SimpleNamespace(agent="reviewer", task="t", parent=None,
+                                 dry_run=True, label=None, model=None,
+                                 review_sha=None)
+
+    agentctl._run_session(
+        args=args, agent={"body": "sys", "model_alias": "sonnet"},
+        run_id="run-toolsession-dry", run_dir=run_dir, worktree=worktree, profile="p",
+        repo="agent-platform", started_at="2026-10-13T00:00:00Z", user_prompt="u")
+
+    assert not calls, "a dry run must never create a tool-session scratch directory"
+    assert not (run_dir / agentctl.TOOL_SESSION_MARKER_RECORD_NAME).exists()
+
+
+def test_sweep_never_signals_a_holder_of_a_different_runs_marker(
+        agentctl, tmp_path):
+    """Two dispatches, two scratch directories, two markers — a process
+    holding run B's marker open must never be touched by run A's own sweep.
+    `_verified_tool_session_marker`
+    reads run A's OWN recorded path only, so `lsof -t` is only ever queried
+    against run A's marker; run B's holder is simply never looked at. Fails
+    against b362c5d2 with an `AttributeError` on `RS.create_tool_session_marker`;
+    once the new names exist but this isolation does not hold, the assertion
+    that catches it is `assert _alive(holder_b.pid)`."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    run_a = tmp_path / "run-a"
+    run_a.mkdir()
+    scratch_a = tmp_path / "scratch-a"
+    scratch_a.mkdir()
+    scratch_b = tmp_path / "scratch-b"
+    scratch_b.mkdir()
+    marker_a = agentctl.RS.create_tool_session_marker(scratch_a)
+    marker_b = agentctl.RS.create_tool_session_marker(scratch_b)
+    agentctl._record_tool_session_marker(run_a, marker_a)
+
+    cmd_b = f'exec 9>>{marker_b}; sleep 30'
+    holder_b = subprocess.Popen([_ZSH, "-c", cmd_b], start_new_session=True)
+    try:
+        assert holder_b.pid in _wait_for_holder(agentctl, marker_b), \
+            "the test's own holder never showed up on run B's marker"
+
+        agentctl._sweep_tool_session_holders(run_a, grace_s=1.0)
+
+        assert _alive(holder_b.pid), \
+            "run A's sweep touched a process holding run B's own marker"
+    finally:
+        if holder_b.poll() is None:
+            holder_b.kill()
+        holder_b.wait()
+        shutil.rmtree(scratch_a, ignore_errors=True)
+        shutil.rmtree(scratch_b, ignore_errors=True)
+
+
+def test_sweep_refuses_a_marker_record_whose_path_was_replaced_with_a_symlink(
+        agentctl, tmp_path, capsys):
+    """If `run_dir`'s own marker record is made to name a DIFFERENT run's
+    marker — the shape a run could produce if it could rewrite its own
+    record (it cannot: `run_dir` sits under `runs_root`, denied for writing
+    by the run) — `_verified_tool_session_marker`'s `O_NOFOLLOW` open refuses
+    to follow the symlink, so the device/inode check never even runs and the
+    sweep signals nothing. Fails against b362c5d2 with an `AttributeError`
+    on `RS.create_tool_session_marker`; once the new names exist but the
+    `O_NOFOLLOW` guard is dropped, the assertion that catches it is
+    `assert _alive(holder_b.pid)`."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    run_a = tmp_path / "run-a-symlink"
+    run_a.mkdir()
+    scratch_a = tmp_path / "scratch-a-symlink"
+    scratch_a.mkdir()
+    scratch_b = tmp_path / "scratch-b-symlink"
+    scratch_b.mkdir()
+    marker_a = agentctl.RS.create_tool_session_marker(scratch_a)
+    marker_b = agentctl.RS.create_tool_session_marker(scratch_b)
+    agentctl._record_tool_session_marker(run_a, marker_a)
+
+    cmd_b = f'exec 9>>{marker_b}; sleep 30'
+    holder_b = subprocess.Popen([_ZSH, "-c", cmd_b], start_new_session=True)
+    try:
+        assert holder_b.pid in _wait_for_holder(agentctl, marker_b), \
+            "the test's own holder never showed up on run B's marker"
+
+        marker_a.unlink()
+        marker_a.symlink_to(marker_b)
+
+        agentctl._sweep_tool_session_holders(run_a, grace_s=1.0)
+
+        assert _alive(holder_b.pid), \
+            "a symlinked record still let the sweep reach another run's holder"
+        err = capsys.readouterr().err
+        assert str(marker_a) in err, \
+            "the refusal was never logged with the marker path it refused"
+    finally:
+        if holder_b.poll() is None:
+            holder_b.kill()
+        holder_b.wait()
+        shutil.rmtree(scratch_a, ignore_errors=True)
+        shutil.rmtree(scratch_b, ignore_errors=True)
+
+
+def test_a_forged_marker_content_causes_no_signal(agentctl, tmp_path):
+    """The marker's CONTENT is never read by the sweep — only its identity
+    (device/inode) and who currently holds it open (`lsof -t`). A run CAN
+    write into the marker (`settings()` grants the file itself, never its
+    parent directory — see that function's own docstring), so this proves
+    writing arbitrary content there — a forged pid, garbage, anything — has
+    no effect at all. `decoy` here never opens the marker; it is only named
+    BY PID inside it. Fails against b362c5d2 with an `AttributeError` on
+    `RS.create_tool_session_marker`; once the new names exist but something
+    reads the marker's content back, the assertion that catches it is
+    `assert _alive(decoy.pid)`."""
+    run_dir = tmp_path / "run-forged-marker"
+    run_dir.mkdir()
+    scratch_dir = tmp_path / "forged-marker-scratch"
+    scratch_dir.mkdir()
+    marker = agentctl.RS.create_tool_session_marker(scratch_dir)
+    agentctl._record_tool_session_marker(run_dir, marker)
+
+    decoy = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    try:
+        # Forged content: a real, live, unrelated pid, written the way a
+        # compromised run could — it lacks write access to the DIRECTORY
+        # (so it cannot replace the marker itself), but it can write INTO it.
+        marker.write_text(f"{decoy.pid}\n")
+
+        agentctl._sweep_tool_session_holders(run_dir, grace_s=1.0)
+
+        assert _alive(decoy.pid), \
+            "forged marker content signaled a pid that never held the marker open"
+    finally:
+        decoy.kill()
+        decoy.wait()
+        shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def test_terminate_run_killpg_branch_kills_a_real_isolated_child(
+        agentctl, monkeypatch):
+    """Round-1 reviewer finding: the existing kill test
+    (`test_kill_still_signals_when_the_agent_cannot_be_resolved`) only ever
+    drives `_terminate_run`'s FALLBACK branch (`os.kill`, no real isolated
+    pgid) — nothing exercised the `os.killpg` branch `agentctl kill` reaches
+    for a real `process_group=0` run. Calls `_terminate_run` directly
+    (never `agentctl kill` — this session's own process tree is exactly the
+    kind a wrongly-aimed `killpg` would reach) on a run record built here,
+    against a real child this test spawns and owns, and asserts the child's
+    group is actually gone afterward."""
+    import threading
+
+    proc = subprocess.Popen(["sleep", "30"], process_group=0)
+    try:
+        assert os.getpgid(proc.pid) == proc.pid, \
+            "process_group=0 did not make the child its own group leader"
+        pid_started_at = agentctl._pid_start_time(proc.pid)
+
+        monkeypatch.setattr(agentctl.R, "get_run",
+                            lambda rid: {"pid": proc.pid,
+                                         "pid_started_at": pid_started_at})
+        removed = []
+        monkeypatch.setattr(agentctl.R, "remove_run", lambda rid: removed.append(rid))
+        monkeypatch.setattr(agentctl, "_find_run_dir", lambda rid: None)
+
+        # Plays the role the real dispatcher's own reap always does: without
+        # something calling `proc.wait()`, a terminated child sits as a
+        # zombie THIS test still owns, and `_terminate_run`'s own `killpg(.,
+        # 0)` liveness poll would read that zombie as "still here" for its
+        # entire 10s window regardless of whether the kill worked.
+        reaper = threading.Thread(target=proc.wait, daemon=True)
+        reaper.start()
+
+        rc = agentctl._terminate_run("run-isolated-kill-test", True)
+        reaper.join(timeout=5)
+
+        assert rc == 0
+        assert removed == ["run-isolated-kill-test"]
+        with pytest.raises(ProcessLookupError):
+            os.getpgid(proc.pid)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+
+
+def test_terminate_run_refuses_to_killpg_a_pid_the_registry_start_time_disowns(
+        agentctl, monkeypatch):
+    """Round-1 reviewer finding (non-blocking): `_terminate_run` trusted the
+    registry's pid enough to compute and `killpg` its group with no
+    recycling corroboration — the same guard `_run_process_gone` already
+    applies to a meta-recorded pid elsewhere (`cmd_status`,
+    `_died_without_finalizing`). `process_group=0` makes that omission
+    costlier here specifically: a live, UNRELATED process (this test's own
+    `decoy`, standing in for whatever the OS reused the registry's pid for)
+    whose registry-recorded start time doesn't match its real one must read
+    as already-gone and must never be killpg'd."""
+    import threading
+
+    decoy = subprocess.Popen(["sleep", "30"], process_group=0)
+    try:
+        monkeypatch.setattr(agentctl.R, "get_run",
+                            lambda rid: {"pid": decoy.pid,
+                                         "pid_started_at": "not a real start time"})
+        removed = []
+        monkeypatch.setattr(agentctl.R, "remove_run", lambda rid: removed.append(rid))
+        monkeypatch.setattr(agentctl, "_find_run_dir", lambda rid: None)
+
+        # If the fix regresses and `decoy` DOES get killpg'd, this reaps it
+        # the moment it dies — same reason as the sibling isolated-kill test:
+        # without it, a signaled-but-unreaped zombie this test still owns
+        # would make _terminate_run's own group-liveness poll misbehave
+        # rather than cleanly reporting the kill that shouldn't have happened.
+        reaper = threading.Thread(target=decoy.wait, daemon=True)
+        reaper.start()
+
+        rc = agentctl._terminate_run("run-recycled-pid-test", True)
+        reaper.join(timeout=5)
+
+        assert rc == 0
+        assert removed == ["run-recycled-pid-test"]
+        assert decoy.poll() is None, \
+            ("an unrelated live process was killpg'd off a recorded start "
+             "time that didn't match its real one")
+    finally:
+        decoy.kill()
+        decoy.wait()
+
+
+def test_terminate_run_signals_tool_session_holders_and_removes_the_scratch_dir(
+        agentctl, tmp_path, monkeypatch):
+    """CQ·138: `agentctl kill`'s `_terminate_run` must do what the in-process
+    finalize always did — sweep
+    this run's own tool-session holders AND remove its scratch directory —
+    from its own, separate invocation, which never reaches `_finalize_run` at
+    all. Exercises `_terminate_run`'s "already gone" branch (a decoy registry
+    pid with a mismatched start time, the same trick
+    `test_terminate_run_refuses_to_killpg_a_pid_the_registry_start_time_disowns`
+    uses, so no real `killpg` happens here at all) with a real zsh tool shell
+    holding this run's own marker open and backgrounded past its own exit.
+    Fails against b362c5d2 with an `AttributeError` on
+    `RS.create_tool_session_marker`."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    run_dir = tmp_path / "run-kill-toolsession"
+    run_dir.mkdir()
+    # `_terminate_run` writes `ended_at`/`outcome.json` on every path it takes,
+    # which needs a real meta.json to update — the existing kill tests avoid
+    # this by stubbing `_find_run_dir` to return None; this one needs a real
+    # `run_dir` for the tool-session record to live under.
+    agentctl.T.write_meta(run_dir, run_id="run-kill-toolsession", agent="reviewer",
+                          task="t", started_at="2026-10-13T00:00:00Z",
+                          repo="agent-platform", worktree=str(tmp_path / "wt"),
+                          profile="p", model="sonnet")
+    scratch_dir = tmp_path / "kill-toolsession-scratch"
+    scratch_dir.mkdir()
+    marker = agentctl.RS.create_tool_session_marker(scratch_dir)
+    agentctl._record_tool_session_marker(run_dir, marker)
+
+    cmd = f'exec 9>>{marker}; sleep 30 & disown'
+    holder_shell = subprocess.Popen([_ZSH, "-c", cmd], start_new_session=True)
+    holder_shell.wait(timeout=5)
+    holders = _wait_for_holder(agentctl, marker)
+    assert holders, "no process held this run's own marker open"
+    holder_pid = holders[0]
+
+    decoy = subprocess.Popen(["sleep", "30"])
+    try:
+        monkeypatch.setattr(agentctl.R, "get_run",
+                            lambda rid: {"pid": decoy.pid,
+                                         "pid_started_at": "not a real start time"})
+        monkeypatch.setattr(agentctl, "_find_run_dir", lambda rid: run_dir)
+        removed = []
+        monkeypatch.setattr(agentctl.R, "remove_run", lambda rid: removed.append(rid))
+
+        rc = agentctl._terminate_run("run-kill-toolsession", True)
+
+        assert rc == 0
+        assert removed == ["run-kill-toolsession"]
+        assert not _alive(holder_pid), \
+            "agentctl kill's own path left the tool-session holder alive"
+        assert not scratch_dir.exists(), \
+            "agentctl kill's own path never removed the scratch directory"
+    finally:
+        decoy.kill()
+        decoy.wait()
+        if _alive(holder_pid):
+            os.kill(holder_pid, signal.SIGKILL)
+
+
 # --- a skipped required check is not a passing one (2026-07-20) ---------------
 
 def test_review_status_fails_when_a_ready_pr_has_a_skipped_check(agentctl, monkeypatch, capsys):
@@ -14127,6 +15575,35 @@ def test_finalize_run_library_refusal_message_gives_a_working_repost_command(
     assert "unposted-review.md" in err
     assert "Re-dispatch" not in err
     assert "do not post it yourself" not in err
+
+
+def test_finalize_run_library_refusal_message_uses_the_registered_owner(
+        agentctl, tmp_path, monkeypatch, capsys):
+    """Before homebrew-tap's registry entry existed, this printed
+    `--repo convivy/homebrew-tap`, the wrong owner — review-post's own
+    refusal would then have rejected it as not the `owner/repo` GitHub holds."""
+    monkeypatch.setattr(agentctl, "_changed_files", lambda *a: ([], [], []))
+    monkeypatch.setattr(agentctl, "_gh_pr_json", lambda *a, **k: {"comments": []})
+    monkeypatch.setattr(agentctl, "RESCUE_DIGEST_INDEX", tmp_path / "rescued-review-digests")
+    rd, wt = _mk_review_run_dir(tmp_path, repo="homebrew-tap")
+
+    with (rd / "transcript.jsonl").open("a") as f:
+        f.write(json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": "tu1", "name": "Bash",
+                                     "input": {"command":
+                                         "agentctl review-post --pr 5 --verdict "
+                                         "REQUEST_CHANGES --agent reviewer "
+                                         "--body-file review.md --repo homebrew-tap"}}]},
+        }) + "\n")
+    with (rd / "detach.out.log").open("a") as f:
+        f.write(json.dumps({"type": "result", "result": "## Review\nFinding.\n"}) + "\n")
+    (rd / agentctl._LIBRARY_REFUSAL_MARKER_FILENAME).write_text(
+        json.dumps({"status": "error:422", "error": "at most 20 paths entries"}))
+
+    assert _finalize(agentctl, rd, wt, run_id="run-test") == "errored"
+    err = capsys.readouterr().err
+    assert "--repo convivybuilder/homebrew-tap" in err
 
 
 def test_finalize_run_library_refusal_command_reposts_for_real(
@@ -17285,6 +18762,22 @@ def test_api_retry_refused_under_a_no_fallback_marker(
     assert refusal and "no-fallback" in refusal
 
 
+def test_review_run_posted_stamp_uses_the_registered_owner_for_homebrew_tap(
+        agentctl, monkeypatch):
+    """Before homebrew-tap's registry entry existed, this called `gh pr view`
+    with `-R convivy/homebrew-tap`, the wrong owner."""
+    calls = []
+
+    def fake_gh_pr_json(pr, fields, repo=None):
+        calls.append(repo)
+        return {"comments": []}
+
+    monkeypatch.setattr(agentctl, "_gh_pr_json", fake_gh_pr_json)
+    assert agentctl._review_run_posted_stamp(
+        repo="homebrew-tap", pr="1", run_id="run-xyz") is False
+    assert calls == ["convivybuilder/homebrew-tap"]
+
+
 def test_api_retry_refused_when_the_reviewer_already_stamped(
         agentctl, tmp_path, monkeypatch):
     import telemetry as T
@@ -18993,6 +20486,13 @@ def test_primary_mutated_makes_wait_exit_failed(agentctl):
     assert "primary_mutated" in agentctl.WAIT_FAILURE_STATUSES
 
 
+def test_project_cap_refused_makes_wait_exit_failed(agentctl):
+    """E1·8: a dispatch the Library refused over the project ledger's soft/hard
+    cap never started, the same "never happened" shape as budget_refused and
+    capacity_refused — `agentctl wait` must not exit 0 on it."""
+    assert "project_cap_refused" in agentctl.WAIT_FAILURE_STATUSES
+
+
 def test_the_leak_report_attributes_it_to_this_run_when_the_worktree_echoes_it(
         agentctl, tmp_path, monkeypatch, capsys):
     """The concurrent-run problem, end to end. On a 20-worker night one real leak
@@ -19621,6 +21121,50 @@ def test_one_vanished_run_does_not_crash_the_report_for_the_batch(
     assert "run-gone002" in err
     assert "run-fine01" in out, "the healthy run in the batch must still report"
     assert "agentctl status run-gone002" in err, "and the detail line must name one"
+
+
+def test_wait_sweeps_a_vanished_runs_tool_session_holders_and_removes_its_scratch_dir(
+        agentctl, tmp_path, monkeypatch):
+    """CQ·138: the vanished-run branch `_wait_for_runs`
+    added (right where it prints `died-unfinalized`) is the only termination
+    path in this PR with no test of its own — `test_the_tool_session_scratch_dir_is_removed_once_the_run_is_finalized`
+    covers the in-process finalize, and
+    `test_terminate_run_signals_tool_session_holders_and_removes_the_scratch_dir`
+    covers `agentctl kill`'s own path; this is the third and last. Same real
+    zsh holder shell as both of those, on a run `_unfinalized_run` leaves with
+    no `outcome.json` and a dead pid, so `_wait_for_runs` confirms it vanished
+    and takes the `elif rid in vanished:` branch. Passes against 8b45d29a,
+    where the branch already sweeps and removes; it would fail with the
+    holder left alive and the scratch directory still present against any
+    version of that branch missing either call."""
+    assert _ZSH, "no zsh on PATH; the CI runner must install it"
+    import telemetry as T
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path)
+    run_dir = _unfinalized_run(agentctl, T, tmp_path, "run-vanish-ts1", pid=999999)
+    scratch_dir = tmp_path / "vanish-toolsession-scratch"
+    scratch_dir.mkdir()
+    marker = agentctl.RS.create_tool_session_marker(scratch_dir)
+    agentctl._record_tool_session_marker(run_dir, marker)
+
+    cmd = f'exec 9>>{marker}; sleep 30 & disown'
+    holder_shell = subprocess.Popen([_ZSH, "-c", cmd], start_new_session=True)
+    holder_shell.wait(timeout=5)
+    holders = _wait_for_holder(agentctl, marker)
+    assert holders, "no process held this run's own marker open"
+    holder_pid = holders[0]
+
+    try:
+        rc = agentctl._wait_for_runs(["run-vanish-ts1"], timeout=30, poll=0.01)
+
+        assert rc == agentctl.EXIT_RUN_FAILED
+        assert not _alive(holder_pid), (
+            "agentctl wait's vanished-run path left the tool-session holder alive")
+        assert not scratch_dir.exists(), (
+            "agentctl wait's vanished-run path never removed the scratch directory")
+    finally:
+        if _alive(holder_pid):
+            os.kill(holder_pid, signal.SIGKILL)
 
 
 def test_wait_survives_a_slow_finalize_when_the_dispatcher_is_still_alive(
@@ -23206,6 +24750,16 @@ def test_review_launch_cmd_builds_the_fixed_grammar(agentctl, tmp_path):
                    "--pr", "488", "--role", "security-reviewer", "--run-id", "run-xyz"]
 
 
+def test_review_launch_cmd_uses_the_registered_owner_for_homebrew_tap(agentctl, tmp_path):
+    """Before homebrew-tap's registry entry existed, this built
+    --repo convivy/homebrew-tap, the wrong owner."""
+    launcher = tmp_path / "review-launch"
+    cmd = agentctl._review_launch_cmd(launcher, repo="homebrew-tap", pr="1",
+                                      role="reviewer", run_id="run-xyz")
+    assert cmd == ["sudo", str(launcher), "--repo", "convivybuilder/homebrew-tap",
+                   "--pr", "1", "--role", "reviewer", "--run-id", "run-xyz"]
+
+
 class _PopenCaptured(BaseException):
     """Raised by the fake `subprocess.Popen` below instead of returning a
     real process, carrying what `_spawn_claude` was about to launch.
@@ -23243,7 +24797,7 @@ def _run_review_session_capturing_popen(agentctl, tmp_path, monkeypatch, *, pr):
     stub.write_text("#!/bin/sh\nexit 0\n")
     stub.chmod(0o755)
 
-    def _capture(cmd, cwd=None, stdout=None, stderr=None, env=None, stdin=None):
+    def _capture(cmd, cwd=None, stdout=None, stderr=None, env=None, stdin=None, **_kw):
         raise _PopenCaptured(cmd, env, cwd, stdin=stdin)
 
     monkeypatch.setattr(agentctl, "CLAUDE_BIN", str(stub))
@@ -23378,7 +24932,7 @@ def _run_eval_session_capturing_popen(agentctl, tmp_path, monkeypatch):
     scratch_dir = tmp_path / "eval-scratch" / "agentctl-eval-test"
     scratch_dir.mkdir(parents=True)
 
-    def _capture(cmd, cwd=None, stdout=None, stderr=None, env=None, stdin=None):
+    def _capture(cmd, cwd=None, stdout=None, stderr=None, env=None, stdin=None, **_kw):
         captured = _PopenCaptured(cmd, env, cwd, stdin=stdin)
         captured.scratch_dir = scratch_dir
         raise captured

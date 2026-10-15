@@ -23,13 +23,16 @@ ARCH-408/#240. This server is not one of them.)
 """
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -369,6 +372,19 @@ AGENTCTL = str(Path.home() / ".local" / "bin" / "agentctl")
 # authorization is "the caller holds the lease", it deleted another holder's
 # checked-out document under their name. So options come first, then `--`, then
 # only the values the caller named as documents.
+#
+# `kb_checkout`'s `owner` (CQ·96, issue_01M0YAS4S64P5TXN7S2C17GHF6) is the one
+# exception, and it is not a reopening of PR 537: that hole was a caller-
+# controlled DOCUMENT-LIST entry landing ahead of `--` and being parsed as the
+# option this server never defined. `owner` is its own typed keyword parameter,
+# always placed as its own `--holder <value>` argv pair ahead of `--`, never
+# built by interleaving a document string — so there is no position for a
+# caller's `id` or `also_delete` entry to be mistaken for it. The Library's own
+# contract (comment 5320 on the issue above) is also why this is safe to carry
+# through: `owner` is a coordination label, not an authorization principal —
+# the bearer token is what authorizes, so a caller naming itself something
+# else gains no access it did not already have, the same acceptance agentctl's
+# own `_kb_holder` already recorded for `--holder` (security review, PR 532).
 
 
 PERSON_REFUSAL = (
@@ -423,8 +439,254 @@ def _run_kb(*args: str) -> dict[str, Any]:
     return out
 
 
+# --- the Library's checkout (CQ·96, issue_01M0YAS4S64P5TXN7S2C17GHF6) -------
+#
+# The cage's lease (above) and the Library's checkout (`POST /reference/
+# documents/{id}/checkout`) are two different stores that must agree on ONE
+# holder identity, so that `kb apply` calling `POST /reference/admission` with
+# that identity (CQ·96 step 2(c), not built here) refuses nothing a live
+# caller is actually doing. Comment 5320 on the issue: the Library stores the
+# holder raw, requiring only a non-empty string, stripped and cut at 200
+# characters — so the value it RETURNS from a checkout can differ from what
+# was sent, and that returned value, not the input, is what every later call
+# (`kb apply --holder`, a check-in) must carry.
+
+
+def _session_holder() -> str:
+    """This session's one holder identity, mirroring `bin/agentctl`'s own
+    `_kb_holder()` default exactly (same env vars, same fallback order).
+    Duplicated rather than shelled out for: the Library call below never goes
+    through agentctl, so there is no agentctl process to ask, and the two
+    must still agree on the same string."""
+    run_id = os.environ.get("AGENTCTL_RUN_ID")
+    if run_id:
+        return run_id
+    for var in ("CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID"):
+        session_id = os.environ.get(var)
+        if session_id:
+            return f"session:{session_id}"
+    return f"session:{getpass.getuser()}"
+
+
+def _library_doc_id(source_ref: str) -> str | None:
+    """The Library's Reference Room id for an indexable `source_ref`, by the
+    one convention every row in the index follows (confirmed directly against
+    `~/.knowledge-index/index.db`: `id` is `source_ref` with the `projects/`
+    prefix and the `.md` suffix removed). `None` for anything `kb apply`'s own
+    `is_indexable_rel` would refuse anyway (a profile, a roster path outside
+    `projects/`) — the Reference Room never holds those, so there is nothing
+    to check out."""
+    if source_ref.startswith("projects/") and source_ref.endswith(".md"):
+        return source_ref[len("projects/"):-len(".md")]
+    return None
+
+
+def _library_doc_path(doc_id: str) -> str:
+    return "/reference/documents/" + urllib.parse.quote(doc_id, safe="/")
+
+
+class _LibraryUnreachable(Exception):
+    """The Library could not be reached, its credential could not be read, or
+    it answered something this server cannot parse as a JSON object."""
+
+
+_LIBRARY_TIMEOUT_S = 10
+
+
+def _library_request(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+    """One call to the Library's fixed default address (never
+    `LIBRARY_BASE_URL`-repointable, matching `bin/agentctl`'s own
+    `_library_get`/`_library_post`, which this mirrors).
+
+    Returns `(status, parsed body)` for anything the Library answered, 2xx or
+    not — a 409 checkout conflict is a routing signal to read, not a failure
+    here. Raises `_LibraryUnreachable` only when nothing usable came back at
+    all: unreadable credential, unreachable host, or an unparseable body.
+    """
+    import http.client
+    import urllib.error
+    import urllib.request
+    import issue_client as IC
+    import signal_client as SIGC
+    import vault_plane as VP
+    try:
+        tok = SIGC.TOKEN_FILE.read_text().strip()
+    except OSError as e:
+        raise _LibraryUnreachable(f"its credential is unreadable ({type(e).__name__})")
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(VP.fixed_library_url(path), data=data, method=method,
+                                 headers=VP.library_headers(token=tok, json_body=data is not None))
+    try:
+        with IC.pinned_opener().open(req, timeout=_LIBRARY_TIMEOUT_S) as resp:
+            raw = resp.read()
+        status = 200
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        status = e.code
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        raise _LibraryUnreachable(f"unreachable ({type(e).__name__})")
+    try:
+        parsed = json.loads(raw.decode("utf-8")) if raw else {}
+    except ValueError as e:
+        raise _LibraryUnreachable(f"answered with malformed JSON ({type(e).__name__})")
+    if not isinstance(parsed, dict):
+        raise _LibraryUnreachable("answered with a non-object")
+    return status, parsed
+
+
+def _has_parseable_holder(checkout: dict) -> bool:
+    """A Library checkout record is usable only when its `holder` is a
+    non-empty string. `holder_for_apply = checkout["holder"]` further down
+    would otherwise raise KeyError on a checkout the Library answered without
+    one — treated here as the Library answering something unparseable (the
+    same refusal as an unreachable Library), not a crash."""
+    return isinstance(checkout, dict) and isinstance(checkout.get("holder"), str) \
+        and bool(checkout["holder"])
+
+
+def _library_held_refusal(doc_id: str, held: dict) -> dict[str, Any]:
+    """The same shape agentctl's own lease conflict produces (error='leased',
+    exit_code 3), naming the holder and the expiry, for a Library checkout
+    held by someone else."""
+    other = held.get("holder", "another session")
+    until = held.get("expires_at")
+    return {"ok": False, "error": "leased", "exit_code": 3,
+            "stderr": f"{doc_id} is held by {other} until {until} in the Library's "
+                      f"checkout. Wait, or coordinate with that holder."}
+
+
+def _library_unreachable_refusal(detail: str) -> dict[str, Any]:
+    """Distinct from `_library_held_refusal`: a reader needs to know whether to
+    wait for a holder or to retry once the Library is back, and the two sent
+    an operator to different places."""
+    return {"ok": False, "error": "library-unreachable",
+            "stderr": f"the Library is unreachable ({detail}); nothing was written."}
+
+
+def _ensure_library_checkout(doc_id: str, holder: str) -> tuple[dict | None, bool, dict | None]:
+    """Make sure `holder` holds the Library's checkout on `doc_id`, taking one
+    only if nothing else already covers it.
+
+    Returns `(checkout, took_it, refusal)`:
+      - a live checkout already held by `holder` -> `(checkout, False, None)`,
+        reused rather than re-taken (`POST .../checkout` refuses a second
+        checkout unconditionally, same holder or not — confirmed against
+        `reference_checkout.take`, which raises `CheckoutConflict` on any
+        live row regardless of whose);
+      - none held, `holder` just took it -> `(checkout, True, None)`;
+      - a 404 (nothing in the Library's index names this id yet — its
+        checkout route 404s against the index before taking anything) ->
+        `(None, False, None)`: there is nothing here for another writer to
+        hold, so the caller writes with no Library checkout at all;
+      - held by someone else, or the Library unreachable -> `(None, False,
+        refusal)`, and nothing is written.
+    """
+    try:
+        status, body = _library_request("GET", _library_doc_path(doc_id) + "/checkout")
+    except _LibraryUnreachable as e:
+        return None, False, _library_unreachable_refusal(str(e))
+    if status == 404:
+        return None, False, None
+    if status != 200:
+        return None, False, _library_unreachable_refusal(
+            f"answered HTTP {status} for the checkout status of {doc_id}")
+    held = body.get("checkout")
+    if held is not None:
+        if not _has_parseable_holder(held):
+            return None, False, _library_unreachable_refusal(
+                f"answered a checkout for {doc_id} with no holder recorded")
+        if held["holder"] == holder:
+            return held, False, None
+        return None, False, _library_held_refusal(doc_id, held)
+    try:
+        status, body = _library_request("POST", _library_doc_path(doc_id) + "/checkout",
+                                        {"owner": holder})
+    except _LibraryUnreachable as e:
+        return None, False, _library_unreachable_refusal(str(e))
+    if status == 404:
+        return None, False, None
+    if status == 409:
+        return None, False, _library_held_refusal(doc_id, body.get("checkout") or {})
+    if status != 200:
+        return None, False, _library_unreachable_refusal(
+            f"answered HTTP {status} taking the checkout on {doc_id}")
+    taken = body.get("checkout")
+    if not _has_parseable_holder(taken):
+        return None, False, _library_unreachable_refusal(
+            f"answered taking the checkout on {doc_id} with no holder recorded")
+    return taken, True, None
+
+
+def _release_library_checkout(doc_id: str, holder: str) -> None:
+    """Hand the Library checkout back. Best-effort: this call only ever
+    releases a checkout THIS call took (never one the caller took with
+    `kb_checkout`, which stays theirs), and a release that fails leaves a
+    checkout that still expires on its own TTL — the write already landed or
+    was refused for its own reason either way, so this never turns that
+    outcome into a different one."""
+    try:
+        _library_request("POST", _library_doc_path(doc_id) + "/checkin", {"owner": holder})
+    except _LibraryUnreachable:
+        pass
+
+
+def _resolve_for_library(id: str, holder: str) -> tuple[str | None, dict | None]:
+    """The Library id for a write about to go through `kb apply`, or the
+    refusal from resolving it.
+
+    Goes through `agentctl kb checkout --sha-only` (CQ·96 step 1, #888) rather
+    than re-deriving a path from `id` here: that is the one place that already
+    turns an index id OR a repo-relative path into the canonical `source_ref`
+    and tells whether it currently exists on origin/main, and it takes no
+    agentctl lease. `None` doc id (document does not exist yet, or is not
+    something the Reference Room holds) is not an error — see
+    `_ensure_library_checkout`'s 404 case — so the second element is only
+    ever set on an actual failure to resolve or parse.
+    """
+    r = _run_kb("checkout", "--sha-only", "--holder", holder, "--", id)
+    if not r["ok"]:
+        return None, r
+    try:
+        payload = json.loads(r["stdout"])
+    except json.JSONDecodeError:
+        return None, {"ok": False, "error": "unparseable-cage-output"}
+    source_ref = payload.get("source_ref")
+    if payload.get("exists") and isinstance(source_ref, str):
+        return _library_doc_id(source_ref), None
+    return None, None
+
+
+def _leased_source_refs(holder: str) -> set[str]:
+    """Every `source_ref` `holder` already has an active agentctl lease on,
+    read via `agentctl kb leases --json` BEFORE `kb_checkout` takes its own
+    lease — this server has no direct access to the lease store, only to
+    agentctl's own subcommands. Lets a refusal downstream of that lease (the
+    Library's checkout held by someone else, or unreachable) tell a lease this
+    call just took from one the holder walked in with — the same distinction
+    `cmd_kb_checkout` makes with its own `held_before`, so that a refusal
+    releases only what it took.
+
+    An unreadable or unparseable leases list reads as 'nothing held before',
+    the safer default here: it means a refusal releases the lease this call
+    took, rather than risk leaving it stuck for its full 4-hour TTL against a
+    holder another caller may be waiting behind.
+    """
+    r = _run_kb("leases", "--json")
+    if not r["ok"]:
+        return set()
+    try:
+        leases = json.loads(r["stdout"])
+    except json.JSONDecodeError:
+        return set()
+    if not isinstance(leases, list):
+        return set()
+    return {lease["source_ref"] for lease in leases
+            if isinstance(lease, dict) and lease.get("holder") == holder
+            and isinstance(lease.get("source_ref"), str)}
+
+
 @mcp.tool()
-def kb_checkout(id: str, note: str | None = None) -> dict[str, Any]:
+def kb_checkout(id: str, note: str | None = None, owner: str | None = None) -> dict[str, Any]:
     """Lease a doc for editing and read it back with the sha to write against.
 
     The lease stops two sessions doing work that will be thrown away; it does NOT
@@ -432,33 +694,102 @@ def kb_checkout(id: str, note: str | None = None) -> dict[str, Any]:
     that — pass it to kb_update/kb_create as `base_sha` and the write is refused
     if main moved underneath you.
 
+    This also takes the Library's own checkout on the document (CQ·96,
+    issue_01M0YAS4S64P5TXN7S2C17GHF6), under the SAME holder identity as the
+    lease above and as every `KB-Write` commit trailer — one coordination
+    label, consistently, across both stores. A document the index has never
+    indexed (e.g. a brand-new one `kb_create` will create) has nothing in the
+    Library to check out; this proceeds with the lease alone, since there is
+    nothing there for another writer to hold either.
+
     Args:
         id: doc id ('shared/agents/architect'), or a repo-relative path: a .md
             doc, or a .yaml profile under projects/<project>/profiles/ (which
             only kb_propose can then change).
         note: what you intend to change; shown to whoever hits the conflict.
+        owner: the holder identity to record, in place of this session's own.
+            Recorded EXACTLY as given — never silently replaced — in both the
+            lease and the Library's checkout. Per the Library's own contract,
+            this is a coordination label, not an authorization principal: the
+            bearer token is what authorizes, so naming yourself something else
+            gains no access you did not already have.
 
     Returns:
-        {ok, source_ref, exists, content, content_sha, lease} on success.
-        On conflict, error='leased' with the holder and expiry in stderr — wait
-        or coordinate rather than retrying, because the lease is someone's live
-        editing pass.
+        {ok, source_ref, exists, content, content_sha, lease} on success, plus
+        `library_checkout` (the Library's own record, or `None` when nothing
+        there holds this document yet). On conflict, error='leased' with the
+        holder and expiry in stderr — wait or coordinate rather than retrying,
+        because the lease or checkout is someone's live editing pass. A
+        Library that cannot be reached refuses as error='library-unreachable'
+        instead. Either refusal releases the agentctl lease THIS CALL took, so
+        the refusal leaves nothing new held; a lease you already held on the
+        doc before calling is yours from before and is left alone.
     """
-    args = ["checkout"] + (["--note", note] if note else []) + ["--", id]
+    holder = owner if owner else _session_holder()
+    pre_existing_leases = _leased_source_refs(holder)
+    args = ["checkout", "--holder", holder] + (["--note", note] if note else []) + ["--", id]
     r = _run_kb(*args)
-    if r["ok"]:
-        try:
-            r.update(json.loads(r.pop("stdout")))
-        except json.JSONDecodeError:
-            r["ok"] = False
-            r["error"] = "unparseable-cage-output"
+    if not r["ok"]:
+        return r
+    try:
+        r.update(json.loads(r.pop("stdout")))
+    except json.JSONDecodeError:
+        r["ok"] = False
+        r["error"] = "unparseable-cage-output"
+        return r
+    source_ref = r.get("source_ref")
+    doc_id = _library_doc_id(source_ref) if (r.get("exists") and isinstance(source_ref, str)) else None
+    r["library_checkout"] = None
+    if doc_id:
+        checkout, _took_it, refusal = _ensure_library_checkout(doc_id, holder)
+        if refusal:
+            if source_ref not in pre_existing_leases:
+                _run_kb("release", "--holder", holder, "--", id)
+            return refusal
+        r["library_checkout"] = checkout
     return r
+
+
+def _apply_through_library(id: str, build_args, owner: str | None = None) -> dict[str, Any]:
+    """Run `kb apply`, taking or reusing the Library's checkout first under
+    ONE holder identity, and releasing it afterward only when this call is
+    the one that took it — a checkout the caller already holds (from its own
+    `kb_checkout`) stays theirs.
+
+    `owner`, when given, MUST be the same value the caller passed to its own
+    `kb_checkout` — the agentctl lease and the Library checkout that call took
+    are recorded under that value, not this session's own, so a write here
+    under any other holder finds both held by someone else and is refused as
+    `leased`, even though the caller is the one who checked the doc out.
+
+    `build_args(holder)` builds the `kb apply` argv (everything after
+    `apply`, before `--`), called with the holder value the Library checkout
+    RETURNED, never `owner` or this session's input (comment 5320: the
+    Library strips and clips, so the two can differ) — or `owner` (or this
+    session's own holder) when there was nothing in the Reference Room to
+    check out (a brand-new document, or a path it does not hold).
+    """
+    holder = owner if owner else _session_holder()
+    doc_id, err = _resolve_for_library(id, holder)
+    if err:
+        return err
+    took_it = False
+    holder_for_apply = holder
+    if doc_id:
+        checkout, took_it, refusal = _ensure_library_checkout(doc_id, holder)
+        if refusal:
+            return refusal
+        holder_for_apply = checkout["holder"]
+    result = _run_kb(*build_args(holder_for_apply), "--", id)
+    if took_it:
+        _release_library_checkout(doc_id, holder_for_apply)
+    return result
 
 
 @mcp.tool()
 def kb_update(id: str, base_sha: str, provenance: str,
               edits: list[dict] | None = None, content: str | None = None,
-              message: str | None = None) -> dict[str, Any]:
+              message: str | None = None, owner: str | None = None) -> dict[str, Any]:
     """Edit an existing doc, writing straight to main when policy allows it.
 
     Give EITHER `edits` (a list of {old, new} exact anchors, each of which must
@@ -471,8 +802,11 @@ def kb_update(id: str, base_sha: str, provenance: str,
     what stops two sessions' edits from silently overwriting one another.
 
     The write is refused with error='leased' while ANOTHER holder has a live
-    lease on the doc, and stderr names the holder and its expiry. Check the doc
-    out first; that is where `base_sha` comes from anyway.
+    lease OR Library checkout on the doc, and stderr names the holder and its
+    expiry. Check the doc out first; that is where `base_sha` comes from
+    anyway, and it takes the Library's checkout too. A Library that cannot be
+    reached refuses as error='library-unreachable' instead, and nothing is
+    written either way.
 
     `provenance` says on what authority this is written:
       in-session     a decision the operator states in this session — not a
@@ -491,44 +825,66 @@ def kb_update(id: str, base_sha: str, provenance: str,
     Any `agents/` path (the roster) and any `profiles/` path are refused
     under EVERY provenance; they take kb_propose. A bad commit there breaks agent
     dispatch platform-wide, so that rule has no exceptions.
+
+    Args (beyond the above):
+        owner: the holder identity to write under, in place of this session's
+            own. Pass the SAME value you passed to kb_checkout's own `owner`
+            when you checked this doc out under one — otherwise the agentctl
+            lease and Library checkout that call took are held by that value,
+            not this call's, and this write is refused as `leased` against
+            its own caller's checkout.
     """
     if (refused := _refuse_person(provenance)):
         return refused
-    args = ["apply", "--base-sha", base_sha, "--provenance", provenance]
-    if edits is not None:
-        args += ["--edits", json.dumps(edits)]
-    if content is not None:
-        args += ["--content", content, "--allow-overwrite"]
-    if message:
-        args += ["--message", message]
-    return _run_kb(*args, "--", id)
+
+    def _args(holder: str) -> list[str]:
+        args = ["apply", "--base-sha", base_sha, "--provenance", provenance,
+                "--holder", holder]
+        if edits is not None:
+            args += ["--edits", json.dumps(edits)]
+        if content is not None:
+            args += ["--content", content, "--allow-overwrite"]
+        if message:
+            args += ["--message", message]
+        return args
+
+    return _apply_through_library(id, _args, owner=owner)
 
 
 @mcp.tool()
 def kb_create(id: str, content: str, provenance: str,
-              message: str | None = None) -> dict[str, Any]:
+              message: str | None = None, owner: str | None = None) -> dict[str, Any]:
     """Create a doc that does not exist yet.
 
     Same policy as kb_update, including that provenance `person` is refused: a
     person's route is the Orient editor. The base-sha precondition is the sha of the empty
     string, so a doc that turns out to already exist is refused as stale rather
     than silently overwritten — creating over someone else's doc is exactly the
-    lost update the precondition exists to stop.
+    lost update the precondition exists to stop. An ordinary new document has
+    nothing in the Reference Room to check out yet; this proceeds straight to
+    the write in that case, the same as `kb_checkout` does.
 
     Args:
         id: repo-relative path, e.g. 'projects/vivy/decisions/0069-thing.md'.
         content: the full document, frontmatter included. It must satisfy the
             repo's own validate.py — the cage runs it before committing and
             refuses with error='invalid' rather than reddening knowledge CI.
+        owner: the holder identity to write under, in place of this session's
+            own. Pass the SAME value you passed to kb_checkout's own `owner`
+            when you checked this path out under one.
     """
     if (refused := _refuse_person(provenance)):
         return refused
     empty_sha = hashlib.sha256(b"").hexdigest()
-    args = ["apply", "--base-sha", empty_sha,
-            "--provenance", provenance, "--content", content]
-    if message:
-        args += ["--message", message]
-    return _run_kb(*args, "--", id)
+
+    def _args(holder: str) -> list[str]:
+        args = ["apply", "--base-sha", empty_sha, "--provenance", provenance,
+                "--content", content, "--holder", holder]
+        if message:
+            args += ["--message", message]
+        return args
+
+    return _apply_through_library(id, _args, owner=owner)
 
 
 @mcp.tool()
@@ -614,15 +970,62 @@ def kb_merge(pr: int, dry_run: bool = False) -> dict[str, Any]:
     return _run_kb("merge", "--pr", str(int(pr)), *(["--dry-run"] if dry_run else []))
 
 
+def _checkin_library_checkout_if_held(id: str, holder: str) -> dict[str, Any]:
+    """The Library-checkout half of kb_release: check the Library's checkout
+    on `id` back in when `holder` holds it — the twin of what `kb_checkout`
+    takes, so a checkout-then-release round trip does not leave the Library's
+    side held until its own TTL, blocking every other writer.
+
+    Best-effort and never raises: a Library-side failure here must not undo
+    the agentctl release that runs alongside it, so this returns a small
+    report rather than a refusal.
+    """
+    doc_id, err = _resolve_for_library(id, holder)
+    if err:
+        return {"released": False, "reason": "could-not-resolve", "detail": err}
+    if not doc_id:
+        return {"released": False, "reason": "not-in-the-library"}
+    try:
+        status, body = _library_request("GET", _library_doc_path(doc_id) + "/checkout")
+    except _LibraryUnreachable as e:
+        return {"released": False, "reason": "library-unreachable", "detail": str(e)}
+    if status == 404:
+        return {"released": False, "reason": "not-in-the-library"}
+    if status != 200:
+        return {"released": False, "reason": "library-unreachable",
+                "detail": f"answered HTTP {status}"}
+    held = body.get("checkout")
+    if not _has_parseable_holder(held) or held["holder"] != holder:
+        return {"released": False, "reason": "not-held-by-this-holder"}
+    _release_library_checkout(doc_id, holder)
+    return {"released": True}
+
+
 @mcp.tool()
-def kb_release(id: str) -> dict[str, Any]:
+def kb_release(id: str, owner: str | None = None) -> dict[str, Any]:
     """Drop a lease you hold, before its 4-hour expiry.
 
     Session-end hygiene. The TTL is the backstop that stops a dead session
     holding a doc forever; this is the polite path that frees it immediately.
     Releasing a lease you do not hold is reported, not an error.
+
+    Also checks the Library's own checkout on the doc back in (CQ·96,
+    issue_01M0YAS4S64P5TXN7S2C17GHF6) when THIS holder holds it — the twin of
+    what kb_checkout takes, so a checkout-then-release round trip does not
+    leave the Library's side held until its own TTL. Reported under
+    `library_release` in the result; a Library that cannot be reached is
+    reported there too, without failing the agentctl release above.
+
+    Args:
+        owner: the holder identity to release under, in place of this
+            session's own. Pass the SAME value you passed to kb_checkout's
+            own `owner` when you checked this document out under one.
     """
-    return _run_kb("release", "--", id)
+    holder = owner if owner else _session_holder()
+    library_release = _checkin_library_checkout_if_held(id, holder)
+    result = _run_kb("release", "--holder", holder, "--", id)
+    result["library_release"] = library_release
+    return result
 
 
 @mcp.tool()

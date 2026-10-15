@@ -88,11 +88,14 @@ jobs:
       # to the list as well as to the code.
       installer_tests: ${{ steps.filter.outputs.installer_tests }}
       # Whether this PR touches the Individuator's Swift package
-      # (CQ·447) or this workflow file itself. Same fail-safe polarity as
-      # `code` and `installer_tests` above: starts true, flips to false
-      # only after positively proving no changed path matches, so an API
-      # failure or a truncated page still runs the `swift` job rather than
-      # silently skipping it.
+      # (CQ·447), this workflow file itself, bin/install-individuator (which
+      # stages that package for a real build and needs the `swift` job's
+      # `swift` to validate it — tests/bash/check_install_individuator_stage.sh),
+      # or that check script itself. Same fail-safe polarity as `code` and
+      # `installer_tests` above: starts true, flips to false only after
+      # positively proving no changed path matches, so an API failure or a
+      # truncated page still runs the `swift` job rather than silently
+      # skipping it.
       individuator: ${{ steps.filter.outputs.individuator }}
       # Whether a `push` to main is a merge commit whose tree already passed,
       # as a PR head, the same two check-runs this workflow is about to run
@@ -180,8 +183,12 @@ jobs:
 
                 # individuator: same counting discipline as `code` above.
                 # `.github/workflows/` is included so an edit to this
-                # workflow's own `swift` job still runs it.
-                hit=$(printf '%s\n' "$files" | grep -cE '^individuator/|^\.github/workflows/' || true)
+                # workflow's own `swift` job still runs it. bin/install-individuator
+                # and its own check script are included so a change to either
+                # still runs the `swift` job that validates them
+                # (tests/bash/check_install_individuator_stage.sh needs `swift`,
+                # which only that job has).
+                hit=$(printf '%s\n' "$files" | grep -cE '^individuator/|^\.github/workflows/|^bin/install-individuator$|^tests/bash/check_install_individuator_stage\.sh$' || true)
                 if [ "${hit:-1}" -eq 0 ]; then
                   individuator=false
                 fi
@@ -309,6 +316,21 @@ jobs:
             ln -sf "$npx_path" /usr/local/bin/npx
           else
             sudo ln -sf "$npx_path" /usr/local/bin/npx
+          fi
+      # CQ·138 round 1's tool-session tests drive a real `/bin/zsh -c` (the
+      # same invocation Claude Code's own Bash tool makes) with a real
+      # ZDOTDIR, so they need an actual zsh on this runner, not a stand-in.
+      # The Linux runner's image has none. Same root-vs-sudo split as the npx
+      # step above; apt-get is this image's package manager (see that step's
+      # own comment on how the two differ here).
+      - name: install zsh (for the real /bin/zsh tool-session tests)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update && apt-get install -y zsh
+          else
+            sudo apt-get update && sudo apt-get install -y zsh
           fi
       - if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
         run: pip install -r requirements-dev.txt
@@ -472,6 +494,18 @@ jobs:
         if: needs.changes.outputs.tree_skip == 'true'
         run: |
           echo "Skipped: merge commit ${{ github.sha }} has the same tree as PR #${{ needs.changes.outputs.skip_pr }} head ${{ needs.changes.outputs.skip_head }}, whose run ${{ needs.changes.outputs.skip_run_url }} passed." >> "$GITHUB_STEP_SUMMARY"
+      - name: install-individuator builds its two products
+        # Runs bin/install-individuator's own real archive-and-extract step,
+        # then --build-only, which calls the installer's own
+        # build_release_binaries function to build the two installed products
+        # (one `swift build -c release --product <p>` per product) — the gap
+        # tests/bash/test_install_individuator.sh leaves, since that one
+        # always runs with --skip-build. This is the only job with a real
+        # `swift` on PATH, which is why the check lives here rather than in
+        # tests/bash/run.sh (see tests/bash/check_install_individuator_stage.sh's
+        # own header).
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.individuator == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: /bin/bash tests/bash/check_install_individuator_stage.sh
       - name: set up Python (for the mTLS integration test's Python harness)
         id: setup-python
         if: (github.event_name != 'pull_request' || needs.changes.outputs.individuator == 'true') && needs.changes.outputs.tree_skip != 'true'

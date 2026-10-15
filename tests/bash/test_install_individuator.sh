@@ -104,11 +104,20 @@ socket_dir=$(mktemp -d)/individuator-daemon
 STUB_LOG=$(mktemp)
 export STUB_LOG
 
+# A --root-ca source the test controls directly: an operator-writable path
+# (standing in for the real one, typically under the operator's own home),
+# so a test can tell the written config apart from a config that still
+# names this path as-is (the defect) rather than the root-owned copy.
+root_ca_dir=$(mktemp -d)
+root_ca_src="$root_ca_dir/library-root.pem"
+echo "fixture library root CA (synthetic; not a real certificate) v1" > "$root_ca_src"
+root_ca_copy="$(dirname "$config_path")/root-ca.pem"
+
 run_installer() {
     PATH="$sudo_dir:$PATH" sudo "$INSTALLER" \
         --repo="$repo" --skip-build --build-dir="$stub_dir" \
         --bosun-host=bosun-test --bosun-address=127.0.0.1:8710 \
-        --root-ca=/tmp/library-root.pem --operator-uid=501 \
+        --root-ca="$root_ca_src" --operator-uid=501 \
         --machine-name=test-machine-1 \
         --key-dir="$key_dir" --install-dir="$install_dir" \
         --config-path="$config_path" --launch-daemons-dir="$launchd_dir" \
@@ -124,6 +133,8 @@ out2=$(run_installer); rc2=$?
 assert_rc 0 "$rc2" "a second run installs cleanly too"
 assert_contains "$out2" "already present" \
     "a second run announces the existing key rather than silently skipping it"
+assert_contains "$out2" "Root CA unchanged" \
+    "a second run with the same --root-ca source leaves the copy as-is and says so"
 
 keygen_calls=$(grep -c '^keygen' "$STUB_LOG")
 assert_eq "1" "$keygen_calls" \
@@ -133,10 +144,24 @@ assert_contains "$(cat "$config_path")" '"bosun_host": "bosun-test"' \
     "--bosun-host reaches the written config"
 assert_contains "$(cat "$config_path")" '"bosun_address": "127.0.0.1:8710"' \
     "--bosun-address reaches the written config"
-assert_contains "$(cat "$config_path")" '"root_ca_path": "/tmp/library-root.pem"' \
-    "--root-ca reaches the written config"
+assert_contains "$(cat "$config_path")" "\"root_ca_path\": \"$root_ca_copy\"" \
+    "root_ca_path in the config names the root-owned copy, not --root-ca's own path"
 assert_contains "$(cat "$config_path")" '"operator_uid": 501' \
     "--operator-uid reaches the written config"
+
+case "$(cat "$config_path")" in
+    *"$root_ca_src"*) root_ca_src_leaked="yes" ;;
+    *) root_ca_src_leaked="no" ;;
+esac
+assert_eq "no" "$root_ca_src_leaked" \
+    "the config never names the operator-writable --root-ca path directly"
+
+assert_eq "present" "$([ -f "$root_ca_copy" ] && echo present || echo missing)" \
+    "--root-ca was copied beside the config"
+assert_contains "$(cat "$root_ca_copy" 2>/dev/null)" "v1" \
+    "and the copy's content matches the source"
+assert_eq "644" "$(stat -f '%Lp' "$root_ca_copy")" \
+    "the copy is mode 0644"
 
 assert_contains "$(cat "$STUB_LOG")" "self-test --key-dir $key_dir" \
     "--key-dir reaches the self-test call"
@@ -156,7 +181,17 @@ assert_eq "present" "$([ -d "$socket_dir" ] && echo present || echo missing)" \
 assert_eq "755" "$(stat -f '%Lp' "$socket_dir")" \
     "the socket directory is mode 0755, matching DaemonSocketDirectory.mode"
 
+echo "== a changed --root-ca source is recopied, and the run says so =="
+echo "fixture library root CA (synthetic; not a real certificate) v2" > "$root_ca_src"
+out3=$(run_installer); rc3=$?
+assert_rc 0 "$rc3" "a third run, with a changed --root-ca source, installs cleanly"
+assert_contains "$out3" "Root CA copied" \
+    "a changed --root-ca source is recopied and the run says so"
+assert_contains "$(cat "$root_ca_copy" 2>/dev/null)" "v2" \
+    "the copy picks up the changed source"
+
 rm -rf "$repo" "$stub_dir" "$sudo_dir" "$(dirname "$key_dir")" "$(dirname "$install_dir")" \
-    "$(dirname "$config_path")" "$(dirname "$launchd_dir")" "$(dirname "$socket_dir")" "$STUB_LOG"
+    "$(dirname "$config_path")" "$(dirname "$launchd_dir")" "$(dirname "$socket_dir")" \
+    "$root_ca_dir" "$STUB_LOG"
 
 finish

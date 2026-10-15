@@ -45,6 +45,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import plistlib
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,8 @@ import pytest
 import projects
 
 FIX = Path(__file__).resolve().parent / "fixtures" / "pr_state_capture" / "pulls.json"
+PLIST = (Path(__file__).resolve().parent.parent / "launchd"
+         / "com.convivy.pr-state-capture.plist")
 
 
 @pytest.fixture(autouse=True)
@@ -142,6 +145,52 @@ def test_repos_to_capture_excludes_private_projects(pr_state_capture, synthetic_
     repos = pr_state_capture.repos_to_capture()
     assert "convivy/public-x" in repos
     assert "convivy/private-a" not in repos
+
+
+@pytest.fixture
+def synthetic_registry_with_a_non_convivy_owner(tmp_path, monkeypatch):
+    """A project with one plain repo and one repo pinned to a non-`convivy`
+    GitHub owner via `repo_owners` — the shape `config/projects.json` uses
+    for Shipwright's homebrew-tap (under `convivybuilder`), isolated from
+    today's real registry so this test does not depend on that entry
+    staying as it is."""
+    registry = {
+        "shipyard": {"class": "project", "display": "Shipyard", "owner": "convivy",
+                    "home_dir": "<root>/shipyard", "dirs": [], "crew": "shipyard",
+                    "lifecycle": "active", "products": [], "kb": "local",
+                    "repos": ["shipyard", "shipyard-tap"], "aliases": [],
+                    "repo_owners": {"shipyard-tap": "shipyard-builder"}},
+    }
+    p = tmp_path / "synthetic-projects.json"
+    p.write_text(json.dumps(registry))
+    monkeypatch.setattr(projects, "PROJECTS_JSON", p)
+    projects._load_raw.cache_clear()
+    yield
+    projects._load_raw.cache_clear()
+
+
+def test_repos_to_capture_resolves_a_repo_under_its_own_registered_owner(
+        pr_state_capture, synthetic_registry_with_a_non_convivy_owner):
+    """A repo named in a project's `repo_owners` resolves to THAT owner, not
+    `convivy` — this is the fix: `repos_to_capture` used to build every slug
+    as `f"convivy/{r}"` regardless of `repo_owners`, which is how
+    convivy/homebrew-tap (never on GitHub) replaced the real
+    convivybuilder/homebrew-tap."""
+    repos = pr_state_capture.repos_to_capture()
+    assert "shipyard-builder/shipyard-tap" in repos
+    assert "convivy/shipyard-tap" not in repos
+
+
+def test_repos_to_capture_keeps_an_unowned_repo_s_slug_and_state_key_unchanged(
+        pr_state_capture, synthetic_registry_with_a_non_convivy_owner):
+    """A repo with no `repo_owners`/`github_owner` override still resolves to
+    `convivy/<repo>`, exactly the slug the old hardcoded `f"{OWNER}/{r}"`
+    gave it, so a delivered-state record written under that filename before
+    this change still matches — `_state_path` keys on the slug and is
+    otherwise untouched by this change."""
+    repos = pr_state_capture.repos_to_capture()
+    assert "convivy/shipyard" in repos
+    assert pr_state_capture._state_path("convivy/shipyard").name == "convivy__shipyard.json"
 
 
 # --- list_pulls(): the GET, its query params, and pagination --------------------
@@ -814,7 +863,7 @@ def test_main_uses_its_own_credential_and_never_sends_the_shared_token(
     monkeypatch.setattr(sc, "token", lambda: "shared-secret")
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565})
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
     monkeypatch.setattr(pr_state_capture, "repos_to_capture",
@@ -848,7 +897,7 @@ def test_main_falls_back_to_the_shared_token_with_a_warning_when_its_own_is_abse
     monkeypatch.setattr(sc, "token", lambda: "shared-secret")
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565})
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
     monkeypatch.setattr(pr_state_capture, "repos_to_capture",
@@ -950,7 +999,7 @@ def _wire_429_main(pr_state_capture, monkeypatch, *, repos, pulls_by_repo, urlop
     monkeypatch.setattr(sc, "token", lambda: "t")
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565})
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
     monkeypatch.setattr(pr_state_capture, "repos_to_capture", lambda: repos)
@@ -1113,7 +1162,7 @@ def test_the_installation_token_is_minted_read_only(pr_state_capture, monkeypatc
     mints is scoped to read alone, so a bug here would be refused by GitHub."""
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565})
     calls = []
 
@@ -1122,7 +1171,9 @@ def test_the_installation_token_is_minted_read_only(pr_state_capture, monkeypatc
         return "ghs_readonly"
 
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", fake_installation_token)
-    monkeypatch.setattr(pr_state_capture, "repos_to_capture", lambda: [])
+    monkeypatch.setattr(pr_state_capture, "repos_to_capture",
+                        lambda: ["convivy/agent-platform"])
+    monkeypatch.setattr(pr_state_capture, "list_pulls", lambda repo, token, **k: [])
     monkeypatch.setattr(pr_state_capture.sys, "argv", ["pr-state-capture"])
     rc = pr_state_capture.main()
     assert rc == 0
@@ -1137,7 +1188,7 @@ def test_main_captures_every_repo_and_reports_delivery_failures(pr_state_capture
     monkeypatch.setattr(pr_state_capture, "SC", store)
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565})
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
     monkeypatch.setattr(pr_state_capture, "repos_to_capture",
@@ -1167,7 +1218,7 @@ def test_main_reports_a_repo_it_could_not_read_but_continues(pr_state_capture, m
     monkeypatch.setattr(pr_state_capture, "SC", store)
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565})
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
     monkeypatch.setattr(pr_state_capture, "repos_to_capture",
@@ -1196,7 +1247,7 @@ def _wire_main(pr_state_capture, monkeypatch, *, selection, repos, present=None,
     monkeypatch.setattr(pr_state_capture, "SC", store)
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565,
                                                  "repository_selection": selection})
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
@@ -1381,7 +1432,7 @@ def _wire_single_repo_main(pr_state_capture, monkeypatch, store, pulls, *,
     monkeypatch.setattr(pr_state_capture, "SC", store)
     monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
-    monkeypatch.setattr(pr_state_capture.GA, "single_installation",
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
                         lambda jwt, owner, **k: {"id": 155330565})
     monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
     monkeypatch.setattr(pr_state_capture, "repos_to_capture", lambda: [repo])
@@ -1503,3 +1554,217 @@ def test_save_delivered_is_called_once_per_repo_not_once_per_pr(pr_state_capture
     monkeypatch.setattr(pr_state_capture, "save_delivered", counting_save)
     assert pr_state_capture.main() == 0
     assert writes == ["convivy/agent-platform"]  # one write, not four
+
+
+def test_main_resolves_the_convivy_bosun_apps_own_installation_with_two_installed(
+        pr_state_capture, monkeypatch):
+    """The App's installation listing carries TWO installations (`convivy`
+    and `convivybuilder`, once installed for homebrew-tap, PR #884) —
+    `GA.single_installation`'s "exactly one installation total" count would
+    refuse this with "count: the App has 2 installations, not exactly one"
+    and `main()` would return 1. `GA.installation_for_owner` asks GitHub for
+    `convivy`'s installation directly and never lists installations at all,
+    so `main()` still reaches 0. `GA.request` is the real function; only the
+    wire underneath it is faked, so this exercises the actual per-owner
+    HTTP lookup, not a stand-in for it."""
+    monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
+    monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
+    monkeypatch.setattr(pr_state_capture.GA, "installation_token", lambda *a, **k: "ghs_x")
+    monkeypatch.setattr(pr_state_capture, "repos_to_capture",
+                        lambda: ["convivy/agent-platform"])
+    seen = []
+
+    def fake_request(method, url, bearer, body, opener=None):
+        seen.append(url)
+        if url.endswith("/app/installations?per_page=100"):
+            return 200, [{"id": 1, "account": {"login": "convivy"}},
+                        {"id": 2, "account": {"login": "convivybuilder"}}]
+        if url.endswith("/orgs/convivy/installation"):
+            return 200, {"id": 1, "account": {"login": "convivy"}}
+        if "/repos/convivy/agent-platform/pulls" in url:
+            return 200, []
+        raise AssertionError(f"unexpected request to {url}")
+
+    monkeypatch.setattr(pr_state_capture.GA, "request", fake_request)
+    monkeypatch.setattr(pr_state_capture.sys, "argv", ["pr-state-capture"])
+
+    rc = pr_state_capture.main()
+
+    assert rc == 0, "resolving convivy's own installation must succeed with two installed"
+    assert any(u.endswith("/orgs/convivy/installation") for u in seen)
+    assert not any("/app/installations" in u for u in seen), (
+        "installation_for_owner must never list installations to find its own")
+
+
+# --- main(): each owner's repos read under its own installation and token -----
+# (CQ-479, issue_01M4VM4H1KYNA5BKCRM6H0VY7B) — homebrew-tap is registered
+# under the convivybuilder GitHub owner, a separate convivy-bosun App
+# installation from convivy's, so a pass covering both owners must resolve
+# and mint a token for each rather than reusing one for every repo.
+
+
+def _wire_multi_owner_main(pr_state_capture, monkeypatch, *, repos, installations,
+                           pulls_by_repo):
+    """Wiring for a pass spanning more than one GitHub owner. `installations`
+    maps owner -> the installation dict `GA.installation_for_owner` would
+    return for it, OR an `Exception` instance for a test that wants that
+    owner's lookup to raise it (a real failure, e.g. a non-404). An owner
+    missing from the map raises `GA.NotInstalled` naming that owner, as
+    GitHub's own double-404 does for an owner the App is not installed on
+    (operator's decision, 2026-10-15 — see the script's module docstring).
+    Each owner's installation id gets its OWN minted token
+    (`f"token-for-{inst_id}"`), so a test can tell which owner's token a
+    given `list_pulls` call actually carried. `pulls_by_repo` may likewise
+    map a repo to an `Exception` instance for a test that wants that repo's
+    `list_pulls` call to fail."""
+    store = _FakeStore()
+    monkeypatch.setattr(pr_state_capture, "SC", store)
+    monkeypatch.setattr(pr_state_capture.GA, "key_problem", lambda *a, **k: None)
+    monkeypatch.setattr(pr_state_capture.GA, "app_jwt", lambda *a, **k: "jwt.x.y")
+
+    def fake_installation_for_owner(jwt, owner, **k):
+        if owner not in installations:
+            raise pr_state_capture.GA.NotInstalled(
+                f"the convivy-bosun App is not installed on {owner!r}")
+        val = installations[owner]
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    monkeypatch.setattr(pr_state_capture.GA, "installation_for_owner",
+                        fake_installation_for_owner)
+    monkeypatch.setattr(pr_state_capture.GA, "installation_token",
+                        lambda jwt, inst_id, **k: f"token-for-{inst_id}")
+    monkeypatch.setattr(pr_state_capture, "repos_to_capture", lambda: repos)
+
+    read_with_token: dict[str, str] = {}
+
+    def fake_list_pulls(repo, token, **k):
+        read_with_token[repo] = token
+        val = pulls_by_repo[repo]
+        if isinstance(val, Exception):
+            raise val
+        return val
+
+    monkeypatch.setattr(pr_state_capture, "list_pulls", fake_list_pulls)
+    monkeypatch.setattr(pr_state_capture.sys, "argv", ["pr-state-capture"])
+    return store, read_with_token
+
+
+def test_main_reads_each_owner_s_repos_under_its_own_installation_and_token(
+        pr_state_capture, monkeypatch):
+    """convivy/agent-platform and convivybuilder/homebrew-tap in one pass:
+    each is read with ITS OWN owner's installation token (111's for the
+    first, 222's for the second — two different tokens), and both repos'
+    rows are emitted. Red against origin/main on the token-inequality
+    assertion below: the old `main()` resolves only the hardcoded
+    `OWNER = "convivy"` installation once and hands that SAME token to
+    every repo `repos_to_capture()` returns, so the two tokens recorded
+    here would come back equal rather than per-owner."""
+    store, read_with_token = _wire_multi_owner_main(
+        pr_state_capture, monkeypatch,
+        repos=["convivy/agent-platform", "convivybuilder/homebrew-tap"],
+        installations={"convivy": {"id": 111}, "convivybuilder": {"id": 222}},
+        pulls_by_repo={"convivy/agent-platform": _pulls(),
+                       "convivybuilder/homebrew-tap": _pulls()[:1]})
+
+    rc = pr_state_capture.main()
+
+    assert rc == 0
+    assert read_with_token["convivy/agent-platform"] == "token-for-111"
+    assert read_with_token["convivybuilder/homebrew-tap"] == "token-for-222"
+    assert read_with_token["convivy/agent-platform"] != read_with_token["convivybuilder/homebrew-tap"]
+    emitted_repos = {r["meta"]["repo"] for r in store.rows.values()}
+    assert emitted_repos == {"convivy/agent-platform", "convivybuilder/homebrew-tap"}
+
+
+def test_main_skips_an_owner_with_no_installation_but_still_reads_every_other_owner(
+        pr_state_capture, monkeypatch, capsys):
+    """convivybuilder has no convivy-bosun App installation (the App is
+    about to be installed there, but is not yet): convivybuilder/homebrew-tap
+    is never read, stderr names convivybuilder and its one skipped repo, and
+    the pass exits 0 — but convivy/agent-platform is still read and its PRs
+    still emitted in the same pass (operator's decision, 2026-10-15: an
+    uninstalled owner is skipped, not failed). Red against origin/main on
+    the exit-code assertion below: before this change `GA.installation_for_owner`
+    raised a plain `GA.Unreadable` for a missing installation, which `main()`
+    caught in the branch that sets `exit_code = 1`, so this same scenario
+    returned 1."""
+    store, read_with_token = _wire_multi_owner_main(
+        pr_state_capture, monkeypatch,
+        repos=["convivy/agent-platform", "convivybuilder/homebrew-tap"],
+        installations={"convivy": {"id": 111}},  # no entry for convivybuilder: NotInstalled
+        pulls_by_repo={"convivy/agent-platform": _pulls(),
+                       "convivybuilder/homebrew-tap": _pulls()[:1]})
+
+    rc = pr_state_capture.main()
+
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "convivy/agent-platform" in read_with_token
+    assert "convivybuilder/homebrew-tap" not in read_with_token
+    emitted_repos = {r["meta"]["repo"] for r in store.rows.values()}
+    assert emitted_repos == {"convivy/agent-platform"}
+    assert ("convivybuilder: the convivy-bosun App is not installed on this "
+            "owner; its 1 registered repos are skipped") in err
+
+
+def test_main_still_fails_when_a_skipped_owner_is_accompanied_by_a_real_failure(
+        pr_state_capture, monkeypatch, capsys):
+    """The guard the operator asked for explicitly: skipping an uninstalled
+    owner must never mask an unrelated real failure elsewhere in the same
+    pass. convivybuilder has no installation (skipped, no exit_code) while
+    convivy/agent-platform's own `list_pulls` fails with a non-200 — the
+    pass still exits 1."""
+    store, read_with_token = _wire_multi_owner_main(
+        pr_state_capture, monkeypatch,
+        repos=["convivy/agent-platform", "convivybuilder/homebrew-tap"],
+        installations={"convivy": {"id": 111}},  # no entry for convivybuilder: NotInstalled
+        pulls_by_repo={
+            "convivy/agent-platform": pr_state_capture.GA.Unreadable(
+                "convivy/agent-platform: pull requests could not be read (500)"),
+            "convivybuilder/homebrew-tap": _pulls()[:1],
+        })
+
+    rc = pr_state_capture.main()
+
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "convivybuilder" in err  # still named and still skipped, not failed
+    assert "convivy/agent-platform" in read_with_token  # attempted, then failed
+    assert "convivybuilder/homebrew-tap" not in read_with_token  # never read: no installation
+    assert len(store.rows) == 0
+
+
+def test_main_still_fails_when_a_skipped_owner_is_accompanied_by_a_covered_owners_installation_failure(
+        pr_state_capture, monkeypatch, capsys):
+    """Same guard, the other failure site: convivy's OWN installation lookup
+    fails with a non-404 (a real read failure, not a confirmed absence) —
+    still exit 1, even though convivybuilder is correctly only skipped."""
+    store, read_with_token = _wire_multi_owner_main(
+        pr_state_capture, monkeypatch,
+        repos=["convivy/agent-platform", "convivybuilder/homebrew-tap"],
+        installations={
+            "convivy": pr_state_capture.GA.Unreadable(
+                "the convivy-bosun App's installation on 'convivy' could not be read (500)"),
+            # no entry for convivybuilder: NotInstalled
+        },
+        pulls_by_repo={"convivybuilder/homebrew-tap": _pulls()[:1]})
+
+    rc = pr_state_capture.main()
+
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "convivybuilder" in err
+    assert "convivy/agent-platform" not in read_with_token
+    assert "convivybuilder/homebrew-tap" not in read_with_token  # also skipped: no installation
+    assert len(store.rows) == 0
+
+
+def test_plist_start_interval_is_180_seconds():
+    """GitHub-derived state must land within 3 minutes, the pace the crews
+    work at (the operator, 2026-10-15) — StartInterval is seconds, not
+    minutes, so this is 180, not 3."""
+    with PLIST.open("rb") as fh:
+        data = plistlib.load(fh)
+    assert data["StartInterval"] == 180

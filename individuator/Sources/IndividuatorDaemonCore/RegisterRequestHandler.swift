@@ -35,6 +35,7 @@ public struct RegisterRequestHandler {
     /// JSON response line back. Always closes `fileDescriptor` on return.
     public func handle(fileDescriptor: Int32) {
         defer { close(fileDescriptor) }
+        SocketIO.setNoSIGPIPE(fileDescriptor: fileDescriptor)
 
         do {
             try PeerUIDGate.check(fileDescriptor: fileDescriptor, requiredUID: requiredUID)

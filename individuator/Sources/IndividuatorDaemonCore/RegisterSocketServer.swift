@@ -50,6 +50,7 @@ public final class RegisterSocketServer {
         while true {
             let clientFD = accept(listenFD, nil, nil)
             guard clientFD >= 0 else { continue }
+            SocketIO.setNoSIGPIPE(fileDescriptor: clientFD)
             handler.handle(fileDescriptor: clientFD)
         }
     }

@@ -80,4 +80,45 @@ private enum CSRReader {
     // flipping the signature check in `csrSelfSignatureVerifies...` to sign
     // over the wrong bytes (the raw DER rather than `certReqInfoNode`'s
     // re-encoding) turns that assertion red too.
+
+    /// `CertificateSigningRequest.publicKeyFingerprintHex` is what
+    /// `individuator fingerprint` (`Sources/individuator/main.swift`) prints
+    /// (CQ·447 slice 3, fixing the defect where that subcommand hashed the
+    /// raw 65-byte public point instead and so could never match the
+    /// Library's `root-ca sign`, whose own `Fingerprint.publicKey` hashes
+    /// the SPKI DER). Checked two ways: against the SPKI this same package
+    /// embeds in a CSR for the same key, extracted by an independent DER
+    /// walk; and against a fixture value computed entirely outside this
+    /// package, with `openssl ecparam -genkey` / `openssl pkey -pubout
+    /// -outform DER` / `openssl dgst -sha256` for a fixed test key.
+    @Test func publicKeyFingerprintHexMatchesTheCSRsOwnSPKIAndAnIndependentComputation() throws {
+        let key = SoftwareMachineKey()
+        let (der, _) = try CertificateSigningRequest.build(machineName: "synthetic-mac-1", key: key)
+
+        let csr = try ASN1.parseOne(Array(der), at: 0).node
+        let top = try ASN1.children(of: csr)
+        let infoFields = try ASN1.children(of: top[0])
+        let spkiNode = infoFields[2] // certificationRequestInfo: version, subject, subjectPublicKeyInfo, attributes
+        let spkiFromCSR = Data(DER.tlv(spkiNode.tag, spkiNode.content))
+        let fingerprintFromCSR = SHA256.hash(data: spkiFromCSR).map { String(format: "%02x", $0) }.joined()
+
+        #expect(CertificateSigningRequest.publicKeyFingerprintHex(key.publicKey) == fingerprintFromCSR)
+
+        // A fixed test key (never used outside this test), its SPKI DER
+        // fingerprint computed independently with openssl:
+        //   openssl ecparam -name prime256v1 -genkey -noout -out k.pem
+        //   openssl pkey -in k.pem -pubout -outform DER -out pub.der
+        //   openssl dgst -sha256 pub.der
+        let fixedRawScalarHex = "750462129ceeec532bbb5342d4ed5ded4de8534828d378082805776167085478"
+        let expectedOpenSSLFingerprint = "627813238267d066247257b1bd151b5132ca2dac2f977de5c8f098bfc3636dde"
+        var scalarBytes: [UInt8] = []
+        var idx = fixedRawScalarHex.startIndex
+        while idx < fixedRawScalarHex.endIndex {
+            let next = fixedRawScalarHex.index(idx, offsetBy: 2)
+            scalarBytes.append(UInt8(fixedRawScalarHex[idx..<next], radix: 16)!)
+            idx = next
+        }
+        let fixedKey = try P256.Signing.PrivateKey(rawRepresentation: Data(scalarBytes))
+        #expect(CertificateSigningRequest.publicKeyFingerprintHex(fixedKey.publicKey) == expectedOpenSSLFingerprint)
+    }
 }

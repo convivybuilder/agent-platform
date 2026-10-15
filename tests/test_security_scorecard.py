@@ -202,3 +202,54 @@ def test_build_report_empty(security_scorecard):
     assert rep["overall"]["prs_reviewed"] == 0
     assert rep["overall"]["blocking_per_kloc"] == 0.0
     assert rep["by_model"] == {} and rep["by_repo"] == {}
+
+
+# --- agent_prs: refuse a forged repo before it reaches a gh query ------------
+
+
+def test_agent_prs_excludes_a_run_with_a_forged_qualified_repo(
+        security_scorecard, monkeypatch, tmp_path):
+    """Round 2 security finding (PR #881, comment 6152094447): `repo` reaches
+    this ledger row from a run's own meta.json, a file the dispatched run
+    itself can write. Fails against 43f57916: the forged repo was included in
+    agent_prs's output, so main()'s loop called harvest_pr (and its gh query)
+    against it."""
+    import json as json_mod
+    today = datetime.now(timezone.utc).date().isoformat()
+    rows = [
+        {"pr_number": 1, "repo": "acme-attacker/widget", "date": today,
+         "agent": "bug-fixer", "model": "m"},
+        {"pr_number": 2, "repo": "homebrew-tap", "date": today,
+         "agent": "bug-fixer", "model": "m"},
+    ]
+    ledger_path = tmp_path / "scorecard.jsonl"
+    ledger_path.write_text("".join(json_mod.dumps(r) + "\n" for r in rows))
+    monkeypatch.setattr(security_scorecard, "SCORECARD_LEDGER", ledger_path)
+
+    out = security_scorecard.agent_prs(30)
+
+    assert "acme-attacker/widget" not in out
+    assert out["homebrew-tap"][2]["producer_agent"] == "bug-fixer"
+
+
+# --- harvest_pr's slug: registered owner, not always convivy ----------------
+
+
+def test_harvest_pr_queries_the_registered_owner_for_homebrew_tap(
+        security_scorecard, monkeypatch):
+    """Round-1 review (PR #881, comment 6150937461): `harvest_pr` built
+    `f"convivy/{repo}"` directly — the same pattern the PR centralizes
+    everywhere else. Pinning the `--repo` argument it passes through, not
+    real `gh` IO, which this file's module docstring excludes."""
+    captured = {}
+
+    def fake_gh_json(args):
+        captured["args"] = args
+        return None  # harvest_pr returns [] on a falsy view; no further IO
+
+    monkeypatch.setattr(security_scorecard, "_gh_json", fake_gh_json)
+    security_scorecard.harvest_pr("homebrew-tap", 1, {})
+
+    assert captured["args"] and "--repo" in captured["args"]
+    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"

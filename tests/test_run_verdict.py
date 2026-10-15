@@ -11,6 +11,7 @@ import subprocess
 import types
 import pytest
 
+import projects
 import run_verdict as RV
 
 COMMIT = "f2afe367" + "0" * 32
@@ -90,6 +91,25 @@ def test_a_call_naming_another_repository_is_refused_and_a_bare_or_owned_name_is
         "convivy/agent-platform"
     assert RV.target_for(RUN, runs_root=runs_root, repo="agent-platform").repo == \
         "convivy/agent-platform"
+
+
+def test_a_repo_with_a_registered_non_convivy_owner_is_slugged_correctly(runs_root):
+    """Before homebrew-tap's `repo_owners` entry existed, this read
+    convivy/homebrew-tap, the wrong owner."""
+    _run_dir(runs_root, repo="homebrew-tap")
+    assert RV.target_for(RUN, runs_root=runs_root).repo == "convivybuilder/homebrew-tap"
+
+
+def test_an_nyh_repo_is_slugged_under_its_units_github_owner(runs_root):
+    """Round-1 review (PR #881, comment 6150937461): before this call routed
+    through `projects.repo_github_slug`, it built `convivy/nyh-arch-tools`
+    unconditionally, ignoring the unit's own github_owner — a 404ing slug for
+    a merge-gate `_head_advanced_beyond_pin` or stamp-posting call against an
+    NYH repo."""
+    owner = projects.get("nyh-arch-tools")["github_owner"]
+    assert owner and owner != "convivy"
+    _run_dir(runs_root, repo="nyh-arch-tools")
+    assert RV.target_for(RUN, runs_root=runs_root).repo == f"{owner}/nyh-arch-tools"
 
 
 def test_a_call_naming_another_commit_is_refused(runs_root):

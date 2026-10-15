@@ -444,3 +444,35 @@ def test_a_failed_security_reviewer_dispatch_drops_it_from_the_gate(monkeypatch,
     assert attempted == ["reviewer", "security-reviewer"]
     assert ("gate: agentctl review-status --pr 1111 --repo convivy/vivy "
             "--required reviewer") in out
+
+
+# --- homebrew-tap: the registered owner is convivybuilder, not convivy ---
+
+def test_task_names_the_registered_owner_for_homebrew_tap():
+    """Round-1 review (PR #881, comment 6150937461): `_task` built
+    `convivy/{repo}` directly — the same pattern the PR centralizes
+    everywhere else."""
+    task = dr._task("homebrew-tap", _pr(), [], [],
+                    [("pytest", "8.1.0", "8.1.1")], security=False)
+    assert "convivybuilder/homebrew-tap" in task
+
+
+def test_gate_command_names_the_registered_owner_for_homebrew_tap():
+    assert dr._gate_command("homebrew-tap", 1, ["reviewer"]) == (
+        "agentctl review-status --pr 1 --repo convivybuilder/homebrew-tap "
+        "--required reviewer")
+
+
+def test_gh_queries_the_registered_owner_for_homebrew_tap(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(dr.subprocess, "run", fake_run)
+    dr._gh(["pr", "list"], "homebrew-tap")
+
+    assert calls and "--repo" in calls[0]
+    repo_arg = calls[0][calls[0].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"

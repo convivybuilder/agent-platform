@@ -227,7 +227,7 @@ def github_getter(*, key_path: Path = KEY_PATH) -> Callable[[str], tuple[int, di
         raise CheckFailed(problem)
     try:
         jwt = GA.app_jwt(key_path, APP_ID)
-        inst = GA.single_installation(jwt, OWNER)
+        inst = GA.installation_for_owner(jwt, OWNER, label="the convivy-bosun App")
         inst_id = str(inst.get("id") or "")
         if not inst_id:
             raise GA.Unreadable("the installation carries no id")

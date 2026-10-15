@@ -85,6 +85,21 @@ def test_a_cage_commit_is_recognised_by_its_trailer():
     assert out["holder"] == "run-7"
 
 
+def test_a_holder_with_spaces_is_still_recognised_by_its_trailer():
+    """`kb_writes.valid_holder` accepts a holder containing spaces (ARCH-408,
+    issue_01M0YAS4S64P5TXN7S2C17GHF6) and the trailer records it unaltered, so the
+    trailer regex's `holder` group must capture the rest of the line rather than
+    one whitespace-delimited token — otherwise this reads as `unsigned`, a false
+    bypass report on a legitimate write."""
+    out = kb_audit.classify(
+        "docs: x",
+        TRAILER.format(ref="projects/vivy/decisions/0001-x.md", prov="in-session",
+                       holder="Pat Holder"),
+        is_merge=False)
+    assert out["path"] == "cage"
+    assert out["holder"] == "Pat Holder"
+
+
 def test_a_legacy_scribe_commit_is_not_reported_as_a_bypass():
     """The legacy cage predates the trailer and signs in prose. Counting those as
     bypasses would have produced 33 false positives in the first real week, and
@@ -811,7 +826,7 @@ def test_main_scopes_the_minted_token_to_knowledge_with_read_only_permissions(mo
     every repository the org-wide installation can see rather than
     `convivy/knowledge` alone (reviewer + security-reviewer, PR #803 round 1).
 
-    `github_app` is stubbed end to end — `app_jwt`, `single_installation` and
+    `github_app` is stubbed end to end — `app_jwt`, `installation_for_owner` and
     `installation_token` never run — so this never mints a real token or
     calls GitHub.
     """
@@ -819,7 +834,7 @@ def test_main_scopes_the_minted_token_to_knowledge_with_read_only_permissions(mo
 
     monkeypatch.setattr(GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(GA, "app_jwt", lambda *a, **k: "stub-jwt")
-    monkeypatch.setattr(GA, "single_installation", lambda *a, **k: {"id": 123})
+    monkeypatch.setattr(GA, "installation_for_owner", lambda *a, **k: {"id": 123})
 
     calls: dict = {}
 
@@ -836,3 +851,41 @@ def test_main_scopes_the_minted_token_to_knowledge_with_read_only_permissions(mo
     assert rc == 0
     assert calls["kwargs"]["repositories"] == ["knowledge"]
     assert calls["kwargs"]["permissions"] == {"contents": "read", "metadata": "read"}
+
+
+def test_main_resolves_the_convivy_bosun_apps_own_installation_with_two_installed(monkeypatch):
+    """The App's installation listing carries TWO installations (`convivy`
+    and `convivybuilder`, once installed for homebrew-tap, PR #884) —
+    `GA.single_installation`'s "exactly one installation total" count would
+    refuse this with "count: the App has 2 installations, not exactly one"
+    and `main()` would return 2. `GA.installation_for_owner` asks GitHub for
+    `convivy`'s installation directly and never lists installations at all,
+    so `main()` still reaches 0. `GA.request` is the real function; only the
+    wire underneath it is faked, so this exercises the actual per-owner HTTP
+    lookup, not a stand-in for it."""
+    import github_app as GA
+
+    monkeypatch.setattr(GA, "key_problem", lambda *a, **k: None)
+    monkeypatch.setattr(GA, "app_jwt", lambda *a, **k: "stub-jwt")
+    monkeypatch.setattr(GA, "installation_token", lambda *a, **k: "stub-token")
+    monkeypatch.setattr(kb_audit, "audit_access",
+                        lambda get, **k: {"findings": [], "unreadable": []})
+    seen = []
+
+    def fake_request(method, url, bearer, body, opener=None):
+        seen.append(url)
+        if url.endswith("/app/installations?per_page=100"):
+            return 200, [{"id": 1, "account": {"login": "convivy"}},
+                        {"id": 2, "account": {"login": "convivybuilder"}}]
+        if url.endswith("/orgs/convivy/installation"):
+            return 200, {"id": 1, "account": {"login": "convivy"}}
+        raise AssertionError(f"unexpected request to {url}")
+
+    monkeypatch.setattr(GA, "request", fake_request)
+
+    rc = kb_audit.main([])
+
+    assert rc == 0, "resolving convivy's own installation must succeed with two installed"
+    assert any(u.endswith("/orgs/convivy/installation") for u in seen)
+    assert not any("/app/installations" in u for u in seen), (
+        "installation_for_owner must never list installations to find its own")

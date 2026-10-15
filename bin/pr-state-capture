@@ -27,13 +27,48 @@ the JWT/token plumbing is fine; sharing the READ is not.
 
 READ-ONLY. The `convivy-bosun` App holds `pull_requests:write` and
 `contents:write` for other reasons (its own merge/gate duties elsewhere); this
-script mints its OWN installation token scoped to `pull_requests: read` and
-`metadata: read` (`_READ_ONLY_PERMISSIONS`), so a bug here that tried to write
-would be refused by GitHub itself, not merely by review. The only non-GET HTTP
-call anywhere in this file is the installation-token mint
-(`github_app.installation_token`, a POST to `/access_tokens`) — a GitHub App
-authentication handshake, not a write to any repository's content. Nothing
-here issues a POST, PATCH, PUT or DELETE against a `/repos/...` endpoint.
+script mints its OWN installation tokens, one per GitHub owner it reads
+(see "ONE INSTALLATION PER OWNER" below), each scoped to `pull_requests: read`
+and `metadata: read` (`_READ_ONLY_PERMISSIONS`), so a bug here that tried to
+write would be refused by GitHub itself, not merely by review. The only
+non-GET HTTP calls anywhere in this file are the installation-token mints
+(`github_app.installation_token`, a POST to `/access_tokens`, one per owner)
+— a GitHub App authentication handshake, not a write to any repository's
+content. Nothing here issues a POST, PATCH, PUT or DELETE against a
+`/repos/...` endpoint.
+
+ONE INSTALLATION PER OWNER, NOT ONE FOR THE WHOLE RUN. `repos_to_capture()`
+returns `owner/repo` for every registered repo via
+`projects.repo_github_slug`, and most of those repos are `convivy/...` — but
+not all: Shipwright's `homebrew-tap` is registered under the `convivybuilder`
+GitHub owner (`config/projects.json`'s `repo_owners`), its own GitHub App
+installation, separate from `convivy`'s. `main()` groups the repos by owner
+and resolves each owner's installation and token independently, so a
+failure resolving one owner costs only that owner's repos rather than the
+whole pass.
+
+AN OWNER THE APP IS NOT INSTALLED ON IS SKIPPED, NOT FAILED (operator's
+decision, 2026-10-15). `GA.installation_for_owner` raises `GA.NotInstalled`
+— never a plain `GA.Unreadable` — only when BOTH its lookups (the org
+endpoint, then the user endpoint) answer 404: GitHub's own confirmation the
+App has no installation there, not merely a read that failed. `main()`
+catches `GA.NotInstalled` ahead of `GA.Unreadable`, prints one notice naming
+the owner and its registered-repo count, and moves on without setting
+`exit_code` — the same "skip only what's confirmed absent" posture
+`installed_repos`'s docstring already describes for one repo within an
+installed owner. `config/projects.json` registers three projects under a
+personal GitHub account that the App has no installation on; since the
+owner-grouping change deployed on 2026-10-15 (launchd run 464 onward),
+every pass exited 1 on exactly that owner, every time — the same shape of
+incident the 2026-09-16 entry above describes for five unpushed repos, a
+permanent failure hiding a real one. If the operator wants that account's
+pull requests captured, the operator moves those repos to an owner the
+App is installed on; until then this pass leaves them uncaptured rather
+than failing on them every time. Any OTHER failure resolving an
+owner — a non-404 on either lookup, a missing installation id, a token
+this run cannot mint — is still `GA.Unreadable`, is not caught by the
+`NotInstalled` branch, and still fails the pass exactly as before: that is
+a failed read, not a confirmed absence, and must stay loud.
 
 THE SIGNAL'S OWN IDENTITY IS STILL THE CORRECTNESS BACKSTOP; A LOCAL
 SEND-STATE RECORD IS WHAT KEEPS A PASS FROM RE-POSTING EVERYTHING
@@ -121,7 +156,10 @@ panel does not render it (see the field list two paragraphs up), so this
 script does not capture it and there is nothing to go stale.
 
 REPOSITORY LIST is derived from `config/projects.json` (`lib/agent-platform/
-projects.py`) — every repo belonging to a registered, non-private project —
+projects.py`) — every repo belonging to a registered, non-private project,
+each expanded to its own `owner/repo` by `projects.repo_github_slug` (so a
+repo registered under a non-`convivy` owner, like `homebrew-tap`, resolves to
+its real slug rather than being read under the wrong owner's installation) —
 rather than hardcoded here. A project's repos change as the registry changes,
 and a hardcoded list would silently drift from it. Repos of `private: true`
 (black-box) projects are excluded, the same wall ADR-0043 draws for their other
@@ -167,12 +205,14 @@ import github_app as GA  # noqa: E402
 import projects  # noqa: E402
 import signal_client as SC  # noqa: E402
 
-# The convivy-bosun GitHub App, installed org-wide (issue_01M2KV16ZRG3N49GRER8Q7545H,
-# verified 2026-09-15: GET /app returned slug convivy-bosun as app id 4666673). Its
-# installation is derived and checked on every run, never stored — the same posture
+# The convivy-bosun GitHub App (issue_01M2KV16ZRG3N49GRER8Q7545H, verified
+# 2026-09-15: GET /app returned slug convivy-bosun as app id 4666673),
+# installed on more than one GitHub owner (org-wide on `convivy`; also on
+# `convivybuilder`, for homebrew-tap — see the module docstring's "ONE
+# INSTALLATION PER OWNER" section). Each owner's installation is derived and
+# checked on every run, never stored — the same posture
 # kb_merge.knowledge_installation takes for convivy-library.
 APP_ID = "4666673"
-OWNER = "convivy"
 
 # Read from the passwd home, never $HOME, as every trust anchor is
 # (company/decisions/0008) — see builder_root.real_account_home.
@@ -226,9 +266,10 @@ def signal_token() -> str | None:
 # Library's POST /signals 429 (library#176, 120 signals/minute/submitter —
 # see signal_client.post_signal's 429 handling) before main() gives up on it
 # and stops the rest of the pass (see main()'s own 429 handling below). This
-# run's own StartInterval is 900s (launchd/com.convivy.pr-state-capture.plist);
-# 600s leaves 300s of headroom before the next scheduled fire rather than
-# racing it.
+# run's own StartInterval is 180s (launchd/com.convivy.pr-state-capture.plist);
+# a pass that runs long has its next scheduled fire skipped rather than
+# overlapping it (launchd.plist(5), StartInterval), so 600s bounds how long a
+# stuck signal is retried, not a race against the next fire.
 #
 # A prior version of this comment claimed a 300-signal run drains in about
 # 15s at 120/minute. That arithmetic was wrong: 300 signals at 120/minute
@@ -251,12 +292,26 @@ _MAX_PAGES = 10
 
 
 def repos_to_capture() -> list[str]:
-    """`convivy/<repo>` for every repo of a registered, non-private project."""
+    """`owner/repo` for every repo of a registered, non-private project, each
+    expanded by `projects.repo_github_slug` — the one expansion every other
+    owner/repo call site in this repository uses, so a repo registered under
+    a non-`convivy` owner (homebrew-tap, under Builder's own `convivybuilder`
+    account) resolves to its real slug rather than defaulting to `convivy`."""
     private = projects.private_slugs()
-    out = {f"{OWNER}/{r}"
+    out = {projects.repo_github_slug(r, unit)
            for slug, unit in projects.load().items() if slug not in private
            for r in unit.get("repos", [])}
     return sorted(out)
+
+
+def _by_owner(repos: list[str]) -> dict[str, list[str]]:
+    """*repos* (each already an `owner/repo` slug) grouped by owner, each
+    group's repos kept in *repos*' own order — `main()` resolves one
+    installation and mints one token per owner, rather than per run."""
+    out: dict[str, list[str]] = {}
+    for repo in repos:
+        out.setdefault(repo.split("/", 1)[0], []).append(repo)
+    return out
 
 
 def installed_repos(token: str, *, opener=urllib.request.urlopen) -> set[str]:
@@ -507,11 +562,6 @@ def main() -> int:
         return 1
     try:
         jwt = GA.app_jwt(KEY_PATH, APP_ID)
-        inst = GA.single_installation(jwt, OWNER)
-        inst_id = str(inst.get("id") or "")
-        if not inst_id:
-            raise GA.Unreadable("the installation carries no id")
-        token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS)
     except GA.Unreadable as e:
         print(f"pr-state-capture: {e}", file=sys.stderr)
         return 1
@@ -526,38 +576,65 @@ def main() -> int:
     # 429 on signal 300 both resend against the same run budget, so a burst
     # early in the pass can't eat the time a later repo's signals need.
     deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
-    # A repo absent from the installation's list is skipped, not failed, ONLY
-    # when the installation covers every repository in the org: absence then
-    # means the repo is not on GitHub. Under a "selected" installation absence
-    # also means "the App was never granted it", which must stay loud, so
-    # every repo is read and a 404 fails the pass as before.
-    present: set[str] | None = None
-    if inst.get("repository_selection") == "all":
-        try:
-            present = installed_repos(token)
-        except GA.Unreadable as e:
-            print(f"pr-state-capture: {e}; reading every registered repo instead",
-                  file=sys.stderr)
-            exit_code = 1
+
     # Phase 1: read every repo, diff each row against what was last
     # delivered, and collect only the changed ones — see the module
-    # docstring for why a pass no longer re-emits everything it reads.
+    # docstring for why a pass no longer re-emits everything it reads. Repos
+    # are grouped by their GitHub owner first (see the module docstring's
+    # "ONE INSTALLATION PER OWNER" section): each owner's installation and
+    # token are resolved on their own, so a failure resolving one owner
+    # costs only that owner's repos. An owner the App is not installed on
+    # (GA.NotInstalled, both lookups 404) is skipped with a notice and does
+    # not set exit_code (see the module docstring's "AN OWNER THE APP IS NOT
+    # INSTALLED ON IS SKIPPED, NOT FAILED" section); any other owner-level
+    # failure is still a plain GA.Unreadable and still fails the pass.
     pending: list[dict] = []
     delivered_by_repo: dict[str, dict] = {}
-    for repo in repos_to_capture():
-        if present is not None and repo.lower() not in present:
-            print(f"pr-state-capture: {repo}: not on GitHub (the installation covers "
-                  f"every repository and does not list it); skipped", file=sys.stderr)
-            continue
+    for owner, repos in sorted(_by_owner(repos_to_capture()).items()):
         try:
-            pulls = list_pulls(repo, token)
+            inst = GA.installation_for_owner(jwt, owner, label="the convivy-bosun App")
+            inst_id = str(inst.get("id") or "")
+            if not inst_id:
+                raise GA.Unreadable("the installation carries no id")
+            token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS)
+        except GA.NotInstalled:
+            print(f"pr-state-capture: {owner}: the convivy-bosun App is not "
+                  f"installed on this owner; its {len(repos)} registered repos "
+                  f"are skipped", file=sys.stderr)
+            continue
         except GA.Unreadable as e:
-            print(f"pr-state-capture: {e}", file=sys.stderr)
+            print(f"pr-state-capture: {owner}: {e}", file=sys.stderr)
             exit_code = 1
             continue
-        delivered = load_delivered(repo)
-        delivered_by_repo[repo] = delivered
-        pending.extend(_changed_rows(rows_from_pulls(repo, pulls), delivered))
+
+        # A repo absent from the installation's list is skipped, not failed, ONLY
+        # when the installation covers every repository this owner has: absence
+        # then means the repo is not on GitHub. Under a "selected" installation
+        # absence also means "the App was never granted it", which must stay loud,
+        # so every repo is read and a 404 fails the pass as before.
+        present: set[str] | None = None
+        if inst.get("repository_selection") == "all":
+            try:
+                present = installed_repos(token)
+            except GA.Unreadable as e:
+                print(f"pr-state-capture: {e}; reading every registered repo instead",
+                      file=sys.stderr)
+                exit_code = 1
+
+        for repo in repos:
+            if present is not None and repo.lower() not in present:
+                print(f"pr-state-capture: {repo}: not on GitHub (the installation covers "
+                      f"every repository and does not list it); skipped", file=sys.stderr)
+                continue
+            try:
+                pulls = list_pulls(repo, token)
+            except GA.Unreadable as e:
+                print(f"pr-state-capture: {e}", file=sys.stderr)
+                exit_code = 1
+                continue
+            delivered = load_delivered(repo)
+            delivered_by_repo[repo] = delivered
+            pending.extend(_changed_rows(rows_from_pulls(repo, pulls), delivered))
 
     # Phase 2: newest-updated first, across every repo together — not
     # repo-by-repo — so a fresh merge in one repo is never queued behind an

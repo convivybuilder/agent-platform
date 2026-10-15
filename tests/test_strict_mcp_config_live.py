@@ -124,6 +124,7 @@ def test_strict_mcp_config_positive_control_project_mcp_json_loads_without_it(tm
         "check below is not meaningful until this passes again")
 
 
+@pytest.mark.usefixtures("_tool_session_scratch_dir_off_the_real_account_home")
 def test_strict_mcp_config_blocks_a_worktrees_committed_mcp_json(
         agentctl, tmp_path, monkeypatch):
     """The regression check for issue_01M4APS4KRPE6ESTZAVEJVFDKC: a
@@ -132,7 +133,14 @@ def test_strict_mcp_config_blocks_a_worktrees_committed_mcp_json(
     — non-private, the shape every ordinary coder/reviewer dispatch takes)
     must never start that server. `--strict-mcp-config` (now unconditional)
     must suppress it, while `kb`/`ops` still reach the run through the
-    explicit `--mcp-config` this change adds."""
+    explicit `--mcp-config` this change adds.
+
+    This drives `_run_session` for real (the other test in this file, the
+    positive control, never touches agentctl), so it applies the shared
+    fixture that keeps a real dispatch's tool-session scratch directory off
+    the real account's home (conftest.py, CQ·138, round 6, reviewer, PR #879,
+    comment 6166526636) — otherwise live, opted-in run of this test would
+    create one there."""
     run_dir = tmp_path / "run-live-mcp"
     run_dir.mkdir()
     worktree = tmp_path / "wt-live-mcp"

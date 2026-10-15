@@ -310,6 +310,12 @@ def test_repo_slug_normalizes():
     assert TP.repo_slug(None) is None
 
 
+def test_repo_slug_uses_the_registered_owner_for_homebrew_tap():
+    """Before this repo's `repo_owners` entry existed, this read
+    convivy/homebrew-tap, the wrong owner."""
+    assert TP.repo_slug("homebrew-tap") == "convivybuilder/homebrew-tap"
+
+
 def test_policy_record_is_complete():
     """policy.json is the audit artifact — what a run COULD do, as a fact you read rather
     than a claim you trust. Without the mode, the record is unreadable."""

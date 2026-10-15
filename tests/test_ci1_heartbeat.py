@@ -428,6 +428,44 @@ def test_an_app_token_refused_is_a_check_failure(hb, monkeypatch, tmp_path):
         hb.github_getter(key_path=key)
 
 
+def test_github_getter_resolves_its_own_installation_with_two_installed(
+        hb, monkeypatch, tmp_path):
+    """The App's installation listing carries TWO installations (`convivy`
+    and `convivybuilder`, once installed for homebrew-tap, PR #884) —
+    `GA.single_installation`'s "exactly one installation total" count would
+    refuse this with "count: the App has 2 installations, not exactly one"
+    and `github_getter` would raise `CheckFailed`. `GA.installation_for_owner`
+    asks GitHub for `convivy`'s installation directly and never lists
+    installations at all, so `github_getter` still succeeds. `GA.request` is
+    the real function; only the wire underneath it is faked, so this
+    exercises the actual per-owner HTTP lookup, not a stand-in for it."""
+    key = tmp_path / "bosun-app.pem"
+    key.write_text("placeholder")
+    key.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    import github_app as GA
+
+    monkeypatch.setattr(GA, "app_jwt", lambda *a, **k: "jwt.x.y")
+    monkeypatch.setattr(GA, "installation_token", lambda *a, **k: "ghs_x")
+    seen = []
+
+    def fake_request(method, url, bearer, body, opener=None):
+        seen.append(url)
+        if url.endswith("/app/installations?per_page=100"):
+            return 200, [{"id": 1, "account": {"login": "convivy"}},
+                        {"id": 2, "account": {"login": "convivybuilder"}}]
+        if url.endswith("/orgs/convivy/installation"):
+            return 200, {"id": 1, "account": {"login": "convivy"}}
+        raise AssertionError(f"unexpected request to {url}")
+
+    monkeypatch.setattr(GA, "request", fake_request)
+
+    hb.github_getter(key_path=key)  # must not raise CheckFailed
+
+    assert any(u.endswith("/orgs/convivy/installation") for u in seen)
+    assert not any("/app/installations" in u for u in seen), (
+        "installation_for_owner must never list installations to find its own")
+
+
 # --- one run: filing, suppression, recovery, failures ----------------------------------
 
 STATE_NAME = "incident.json"

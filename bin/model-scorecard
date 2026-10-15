@@ -56,6 +56,7 @@ import telemetry as T  # noqa: E402
 import signal_client   # noqa: E402  (structured Reports signal, ARCH-353 Build 2c)
 import issue_client    # noqa: E402  (POST /ledger-entries, the Bosun's first ledger writer)
 import dispatch_env as DE  # noqa: E402
+import projects         # noqa: E402
 import review_protocol as RP  # noqa: E402
 
 import builder_root as BR
@@ -161,6 +162,17 @@ def is_producer_shaped(meta: dict) -> bool:
     close-loop is filtered upstream (list_candidate_runs), so this just
     excludes reviewer-family agents."""
     return not _REVIEWER_AGENT_RE.search(meta.get("agent") or "")
+
+
+def _validated_run_repo(meta: dict) -> str | None:
+    """`meta["repo"]`, but only when `projects.registered_repo_github_slug`
+    accepts it — `meta.json` is a file the dispatched run itself can write, so
+    an owner-qualified forgery there must not reach a `gh` query (security-
+    reviewer, PR #881 round 2). A missing or unregistered-owner repo reads as
+    None, the same attribution-failure value an absent `meta["repo"]` already
+    produces for every caller downstream (an unresolved join, never a gh call)."""
+    repo = meta.get("repo")
+    return repo if repo and projects.registered_repo_github_slug(repo) is not None else None
 
 
 def is_ledger_member(meta: dict, pr_link: dict | None) -> bool:
@@ -291,6 +303,16 @@ def upsert_ledger(existing: list[dict], fresh: list[dict]) -> list[dict]:
     return sorted(by_id.values(), key=lambda r: (r.get("date") or "", r["run_id"]))
 
 
+def _ledger_report_run_dir(run_id: str) -> Path | None:
+    """The run dir backing `run_id`, or None when it can't be resolved — the
+    same ambiguity refusal `_task_for_run` applies, so a planted duplicate run
+    dir can't supply a forged "already refused" mark either."""
+    try:
+        return RP.find_run_dir(run_id, RUNS_ROOT)
+    except RP.AmbiguousRunDir:
+        return None
+
+
 def report_to_ledger(rows: list[dict]) -> dict:
     """POST each row to the Library's ledger (`POST /ledger-entries`,
     issue_01M0TP37M3RRRY5BD1Z4B8GCB0 Part 1 — the Bosun's first ledger writer).
@@ -320,12 +342,24 @@ def report_to_ledger(rows: list[dict]) -> dict:
     reason naming the model, the same way the harvest's other skips are
     reported.
 
+    **A `"disproportionate"` refusal (E1·9, Clause 6 of the budget-enforcement
+    epic) is recorded on the run's OWN meta.json — `ledger_report_refused_usd`
+    and `ledger_report_refused_reason` — and never resubmitted unchanged.**
+    Before posting, a row whose run dir resolves is checked against that mark:
+    an identical `cost_usd` is skipped (status `"skip:refused-unchanged"`)
+    rather than sent again, since it is the same figure the Library already
+    refused for this run. A row whose cost has since been corrected (a
+    different figure) posts as usual — only an exact repeat of the refused
+    figure is held back. A row whose run dir can't be resolved (a synthetic
+    row with no real run directory, or one that has aged off disk) is posted
+    unconditionally, the same as before this mark existed.
+
     Best-effort over the WHOLE set: one row's refusal or an unreachable
     Library never stops the rest, and never undoes the local upsert this
     pass already wrote — `issue_client.post_ledger_entry` itself never
-    raises, and its `"not-recorded"` (no live ledger for the product) and
-    `"error:*"` (a disproportionate-spend refusal, a bad call, or a dead
-    Library) statuses are both counted here rather than retried.
+    raises, and its `"not-recorded"` (no live ledger for the product),
+    `"disproportionate"` and `"error:*"` (a malformed call or a dead Library)
+    statuses are all counted here rather than retried.
 
     Returns {"recorded": n, "not_recorded": n,
              "errors": [(run_id, status, error), ...]}."""
@@ -339,11 +373,23 @@ def report_to_ledger(rows: list[dict]) -> dict:
         if lane is None:
             errors.append((run_id, "skip:no-lane", f"no ledger lane for model {model!r}"))
             continue
+        cost_usd = r.get("cost_usd")
+        run_dir = _ledger_report_run_dir(run_id)
+        if run_dir is not None:
+            try:
+                prior_meta = T.read_meta(run_dir)
+            except (FileNotFoundError, json.JSONDecodeError):
+                prior_meta = {}
+            refused_usd = prior_meta.get("ledger_report_refused_usd")
+            if refused_usd is not None and refused_usd == cost_usd:
+                errors.append((run_id, "skip:refused-unchanged",
+                               prior_meta.get("ledger_report_refused_reason") or ""))
+                continue
         kwargs = {"agent": r.get("agent"), "model": model}
         if r.get("item_id"):
             kwargs["item_id"] = r["item_id"]
         res = issue_client.post_ledger_entry(
-            r.get("repo"), r.get("cost_usd"), run_id=run_id, dedup_key=run_id,
+            r.get("repo"), cost_usd, run_id=run_id, dedup_key=run_id,
             lane=lane, **kwargs)
         status = res.get("status")
         if status == "recorded":
@@ -351,6 +397,9 @@ def report_to_ledger(rows: list[dict]) -> dict:
         elif status == "not-recorded":
             not_recorded += 1
         else:
+            if status == "disproportionate" and run_dir is not None:
+                T.update_meta(run_dir, ledger_report_refused_usd=cost_usd,
+                              ledger_report_refused_reason=res.get("error"))
             errors.append((run_id, status, res.get("error", "")))
     return {"recorded": recorded, "not_recorded": not_recorded, "errors": errors}
 
@@ -401,7 +450,7 @@ def _gh_json(args: list[str]) -> list | dict | None:
 
 def pr_maps(repo: str, limit: int = 300) -> dict:
     """pr_number → PR record for a repo, from one `gh pr list` call."""
-    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+    data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
                      "--limit", str(limit), "--json",
                      "number,headRefName,state,mergedAt"]) or []
     return {p["number"]: p for p in data}
@@ -414,7 +463,7 @@ def ci_first_pass(repo: str, branch: str):
     wf = CI_WORKFLOW.get(repo)
     if not wf or not branch:
         return None
-    data = _gh_json(["run", "list", "--repo", f"convivy/{repo}", "--branch", branch,
+    data = _gh_json(["run", "list", "--repo", projects.repo_github_slug(repo), "--branch", branch,
                      "--workflow", wf, "--json", "conclusion,event,createdAt"]) or []
     pr_runs = [d for d in data if d.get("event") == "pull_request" and d.get("createdAt")]
     if not pr_runs:
@@ -449,7 +498,7 @@ def was_reverted(repo: str, pr_number: int, merged_at: str) -> bool | None:
     None on gh failure / unparseable time."""
     if not pr_number or _parse_iso(merged_at) is None:
         return None
-    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+    data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
                      "--search", f"Reverts #{pr_number}", "--json", "number,title,mergedAt"])
     if data is None:
         return None
@@ -517,7 +566,7 @@ def had_follow_up_bug(repo: str, pr_number: int, merged_at: str) -> bool | None:
     if not pr_number or m is None:
         return None
     since = m.date().isoformat()
-    data = _gh_json(["search", "issues", str(pr_number), "--repo", f"convivy/{repo}",
+    data = _gh_json(["search", "issues", str(pr_number), "--repo", projects.repo_github_slug(repo),
                      "--created", f">={since}", "--limit", "100", "--json",
                      "number,title,body,createdAt,labels,isPullRequest"])
     if data is None:
@@ -830,7 +879,7 @@ def build_judge_prompt(row: dict, ctx: dict) -> str:
         "tight and correct; 1 = buggy, over-broad, or misses the point.\n"
         "Look specifically for defects everyone missed — off-by-one, min/max swaps, boundary "
         "and null cases, silent behavior changes.\n\n"
-        f"## PR #{row.get('pr_number')} in convivy/{row.get('repo')} "
+        f"## PR #{row.get('pr_number')} in {projects.repo_github_slug(row.get('repo'))} "
         f"(produced by agent `{row.get('agent')}`, model `{row.get('model')}`)\n"
         f"### Task\n{ctx.get('task','(unknown)')}\n\n"
         f"### Title\n{ctx.get('title','')}\n\n"
@@ -940,7 +989,7 @@ def _fmt_reviews(meta: dict) -> str:
 def fetch_pr_context(repo: str, pr_number: int, task: str, diff_cap: int = JUDGE_DIFF_CAP) -> dict | None:
     """Gather the diff + reviews + title for one PR. None when the diff is
     unavailable (the judge needs the diff; without it there's nothing to score)."""
-    full = f"convivy/{repo}"
+    full = projects.repo_github_slug(repo)
     diff = _gh_text(["pr", "diff", str(pr_number), "--repo", full])
     if diff is None:
         return None
@@ -1005,6 +1054,14 @@ def judge_sample(rows: list[dict], judge_path: Path, *, sample: int, model: str,
         return []
     new_rows = []
     for r in picks:
+        # `r["repo"]` reached this ledger row from a run's own meta.json (see
+        # build_row) — the same run-writable field `_validated_run_repo` guards
+        # in harvest(); fetch_pr_context calls gh, so this call site needs the
+        # same check (security-reviewer, PR #881 round 2).
+        if projects.registered_repo_github_slug(r.get("repo")) is None:
+            print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): "
+                  f"unregistered repo {r.get('repo')!r}.", file=sys.stderr)
+            continue
         ctx = fetch_pr_context(r["repo"], r["pr_number"], _task_for_run(r["run_id"]))
         if ctx is None:
             print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): no diff.", file=sys.stderr)
@@ -1043,7 +1100,7 @@ def harvest(days: int) -> tuple[list[dict], dict, set[str]]:
     here, per member, rather than earlier in `list_candidate_runs`."""
     runs = list_candidate_runs(days)
     members = [r for r in runs if is_ledger_member(r["meta"], r.get("pr_link"))]
-    repos = {r["meta"].get("repo") for r in members if r["meta"].get("repo")}
+    repos = {repo for r in members if (repo := _validated_run_repo(r["meta"]))}
     pr_by_number = {repo: pr_maps(repo) for repo in repos}
     now = datetime.now(timezone.utc)
     ci_cache: dict = {}
@@ -1052,7 +1109,7 @@ def harvest(days: int) -> tuple[list[dict], dict, set[str]]:
     rows = []
     finished = set()
     for run in members:
-        repo = run["meta"].get("repo")
+        repo = _validated_run_repo(run["meta"])
         linked = linked_pr_number(run["pr_link"])
         pr = pr_by_number.get(repo, {}).get(linked)
         cfp = None
@@ -1160,7 +1217,7 @@ def harvest_repo_prs(repo: str, days: int, crew_label: str) -> list[dict]:
     revert + follow-up-bug logic."""
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(days=days)
-    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+    data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
                      "--limit", "200", "--json",
                      "number,headRefName,state,mergedAt,createdAt,title,author,labels"]) or []
     rows = []

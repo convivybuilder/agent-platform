@@ -76,6 +76,7 @@ import time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent
                        / "lib" / "agent-platform"))
 
+import projects        # noqa: E402
 import registry as R  # noqa: E402
 from worktrees import is_dispatch_target  # noqa: E402
 import builder_root as BR  # noqa: E402
@@ -207,7 +208,7 @@ def _gh(args: list[str], repo: str) -> str | None:
     while the log looked clean. Callers must treat None as "I do not know".
     """
     try:
-        p = subprocess.run(["gh", *args, "--repo", f"convivy/{repo}"],
+        p = subprocess.run(["gh", *args, "--repo", projects.repo_github_slug(repo)],
                            capture_output=True, text=True, timeout=120)
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         print(f"  ! gh {args[0]} {args[1] if len(args) > 1 else ''} on {repo} "
@@ -406,7 +407,8 @@ def _task(repo: str, pr: dict, security_reasons: list[str],
         if ci == "red" else "")
 
     head = (f"{'Security review' if security else 'Review'} of dependabot PR "
-            f"#{pr['number']} on convivy/{repo}, at head {pr['headRefOid'][:9]}.\n\n"
+            f"#{pr['number']} on {projects.repo_github_slug(repo)}, "
+            f"at head {pr['headRefOid'][:9]}.\n\n"
             f"Packages this PR moves:\n{listing}\n\n")
 
     if security:
@@ -515,7 +517,7 @@ def _gate_command(repo: str, number: int, agents: list[str]) -> str:
     what the tool did, even when one dispatch failed.
     """
     flags = " ".join(f"--required {agent}" for agent in agents)
-    return (f"agentctl review-status --pr {number} --repo convivy/{repo}"
+    return (f"agentctl review-status --pr {number} --repo {projects.repo_github_slug(repo)}"
             + (f" {flags}" if flags else ""))
 
 

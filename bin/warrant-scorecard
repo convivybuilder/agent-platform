@@ -47,6 +47,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import builder_root as BR
+import projects
 RUNS_ROOT = BR.runs_root()
 SCORECARD_LEDGER = RUNS_ROOT / "scorecard" / "scorecard.jsonl"    # the merged agent-PR set (ARCH-107)
 LEDGER_PATH = RUNS_ROOT / "scorecard" / "warrant.jsonl"
@@ -103,7 +104,13 @@ def merged_agent_prs(days: int) -> dict[str, dict[int, dict]]:
         pr = r.get("pr_number")
         repo = r.get("repo")
         merged_at = r.get("merged_at") or ""
-        if not pr or not repo or not r.get("merged") or merged_at < cutoff:
+        # `repo` reached this ledger row from a run's own meta.json, a file the
+        # dispatched run itself can write — refuse an owner-qualified forgery
+        # here, at the same attribution-failure check `not pr or not repo`
+        # already makes, rather than let it reach find_reverts's gh query
+        # (security-reviewer, PR #881 round 2).
+        if (not pr or not repo or not r.get("merged") or merged_at < cutoff
+                or projects.registered_repo_github_slug(repo) is None):
             continue
         prev = out[repo].get(pr)
         if prev is None or merged_at >= prev.get("merged_at", ""):
@@ -131,7 +138,7 @@ def _parse_revert(title: str, body: str) -> tuple[int | None, str]:
 
 def find_reverts(repo: str) -> list[dict]:
     """Detected reverts in a repo: {revert_pr, original_pr, reason, reverted_at}."""
-    data = _gh_json(["pr", "list", "--repo", f"convivy/{repo}", "--state", "all",
+    data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
                      "--limit", str(REVERT_SCAN_LIMIT), "--json",
                      "number,title,body,createdAt,state"]) or []
     if len(data) >= REVERT_SCAN_LIMIT:

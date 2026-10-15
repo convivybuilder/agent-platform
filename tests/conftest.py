@@ -1107,3 +1107,70 @@ def _policy_client_live_empty(monkeypatch):
         memo = getattr(mod, "_LIBRARY_DENIALS_MEMO", None)
         if isinstance(memo, dict):
             memo.clear()
+
+
+# --- no test writes under the REAL tool-session scratch root (CQ·138 round 6) ---
+#
+# `run_sandbox.create_tool_session_scratch_dir` creates one dispatch's scratch
+# directory under `tool_session_scratch_root(home)`, read through `RS.passwd_home()`
+# — the real account home, by design (that function cannot be redirected by $HOME
+# the way `Path.home()` can; see its own docstring). A test that drives
+# `_run_session`/`_spawn_claude` for real without stubbing `create_tool_session_
+# scratch_dir` therefore creates, and never removes, a real directory under THIS
+# machine's own `~/.local/state/agent-platform/tool-sessions` (reviewer, PR #879,
+# comment 6166526636: found live in `tests/test_spawn_sandbox.py`'s 11 call sites
+# and one test in `tests/test_codex_review_dispatch.py`).
+#
+# `_tool_session_scratch_dir_off_the_real_account_home`, below, is the fix a test
+# file applies: `tests/test_agentctl.py` and `tests/test_spawn_sandbox.py` apply it
+# to every test in the file via a module-wide `pytestmark`; the one real-dispatch
+# test each in `tests/test_codex_review_dispatch.py` and `tests/
+# test_strict_mcp_config_live.py` apply it directly with `pytest.mark.usefixtures(
+# ...)`.
+#
+# `_no_directory_appears_under_the_real_tool_session_scratch_root`, below that, is
+# the backstop for the WHOLE suite, not only the files named above: it records what
+# the real root already holds before this session runs, and fails if anything new
+# appears after it, whichever test created it — including one added later that
+# forgets to apply the fixture above. It only ever lists the root (`Path.iterdir`);
+# it never opens, renames or removes anything under it, this machine's own account
+# included.
+@pytest.fixture
+def _tool_session_scratch_dir_off_the_real_account_home(agentctl, tmp_path_factory, monkeypatch):
+    """CQ·138: a real (non-dry-run) dispatch creates its own tool-session scratch
+    directory under the account's REAL home (`run_sandbox.tool_session_scratch_root`)
+    rather than the shared system temp root — `passwd_home()`, unlike `Path.home()`,
+    cannot be redirected by an environment variable, by design (see that function's
+    own docstring for why a real dispatch needs it to stay that way). Left unstubbed,
+    a test driving `_run_session`/`_spawn_claude` for real would create (and never
+    remove) a real directory under THIS machine's own `~/.local/state/agent-platform/
+    tool-sessions` — which this test harness's own sandbox refuses to write to at
+    all, and which `_no_directory_appears_under_the_real_tool_session_scratch_root`,
+    below, fails the whole session over. Defaults to a fresh tmp directory for every
+    test that applies it; a test that stubs `create_tool_session_scratch_dir` itself,
+    later in its own body, wins over this default."""
+    real_create = agentctl.RS.create_tool_session_scratch_dir
+    fake_home = tmp_path_factory.mktemp("tool-session-home")
+    monkeypatch.setattr(agentctl.RS, "create_tool_session_scratch_dir",
+                        lambda home=None: real_create(fake_home))
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_directory_appears_under_the_real_tool_session_scratch_root():
+    """The backstop described above the fixture this depends on: records what
+    `run_sandbox.tool_session_scratch_root(run_sandbox.passwd_home())` already holds
+    before this session runs, and fails if a NEW entry appears there after it,
+    whichever test created it — not only the files `_tool_session_scratch_dir_off_
+    the_real_account_home` is applied to today. Only ever lists the root
+    (`Path.iterdir`); never opens, renames or removes anything under it."""
+    root = run_sandbox.tool_session_scratch_root(run_sandbox.passwd_home())
+    before = set(root.iterdir()) if root.is_dir() else set()
+    yield
+    after = set(root.iterdir()) if root.is_dir() else set()
+    new = after - before
+    assert not new, (
+        f"{len(new)} new entry(ies) appeared under the REAL tool-session scratch "
+        f"root ({root}) during this test session: {sorted(p.name for p in new)}. "
+        "A test drove real dispatch code (_run_session/_spawn_claude/"
+        "create_tool_session_scratch_dir) without stubbing it onto a temporary "
+        "home — apply _tool_session_scratch_dir_off_the_real_account_home.")

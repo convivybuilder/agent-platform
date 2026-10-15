@@ -2,7 +2,7 @@
 """mcp-ops-server: stdio MCP server exposing the operations plane's signal
 memory (ARCH-349/351) to agent sessions.
 
-Thirty tools (+ 6 deprecated bug_* aliases for one cycle, ARCH-361).
+Thirty-one tools (+ 6 deprecated bug_* aliases for one cycle, ARCH-361).
 KEEP THIS LIST CURRENT: a tool missing from it is invisible to anyone
 reading the module rather than grepping for @mcp.tool(), which is the same
 shape of omission as the whitelist below — and this list had already drifted
@@ -27,6 +27,7 @@ once (reviewer, PR #522).
 - issue_revise:     revise a held item's own content — title, body, spec, DoD, maturity (POST /api/issues/{id}/revision)
 - issue_prerequisite_verdict: record whether a text prerequisite is met (POST /api/issues/{id}/prerequisites/verdict)
 - issue_correct:    correct a misfiled field — type, severity, maturity, parent_id, spec, DoD (POST /api/issues/{id}/correct)
+- issue_move_product: move a work item and its whole subtree to another product (POST /api/issues/{id}/product)
 - course_list:      the plan for a project, as an ordered list of epics (GET /api/courses)
 - course_get:       one plan, entries expanded, plus its reorder history (GET /api/courses/{id})
 - course_create:    start the plan for a project (POST /api/courses)
@@ -1801,8 +1802,9 @@ def issue_correct(issue_id: str, type: str | None = None,
 
     THIS IS A CORRECTION PATH, NOT A GENERAL EDIT. `title`, `body` and `state`
     are not here — `issue_revise` is the route for an item's own content, and
-    it takes the lease as its authorization. `product` is immutable
-    everywhere.
+    it takes the lease as its authorization. `product` is not a parameter of
+    this tool either; `issue_move_product` is the route that moves an item and
+    its whole subtree to another product in one transaction.
 
     `type` and `severity` correct a MISFILING and take no null — send the
     value or omit the parameter. `maturity` and `parent_id` record a fact that
@@ -1968,6 +1970,67 @@ def issue_correct(issue_id: str, type: str | None = None,
     if "error" in res:
         return json.dumps(res)
     return json.dumps(_shape_issue_detail(res), ensure_ascii=False)
+
+
+@mcp.tool()
+def issue_move_product(issue_id: str, product: str, owner: str | None = None) -> str:
+    """Move a work item and EVERYTHING BENEATH IT to another product, in one
+    transaction (`POST /items/{id}/product`, platform/contracts/library-protocol
+    §5). Neither `issue_correct` nor `issue_revise` exposes `product` as a
+    parameter — a subtree is never allowed to span products (ADR-0023, the
+    descendant-count disclosure on epic retype depends on it), so this is the
+    one route that changes an item's product, and it does it by moving the
+    whole subtree rather than one item at a time.
+
+    EVERY MOVED ITEM GETS A NEW KEY MINTED IN THE DESTINATION, and the old key
+    is never reissued in the source. The response is `{item, moved,
+    left_courses}`: `item` is shaped like every other mutation route's success
+    body, and `moved` and `left_courses` pass through unchanged. `moved` lists
+    `{id, old_key, new_key}` for every item the move touched, including `item`
+    itself. A sub-item whose key extends its epic's keeps its suffix under the
+    epic's new key — `E9·4` becomes `E3·4` when `E9` is the one moving and is
+    reminted `E3`. The moved item leaves its old parent: an epic becomes top
+    level in the destination, a work item joins the destination's corrections
+    queue. Its own descendants keep their parent edges. An approved epic in the
+    subtree leaves the source's live Course and joins none in the destination.
+
+    Pass `owner` when you hold the item's lease under a session name (from
+    `issue_checkout`), the same identity you checked out with — the same
+    convention `issue_correct` uses, including its fallback: every session's
+    tools present one bearer token, so an omitted `owner` falls back to that
+    token identity, and the Library then reads your own lease as someone
+    else's.
+
+    REFUSALS, each surfaced here exactly as `issue_correct` surfaces its own —
+    the whole refusal body passes through unchanged, so read its `error` and
+    `hint` and whatever else it carries directly:
+
+    - **409, `reason: "held"`**, while another holder's live lease covers the
+      item OR ANYTHING BENEATH IT — wider than `issue_correct`'s own check,
+      because the whole subtree moves together. Leave it to the holder rather
+      than retrying.
+    - **409** when the item is terminal, or already in the destination product.
+    - **409** when the subtree cannot be enumerated, since the move takes all
+      of it or nothing.
+    - **409** when the move would cross a `found_during` link: an item in the
+      moving subtree names an epic staying behind, or an item staying behind
+      names an epic that is moving. Correct `found_during` with `issue_correct`
+      first — the move never clears it on its own.
+    - **404** when the source or the destination product is outside the
+      caller's scope.
+
+    The route needs the `item.resolve` capability, the same one `issue_correct`
+    needs."""
+    payload: dict = {"product": product}
+    if owner:
+        payload["owner"] = owner
+    res = _call("POST",
+               f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/product",
+               body=payload)
+    if isinstance(res, dict) and isinstance(res.get("item"), dict):
+        res = dict(res)
+        res["item"] = _shape_issue_detail(res["item"])
+    return json.dumps(res, ensure_ascii=False)
 
 
 # --- handoff_write: this session's rollover handoff (ADR-0069 Slice 5) ---

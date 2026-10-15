@@ -24,7 +24,7 @@ def store(agentctl, tmp_path, monkeypatch):
 
 def _checkout(agentctl, monkeypatch, session_id):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session_id)
-    return agentctl.cmd_kb_checkout(Namespace(doc=DOC, holder=None, note=None))
+    return agentctl.cmd_kb_checkout(Namespace(doc=DOC, holder=None, note=None, sha_only=False))
 
 
 def test_a_second_session_is_refused_the_first_sessions_checkout(
@@ -67,10 +67,42 @@ def test_outside_any_session_the_user_fallback_remains(agentctl, monkeypatch):
 def test_a_malformed_holder_is_refused_before_the_store_sees_it(
         agentctl, store, monkeypatch, capsys, verb):
     """kb apply and kb propose already refused one; checkout and release now match
-    (security review, PR 532). A space is outside HOLDER_RE."""
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "not a valid id")
+    (security review, PR 532). A space is now accepted (ARCH-408,
+    issue_01M0YAS4S64P5TXN7S2C17GHF6) — a newline is still outside the rule, since
+    it would plant a second KB-Write: trailer line."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "not\na valid id")
     cmd = agentctl.cmd_kb_checkout if verb == "checkout" else agentctl.cmd_kb_release
-    rc = cmd(Namespace(doc=DOC, holder=None, note=None))
+    rc = cmd(Namespace(doc=DOC, holder=None, note=None, sha_only=False))
     assert rc == 1
     assert "not a valid identity" in capsys.readouterr().err
     assert store.lease_for(DOC) is None, "nothing may reach the lease store"
+
+
+def test_an_explicit_email_holder_is_recorded_unaltered_in_the_lease(
+        agentctl, store, monkeypatch):
+    """The Library's document checkout records a holder's email address as given
+    (Orient's editor holds checkouts under the user's raw email), so agentctl's
+    lease store must record the exact same string, not a reshaped one."""
+    rc = agentctl.cmd_kb_checkout(
+        Namespace(doc=DOC, holder="person@example.com", note=None, sha_only=False))
+    assert rc == 0
+    assert store.lease_for(DOC)["holder"] == "person@example.com"
+
+
+def test_an_explicit_holder_with_surrounding_whitespace_is_recorded_stripped(
+        agentctl, store, monkeypatch):
+    rc = agentctl.cmd_kb_checkout(
+        Namespace(doc=DOC, holder="  person@example.com  ", note=None, sha_only=False))
+    assert rc == 0
+    assert store.lease_for(DOC)["holder"] == "person@example.com"
+
+
+def test_a_sha_only_checkout_journals_the_normalised_holder(agentctl, store, monkeypatch):
+    """`--sha-only` takes no lease, so the journal row is the only record of which
+    holder it ran under — it must be the same normalised form the lease path
+    records, not the raw string `_kb_holder` returned."""
+    rc = agentctl.cmd_kb_checkout(
+        Namespace(doc=DOC, holder="  person@example.com  ", note=None, sha_only=True))
+    assert rc == 0
+    rows = store.recent_journal(limit=1, verb="checkout")
+    assert rows[0]["holder"] == "person@example.com"

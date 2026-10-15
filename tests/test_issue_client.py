@@ -920,6 +920,9 @@ def test_post_ledger_entry_recorded_false_is_not_recorded_not_an_error(monkeypat
 
 
 def test_post_ledger_entry_a_disproportionate_refusal_is_reported_not_retried(monkeypatch):
+    """A distinct status (E1·9), not folded into `error:422`: the caller must be
+    able to tell this apart from every other refusal without parsing `error`
+    text, since this is the one that must never be resubmitted unchanged."""
     def raise_422(req, timeout=None):
         body = json.dumps({"error": "this report exceeds 10x the scope's soft cap",
                            "basis": "soft_cap"}).encode()
@@ -928,8 +931,28 @@ def test_post_ledger_entry_a_disproportionate_refusal_is_reported_not_retried(mo
     monkeypatch.setattr(bc.urllib.request, "urlopen", raise_422)
     res = bc.post_ledger_entry("vivy", 999.0, run_id="run-abc", dedup_key="run-abc",
                               lane="subscription", tok="t")
-    assert res["status"] == "error:422"
+    assert res["status"] == "disproportionate"
     assert "soft cap" in res["error"]
+    assert res["reported_usd"] == 999.0
+    assert res["basis"] == "soft_cap"
+
+
+def test_post_ledger_entry_a_different_422_stays_error_422(monkeypatch):
+    """"day is too far from this Library's own date" is also a 422, but carries
+    no `basis` field — against an implementation that branches on the status
+    code alone, this would also read "disproportionate" and get silently
+    marked on the run as unchanged-and-never-resubmit, which is wrong for a
+    refusal that has nothing to do with the figure's size."""
+    def raise_422(req, timeout=None):
+        body = json.dumps({"error": "day is too far from this Library's own date",
+                           "day": "2026-10-01", "library_day": "2026-10-13"}).encode()
+        raise bc.urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", raise_422)
+    res = bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+                              lane="subscription", tok="t")
+    assert res["status"] == "error:422"
+    assert "day is too far" in res["error"]
 
 
 def test_post_ledger_entry_an_unreachable_library_is_an_error_status(monkeypatch):

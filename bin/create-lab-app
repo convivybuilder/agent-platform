@@ -177,7 +177,7 @@ ${APP_NAME} is a personal system-of-record lab product in the Convivy suite (ARC
 
 ## The build crew
 
-\`agentctl\`-dispatched, resolved from \`.claude/agents/\` (the \`${PREFIX}-\` prefix), off the shared knowledge index — the crew is dispatchable from this repo (\`LOCAL_AGENT_REPOS\`), and the app's KB stays local because the repo is also in \`REPO_LOCAL_DOCS\`, which is what \`scribe\` refuses against. Two tuples, two properties; ARCH-177 set both at once and they were separated on 2026-08-25.
+Within a \`co\` session, the Task tool resolves the \`${PREFIX}-\` crew straight from the \`.claude/agents/\` files below. \`agentctl spawn\` (the steward-or-overnight cross-repo dispatch path) resolves the same names through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA. See the post-creation checklist for what that path still needs.
 
 \`${PREFIX}-architect\` · \`${PREFIX}-planner\` · \`${PREFIX}-coder\` · \`${PREFIX}-reviewer\` · \`${PREFIX}-security-reviewer\` · \`${PREFIX}-overnight-orchestrator\`
 EOF
@@ -210,7 +210,7 @@ ${APP_NAME} is a **lab product** (ARCH-243): a first-class agentic deployment wi
 
 ## The crew
 
-${APP_NAME} has its own crew in \`.claude/agents/\` (the \`${PREFIX}-\` prefix), resolved by \`agentctl\` from this repo, off the shared knowledge index. The crew is dispatchable because the repo is in \`LOCAL_AGENT_REPOS\`; the app's KB stays local because it is also in \`REPO_LOCAL_DOCS\`. Those were one tuple under ARCH-177 and were separated on 2026-08-25, so neither property implies the other any more:
+${APP_NAME} has its own crew, committed in \`.claude/agents/\` (the \`${PREFIX}-\` prefix). A Task-tool dispatch in this \`co\` session reads those files directly. \`agentctl spawn\` (the steward-or-overnight cross-repo path) resolves the same names through the shared Library-served index every non-black-box crew uses, once the post-creation checklist's registration step is done; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA:
 
 - **\`${PREFIX}-architect\`** — design forks, new subsystems, and ADRs. Produces fleshed-out proposals with options + tradeoffs + recommendation.
 - **\`${PREFIX}-planner\`** — turns an approved design into a build plan: small, independently reviewable PRs with crisp specs.
@@ -314,7 +314,7 @@ ${APP_NAME} is a new lab product in the Convivy personal-apps suite (ARCH-243). 
 - **Crew prefix:** \`${PREFIX}-\`
 - **Crew agents:** architect, planner, coder, reviewer, security-reviewer, overnight-orchestrator
 - **KB:** local, gitignored \`data/\` directory on the mini
-- **Dispatch:** \`agentctl\` via \`LOCAL_AGENT_REPOS\` (ARCH-177) — repo-local agent resolution, off the shared knowledge index
+- **Dispatch:** \`agentctl spawn\` resolves the \`${PREFIX}-\` crew through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA
 
 The lab-product pattern this repo follows is documented in \`docs/lab-product-template.md\` and \`bin/create-lab-app\` in the \`agent-platform\` repo (ARCH-249). The data-locality and trust-boundary invariant is the suite-wide canonical statement at \`knowledge/projects/shared/decisions/0006-suite-data-locality-trust-boundary-invariant.md\` (ARCH-248).
 
@@ -491,7 +491,7 @@ tools: Read, Grep, Glob, Write, Bash(git:*), Bash(gh pr list:*), Bash(gh pr view
 
 You are the **self-contained overnight drain for \`${APP_NAME}\`** — a personal system-of-record lab product (ARCH-243). You wake on a schedule, drain unclaimed feature items from the in-box queue, dispatch the crew to ready-to-merge PRs, and leave the operator a digest. You run as \`claude -p\` with no human in the loop, so you never ask clarifying questions — you either proceed or skip-and-defer. **You do not modify code yourself, and you never merge a PR (ARCH-020).**
 
-\`${APP_NAME}\` is a **local-agent app (ARCH-177)**: its crew lives in its own \`.claude/agents/\` and stays off the shared knowledge index. **You can only dispatch \`${APP_NAME}\`'s own crew** via \`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME}\`.
+\`${APP_NAME}\` is a lab product (ARCH-243). \`agentctl spawn\` resolves the \`${PREFIX}-\` crew through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA. **You dispatch \`${APP_NAME}\`'s own crew** via \`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME}\`.
 
 ## What you drain — unclaimed feature items from the in-box queue
 
@@ -760,16 +760,20 @@ These steps touch shared or external systems; the script does not auto-do them.
      git -C ${TARGET} remote add origin git@github.com:convivy/${APP_NAME}.git
      git -C ${TARGET} push -u origin main
 
-2. Add '${APP_NAME}' to BOTH tuples in bin/agentctl. They were one list until
-   2026-08-25 and answer different questions, so adding it to only the first
-   gives the app a crew and silently grants it shared-KB write access:
+2. Register the ${PREFIX}- crew for the shared dispatch path every
+   non-black-box crew uses (LOCAL_AGENT_REPOS is reserved for the two
+   privacy crews, CFO and EA):
 
-     LOCAL_AGENT_REPOS = (..., "${APP_NAME}")   # where the CREW resolves from
-     REPO_LOCAL_DOCS   = (..., "${APP_NAME}")   # may NOT write the shared KB
-
-   The second is the one an onboarding checklist forgets, because nothing fails
-   when you do — the app works, and the refusal that should have been there is
-   an absence rather than an error.
+   - Add '${PREFIX}-' to _INTERNAL_APP_PREFIXES in bin/agentctl and to
+     INTERNAL_APP_PREFIXES in lib/agent-platform/review_protocol.py, in the
+     same commit (test_agentctl_and_review_protocol_prefixes_match holds
+     the two equal). Without it, agentctl spawn refuses
+     ${PREFIX}-architect, ${PREFIX}-coder, ${PREFIX}-reviewer and
+     ${PREFIX}-security-reviewer rather than giving them a worktree.
+   - Propose the agent files under .claude/agents/ into the knowledge repo
+     as knowledge/projects/${APP_NAME}/agents/${PREFIX}-<role>.md
+     (kind: agent), the Reference Room location agentctl spawn's
+     Library-served resolution reads an agent's definition from.
 
 3. Add a bin/co tab styling entry for ${APP_NAME} — pick a hex accent and add
    an _apply_co_style block in bin/co, following the selector block (~line 355).

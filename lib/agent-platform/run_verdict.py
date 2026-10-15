@@ -31,6 +31,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+import projects
 import review_protocol as RP
 
 # Read by `review-post` for the Library address it writes a record to. Unset, that write
@@ -58,8 +59,11 @@ class Target:
 
 
 def _slug(repo: str) -> str:
-    # The same expansion agentctl applies to `--on` (an owner-less name is convivy/<name>).
-    return repo if "/" in repo else f"convivy/{repo}"
+    # The same expansion `--on` has always carried, now the one function
+    # agentctl, tool_policy and this module all call through
+    # (projects.repo_github_slug): an owner-less name is convivy/<name>,
+    # unless the repo's own registry entry names a different owner.
+    return projects.repo_github_slug(repo)
 
 
 def target_for(run_id: str, *, pr: str | None = None, repo: str | None = None,

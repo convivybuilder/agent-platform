@@ -9,16 +9,19 @@
          (issue_01M2KV16ZRG3N49GRER8Q7545H), authenticating as the convivy-bosun
          GitHub App rather than `gh` under the operator's personal account.
 
-         900s (15 min), matching the cadence `com.convivy.changelog-drain` already
-         notes for orient-github-capture's own GitHub-capture job on this
-         machine — a panel is fine lagging one capture interval (see the
-         script's module docstring), and a tighter cadence buys nothing a
-         reader needs while multiplying calls against every covered repo for
-         no visible gain. Deliberately NOT tied to the gates' live GitHub read,
-         which stays synchronous at merge time — see the module docstring for
-         why the two sources must not merge. -->
+         180s (3 min): the operator wants GitHub-derived state to land within
+         3 minutes, the pace the crews work at (2026-10-15, relayed by the
+         steward). One pass costs about 78 requests and takes about 90
+         seconds, so 20 passes an hour cost about 1,560 against the
+         convivy-bosun installation's 15,000-requests-an-hour limit; every
+         user of that installation at this cadence totals about 28% of it.
+         launchd skips a StartInterval firing while the previous pass is
+         still running (launchd.plist(5)), so passes cannot overlap and no
+         lock is needed. Deliberately NOT tied to the gates' live GitHub
+         read, which stays synchronous at merge time — see the module
+         docstring for why the two sources must not merge. -->
     <key>StartInterval</key>
-    <integer>900</integer>
+    <integer>180</integer>
 
     <!-- Deploy-pinned per platform/decisions/0059 rule 1
          (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is

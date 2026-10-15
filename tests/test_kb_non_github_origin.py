@@ -424,7 +424,7 @@ def test_kb_checkout_reads_a_local_origin_with_no_app_key(local_origin_repos, ag
     path — `kb apply` needs its content-sha, and `kb_create` (the MCP tool)
     reaches it the same way. It shares `_kb_library_git`, so it takes the
     plain-git branch here too."""
-    rc = agentctl.cmd_kb_checkout(Namespace(doc=SEEDED, holder="run-test", note=None))
+    rc = agentctl.cmd_kb_checkout(Namespace(doc=SEEDED, holder="run-test", note=None, sha_only=False))
     assert rc == 0
 
 

@@ -12,6 +12,9 @@ these pin the pure logic.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 
 # --- is_close_loop -------------------------------------------------------------
 
@@ -91,6 +94,26 @@ def test_close_loop_excluded_even_with_a_link(model_scorecard):
     # holds even in the edge case of a stray link from an earlier cycle
     meta = {"agent": "bug-fixer", "task": "CLOSE-LOOP MODE only — no code."}
     assert model_scorecard.is_ledger_member(meta, {"pr_number": 436}) is False
+
+
+# --- _validated_run_repo (round 2 security finding, PR #881) -------------------
+#
+# meta["repo"] is a file the dispatched run itself can write. This is the bound
+# harvest() and judge_sample() call before using it in a `gh` query.
+
+
+def test_validated_run_repo_refuses_a_forged_qualified_owner(model_scorecard):
+    meta = {"repo": "acme-attacker/widget"}
+    assert model_scorecard._validated_run_repo(meta) is None
+
+
+def test_validated_run_repo_accepts_a_registered_bare_name(model_scorecard):
+    meta = {"repo": "homebrew-tap"}
+    assert model_scorecard._validated_run_repo(meta) == "homebrew-tap"
+
+
+def test_validated_run_repo_is_none_when_absent(model_scorecard):
+    assert model_scorecard._validated_run_repo({}) is None
 
 
 # --- skip_counts (the coverage-gap residual) -----------------------------------
@@ -435,6 +458,51 @@ def test_select_judge_sample_round_robins_across_cells(model_scorecard):
     assert {p["run_id"] for p in picks} == {"bf1", "co1"}
 
 
+def test_judge_sample_skips_a_forged_qualified_repo(model_scorecard, monkeypatch, tmp_path):
+    """Round 2 security finding (PR #881, comment 6152094447): a ledger row's
+    `repo` reached it from a run's own meta.json (build_row) — the same
+    run-writable field harvest() guards. fetch_pr_context calls gh, so
+    judge_sample must refuse the forged owner before reaching it rather than
+    pass it straight through. Fails against 43f57916: fetch_pr_context was
+    called with the forged owner/repo string."""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = _mrow("run-x", "bug-fixer", "deepseek/deepseek-v4-flash", today, 1,
+                repo="acme-attacker/widget")
+    monkeypatch.setattr(model_scorecard, "_task_for_run", lambda run_id: "")
+    called = []
+    monkeypatch.setattr(model_scorecard, "fetch_pr_context",
+                        lambda *a, **kw: called.append(a) or {"task": "", "title": "",
+                                                               "reviews": "", "diff": "d"})
+    # Belt-and-suspenders against the unfixed code actually reaching a live
+    # `claude -p` call if the guard under test doesn't fire.
+    monkeypatch.setattr(model_scorecard, "run_judge",
+                        lambda *a, **kw: {"text": "{}", "cost_usd": 0.0})
+    out = model_scorecard.judge_sample([row], tmp_path / "judge.jsonl",
+                                       sample=3, model="m", write=False)
+    assert called == []
+    assert out == []
+
+
+def test_judge_sample_still_resolves_a_registered_repo(model_scorecard, monkeypatch, tmp_path):
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = _mrow("run-y", "bug-fixer", "deepseek/deepseek-v4-flash", today, 1,
+                repo="homebrew-tap")
+    monkeypatch.setattr(model_scorecard, "_task_for_run", lambda run_id: "")
+    called = []
+    monkeypatch.setattr(model_scorecard, "fetch_pr_context",
+                        lambda repo, *a, **kw: called.append(repo) or {
+                            "task": "", "title": "", "reviews": "", "diff": "d"})
+    monkeypatch.setattr(model_scorecard, "run_judge",
+                        lambda prompt, model: {"text": '{"review_thoroughness": 3, "fix_quality": 3}',
+                                              "cost_usd": 0.0})
+    out = model_scorecard.judge_sample([row], tmp_path / "judge.jsonl",
+                                       sample=3, model="m", write=False)
+    assert called == ["homebrew-tap"]
+    assert len(out) == 1
+
+
 def test_parse_verdict_strips_fence_and_validates(model_scorecard):
     text = '```json\n{"review_thoroughness": 4, "fix_quality": 5, ' \
            '"flagged_issues": ["off-by-one risk"], "rationale": "Tight fix."}\n```'
@@ -518,6 +586,118 @@ def test_build_judge_prompt_contains_context_and_json_contract(model_scorecard):
     pr = model_scorecard.build_judge_prompt(row, ctx)
     assert "PR #441" in pr and "Fix formatUSD" in pr and "review_thoroughness" in pr
     assert "Output ONLY a JSON object" in pr
+
+
+def test_build_judge_prompt_names_the_registered_owner_for_homebrew_tap(model_scorecard):
+    """Round-1 review (PR #881, comment 6150937461): this label built
+    `convivy/{repo}` directly — the same pattern the PR centralizes
+    everywhere else."""
+    row = {"pr_number": 1, "repo": "homebrew-tap", "agent": "bug-fixer", "model": "sonnet"}
+    ctx = {"task": "t", "title": "t", "reviews": "", "diff": "d"}
+    pr = model_scorecard.build_judge_prompt(row, ctx)
+    assert "convivybuilder/homebrew-tap" in pr
+
+
+# --- gh-calling slug sites: the registered owner, not always convivy --------
+
+
+def test_pr_maps_queries_the_registered_owner_for_homebrew_tap(model_scorecard, monkeypatch):
+    captured = {}
+
+    def fake_gh_json(args):
+        captured["args"] = args
+        return []
+
+    monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
+    model_scorecard.pr_maps("homebrew-tap")
+
+    assert captured["args"] and "--repo" in captured["args"]
+    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"
+
+
+def test_ci_first_pass_queries_the_registered_owner_for_homebrew_tap(model_scorecard, monkeypatch):
+    monkeypatch.setitem(model_scorecard.CI_WORKFLOW, "homebrew-tap", "ci.yml")
+    captured = {}
+
+    def fake_gh_json(args):
+        captured["args"] = args
+        return []
+
+    monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
+    model_scorecard.ci_first_pass("homebrew-tap", "a-branch")
+
+    assert captured["args"] and "--repo" in captured["args"]
+    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"
+
+
+def test_was_reverted_queries_the_registered_owner_for_homebrew_tap(model_scorecard, monkeypatch):
+    captured = {}
+
+    def fake_gh_json(args):
+        captured["args"] = args
+        return []
+
+    monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
+    model_scorecard.was_reverted("homebrew-tap", 1, "2026-05-20T18:34:53Z")
+
+    assert captured["args"] and "--repo" in captured["args"]
+    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"
+
+
+def test_had_follow_up_bug_queries_the_registered_owner_for_homebrew_tap(
+        model_scorecard, monkeypatch):
+    captured = {}
+
+    def fake_gh_json(args):
+        captured["args"] = args
+        return []
+
+    monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
+    model_scorecard.had_follow_up_bug("homebrew-tap", 1, "2026-05-20T18:34:53Z")
+
+    assert captured["args"] and "--repo" in captured["args"]
+    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"
+
+
+def test_fetch_pr_context_queries_the_registered_owner_for_homebrew_tap(
+        model_scorecard, monkeypatch):
+    captured = []
+
+    def fake_gh_text(args):
+        captured.append(args)
+        return "diff"
+
+    def fake_gh_json(args):
+        captured.append(args)
+        return {}
+
+    monkeypatch.setattr(model_scorecard, "_gh_text", fake_gh_text)
+    monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
+    model_scorecard.fetch_pr_context("homebrew-tap", 1, "task")
+
+    assert captured and all("--repo" in c for c in captured)
+    for c in captured:
+        assert c[c.index("--repo") + 1] == "convivybuilder/homebrew-tap"
+
+
+def test_harvest_repo_prs_queries_the_registered_owner_for_homebrew_tap(
+        model_scorecard, monkeypatch):
+    captured = {}
+
+    def fake_gh_json(args):
+        captured["args"] = args
+        return []
+
+    monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
+    model_scorecard.harvest_repo_prs("homebrew-tap", 30, "shipwright")
+
+    assert captured["args"] and "--repo" in captured["args"]
+    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"
 
 
 def test_render_judge_report_averages_non_null_scores(model_scorecard):
@@ -680,7 +860,9 @@ def test_ledger_lane_none_for_a_codex_model(model_scorecard):
     assert model_scorecard.ledger_lane("gpt-5.5") is None
 
 
-def test_report_to_ledger_posts_the_documented_fields_and_dedup_key(model_scorecard, monkeypatch):
+def test_report_to_ledger_posts_the_documented_fields_and_dedup_key(
+        model_scorecard, monkeypatch, tmp_path):
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
     captured = []
 
     def fake_post(product, usd, *, run_id, dedup_key, lane, agent=None, model=None,
@@ -701,7 +883,9 @@ def test_report_to_ledger_posts_the_documented_fields_and_dedup_key(model_scorec
                          "agent": "coder", "model": "claude-sonnet-5"}]
 
 
-def test_report_to_ledger_sends_the_gateway_lane_for_a_gateway_model(model_scorecard, monkeypatch):
+def test_report_to_ledger_sends_the_gateway_lane_for_a_gateway_model(
+        model_scorecard, monkeypatch, tmp_path):
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
     captured = []
 
     def fake_post(product, usd, *, run_id, dedup_key, lane, **kw):
@@ -739,12 +923,14 @@ def test_report_to_ledger_skips_a_row_with_no_model(model_scorecard, monkeypatch
     assert report["errors"] == [("run-no-model", "skip:no-lane", "no ledger lane for model None")]
 
 
-def test_report_to_ledger_sends_item_id_only_when_the_row_carries_one(model_scorecard, monkeypatch):
+def test_report_to_ledger_sends_item_id_only_when_the_row_carries_one(
+        model_scorecard, monkeypatch, tmp_path):
     """`post_ledger_entry`'s `item_id` is omitted entirely for a row with none
     (the pre-E16·5 shape, and any run with no dispatched work item) rather
     than sent as `None` — against the unfixed code (which always passed
     `item_id=r.get("item_id")`), the first captured call below would be
     `{"item_id": None}`, not `{}`."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
     captured = []
 
     def fake_post(product, usd, *, run_id, dedup_key, lane=None, agent=None, model=None,
@@ -759,10 +945,11 @@ def test_report_to_ledger_sends_item_id_only_when_the_row_carries_one(model_scor
     assert captured == [{}, {"item_id": "issue_E16_5"}]
 
 
-def test_report_to_ledger_a_rerun_sends_the_same_dedup_key(model_scorecard, monkeypatch):
+def test_report_to_ledger_a_rerun_sends_the_same_dedup_key(model_scorecard, monkeypatch, tmp_path):
     """A later harvest pass re-resolves the same run (e.g. its PR is still open) and
     upserts the same row again; the dedup_key sent must not change, since that is
     what makes the resend idempotent at the Library rather than double-counted."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
     seen = []
     monkeypatch.setattr(
         model_scorecard.issue_client, "post_ledger_entry",
@@ -773,7 +960,8 @@ def test_report_to_ledger_a_rerun_sends_the_same_dedup_key(model_scorecard, monk
     assert seen == ["run-abc", "run-abc"]
 
 
-def test_report_to_ledger_counts_not_recorded_without_retrying(model_scorecard, monkeypatch):
+def test_report_to_ledger_counts_not_recorded_without_retrying(model_scorecard, monkeypatch, tmp_path):
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
     calls = []
     monkeypatch.setattr(
         model_scorecard.issue_client, "post_ledger_entry",
@@ -783,7 +971,9 @@ def test_report_to_ledger_counts_not_recorded_without_retrying(model_scorecard, 
     assert len(calls) == 1
 
 
-def test_report_to_ledger_counts_errors_and_keeps_going_over_the_rest(model_scorecard, monkeypatch):
+def test_report_to_ledger_counts_errors_and_keeps_going_over_the_rest(
+        model_scorecard, monkeypatch, tmp_path):
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
     rows = [dict(_LEDGER_ROW, run_id="run-a"), dict(_LEDGER_ROW, run_id="run-b")]
     monkeypatch.setattr(
         model_scorecard.issue_client, "post_ledger_entry",
@@ -795,11 +985,103 @@ def test_report_to_ledger_counts_errors_and_keeps_going_over_the_rest(model_scor
                                 ("run-b", "error:OSError", "down")]
 
 
+# --- report_to_ledger: a disproportionate refusal (E1·9, budget-enforcement
+# epic Clause 6) is recorded on the run and never resubmitted unchanged -------
+
+
+def _make_run_dir(root: Path, run_id: str, *, meta_extra=None) -> Path:
+    rd = root / "2026-10-13" / run_id
+    rd.mkdir(parents=True)
+    meta = {"run_id": run_id, "agent": "coder", "task": "t", "repo": "vivy",
+            "worktree": "/wt", "profile": "p", "model": "claude-sonnet-5",
+            "started_at": "2026-10-13T00:00:00Z", "pid": None}
+    meta.update(meta_extra or {})
+    (rd / "meta.json").write_text(json.dumps(meta))
+    return rd
+
+
+def test_report_to_ledger_marks_a_disproportionate_refusal_on_the_run(
+        model_scorecard, monkeypatch, tmp_path):
+    """Against the unfixed code (no write back to the run at all), the run dir's
+    meta.json never gains `ledger_report_refused_usd`/`_reason`, so the second
+    assertion below fails."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    run_dir = _make_run_dir(tmp_path, "run-abc")
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: {"status": "disproportionate",
+                          "error": "this report exceeds 10x the scope's soft cap",
+                          "reported_usd": 0.1234, "basis": "soft_cap", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert report["errors"] == [("run-abc", "disproportionate",
+                                 "this report exceeds 10x the scope's soft cap")]
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["ledger_report_refused_usd"] == 0.1234
+    assert meta["ledger_report_refused_reason"] == "this report exceeds 10x the scope's soft cap"
+
+
+def test_report_to_ledger_does_not_resend_an_unchanged_refused_figure(
+        model_scorecard, monkeypatch, tmp_path):
+    """Clause 6: a refused report is surfaced against its run and not resubmitted
+    unchanged. Against the unfixed code (no pre-post check against the run's own
+    mark), the stub below would receive a second call for the same $0.1234 figure
+    — `calls` would be 2, not 1."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _make_run_dir(tmp_path, "run-abc", meta_extra={
+        "ledger_report_refused_usd": 0.1234,
+        "ledger_report_refused_reason": "this report exceeds 10x the scope's soft cap",
+    })
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "disproportionate",
+                                             "error": "x", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == []
+    assert report["errors"] == [("run-abc", "skip:refused-unchanged",
+                                 "this report exceeds 10x the scope's soft cap")]
+
+
+def test_report_to_ledger_reposts_a_corrected_figure(model_scorecard, monkeypatch, tmp_path):
+    """A later pass with a DIFFERENT figure for the same run (its cost was
+    corrected) posts again — against an implementation that keys the skip on
+    run_id alone rather than the figure, the stub below would never be called
+    and `calls` would stay empty."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _make_run_dir(tmp_path, "run-abc", meta_extra={
+        "ledger_report_refused_usd": 999.0,
+        "ledger_report_refused_reason": "this report exceeds 10x the scope's soft cap",
+    })
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])  # cost_usd 0.1234, not 999.0
+    assert calls == [1]
+    assert report == {"recorded": 1, "not_recorded": 0, "errors": []}
+
+
+def test_report_to_ledger_posts_unconditionally_with_no_resolvable_run_dir(
+        model_scorecard, monkeypatch, tmp_path):
+    """A synthetic row (or a run that has aged off disk) has no run dir to check
+    or mark — it posts the same as it always did, rather than erroring."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)  # empty: no run dirs exist
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "disproportionate",
+                                             "error": "x", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == [1]
+    assert report["errors"] == [("run-abc", "disproportionate", "x")]
+
+
 def test_main_still_writes_the_local_ledger_when_the_library_is_unreachable(
         model_scorecard, monkeypatch, tmp_path, capsys):
     """The Library write is a side effect of the harvest pass, not a precondition
     for it — an unreachable Library must not stop the local upsert that was
     already decided, and the failure is reported rather than swallowed."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path / "agent-runs")
     monkeypatch.setattr(model_scorecard, "harvest", lambda days: ([_LEDGER_ROW], {}, {"run-abc"}))
     monkeypatch.setattr(
         model_scorecard.issue_client, "post_ledger_entry",
@@ -892,6 +1174,63 @@ def test_harvest_prices_a_row_from_the_same_read_that_decided_finality(
     assert [r["run_id"] for r in rows] == ["run-toctou"]
     assert finished == {"run-toctou"}  # the run that finished mid-pass is posted
     assert rows[0]["cost_usd"] == 4.50  # priced from cost.json, not the stale $0.00 snapshot
+
+
+def _write_candidate_run(tmp_path, run_id: str, repo: str, pr_number: int = 1) -> None:
+    import json as json_mod
+    from datetime import datetime, timezone
+
+    today = datetime.now(timezone.utc)
+    day_dir = tmp_path / today.date().isoformat()
+    run_dir = day_dir / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text(json_mod.dumps({
+        "started_at": today.isoformat().replace("+00:00", "Z"),
+        "agent": "bug-fixer",
+        "model": "claude-sonnet-5",
+        "repo": repo,
+        "task": "t",
+    }))
+    (run_dir / "pr-link.json").write_text(json_mod.dumps({"pr_number": pr_number}))
+    (run_dir / "cost.json").write_text(json_mod.dumps({"usd": 1.0}))
+
+
+def test_harvest_refuses_a_forged_qualified_repo(model_scorecard, monkeypatch, tmp_path):
+    """Round 2 security finding (PR #881, comment 6152094447): meta.json's
+    `repo` is run-writable, and harvest's gh joins built `convivy/<repo>` (or,
+    after round 1, repo_github_slug(repo)) unconditionally. Fails against
+    43f57916: pr_maps was called with the forged owner/repo string."""
+    _write_candidate_run(tmp_path, "run-forged", "acme-attacker/widget")
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+
+    calls = []
+    monkeypatch.setattr(model_scorecard, "pr_maps", lambda repo: calls.append(repo) or {})
+
+    rows, skipped, finished = model_scorecard.harvest(days=3)
+
+    assert calls == []  # the forged repo never reached a gh query
+    assert [r["run_id"] for r in rows] == ["run-forged"]
+    assert rows[0]["pr_state"] == "unresolved"  # degrades like a missing repo
+
+
+def test_harvest_still_resolves_a_registered_repo_like_homebrew_tap(
+        model_scorecard, monkeypatch, tmp_path):
+    _write_candidate_run(tmp_path, "run-real", "homebrew-tap")
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+
+    calls = []
+
+    def fake_pr_maps(repo):
+        calls.append(repo)
+        return {1: {"number": 1, "state": "OPEN", "headRefName": "b", "mergedAt": None}}
+
+    monkeypatch.setattr(model_scorecard, "pr_maps", fake_pr_maps)
+    monkeypatch.setattr(model_scorecard, "ci_first_pass", lambda repo, branch: None)
+
+    rows, skipped, finished = model_scorecard.harvest(days=3)
+
+    assert calls == ["homebrew-tap"]
+    assert rows[0]["pr_number"] == 1
 
 
 def test_main_does_not_post_a_run_still_in_flight(model_scorecard, monkeypatch, tmp_path):

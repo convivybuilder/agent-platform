@@ -45,6 +45,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+import projects
+
 AUTONOMOUS = "autonomous"
 INTERACTIVE = "interactive"
 
@@ -357,10 +359,17 @@ def strip_app_prefix(agent_name: str) -> str:
 def repo_slug(repo: str | None) -> str | None:
     """`vivy` -> `convivy/vivy`. `gh --repo` wants owner/name; agentctl carries the
     short form. Returns None when there is no repo to scope to, which callers must
-    treat as "cannot scope" rather than "scope to everything"."""
+    treat as "cannot scope" rather than "scope to everything".
+
+    The owner comes from `projects.repo_github_slug` — a registered repo's own
+    `repo_owners` entry, else its unit's `github_owner`, else `convivy` — so a
+    repo under a different GitHub owner (homebrew-tap, under convivybuilder)
+    gets its real slug here too, used only in the caveat text `review_tools`
+    prints below, not to scope any actual grant (see that function's own
+    docstring on why the grants themselves aren't repo-scoped)."""
     if not repo:
         return None
-    return repo if "/" in repo else f"convivy/{repo}"
+    return projects.repo_github_slug(repo)
 
 
 def review_tools(repo: str | None) -> tuple[list[str], list[str]]:

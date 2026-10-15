@@ -136,6 +136,21 @@ APP_LEDGER_DIR = RUNS_ROOT / "llm-spend"  # collected ledgers from the ingest en
 # billing lane (the provider's own console, not the litellm gateway).
 ROW_TAGS = {"est": "", "actual": "  _(actual)_", "api": "  _(direct API)_"}
 
+# Pinned, not @latest (steward ruling, 2026-10-15). On 2026-10-14/15 npx's cache
+# for ccusage@latest was two minutes old and missing its darwin-arm64 native
+# binary, so every run exited 1 and the old code turned that into a silent $0 —
+# $445.28 and $146.92 of real spend went unrecorded. ccusage also runs as the
+# operator over every Claude Code transcript, so a floating version takes
+# whatever the next release is, broken or compromised, the moment it ships.
+# Bumping this is an ordinary reviewed pull request.
+CCUSAGE_VERSION = "20.0.33"  # verified 2026-10-15: reports $445.28 for 2026-10-14
+
+
+class CcusageError(RuntimeError):
+    """ccusage failed, or returned something that cannot be trusted as a cost
+    figure. Never swallow this into a $0 result — that is the exact failure
+    this class exists to stop (see CCUSAGE_VERSION above)."""
+
 
 def _resolve_npx() -> str:
     """Absolute npx for the launchd thin PATH (ARCH-086).
@@ -204,15 +219,27 @@ def overage_rollup(day: date_t) -> dict:
 
 
 def ccusage_by_model(day: date_t) -> dict[str, float]:
-    """Return {model_name: usd} from ccusage for `day`, claude-* models only."""
+    """Return {model_name: usd} from ccusage for `day`, claude-* models only.
+
+    Raises CcusageError on a non-zero exit, an exit 0 with empty stdout, or
+    stdout that doesn't parse as JSON with a `daily` list. A ccusage failure
+    swallowed into {} is a silent $0 that reads as "no spend today" — that is
+    the 2026-10-14/15 incident this guards against, not a hypothetical."""
     ymd = day.strftime("%Y%m%d")
-    out = subprocess.run(
-        [_resolve_npx(), "ccusage@latest", "daily", "--json", "--since", ymd, "--until", ymd],
-        capture_output=True, text=True, check=False,
-    )
-    if out.returncode != 0 or not out.stdout.strip():
-        return {}
-    data = json.loads(out.stdout)
+    argv = [_resolve_npx(), f"ccusage@{CCUSAGE_VERSION}", "daily", "--json",
+            "--since", ymd, "--until", ymd]
+    out = subprocess.run(argv, capture_output=True, text=True, check=False)
+    if out.returncode != 0:
+        detail = "\n".join((out.stderr or "").splitlines()[:5])
+        raise CcusageError(f"ccusage exited {out.returncode}: {detail}")
+    if not out.stdout.strip():
+        raise CcusageError("ccusage exited 0 but printed no output")
+    try:
+        data = json.loads(out.stdout)
+    except json.JSONDecodeError as e:
+        raise CcusageError(f"ccusage printed unparseable output: {e}") from e
+    if not isinstance(data, dict) or not isinstance(data.get("daily"), list):
+        raise CcusageError("ccusage output had no 'daily' list")
     by_model: dict[str, float] = {}
     for row in data.get("daily", []):
         for mb in row.get("modelBreakdowns", []):
@@ -594,25 +621,34 @@ def main() -> int:
                     help="recompute the last DAYS days of by-model history rows and exit")
     args = ap.parse_args()
 
-    if args.backfill is not None:
-        return backfill_history(args.backfill, datetime.now().isoformat())
+    # A ccusage failure must not be read as a $0 day (2026-10-14/15). Caught here,
+    # at the top of every path that can reach ccusage_by_model (the live run and
+    # --backfill alike), so the job exits non-zero and writes nothing for the day
+    # that failed rather than recording — or backfilling past — a wrong number.
+    try:
+        if args.backfill is not None:
+            return backfill_history(args.backfill, datetime.now().isoformat())
 
-    # The 00:00 launchd slot records the FINAL total for the day that just ended
-    # (the day-close), not a structurally-$0 "today as of 00:00". This is the one
-    # thing the 15-min refresh cannot do for itself: it always computes "today",
-    # so once the date rolls, yesterday's last ~15 minutes would never land in its
-    # history row. That is why retiring the summary post did NOT retire this job.
-    now = datetime.now()
-    now_iso = now.isoformat()
-    auto_close = (not args.date) and now.hour == 0
-    is_close = args.close or auto_close
-    if args.date:
-        day = date_t.fromisoformat(args.date)
-    elif auto_close:
-        day = date_t.today() - timedelta(days=1)
-    else:
-        day = date_t.today()
-    today_total, plain, snapshot = build_report(day, now_iso, is_close)
+        # The 00:00 launchd slot records the FINAL total for the day that just
+        # ended (the day-close), not a structurally-$0 "today as of 00:00". This
+        # is the one thing the 15-min refresh cannot do for itself: it always
+        # computes "today", so once the date rolls, yesterday's last ~15 minutes
+        # would never land in its history row. That is why retiring the summary
+        # post did NOT retire this job.
+        now = datetime.now()
+        now_iso = now.isoformat()
+        auto_close = (not args.date) and now.hour == 0
+        is_close = args.close or auto_close
+        if args.date:
+            day = date_t.fromisoformat(args.date)
+        elif auto_close:
+            day = date_t.today() - timedelta(days=1)
+        else:
+            day = date_t.today()
+        today_total, plain, snapshot = build_report(day, now_iso, is_close)
+    except CcusageError as e:
+        print(f"agent-cost-report: {e}", file=sys.stderr)
+        return 1
 
     # Refresh the snapshot the cost dashboards read (ARCH-136), even on a plain
     # print run, so the panel is current whoever ran the report.

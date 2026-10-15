@@ -13,6 +13,12 @@ import pytest
 
 import run_sandbox as RS
 
+# Every test here drives `_run_session` for real through `_spawn`, below —
+# apply the shared fixture (conftest.py, CQ·138) so none of them creates a
+# directory under the real account's `~/.local/state/agent-platform/
+# tool-sessions` (round 6, reviewer, PR #879, comment 6166526636).
+pytestmark = pytest.mark.usefixtures("_tool_session_scratch_dir_off_the_real_account_home")
+
 
 def _spawn(agentctl, tmp_path, monkeypatch, *, user_prompt="u", repo="constance", **session_kwargs):
     """Drive `_run_session` (the path foreground, detached and reviewer runs all

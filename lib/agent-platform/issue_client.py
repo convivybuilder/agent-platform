@@ -265,15 +265,30 @@ def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
     and reads as unattributed to the Library the same way it does in
     `cost_join`'s run-record report.
 
-    Returns `{"status": "recorded"|"not-recorded"|"skip"|"error:<code>|
-    <ExceptionName>|bad-body", "entry": <the route's body, or {}>}`, plus
-    `"error": <str>` on an `error:` status. Never raises.
+    Returns `{"status": "recorded"|"not-recorded"|"disproportionate"|"skip"|
+    "error:<code>|<ExceptionName>|bad-body", "entry": <the route's body, or
+    {}>}`, plus `"error": <str>` on a `disproportionate` or `error:` status.
+    Never raises.
 
     `"not-recorded"` is the route's documented `{"recorded": false}` answer
     for a product with no live ledger — NOT an error, and the caller must
-    not retry it, the same as every `error:` status here: a disproportionate-
-    spend refusal, a malformed call, or an unreachable Library are each a
-    fault in this report, not a transient condition to resend.
+    not retry it, the same as `"disproportionate"` and every `error:` status
+    here: a malformed call or an unreachable Library are each a fault in
+    this report, not a transient condition to resend.
+
+    `"disproportionate"` is the Library's 422 refusal of a single report
+    larger than its ceiling (`store.DisproportionateSpend` — ten times the
+    scope's soft cap, else its hard cap, else a flat $1,000 for an uncapped
+    scope): a report this size means THIS CLIENT'S OWN FIGURE for the run is
+    wrong, not a transient condition, so it carries its own status rather
+    than folding into `error:422` the way the unrelated `day is too far from
+    this Library's own date` 422 still does (E1·9, Clause 6 of the
+    budget-enforcement epic — a refused report is surfaced against the run
+    that produced it and never resubmitted unchanged). `"error"` is the
+    Library's own refusal text; `"reported_usd"` is the figure that was
+    refused, and `"basis"` names which rule computed the ceiling
+    (`"soft_cap"`, `"hard_cap"`, or `"uncapped"`) when the Library's body
+    carries one.
 
     `dedup_key` collides at the Library with any earlier entry carrying the
     same key, answering a resend with the existing row rather than double-
@@ -322,12 +337,22 @@ def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
             body = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         err_text = str(e)
+        err_body: dict[str, Any] = {}
         try:
-            err_body = json.loads(e.read().decode("utf-8"))
-            if isinstance(err_body, dict) and isinstance(err_body.get("error"), str):
-                err_text = err_body["error"]
+            parsed = json.loads(e.read().decode("utf-8"))
+            if isinstance(parsed, dict):
+                err_body = parsed
+                if isinstance(parsed.get("error"), str):
+                    err_text = parsed["error"]
         except Exception:
             pass
+        # `basis` is unique to store.DisproportionateSpend's refusal body — the
+        # OTHER 422 this route can answer ("day is too far from this Library's
+        # own date") carries no such field, so this is what tells the two apart
+        # rather than branching on the status code alone.
+        if e.code == 422 and "basis" in err_body:
+            return {"status": "disproportionate", "error": err_text, "entry": {},
+                   "reported_usd": usd, "basis": err_body.get("basis")}
         return {"status": f"error:{e.code}", "error": err_text, "entry": {}}
     except Exception as e:
         return {"status": f"error:{e.__class__.__name__}", "error": str(e), "entry": {}}

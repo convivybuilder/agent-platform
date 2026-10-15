@@ -72,7 +72,13 @@ BUCKETS: dict[str, list[str]] = {
     # placard: added with its registry entry, because test_repos_match_velocity_buckets
     # goes red when the two disagree. Its ADRs file under the `company` KB slice,
     # which is unmapped below and counts in the Engineering-internal fallback.
-    "Shipwright": ["shipwright"],
+    # homebrew-tap (2026-10-13): shipwright's public Homebrew formula, added
+    # with its registry entry for the same reason — it lives under
+    # convivybuilder on GitHub, not convivy (gh_full's GH_OWNER table below is
+    # unaware of that split and still reads convivy/homebrew-tap; this bucket
+    # entry is what the drift test requires, not a claim that the gh-backed
+    # PR/feature metrics below resolve against the right repo).
+    "Shipwright": ["shipwright", "homebrew-tap"],
     # Signals (2026-09-16), the internal product crew writing derived signal to the
     # Archives. tests/test_projects.py holds this table to the registry.
     "Signals": ["signals"],

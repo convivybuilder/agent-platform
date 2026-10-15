@@ -170,3 +170,20 @@ def test_issues_section_no_issues_when_nothing_is_bad(agent_summary, tmp_path, m
     runs = [{"run_id": "run-ok01", "meta": {"agent": "coder"},
              "outcome": {"exit_status": "completed"}}]
     assert agent_summary.issues_section(start, end, runs) == "_No issues._\n"
+
+
+# --- issues_section: refusal exit_statuses must surface (E1·8) --------------
+
+
+def test_issues_section_lists_project_cap_refused(agent_summary, tmp_path, monkeypatch):
+    # No marker/stale-log files under this empty root, so only the exit_status
+    # filter below drives the result.
+    monkeypatch.setattr(agent_summary, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(agent_summary, "STALE_LOG", tmp_path / "stale-runs.jsonl")
+    start = datetime(2026, 5, 31, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 31, 7, tzinfo=timezone.utc)
+    runs = [{"run_id": "run-cap-1", "meta": {"agent": "platform-coder"},
+             "outcome": {"exit_status": "project_cap_refused"}}]
+    out = agent_summary.issues_section(start, end, runs)
+    assert "run-cap-1" in out
+    assert "project_cap_refused" in out

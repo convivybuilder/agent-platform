@@ -380,6 +380,9 @@ def _repo_with_a_commit_at(path, message):
     _git("init", "-q", "-b", "main", cwd=path)
     _git("config", "user.email", "t@example.com", cwd=path)
     _git("config", "user.name", "t", cwd=path)
+    # Git's detached auto-maintenance after a commit briefly holds objects/maintenance.lock, which races a test snapshotting this repo's objects directory.
+    _git("config", "maintenance.auto", "false", cwd=path)
+    _git("config", "gc.auto", "0", cwd=path)
     _git("commit", "-q", "--allow-empty", "-m", message, cwd=path)
     return path
 

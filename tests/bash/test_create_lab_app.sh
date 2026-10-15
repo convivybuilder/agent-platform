@@ -67,49 +67,58 @@ assert_rc 0 "$?" "handoff-pickup preserves literal \$(git rev-parse ...)"
 grep -q 'ARCH-043' "$LEAVE"
 assert_rc 0 "$?" "handoff-leave carries the ARCH-043 path convention"
 
-# The scaffolded README and CLAUDE.md must not tell a new app that registration
-# in LOCAL_AGENT_REPOS alone keeps its KB local. That was true until 2026-08-25,
-# when REPO_LOCAL_DOCS was split out of it; since then the crew half and the
-# KB-write half are separate tuples and neither implies the other.
+# The scaffolded README, CLAUDE.md and post-creation checklist must not tell a
+# new app to rely on REPO_LOCAL_DOCS, or on 'scribe' refusing writes against it:
+# #578 (b23cf33e, 2026-09-14) deleted both the tuple and the `scribe verify`/
+# `scribe apply` commands that read it from bin/agentctl, so a line generated
+# against them names a variable and a refusal that no longer exist.
 #
 # This is asserted because the claim is BOILERPLATE ASSERTED AS FACT, baked into
 # each new app's own charter at creation time, where nothing prompts a second
-# look — unlike a checklist line an operator reads before acting. It survived two
-# earlier fixes to the checklist sites and was found only by a reviewer asked to
-# sweep for a third instance.
+# look — unlike a checklist line an operator reads before acting.
 README="$FAKE_HOME/Convivy/testapp/README.md"
 CLAUDEMD="$FAKE_HOME/Convivy/testapp/CLAUDE.md"
+ORCH="$FAKE_HOME/Convivy/testapp/.claude/agents/tt-overnight-orchestrator.md"
+ADR="$FAKE_HOME/Convivy/testapp/docs/decisions/0001-testapp-creation.md"
 
-for f in "$README" "$CLAUDEMD"; do
+for f in "$README" "$CLAUDEMD" "$ORCH" "$ADR"; do
     [ -f "$f" ]; assert_rc 0 "$?" "scaffold wrote $(basename "$f")"
     grep -q 'REPO_LOCAL_DOCS' "$f"
-    assert_rc 0 "$?" "$(basename "$f") names REPO_LOCAL_DOCS as the KB-local half"
-    # Require the two tuples to appear WITH their properties, rather than only
-    # requiring the name to appear somewhere. A mention of REPO_LOCAL_DOCS as an
-    # unconnected aside satisfies the check above while leaving the false claim
-    # intact next to it.
-    # Order-independent: the tuple and its property must share a sentence, in
-    # either direction. The generated text puts the name in parentheses after the
-    # property in one file and before it in the other, and pinning one order
-    # would fail on prose that is correct.
-    grep -qE '(KB stays local[^.]*REPO_LOCAL_DOCS|REPO_LOCAL_DOCS[^.]*(KB|scribe))' "$f"
-    assert_rc 0 "$?" "$(basename "$f") ties the KB-local property to REPO_LOCAL_DOCS"
-    grep -qE '(dispatchable[^.]*LOCAL_AGENT_REPOS|LOCAL_AGENT_REPOS[^.]*(dispatch|crew|resolv))' "$f"
-    assert_rc 0 "$?" "$(basename "$f") ties the crew property to LOCAL_AGENT_REPOS"
+    assert_rc 1 "$?" "$(basename "$f") no longer names the removed REPO_LOCAL_DOCS"
+    grep -qE '\bscribe\b' "$f"
+    assert_rc 1 "$?" "$(basename "$f") no longer claims scribe refuses anything"
+    grep -qE '(dispatchable[^.]*LOCAL_AGENT_REPOS|LOCAL_AGENT_REPOS[^.]*dispatchable)' "$f"
+    assert_rc 1 "$?" "$(basename "$f") no longer claims the crew is dispatchable via LOCAL_AGENT_REPOS"
+    grep -qF 'Library-served index' "$f"
+    assert_rc 0 "$?" "$(basename "$f") states agentctl spawn resolves the crew through the shared Library-served index"
+    grep -qE 'LOCAL_AGENT_REPOS.*reserved' "$f"
+    assert_rc 0 "$?" "$(basename "$f") says LOCAL_AGENT_REPOS is reserved for the privacy crews, not this app"
 
     # WHAT THIS CANNOT DO, stated so nobody reads a green run as proof. These are
     # assertions about PROSE, so there is no behaviour to exercise and no
-    # behavioural test to write instead — unlike the scribe gate, where a
-    # differential test replaced exactly this kind of string matching.
-    #
-    # A security reviewer defeated the first version of this check by rewording
-    # the sentence to preserve the false meaning while dodging the pattern, and
-    # the same is possible here with more effort. That is the wrong bar: the
-    # realistic failure is someone editing the boilerplate and reintroducing the
-    # old claim, or the text drifting as the tuples change again — not an author
-    # working to evade a grep. This catches those. It does not catch a
-    # deliberately reworded falsehood, and no regex over prose will.
+    # behavioural test to write instead. A security reviewer defeated an earlier
+    # version of this check (when it asserted a claim's PRESENCE) by rewording the
+    # sentence to preserve a false meaning while dodging the pattern; asserting
+    # ABSENCE instead does not have that gap in the same way, but still does not
+    # catch a reworded claim that keeps the same meaning without the word
+    # 'REPO_LOCAL_DOCS' or 'scribe' in it, and no regex over prose will.
 done
+
+# The post-creation checklist is printed to stdout, never written to a file, so
+# it needs its own dry-run capture rather than the loop over README/CLAUDE.md
+# ($out from the top of this script is NOT reused here — it is reassigned below
+# for the no-root-config case by the time this runs). The checklist's `cat`
+# block runs unconditionally, before the DRY_RUN branch that gates file content,
+# so a dry-run capture still carries it.
+checklist=$(/bin/bash "$CLA" testapp --prefix tt --dry-run 2>&1)
+echo "$checklist" | grep -q 'REPO_LOCAL_DOCS'
+assert_rc 1 "$?" "dry-run checklist no longer tells the operator to add the app to REPO_LOCAL_DOCS"
+echo "$checklist" | grep -q 'BOTH tuples'
+assert_rc 1 "$?" "dry-run checklist no longer tells the operator to add the app to two tuples"
+echo "$checklist" | grep -q 'to LOCAL_AGENT_REPOS'
+assert_rc 1 "$?" "dry-run checklist no longer tells the operator to add the app to LOCAL_AGENT_REPOS"
+echo "$checklist" | grep -q '_INTERNAL_APP_PREFIXES'
+assert_rc 0 "$?" "dry-run checklist tells the operator to register the crew prefix in _INTERNAL_APP_PREFIXES"
 
 # The scaffolded CLAUDE.md review cycle step and the overnight-orchestrator's
 # auto-cycle step must both name the current posting command (`agentctl

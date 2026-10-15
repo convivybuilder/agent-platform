@@ -275,6 +275,70 @@ def crew_for_repo(repo: str | None, knowledge_root: Path | str | None = None) ->
     return project if project == repo else None
 
 
+def repo_github_slug(repo: str, unit: dict[str, Any] | None = None) -> str:
+    """`owner/repo` for *repo*, the expansion `--on` has always carried: a name
+    already containing `/` is returned unchanged. Otherwise the owner is the
+    repo's own entry in its unit's `repo_owners` map, else the unit's
+    `github_owner`, else `"convivy"` — an unregistered name is `"convivy"`,
+    matching every call site's behaviour before this function existed.
+
+    `unit`, when given, is used in place of searching `load()` for the owning
+    unit: `issue_gate.py` reads its own registry snapshot from GitHub's
+    contents API at `origin/main` rather than this module's `load()` (its
+    docstring explains why — avoiding a dispatched coder's own writable
+    checkout as the source of truth), so it already holds the unit dict this
+    function would otherwise have to search for, and passes it straight in
+    rather than asking this function to repeat a search it cannot make
+    against a registry it never loaded.
+
+    This is the ONE place that expansion lives; `bin/agentctl`'s five inline
+    copies, `run_verdict._slug` and `tool_policy.repo_slug` all call through
+    here now, so a repo that needs a non-`convivy` owner (homebrew-tap, under
+    Builder's own `convivybuilder` account) is named in exactly one place."""
+    if repo and "/" in repo:
+        return repo
+    if unit is None:
+        for u in load().values():
+            if repo in list(u.get("repos", [])) + list(u.get("aliases", [])):
+                unit = u
+                break
+    owner = "convivy"
+    if unit is not None:
+        owner = (unit.get("repo_owners") or {}).get(repo) or unit.get("github_owner") or "convivy"
+    return f"{owner}/{repo}"
+
+
+def registered_repo_github_slug(repo: str | None) -> str | None:
+    """`owner/repo` for *repo*, like `repo_github_slug`, but refusing an owner the
+    registry does not itself attest to — for a caller whose `repo` string comes
+    from a run-writable record (a dispatched run's own `meta.json`) rather than
+    from the orchestrating session's own `--on`.
+
+    `repo_github_slug` treats a `/`-qualified value as already resolved and
+    returns it unchanged, which is correct for `--on` (the dispatcher's own
+    input) but lets a run that writes its own `meta.json["repo"]` name ANY
+    owner/repo, convivy or not (security-reviewer, PR #881 round 2). This
+    function re-derives the slug the registry would assign the BARE repo name
+    and only returns a `/`-qualified `repo` when it equals that — an owner the
+    registry does not record for that bare name, named or unregistered, never
+    comes back, so a forged `someone/elsewhere` resolves to None rather than
+    pointing a `gh` query at an arbitrary repository.
+
+    A bare name (no `/`) is resolved exactly as `repo_github_slug` resolves it,
+    unregistered included: an unregistered bare name still returns
+    `convivy/<name>`, the default every bare name has had since before this
+    function existed. That default never leaves the convivy org, so it carries
+    none of the risk a `/`-qualified forgery does, and refusing it here would
+    drop a legitimate run on a repo the registry hasn't caught up to yet."""
+    if not repo:
+        return None
+    if "/" not in repo:
+        return repo_github_slug(repo)
+    bare = repo.rsplit("/", 1)[1]
+    registered = repo_github_slug(bare)
+    return repo if repo == registered else None
+
+
 def kb_scope_exceptions() -> dict[str, dict[str, str]]:
     """Every repo across the registry with a recorded, deliberate knowledge-scope
     exception: `{repo: {"kb_project": ..., "reason": ...}}`, gathered from each
@@ -434,6 +498,19 @@ EXPLICIT_PROJECT_BY_NAME = {
     # profile whose claude_md_extras describe substrate, into the crew that
     # ships publicly. Dispatch was never the only consumer.
     "shipwright": "shipwright",
+    # homebrew-tap → shipwright's project too (2026-10-13). Builder's public
+    # Homebrew formula, convivybuilder/homebrew-tap on GitHub, created by the
+    # Shipwright crew. Without this row,
+    # `default_profile`'s `resolve_project` call finds no explicit mapping and
+    # no `knowledge/projects/homebrew-tap/` directory, so a bare
+    # `--on homebrew-tap` (no --profile) hit the "no knowledge project
+    # mapped" refusal — `platform/default` is not served on this machine (see
+    # the comment in `default_profile`), so there was no soft landing either.
+    # `config/projects.json` lists homebrew-tap under shipwright's own
+    # `repos`, which is what makes `crew_for_repo`/`project_for_repo` resolve
+    # it without a row here; this map is the one `resolve_project` actually
+    # reads, and it needs its own entry.
+    "homebrew-tap": "shipwright",
     # signals → its OWN project (2026-09-16). It is what makes `knowledge-ctx use daytime` from <root>/signals resolve.
     "signals": "signals",
     # write-better → its OWN project (ARCH-440).

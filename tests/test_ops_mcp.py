@@ -2253,6 +2253,100 @@ def test_issue_correct_refuses_a_field_both_cleared_and_set(mcp_ops_server, monk
     assert not sent
 
 
+# --- issue_move_product (POST /api/issues/{id}/product) --------------------------
+
+def test_issue_move_product_posts_to_the_product_route(mcp_ops_server, monkeypatch):
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"item": _item(product="selector"),
+                           "moved": [{"id": "issue_a", "old_key": "E9·4",
+                                      "new_key": "E3·4"}],
+                           "left_courses": ["course_vivy"]})
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+    assert seen[0].full_url.endswith("/api/issues/issue_a/product")
+    assert json.loads(seen[0].data) == {"product": "selector"}
+    assert out["item"]["product"] == "selector"
+    assert out["moved"] == [{"id": "issue_a", "old_key": "E9·4", "new_key": "E3·4"}]
+    assert out["left_courses"] == ["course_vivy"]
+
+
+def test_issue_move_product_sends_the_owner_when_supplied(mcp_ops_server, monkeypatch):
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"item": _item(), "moved": [], "left_courses": []})
+    mcp_ops_server.issue_move_product("issue_a", "selector", owner="co-a")
+    assert json.loads(seen[0].data) == {"product": "selector", "owner": "co-a"}
+
+
+def test_issue_move_product_omits_owner_when_absent(mcp_ops_server, monkeypatch):
+    """Matches issue_correct: no `owner` argument sends no `owner` key, leaving
+    the Library to fall back to the token identity."""
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"item": _item(), "moved": [], "left_courses": []})
+    mcp_ops_server.issue_move_product("issue_a", "selector")
+    assert "owner" not in json.loads(seen[0].data)
+
+
+def test_issue_move_product_ids_are_percent_encoded(mcp_ops_server, monkeypatch):
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"item": _item(), "moved": [], "left_courses": []})
+    mcp_ops_server.issue_move_product("a/b", "selector")
+    assert "a%2Fb" in seen[0].full_url
+    assert "/a/b/" not in seen[0].full_url
+
+
+def test_issue_move_product_surfaces_a_held_refusal(mcp_ops_server, monkeypatch):
+    """A live lease anywhere in the subtree refuses the move (409, `reason:
+    "held"`), surfaced the same way `issue_correct`'s own held refusal is."""
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch, error=urllib.error.HTTPError(
+        "u", 409, "Conflict", {}, io.BytesIO(json.dumps({
+            "error": "held by co-other", "reason": "held",
+            "lease": _lease(),
+        }).encode())))
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+    assert out["reason"] == "held"
+    assert out["lease"]["holder"] == "co-vivy-0930"
+    assert "HTTP 409" in out["error"]
+
+
+def test_issue_move_product_surfaces_a_found_during_crossing_refusal(
+        mcp_ops_server, monkeypatch):
+    """Moving would leave a `found_during` link pointing across products —
+    refused 409, the crossing items named in the body rather than only in
+    prose."""
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch, error=urllib.error.HTTPError(
+        "u", 409, "Conflict", {}, io.BytesIO(json.dumps({
+            "error": "found_during would cross products",
+            "hint": "correct found_during with issue_correct first",
+            "moving_away_from_their_epic": ["issue_b"],
+            "left_behind_naming_a_moved_epic": ["issue_c"],
+        }).encode())))
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+    assert "error" in out and "found_during" in out["error"]
+    assert out["moving_away_from_their_epic"] == ["issue_b"]
+    assert out["left_behind_naming_a_moved_epic"] == ["issue_c"]
+
+
+def test_issue_move_product_surfaces_an_out_of_scope_refusal(mcp_ops_server, monkeypatch):
+    """Either product outside the caller's scope reads 404, the same wording
+    every other out-of-scope item read gets."""
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch, error=urllib.error.HTTPError(
+        "u", 404, "Not Found", {}, io.BytesIO(json.dumps({
+            "error": "no such item, or none this identity may see",
+        }).encode())))
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "some-other-product"))
+    assert "error" in out and "HTTP 404" in out["error"]
+
+
 def test_issue_revise_refuses_the_old_empty_string_convention_alongside_clear(
         mcp_ops_server, monkeypatch):
     """`""` is itself "a value given" for this check: the two conventions reach
@@ -2817,13 +2911,21 @@ def test_an_unset_field_is_left_off_the_row(mcp_ops_server, empty):
     assert "some_future_field" not in listed
 
 
-def test_the_withheld_fields_never_reach_a_caller(mcp_ops_server):
+def test_the_withheld_fields_never_reach_a_caller(mcp_ops_server, monkeypatch):
     full = _item(created_by="co-vivy-0930", resolved_by="co-vivy-0930",
                  refs={"pr": 42, "url": "https://github.com/convivy/x/pull/42"})
     for shaped in (mcp_ops_server._shape_issue(full),
                    mcp_ops_server._shape_issue_detail(full)):
         assert not {"created_by", "resolved_by", "refs"} & set(shaped), shaped
     assert mcp_ops_server._shape_issue(full)["pr"] == 42
+
+    # issue_move_product is a mutation route like issue_correct and issue_revise,
+    # not a list route, so its echoed `item` must go through the same shaping.
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch,
+                  payload={"item": full, "moved": [], "left_courses": []})
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+    assert not {"created_by", "resolved_by", "refs"} & set(out["item"]), out["item"]
 
 
 def test_the_always_emitted_fields_are_present_even_when_null(mcp_ops_server):

@@ -121,3 +121,48 @@ def test_build_report_empty(warrant_scorecard, monkeypatch):
     rep = warrant_scorecard.build_report([], 90)
     assert rep["overall"]["merged_prs"] == 0
     assert rep["overall"]["unwarranted_rate"] == 0.0
+
+
+def test_merged_agent_prs_excludes_a_run_with_a_forged_qualified_repo(
+        warrant_scorecard, monkeypatch, tmp_path):
+    """Round 2 security finding (PR #881, comment 6152094447): `repo` reaches
+    this ledger row from a run's own meta.json, a file the dispatched run
+    itself can write. Fails against 43f57916: the forged repo was included in
+    merged_agent_prs's output, so harvest()'s loop called find_reverts (and
+    its gh query) against it."""
+    import json as json_mod
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    rows = [
+        {"pr_number": 1, "repo": "acme-attacker/widget", "merged": True,
+         "merged_at": now, "agent": "bug-fixer", "model": "m"},
+        {"pr_number": 2, "repo": "homebrew-tap", "merged": True,
+         "merged_at": now, "agent": "bug-fixer", "model": "m"},
+    ]
+    ledger_path = tmp_path / "scorecard.jsonl"
+    ledger_path.write_text("".join(json_mod.dumps(r) + "\n" for r in rows))
+    monkeypatch.setattr(warrant_scorecard, "SCORECARD_LEDGER", ledger_path)
+
+    out = warrant_scorecard.merged_agent_prs(90)
+
+    assert "acme-attacker/widget" not in out
+    assert out["homebrew-tap"][2]["producer_agent"] == "bug-fixer"
+
+
+def test_find_reverts_queries_the_registered_owner_for_homebrew_tap(
+        warrant_scorecard, monkeypatch):
+    """Round-1 review (PR #881, comment 6150937461): `find_reverts` built
+    `f"convivy/{repo}"` directly — the same pattern the PR centralizes
+    everywhere else."""
+    captured = {}
+
+    def fake_gh_json(args):
+        captured["args"] = args
+        return []
+
+    monkeypatch.setattr(warrant_scorecard, "_gh_json", fake_gh_json)
+    warrant_scorecard.find_reverts("homebrew-tap")
+
+    assert captured["args"] and "--repo" in captured["args"]
+    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
+    assert repo_arg == "convivybuilder/homebrew-tap"

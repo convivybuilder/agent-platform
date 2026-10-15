@@ -169,6 +169,118 @@ def test_a_null_spend_cap_is_not_malformed(agentctl, grant_library):
     assert agent["grant"]["budget"]["cap_usd"] is None
 
 
+# --- the checkout names the dispatched role and its dispatch profile --------------
+# (issue_01M35KSS8E603FE0EPYR0M5SBN). Before this fix `_checkout_item_grant`'s body
+# carried only `owner`/`run_id`: a `spawn --materialize-from-grant --issue` dispatch
+# never told the Library which role or which dispatch profile it was for, so the
+# Library's call-slip grant minted with no persona (`persona_md` began "# default")
+# and no resolved model (the sentinel "model-resolution-not-implemented") — the
+# occurrence this closes (run-a8621f37, 2026-10-13, a platform-coder dispatch for
+# work item E1·9).
+
+
+def test_the_checkout_names_the_dispatched_role_as_persona(
+        agentctl, grant_library, tmp_path):
+    """Fails against the unfixed code: there, the checkout body carried no
+    `persona` at all, no matter what role name the dispatch gave.
+
+    `agents_dir` names an empty directory so the builtins lookup
+    (`resolve_agent`, CQ·434) fails locally without reaching the Library's
+    agent listing, which this fake does not stub — persona is sent from
+    `agent_name` itself, independent of whether that lookup resolves."""
+    grant_library.checkout_responses["issue_test"] = (200, _grant())
+
+    agentctl.resolve_agent_from_grant(
+        "issue_test", repo="agent-platform", agent_name="platform-coder",
+        agents_dir=str(tmp_path / "empty-agents"))
+
+    assert grant_library.checkout_log == [
+        {"issue_id": "issue_test", "persona": "platform-coder"}]
+
+
+def test_the_checkout_names_the_profile_the_run_executes_under(
+        agentctl, grant_library, tmp_path):
+    grant_library.checkout_responses["issue_test"] = (200, _grant())
+
+    agentctl.resolve_agent_from_grant(
+        "issue_test", repo="agent-platform", agent_name="platform-coder",
+        agents_dir=str(tmp_path / "empty-agents"), profile="agent-platform/overnight")
+
+    assert grant_library.checkout_log == [
+        {"issue_id": "issue_test", "persona": "platform-coder",
+         "profile": "agent-platform/overnight"}]
+
+
+def test_no_role_or_profile_sends_neither_field(agentctl, grant_library):
+    """Back-compat default: a caller naming neither still sends the body this
+    function always sent before this fix."""
+    grant_library.checkout_responses["issue_test"] = (200, _grant())
+
+    agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+
+    assert grant_library.checkout_log == [{"issue_id": "issue_test"}]
+
+
+# --- `spawn --materialize-from-grant` sends the checkout the same profile the --
+# run executes under, whether named by an explicit `--profile` or left to
+# `default_profile` to compute (issue_01M35KSS8E603FE0EPYR0M5SBN).
+
+
+def _stub_through_the_budget_gate(agentctl, monkeypatch):
+    """Stubs everything `_spawn_dispatch` touches between the checkout and
+    `_budget_gate`, so a test can stop a grant-materialized dispatch right
+    after the checkout and read what it sent — the same posture
+    `test_a_project_with_no_ledger_cap_is_never_refused_on_money` above takes."""
+    monkeypatch.setattr(agentctl, "_warn_deployed_tree", lambda: None)
+    monkeypatch.setattr(agentctl, "_spawn_lib_gate", lambda: None)
+    monkeypatch.setattr(agentctl, "_library_denials", lambda *a, **kw: [])
+    monkeypatch.setattr(agentctl, "resolve_agent", lambda *a, **kw: {"builtins": None})
+    monkeypatch.setattr(agentctl, "_fetch_work_item", lambda issue_id: ({}, None))
+
+    class _ReachedBudgetGate(Exception):
+        pass
+
+    def _boom(*a, **kw):
+        raise _ReachedBudgetGate()
+    monkeypatch.setattr(agentctl, "_budget_gate", _boom)
+    return _ReachedBudgetGate
+
+
+def test_spawn_dispatch_sends_an_explicit_profile_to_the_checkout(
+        agentctl, grant_library, monkeypatch):
+    grant_library.checkout_responses["issue_test"] = (200, _grant())
+    reached = _stub_through_the_budget_gate(agentctl, monkeypatch)
+
+    args = _spawn_args(materialize_from_grant=True, issue="issue_test",
+                       agent="platform-coder", profile="agent-platform/overnight")
+    with pytest.raises(reached):
+        agentctl._spawn_dispatch(args)
+
+    assert grant_library.checkout_log == [
+        {"issue_id": "issue_test", "persona": "platform-coder",
+         "profile": "agent-platform/overnight"}]
+
+
+def test_spawn_dispatch_sends_the_default_profile_to_the_checkout_when_none_given(
+        agentctl, grant_library, monkeypatch):
+    """No `--profile`: the checkout is told the same `default_profile` value
+    the run itself computes just afterward (`agent-platform/daytime` for
+    `platform-coder`, pinned by `test_default_profile_by_repo_and_role`)."""
+    from conftest import stub_profile_listing
+    stub_profile_listing(agentctl, monkeypatch)
+    grant_library.checkout_responses["issue_test"] = (200, _grant())
+    reached = _stub_through_the_budget_gate(agentctl, monkeypatch)
+
+    args = _spawn_args(materialize_from_grant=True, issue="issue_test",
+                       agent="platform-coder", profile=None)
+    with pytest.raises(reached):
+        agentctl._spawn_dispatch(args)
+
+    assert grant_library.checkout_log == [
+        {"issue_id": "issue_test", "persona": "platform-coder",
+         "profile": "agent-platform/daytime"}]
+
+
 # --- a missing or malformed field refuses the dispatch, naming the field ----------
 
 
@@ -207,6 +319,29 @@ def test_a_non_numeric_spend_cap_refuses(agentctl, grant_library):
     grant_library.checkout_responses["issue_test"] = (200, g)
     with pytest.raises(SystemExit, match="cap_usd"):
         agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+
+
+def test_a_sentinel_model_refuses_naming_the_item_and_sentinel(agentctl, grant_library):
+    """The Library sends this literal string as `model` when the checkout
+    resolved none (no model_choice, no persona agent-definition pin inside
+    the caller's bound dispatch profile) — a deliberate sentinel, confirmed
+    by the Library's crew on 2026-10-14, that must never reach `--model`
+    (run-a8621f37: spawned with it, the Anthropic API answered 404, and the
+    run ended after 4 seconds with no known tier to fail over to)."""
+    grant_library.checkout_responses["issue_test"] = (
+        200, _grant(model="model-resolution-not-implemented"))
+    with pytest.raises(SystemExit, match="issue_test.*model-resolution-not-implemented"):
+        agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+    # the lease taken to read the grant is released on this refusal too
+    assert grant_library.release_log == [{"issue_id": "issue_test"}]
+
+
+def test_a_sentinel_model_with_surrounding_whitespace_still_refuses(agentctl, grant_library):
+    grant_library.checkout_responses["issue_test"] = (
+        200, _grant(model="  model-resolution-not-implemented\n"))
+    with pytest.raises(SystemExit, match="issue_test.*model-resolution-not-implemented"):
+        agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+    assert grant_library.release_log == [{"issue_id": "issue_test"}]
 
 
 def test_a_docs_entry_with_no_id_refuses(agentctl, grant_library):
@@ -282,6 +417,57 @@ def test_an_unreachable_library_refuses_the_dispatch(agentctl, grant_library):
     assert grant_library.release_log == []
 
 
+# --- a project-ledger soft/hard cap refuses admission distinctly (E1·8,
+# issue_01M35KSM0KFKJ4P3DN1G19KYBD) --------------------------------------------
+#
+# `_refuse_on_capped_ledger` (library app.py) answers `/items/{id}/checkout` with
+# 409 and a `ledger` dict when the dispatched project's spend has reached its
+# soft cap, or — until revocation exists — its hard cap. Before this change
+# `_checkout_item_grant` read every non-200 answer the same way (bare
+# `SystemExit`, the "already claimed" shape `test_a_held_item_refuses_rather_
+# than_falling_back_to_the_roster_render` above pins), so a caller had no way
+# to tell a money refusal apart from a routing one without parsing the message
+# text, and nothing recorded it as a run.
+
+
+def test_a_soft_capped_checkout_raises_LedgerCapRefused_not_bare_SystemExit(
+        agentctl, grant_library):
+    """Fails against the unfixed code on the TYPE of the exception raised, not
+    on whether one is raised at all: before this change this same 409 took the
+    generic branch and raised `SystemExit`, which `_spawn_dispatch` could not
+    tell apart from "already claimed" or an unreachable Library."""
+    grant_library.checkout_responses["issue_test"] = (409, {
+        "error": "the ledger for 'agent-platform' has reached its soft_cap for "
+                 "2026-10-13",
+        "hint": "this is not a reason to try another item",
+        "ledger": {"id": 7, "scope_kind": "project", "scope_id": "agent-platform",
+                   "day": "2026-10-13", "state": "soft_capped",
+                   "cap": "soft_cap", "cap_usd": 30.0, "total_usd": 31.42},
+    })
+    with pytest.raises(agentctl._LedgerCapRefused) as exc_info:
+        agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+    assert exc_info.value.body["ledger"]["cap"] == "soft_cap"
+    assert exc_info.value.body["ledger"]["total_usd"] == 31.42
+    # the Library checks the ledger ahead of the item lock, so no lease was
+    # taken and there is nothing to release
+    assert grant_library.release_log == []
+
+
+def test_a_hard_capped_checkout_also_raises_LedgerCapRefused(agentctl, grant_library):
+    """Until revocation exists, a hard-capped total refuses admission the same
+    way a soft cap does (same route, same shape, `cap: hard_cap`)."""
+    grant_library.checkout_responses["issue_test"] = (409, {
+        "error": "the ledger for 'agent-platform' has reached its hard_cap for "
+                 "2026-10-13",
+        "ledger": {"id": 7, "scope_kind": "project", "scope_id": "agent-platform",
+                   "day": "2026-10-13", "state": "hard_capped",
+                   "cap": "hard_cap", "cap_usd": 80.0, "total_usd": 85.0},
+    })
+    with pytest.raises(agentctl._LedgerCapRefused) as exc_info:
+        agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+    assert exc_info.value.body["ledger"]["cap"] == "hard_cap"
+
+
 # --- selected explicitly by `spawn --materialize-from-grant` ----------------------
 
 
@@ -308,17 +494,22 @@ def test_spawn_without_issue_refuses_materialize_from_grant_before_any_library_c
 
 def test_spawn_with_materialize_from_grant_and_issue_takes_the_grant_path_not_the_roster(
         agentctl, monkeypatch):
+    from conftest import stub_profile_listing
+    stub_profile_listing(agentctl, monkeypatch)
     monkeypatch.setattr(agentctl, "_warn_deployed_tree", lambda: None)
     monkeypatch.setattr(agentctl, "_spawn_lib_gate", lambda: None)
 
     class _ReachedGrantPath(Exception):
         pass
 
-    def _grant_path(issue_id, repo=None, agent_name=None, agents_dir=None):
+    def _grant_path(issue_id, repo=None, agent_name=None, agents_dir=None, profile=None):
         assert issue_id == "issue_test" and repo == "agent-platform"
         # CQ·434: the role name travels with the dispatch so the grant path can
         # carry that role's `builtins:` the same way the roster path does.
         assert agent_name == "reviewer" and agents_dir is None
+        # issue_01M35KSS8E603FE0EPYR0M5SBN: no --profile given, so this is the
+        # same default_profile(repo, args.agent) the run executes under.
+        assert profile == "agent-platform/daytime"
         raise _ReachedGrantPath()
     monkeypatch.setattr(agentctl, "resolve_agent_from_grant", _grant_path)
     monkeypatch.setattr(agentctl, "resolve_agent",
@@ -352,6 +543,109 @@ def test_spawn_without_materialize_from_grant_still_uses_the_roster_render(
     args = _spawn_args(materialize_from_grant=False, issue="issue_test")
     with pytest.raises(_ReachedRosterPath):
         agentctl.cmd_spawn(args)
+
+
+# --- E1·8 (issue_01M35KSM0KFKJ4P3DN1G19KYBD): a soft cap refuses a NEW dispatch
+# for the capped project without disturbing a run already in flight, and a
+# project with no caps is never refused on money -------------------------------
+
+
+def test_a_soft_capped_project_refuses_a_new_dispatch_while_a_run_already_going_is_untouched(
+        agentctl, grant_library, runs_root, tmp_path, monkeypatch):
+    """Both halves of the epic's done-clause in one test (issue_01KZBWEYGQ5JXE96V1D0DYX5RA,
+    clause 5): a run that started before the project's ledger crossed its soft cap
+    is not touched by a later dispatch's refusal and finishes normally, while that
+    later dispatch — for the SAME project, after the crossing — is refused with the
+    Library's own reason (which cap, the total, the day) recorded in its own run dir.
+
+    Fails against the unfixed code on two assertions: `_checkout_item_grant`'s only
+    refusal shape was a bare `SystemExit`, so `agentctl._spawn_dispatch` would
+    propagate it uncaught instead of returning exit code 3; and nothing wrote a run
+    record for the refusal at all, so `outcome["exit_status"] == "project_cap_refused"`
+    had no run dir to read it from.
+    """
+    import telemetry as T
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(T, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(agentctl, "_warn_deployed_tree", lambda: None)
+    monkeypatch.setattr(agentctl, "_spawn_lib_gate", lambda: None)
+    monkeypatch.setattr(agentctl.T, "new_run_id", lambda: "run-refused-01")
+    # The role-name builtins lookup (CQ·434) and the --issue model-choice read
+    # (model-lane epic issue_01M35KQ8WTW8R3WSKXS81TV2DZ) both run before the
+    # checkout and are orthogonal to the ledger gate under test here; stubbed
+    # so neither reaches the fake Library's unstubbed endpoints.
+    monkeypatch.setattr(agentctl, "resolve_agent", lambda *a, **kw: {"builtins": None})
+    monkeypatch.setattr(agentctl, "_fetch_work_item", lambda issue_id: ({}, None))
+    today = T.today_dir()
+
+    # A run already going, started before the ledger crossed its soft cap.
+    live = T.create_run_dir("run-live-01", date=today)
+    T.write_meta(live, run_id="run-live-01", agent="platform-coder", task="earlier work",
+                started_at=T.now_iso(), repo="agent-platform",
+                worktree=str(tmp_path / "wt"), profile="agent-platform/overnight",
+                model="claude-sonnet-5")
+
+    # The project's ledger has now crossed its soft cap.
+    grant_library.checkout_responses["issue_test"] = (409, {
+        "error": f"the ledger for 'agent-platform' has reached its soft_cap for {today}",
+        "ledger": {"id": 7, "scope_kind": "project", "scope_id": "agent-platform",
+                   "day": today, "state": "soft_capped",
+                   "cap": "soft_cap", "cap_usd": 30.0, "total_usd": 31.42},
+    })
+
+    args = _spawn_args(materialize_from_grant=True, issue="issue_test",
+                       agent="platform-coder", task="new work",
+                       profile="agent-platform/overnight")
+    rc, run_id = agentctl._spawn_dispatch(args)
+    assert rc == 3
+    assert run_id is None  # the same "no id allocated on this refusal" shape budget_refused uses
+
+    # The refusal got its OWN run dir, distinct from budget_refused.
+    refused = T.run_dir("run-refused-01", date=today)
+    outcome = T.read_outcome(refused)
+    assert outcome["exit_status"] == "project_cap_refused"
+    assert outcome["exit_status"] != "budget_refused"
+    for needle in ("soft_cap", "31.42", today):
+        assert needle in outcome["error_reason"], outcome["error_reason"]
+
+    # The LIVE run was never touched by the refusal: still no outcome.json.
+    assert not (live / "outcome.json").exists()
+    # It goes on to finish normally, unaffected by the refusal that happened
+    # in between.
+    T.write_outcome(live, exit_status="completed")
+    assert T.read_outcome(live)["exit_status"] == "completed"
+
+
+def test_a_project_with_no_ledger_cap_is_never_refused_on_money(
+        agentctl, grant_library, monkeypatch):
+    """E1·8 clause 10 (issue_01KZBWEYGQ5JXE96V1D0DYX5RA): the ordinary case — a
+    project the Library has set no caps on — is admitted and the dispatch
+    proceeds. The stub Library's checkout response carries no `ledger` key at
+    all, the same shape `_grant()` already builds for every OTHER test in this
+    file's successful-checkout path (`_refuse_on_capped_ledger` returns None,
+    not a `state: "ok"` row, when there is no ledger row to refuse on). What's
+    new here is pinning that this reaches all the way to the budget gate
+    rather than being refused — the dispatch is never even offered a chance to
+    be refused on money."""
+    grant_library.checkout_responses["issue_test"] = (200, _grant())
+    monkeypatch.setattr(agentctl, "_warn_deployed_tree", lambda: None)
+    monkeypatch.setattr(agentctl, "_spawn_lib_gate", lambda: None)
+    monkeypatch.setattr(agentctl, "_library_denials", lambda *a, **kw: [])
+    # Orthogonal to the ledger gate under test — see the twin test above.
+    monkeypatch.setattr(agentctl, "resolve_agent", lambda *a, **kw: {"builtins": None})
+    monkeypatch.setattr(agentctl, "_fetch_work_item", lambda issue_id: ({}, None))
+
+    class _ReachedBudgetGate(Exception):
+        pass
+
+    def _boom(*a, **kw):
+        raise _ReachedBudgetGate()
+    monkeypatch.setattr(agentctl, "_budget_gate", _boom)
+
+    args = _spawn_args(materialize_from_grant=True, issue="issue_test",
+                       profile="agent-platform/daytime")
+    with pytest.raises(_ReachedBudgetGate):
+        agentctl._spawn_dispatch(args)
 
 
 # --- the grant's budget.cap_usd reaches the per-run dollar cap decision -----------
@@ -482,7 +776,10 @@ def test_an_unresolvable_role_dispatches_with_builtins_unset_and_does_not_claim_
 
     assert agent.get("builtins") is None
     assert agentctl._resolved_agent_builtins(agent, "no-such-role") is None
-    assert grant_library.checkout_log == [{"issue_id": "issue_test"}]
+    # persona names the dispatched ROLE regardless of whether the builtins
+    # lookup above resolved it locally (issue_01M35KSS8E603FE0EPYR0M5SBN).
+    assert grant_library.checkout_log == [
+        {"issue_id": "issue_test", "persona": "no-such-role"}]
     assert "no-such-role" in capsys.readouterr().err
 
 
@@ -504,7 +801,8 @@ def test_a_resolvable_role_still_carries_builtins_through_the_fixed_order(
         agents_dir=str(agents_dir))
 
     assert agent["builtins"] == ["Bash", "Read", "Edit", "Write", "Glob", "Grep"]
-    assert grant_library.checkout_log == [{"issue_id": "issue_test"}]
+    assert grant_library.checkout_log == [
+        {"issue_id": "issue_test", "persona": "coder"}]
 
 
 def test_the_role_lookup_runs_before_the_checkout(agentctl, grant_library, monkeypatch):
@@ -532,3 +830,103 @@ def test_the_role_lookup_runs_before_the_checkout(agentctl, grant_library, monke
 
     assert order == ["resolve_agent", "checkout"]
     assert agent["builtins"] == ["Read"]
+
+
+# --- the Library's placeholder persona (no persona storage or registry exists ----
+# yet) is not real persona content: the dispatched role's roster render supplies
+# the body instead, and refuses by name when no role resolves to fall back to
+# (run-60cafe23, 2026-10-14, a platform-coder dispatch for work item CQ·480 that ran
+# with exactly the placeholder as its system prompt — the steward ruled: treat it
+# the way #890 treats the Library's model sentinel, preferring the roster fallback
+# over a bare refusal). Built from the literal placeholder text, not imported from
+# `agentctl`'s own sentinel constant, so a change to that constant can't silently
+# carry both sides of the comparison.
+
+
+_LIBRARYS_PLACEHOLDER_SENTENCE = (
+    "Persona content is not resolved yet — no persona storage or registry "
+    "exists. This is a placeholder pinning the call slip's shape ahead of it."
+)
+
+
+def _librarys_placeholder_persona_md(heading: str) -> str:
+    """The exact body `_persona_md` (Library app.py) builds when it has no
+    persona to resolve: `f"# {heading}\\n\\n" + ` the sentence above."""
+    return f"# {heading}\n\n{_LIBRARYS_PLACEHOLDER_SENTENCE}"
+
+
+def _write_role_agent(agents_dir, name: str, *, body: str = "You are a test agent.\n"):
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    (agents_dir / f"{name}.md").write_text(f"---\nmodel: sonnet\n---\n{body}")
+
+
+@pytest.mark.parametrize("heading", ["platform-coder", "default"])
+def test_a_placeholder_persona_with_a_resolvable_role_takes_the_rosters_body(
+        agentctl, grant_library, tmp_path, heading):
+    """Fails against the unfixed code: there, `agent["body"]` is the Library's
+    placeholder sentence itself, no matter what `heading` the Library used to
+    build it or whether the dispatched role resolves."""
+    agents_dir = tmp_path / "agents"
+    _write_role_agent(agents_dir, "platform-coder", body="You are platform-coder.\n")
+    grant_library.checkout_responses["issue_test"] = (
+        200, _grant(persona_md=_librarys_placeholder_persona_md(heading)))
+
+    agent = agentctl.resolve_agent_from_grant(
+        "issue_test", repo="agent-platform", agent_name="platform-coder",
+        agents_dir=str(agents_dir))
+
+    assert agent["body"] == "You are platform-coder.\n"
+    assert agent["persona_source"] == "roster"
+    # the lease taken to read the grant is still released, same as every
+    # successful checkout
+    assert grant_library.release_log == [{"issue_id": "issue_test"}]
+
+
+def test_real_persona_content_keeps_it_and_records_grant(agentctl, grant_library):
+    """The twin of the test above: persona content that is NOT the Library's
+    placeholder is used unchanged, and `persona_source` names the grant as its
+    origin, not the roster."""
+    grant_library.checkout_responses["issue_test"] = (
+        200, _grant(persona_md="# the persona\n\nreal body, not a placeholder."))
+
+    agent = agentctl.resolve_agent_from_grant("issue_test", repo="agent-platform")
+
+    assert agent["body"] == "# the persona\n\nreal body, not a placeholder."
+    assert agent["persona_source"] == "grant"
+
+
+@pytest.mark.parametrize("agent_name", [None, "no-such-role"],
+                         ids=["no_role_named", "role_does_not_resolve"])
+def test_a_placeholder_persona_with_no_resolvable_role_refuses_and_releases_the_lease(
+        agentctl, grant_library, tmp_path, agent_name):
+    """Fails against the unfixed code: there, a placeholder `persona_md` is
+    read as valid persona content no matter what, so this would succeed with
+    the placeholder sentence as `agent["body"]` instead of refusing."""
+    agents_dir = tmp_path / "empty-agents"
+    grant_library.checkout_responses["issue_test"] = (
+        200, _grant(persona_md=_librarys_placeholder_persona_md("default")))
+
+    with pytest.raises(SystemExit, match="issue_test.*placeholder"):
+        agentctl.resolve_agent_from_grant(
+            "issue_test", repo="agent-platform", agent_name=agent_name,
+            agents_dir=str(agents_dir))
+
+    # the lease taken to read the grant is released on this refusal too
+    assert grant_library.release_log == [{"issue_id": "issue_test"}]
+
+
+def test_a_placeholder_persona_with_the_same_grant_and_a_resolvable_role_dispatches(
+        agentctl, grant_library, tmp_path):
+    """The twin of the refusal above, same grant: a role that DOES resolve
+    reaches a materialized agent rather than the refusal."""
+    agents_dir = tmp_path / "agents"
+    _write_role_agent(agents_dir, "platform-coder", body="You are platform-coder.\n")
+    grant_library.checkout_responses["issue_test"] = (
+        200, _grant(persona_md=_librarys_placeholder_persona_md("default")))
+
+    agent = agentctl.resolve_agent_from_grant(
+        "issue_test", repo="agent-platform", agent_name="platform-coder",
+        agents_dir=str(agents_dir))
+
+    assert agent["body"] == "You are platform-coder.\n"
+    assert agent["persona_source"] == "roster"

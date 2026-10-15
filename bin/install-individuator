@@ -22,9 +22,12 @@
 #      CLI; `individuator-daemon`, the root service) as root-owned copies
 #      under the install directory, and records their SHA-256 code hashes
 #      alongside the ref and commit they were built from.
-#   4. Writes the root-owned configuration (`IndividuatorRootConfig`'s own
-#      JSON shape) naming the Bosun host, its address, the Library root CA
-#      path, and the operator uid.
+#   4. Copies `--root-ca` into a root-owned file beside the config (never
+#      naming the operator-supplied path directly: that path typically sits
+#      in the operator's home, writable by any process running as the
+#      operator's uid), then writes the root-owned configuration
+#      (`IndividuatorRootConfig`'s own JSON shape) naming the Bosun host,
+#      its address, that copy's path, and the operator uid.
 #   5. Copies the LaunchDaemon plist into the system LaunchDaemons
 #      directory (refusing to clobber a live one that has drifted from the
 #      template, unless --force — the same idiom install.sh phase 4 and
@@ -67,7 +70,9 @@ Must be run as root (sudo).
                               is convivy://machine/<name>). Required unless
                               --status or a config already exists at --config-path.
   --bosun-address=<host:port> Where to dial the Bosun's registration listener.
-  --root-ca=<path>           The Library's root certificate, PEM.
+  --root-ca=<path>           The Library's root certificate, PEM. Copied to a
+                              root-owned file beside --config-path; the config
+                              names that copy, never this path.
   --operator-uid=<uid>       The uid the root daemon's Unix socket accepts a
                               `register` request from (default: $SUDO_UID).
   --machine-name=<name>      THIS machine's own name for the CSR (default:
@@ -110,6 +115,14 @@ SOCKET_DIR="/var/db/individuator-daemon"
 # real Swift package on every run.
 SKIP_BUILD=0
 BUILD_DIR=""
+# FOR TESTS ONLY: runs the real git-archive-and-extract step below (the same
+# file list a real build uses), then runs the same per-product release build
+# the real install path runs (build_release_binaries, below), and exits with
+# that result before anything is installed. This is the real build, not a
+# cheaper stand-in: `swift package describe` never compiles anything, so it
+# cannot catch a build command that drags in the test targets (see
+# build_release_binaries's own comment).
+BUILD_ONLY=0
 
 for arg in "$@"; do
   case "$arg" in
@@ -132,6 +145,8 @@ for arg in "$@"; do
     --root-config=*) ROOT_CONFIG="${arg#--root-config=}" ;;
     --skip-build) SKIP_BUILD=1 ;;
     --build-dir=*) BUILD_DIR="${arg#--build-dir=}" ;;
+    # FOR TESTS ONLY, see BUILD_ONLY above.
+    --build-only) BUILD_ONLY=1 ;;
     -h|--help) usage ;;
     *) echo "install-individuator: unknown option: $arg" >&2; usage ;;
   esac
@@ -139,6 +154,21 @@ done
 
 say() { printf '\033[1;34m▸\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$*" >&2; }
+
+# build_release_binaries <package-dir> — builds ONLY the two installed
+# products, one `swift build -c release --product <p>` per product, rather
+# than a whole-package `swift build -c release`. The whole-package form also
+# builds the test targets (IndividuatorCoreTests, IndividuatorNetworkTests),
+# and `@testable import IndividuatorCore` inside those targets cannot resolve
+# against a release build of IndividuatorCore, which fails the build outright
+# instead of producing the two binaries below (seen with Xcode 27 / Swift
+# 6.4: "unable to resolve Swift module dependency to a compatible module").
+# Both the real install path and --build-only call this same function, so the
+# check mode can never drift from what actually gets installed.
+build_release_binaries() {
+  ( cd "$1" && swift build -c release --product individuator ) || return 1
+  ( cd "$1" && swift build -c release --product individuator-daemon ) || return 1
+}
 
 # --- --status: no install side effects --------------------------------------
 if [ "$STATUS_ONLY" -eq 1 ]; then
@@ -226,12 +256,24 @@ else
       individuator/Package.swift \
       individuator/Package.resolved \
       individuator/Sources \
+      individuator/Tests \
     > "$ARCHIVE"
   tar -x -C "$STAGE" -f "$ARCHIVE"
   rm -f "$ARCHIVE"
 
-  say "Building the release binaries (swift build -c release)"
-  ( cd "$STAGE/individuator" && swift build -c release )
+  if [ "$BUILD_ONLY" -eq 1 ]; then
+    say "Build-only: building the two installed products (swift build -c release --product ...)"
+    if build_release_binaries "$STAGE/individuator" \
+        && [ -x "$STAGE/individuator/.build/release/individuator" ] \
+        && [ -x "$STAGE/individuator/.build/release/individuator-daemon" ]; then
+      exit 0
+    else
+      exit 1
+    fi
+  fi
+
+  say "Building the release binaries (swift build -c release --product individuator, --product individuator-daemon)"
+  build_release_binaries "$STAGE/individuator"
   BUILT_INDIVIDUATOR="$STAGE/individuator/.build/release/individuator"
   BUILT_DAEMON="$STAGE/individuator/.build/release/individuator-daemon"
 fi
@@ -298,12 +340,33 @@ say "Running the self-test (sign, verify, reload from the blob, sign again)"
 if [ -n "$BOSUN_HOST" ]; then
   mkdir -p "$(dirname "$CONFIG_PATH")"
   chmod 700 "$(dirname "$CONFIG_PATH")"
+
+  # --- pin the trust anchor: copy --root-ca into the same root-owned 0700
+  # directory as the config, rather than pointing the config at the path the
+  # operator gave as-is. The natural --root-ca value sits in the operator's
+  # home, writable by any process running as the operator's uid — including
+  # a dispatched run — which could otherwise redirect the daemon's trust
+  # anchor after this install finishes. The copy is refreshed only when the
+  # source differs from what is already there, so a re-run that passes the
+  # same --root-ca does not needlessly rewrite a root-owned file. -----------
+  ROOT_CA_COPY="$(dirname "$CONFIG_PATH")/root-ca.pem"
+  if [ -f "$ROOT_CA_COPY" ] && cmp -s "$ROOT_CA" "$ROOT_CA_COPY"; then
+    say "Root CA unchanged: $ROOT_CA_COPY"
+  else
+    ROOT_CA_TMP="$ROOT_CA_COPY.new.$$"
+    cp "$ROOT_CA" "$ROOT_CA_TMP"
+    chmod 644 "$ROOT_CA_TMP"
+    chown root:wheel "$ROOT_CA_TMP" 2>/dev/null || true
+    mv "$ROOT_CA_TMP" "$ROOT_CA_COPY"
+    say "Root CA copied: $ROOT_CA -> $ROOT_CA_COPY"
+  fi
+
   CONFIG_TMP="$CONFIG_PATH.new.$$"
   cat > "$CONFIG_TMP" <<JSON
 {
   "bosun_host": "$BOSUN_HOST",
   "bosun_address": "$BOSUN_ADDRESS",
-  "root_ca_path": "$ROOT_CA",
+  "root_ca_path": "$ROOT_CA_COPY",
   "operator_uid": $OPERATOR_UID
 }
 JSON
