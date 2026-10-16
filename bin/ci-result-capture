@@ -219,9 +219,11 @@ STALE_PENDING_AFTER = dt.timedelta(hours=24)
 NO_CURSOR_WINDOW_DAYS = 90
 
 # Bounds one run deadline the same way `pr-state-capture._RUN_DEADLINE_SECONDS`
-# does: this job's own `StartInterval` is 900s; 600s leaves headroom before
-# the next scheduled fire rather than racing it.
-_RUN_DEADLINE_SECONDS = 600
+# does: this job's own `StartInterval` is 180s; a pass that runs long has its
+# next scheduled fire skipped rather than overlapping it (launchd.plist(5),
+# StartInterval), so 150s bounds how long a stuck pass is retried, not a race
+# against the next fire.
+_RUN_DEADLINE_SECONDS = 150
 
 # The delivery-wanting timeout `signal_client._DELIVERY_TIMEOUT` uses for a
 # one-shot launchd job that cares whether a write landed, not the tee's

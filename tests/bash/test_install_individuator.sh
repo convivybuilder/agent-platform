@@ -1,15 +1,20 @@
 #!/bin/bash
 # bin/install-individuator's own gates: it refuses without root, it never
-# regenerates a key that is already present, and its flags reach both the
-# config it writes and the `individuator` binary it calls.
+# calls `individuator keygen`/`self-test`/`fingerprint` (the daemon creates
+# and self-tests its own key now — 2026-10-15), it waits for and reads the
+# daemon's own self-test line, and its flags reach both the config it
+# writes and the `individuator` binary's `csr` call.
 #
-# Nothing here touches a real root path, a real Secure Enclave key, or real
+# Nothing here touches a real root path, a real machine key, or real
 # launchd: --install-dir/--config-path/--launch-daemons-dir/--key-dir/
-# --socket-dir redirect every write into this test's own tmp dirs,
-# --skip-build with a stubbed `individuator`/`individuator-daemon` pair
-# stands in for `swift build` and the real key, `sudo` is stubbed to exec
-# its argv directly (with a faked `id -u` so the script's own root check
-# passes), and `launchctl` is tests/bash/lib.sh's own global stub.
+# --socket-dir/--daemon-log redirect every write into this test's own tmp
+# dirs, --skip-build with a stubbed `individuator`/`individuator-daemon`
+# pair stands in for `swift build` and the real key, `sudo` is stubbed to
+# exec its argv directly (with a faked `id -u` so the script's own root
+# check passes), and `launchctl` is tests/bash/lib.sh's own global stub,
+# which refuses `bootstrap`/`bootout` loudly — so the stub daemon this
+# installs never actually runs, and never writes a real self-test line;
+# tests that need one pre-write it to --daemon-log themselves.
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=/dev/null
@@ -17,27 +22,17 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 INSTALLER="$REPO_ROOT/bin/install-individuator"
 
-# A stub individuator binary. `keygen` writes a marker key file (so a test
-# can tell whether it was actually asked to make one); every subcommand,
-# keygen included, logs its full argv to $STUB_LOG first, so a test can
-# assert both HOW OFTEN and WITH WHAT ARGUMENTS this script called it.
+# A stub individuator binary: every subcommand just logs its full argv to
+# $STUB_LOG, so a test can assert both HOW OFTEN and WITH WHAT ARGUMENTS
+# this script called it. Never special-cases any subcommand — unlike the
+# retired Secure Enclave key's keygen stub, the daemon (never this binary)
+# is what creates a key now, so there is nothing here for this script to
+# fake creating.
 make_stub_bin() { # <dir>
     mkdir -p "$1"
     cat > "$1/individuator" <<'STUB'
 #!/bin/bash
 echo "$*" >> "$STUB_LOG"
-if [ "$1" = "keygen" ]; then
-    key_dir=""
-    shift
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --key-dir) key_dir="$2"; shift 2 ;;
-            *) shift ;;
-        esac
-    done
-    mkdir -p "$key_dir"
-    echo "stub-key" > "$key_dir/machine.key"
-fi
 exit 0
 STUB
     chmod +x "$1/individuator"
@@ -91,7 +86,7 @@ rc=$?
 assert_rc 1 "$rc" "install-individuator must refuse when not running as root"
 assert_contains "$out" "must be run as root" "and say why"
 
-echo "== happy path: keygen runs once, is never regenerated, and arguments reach both the config and the binary =="
+echo "== happy path: the daemon's own self-test line is read, and arguments reach both the config and the csr call =="
 repo=$(make_repo)
 stub_dir=$(mktemp -d)
 make_stub_bin "$stub_dir"
@@ -101,6 +96,7 @@ install_dir=$(mktemp -d)/opt
 config_path=$(mktemp -d)/config.json
 launchd_dir=$(mktemp -d)/LaunchDaemons
 socket_dir=$(mktemp -d)/individuator-daemon
+daemon_log=$(mktemp -d)/individuator.out.log
 STUB_LOG=$(mktemp)
 export STUB_LOG
 
@@ -113,6 +109,13 @@ root_ca_src="$root_ca_dir/library-root.pem"
 echo "fixture library root CA (synthetic; not a real certificate) v1" > "$root_ca_src"
 root_ca_copy="$(dirname "$config_path")/root-ca.pem"
 
+# `launchctl bootstrap` is stubbed to refuse (tests/bash/lib.sh), so the
+# stub daemon never actually runs and never writes its own self-test line
+# — this stands in for it already being there from an earlier real start,
+# so every run below finds it on the very first check, with no waiting.
+fake_self_test_line="individuator-daemon: machine key self-test passed (created), effective uid 0, public key fingerprint deadbeef"
+echo "$fake_self_test_line" > "$daemon_log"
+
 run_installer() {
     PATH="$sudo_dir:$PATH" sudo "$INSTALLER" \
         --repo="$repo" --skip-build --build-dir="$stub_dir" \
@@ -121,24 +124,23 @@ run_installer() {
         --machine-name=test-machine-1 \
         --key-dir="$key_dir" --install-dir="$install_dir" \
         --config-path="$config_path" --launch-daemons-dir="$launchd_dir" \
-        --socket-dir="$socket_dir" 2>&1
+        --socket-dir="$socket_dir" --daemon-log="$daemon_log" 2>&1
 }
 
 out1=$(run_installer); rc1=$?
 assert_rc 0 "$rc1" "the first run installs cleanly as root"
-assert_contains "$(cat "$key_dir/machine.key" 2>/dev/null)" "stub-key" \
-    "the first run generates the key"
+assert_contains "$out1" "$fake_self_test_line" \
+    "the daemon's own self-test line is read and printed"
 
 out2=$(run_installer); rc2=$?
 assert_rc 0 "$rc2" "a second run installs cleanly too"
-assert_contains "$out2" "already present" \
-    "a second run announces the existing key rather than silently skipping it"
 assert_contains "$out2" "Root CA unchanged" \
     "a second run with the same --root-ca source leaves the copy as-is and says so"
 
-keygen_calls=$(grep -c '^keygen' "$STUB_LOG")
-assert_eq "1" "$keygen_calls" \
-    "individuator keygen is called exactly once across two installer runs — the second run must not overwrite the key"
+for subcommand in keygen self-test fingerprint; do
+    assert_eq "0" "$(grep -c "^$subcommand" "$STUB_LOG")" \
+        "individuator $subcommand is never called — the daemon creates and self-tests its own key"
+done
 
 assert_contains "$(cat "$config_path")" '"bosun_host": "bosun-test"' \
     "--bosun-host reaches the written config"
@@ -163,12 +165,8 @@ assert_contains "$(cat "$root_ca_copy" 2>/dev/null)" "v1" \
 assert_eq "644" "$(stat -f '%Lp' "$root_ca_copy")" \
     "the copy is mode 0644"
 
-assert_contains "$(cat "$STUB_LOG")" "self-test --key-dir $key_dir" \
-    "--key-dir reaches the self-test call"
 assert_contains "$(cat "$STUB_LOG")" "csr --machine-name test-machine-1 --key-dir $key_dir" \
     "--machine-name and --key-dir reach the csr call"
-assert_contains "$(cat "$STUB_LOG")" "fingerprint --key-dir $key_dir" \
-    "--key-dir reaches the fingerprint call"
 
 present() { [ -f "$1" ] && echo "present" || echo "missing"; }
 assert_eq "present" "$(present "$install_dir/individuator")" "the individuator binary was installed"
@@ -190,8 +188,24 @@ assert_contains "$out3" "Root CA copied" \
 assert_contains "$(cat "$root_ca_copy" 2>/dev/null)" "v2" \
     "the copy picks up the changed source"
 
+echo "== no self-test line ever appears: the run still installs, and warns rather than hanging =="
+missing_log=$(mktemp -d)/individuator.out.log
+out4=$(PATH="$sudo_dir:$PATH" sudo "$INSTALLER" \
+    --repo="$repo" --skip-build --build-dir="$stub_dir" \
+    --bosun-host=bosun-test --bosun-address=127.0.0.1:8710 \
+    --root-ca="$root_ca_src" --operator-uid=501 \
+    --machine-name=test-machine-1 \
+    --key-dir="$key_dir" --install-dir="$install_dir" \
+    --config-path="$config_path" --launch-daemons-dir="$launchd_dir" \
+    --socket-dir="$socket_dir" --daemon-log="$missing_log" \
+    --self-test-wait-seconds=1 2>&1)
+rc4=$?
+assert_rc 0 "$rc4" "the run still installs cleanly when no self-test line ever appears"
+assert_contains "$out4" "no self-test line from the daemon" \
+    "and it warns, rather than ever hanging or failing the whole install"
+
 rm -rf "$repo" "$stub_dir" "$sudo_dir" "$(dirname "$key_dir")" "$(dirname "$install_dir")" \
     "$(dirname "$config_path")" "$(dirname "$launchd_dir")" "$(dirname "$socket_dir")" \
-    "$root_ca_dir" "$STUB_LOG"
+    "$(dirname "$daemon_log")" "$(dirname "$missing_log")" "$root_ca_dir" "$STUB_LOG"
 
 finish

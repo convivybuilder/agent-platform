@@ -1373,3 +1373,13 @@ def test_the_occurrence_a_pair_starved_in_pass_one_delivers_in_pass_two(
         "code (always restarting at TRACKED[0]) this assertion is the one "
         "that goes red: p2 is starved identically in both passes and its "
         "cursor never moves off 2026-10-01T10:02:00Z")
+
+
+def test_run_deadline_bounds_a_stuck_pass_rather_than_racing_the_next_fire(ci_result_capture):
+    """`_RUN_DEADLINE_SECONDS` is sized against this job's own launchd
+    `StartInterval` (180s, `com.convivy.ci-result-capture.plist`), the same
+    pairing `pr-state-capture._RUN_DEADLINE_SECONDS` keeps against its own
+    180s interval: a pass that runs long has its next scheduled fire skipped
+    rather than overlapping it, so 150s bounds how long a stuck pass is
+    retried, not a race against the next fire."""
+    assert ci_result_capture._RUN_DEADLINE_SECONDS == 150

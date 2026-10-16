@@ -31,14 +31,24 @@ machine revoked in the Library keeps its live sessions until an operator runs
 renewed. 0092 names this cost explicitly and accepts it.
 
 THE BOSUN REGISTERS A SESSION ONLY FOR A MACHINE WHOSE KEY CUSTODY IS
-EXACTLY "HARDWARE" (`REQUIRED_CUSTODY`, operator decision D2, 2026-10-12).
-This amends 0092 decision #4, which accepted a file-held key in stage one —
-a certificate plan now in progress will issue file-held clientAuth keys to
+EXACTLY ONE OF THE ALLOWED CUSTODY VALUES (`REQUIRED_CUSTODY`, operator
+decision D2, 2026-10-12; widened to add `"root-file"` 2026-10-15). This
+amends 0092 decision #4, which accepted a file-held key in stage one — a
+certificate plan now in progress will issue file-held clientAuth keys to
 agent-platform's own tools, and a key readable from inside a dispatched run
 must never be sufficient to register a session in the Individuator's place.
-`handle_registration` checks this after the registry lookup already finds
-the machine active and matching, and before `register_session` ever mints a
-token, refusing with `machine_custody_not_hardware` otherwise.
+`"root-file"` is a software key in a file only root can read — the
+Individuator's own machine key, held that way because a launchd daemon
+cannot use the Secure Enclave (Apple DTS; 2026-10-15 occurrence) — and is
+kept distinct from plain `"file"`, which means a key the operator account
+can read (agent-platform's own tools run as the operator account, so
+`"file"` stays refused). `handle_registration` checks this after the
+registry lookup already finds the machine active and matching, and before
+`register_session` ever mints a token, refusing with
+`machine_custody_not_hardware` otherwise. The check applies to every
+machine on this listener: `library_machine_verify`'s result carries only
+`custody`, `machine` and `status`, no machine kind to scope the allowlist
+by.
 
 THE PER-CALL AUTHORIZATION ENDPOINT (E12·3's endpoint half; E12·8's per-call
 half) lives on this same mTLS listener, at `POST /authorize` — never a second
@@ -324,16 +334,21 @@ def check_client_certificate(der: bytes) -> CertCheck:
 
 _LIBRARY_STATUSES = frozenset({"active", "revoked", "expired", "unknown"})
 
-# The custody the Bosun requires before it will register a session (operator
-# decision D2, 2026-10-12, amending 0092 decision #4 — 0092 itself accepted a
-# file-held key in stage one). A certificate plan now in progress will issue
-# file-held clientAuth keys to agent-platform's own tools, and a key readable
-# from inside a dispatched run must never be sufficient to register a
-# session in the Individuator's place. Compared for exact string equality
-# against the Library row's `custody` field in `handle_registration` — any
-# value other than this one, including a missing key, `None`, `""` and a
-# differently-cased spelling, refuses.
-REQUIRED_CUSTODY = "hardware"
+# The custody values the Bosun accepts before it will register a session
+# (operator decision D2, 2026-10-12, amending 0092 decision #4 — 0092 itself
+# accepted a file-held key in stage one; widened 2026-10-15 to add
+# "root-file" for the Individuator's own software-held machine key). A
+# certificate plan now in progress will issue file-held clientAuth keys to
+# agent-platform's own tools, and a key readable from inside a dispatched
+# run must never be sufficient to register a session in the Individuator's
+# place — which is exactly why plain "file" (a key the operator account can
+# read) stays out of this set while "root-file" (a key only root can read)
+# is in it. `handle_registration` checks the Library row's `custody` field
+# for exact membership in this set — any value not in it, including a
+# missing key, `None`, `""` and a differently-cased spelling, refuses. This
+# applies to every machine on the registration listener: the lookup result
+# carries no machine kind to scope the check by (see the module docstring).
+REQUIRED_CUSTODY = frozenset({"hardware", "root-file"})
 
 
 @dataclass(frozen=True)
@@ -701,10 +716,11 @@ def handle_registration(peer_cert_der: bytes, body: object) -> RegistrationOutco
 
     The custody refusal runs after the registry lookup already found the
     machine active and matching, and before `register_session` ever mints a
-    token, so a machine whose key custody is not exactly `REQUIRED_CUSTODY`
+    token, so a machine whose key custody is not in `REQUIRED_CUSTODY`
     never gets a session row — fail closed: `result.custody` is compared for
-    exact equality, so a missing key, `None`, `""`, a differently-cased
-    spelling or any other value all refuse the same as `"file"` does.
+    exact membership in that set, so a missing key, `None`, `""`, `"file"`
+    (a key the operator account can read) and a differently-cased spelling
+    all refuse the same way.
     """
     check = check_client_certificate(peer_cert_der)
     if check.reason:
@@ -746,7 +762,7 @@ def handle_registration(peer_cert_der: bytes, body: object) -> RegistrationOutco
         detail = {"status": result.status} if result.status else {}
         return RegistrationOutcome(False, result.reason, detail=detail)
 
-    if result.custody != REQUIRED_CUSTODY:
+    if result.custody not in REQUIRED_CUSTODY:
         return RegistrationOutcome(False, "machine_custody_not_hardware")
 
     created = register_session(

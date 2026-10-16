@@ -352,4 +352,400 @@ out=$(env -u TAILSCALE_WATCHDOG_STATE HOME="$_fake_home" /bin/sh "$_state_probe"
 assert_eq "$_fake_home/.local/state/tailscale-watchdog" "$out" \
     "STATE's default is \$HOME-relative, not a hardcoded account"
 
+echo "== step 2 restores a tunnel on a node with non-default prefs, and keeps its services =="
+#
+# On 2026-10-15 a plain `tailscale up` was refused on a node with non-default
+# prefs ("changing settings via 'tailscale up' requires mentioning all
+# non-default flags"), and running the CLI's own suggested re-run also
+# cleared AdvertiseServices. Everything below is synthetic: no real keys, no
+# real node IDs, Config filled with an obvious placeholder.
+
+PLACEHOLDER_KEY="privkey:PLACEHOLDER0000000000000000000000000000000000000000000000000000"
+
+EXITNODE_PREFS_BEFORE="$WORK/exitnode-before.json"
+cat > "$EXITNODE_PREFS_BEFORE" <<JSON
+{
+  "WantRunning": false,
+  "AdvertiseRoutes": ["0.0.0.0/0", "::/0"],
+  "AdvertiseServices": ["svc:a", "svc:b", "svc:c", "svc:d"],
+  "Config": {"PrivateNodeKey": "$PLACEHOLDER_KEY", "NodeID": "nSYNTHETIC00000001"}
+}
+JSON
+
+EXITNODE_PREFS_AFTER="$WORK/exitnode-after.json"
+cat > "$EXITNODE_PREFS_AFTER" <<JSON
+{
+  "WantRunning": true,
+  "AdvertiseRoutes": ["0.0.0.0/0", "::/0"],
+  "AdvertiseServices": [],
+  "Config": {"PrivateNodeKey": "$PLACEHOLDER_KEY", "NodeID": "nSYNTHETIC00000001"}
+}
+JSON
+
+TAG_PREFS="$WORK/tag-prefs.json"
+cat > "$TAG_PREFS" <<JSON
+{
+  "WantRunning": false,
+  "AdvertiseTags": ["tag:apps"],
+  "Config": {"PrivateNodeKey": "$PLACEHOLDER_KEY", "NodeID": "nSYNTHETIC00000002"}
+}
+JSON
+
+DEFAULT_PREFS="$WORK/default-prefs.json"
+cat > "$DEFAULT_PREFS" <<JSON
+{
+  "WantRunning": false,
+  "Config": {"PrivateNodeKey": "$PLACEHOLDER_KEY", "NodeID": "nSYNTHETIC00000003"}
+}
+JSON
+
+# A process whose full command line ends in the exact string step 1's pgrep
+# looks for, so step 1 (already covered elsewhere) stands aside and every run
+# below reaches step 2 directly rather than sleeping 20s and shelling out to
+# the real `open -a Tailscale`.
+FAKE_APP_DIR="$WORK/Tailscale.app/Contents/MacOS"
+mkdir -p "$FAKE_APP_DIR"
+printf '#!/bin/sh\nsleep 600\n' > "$FAKE_APP_DIR/Tailscale"
+chmod +x "$FAKE_APP_DIR/Tailscale"
+"$FAKE_APP_DIR/Tailscale" &
+FAKE_APP_PID=$!
+trap 'kill "$FAKE_APP_PID" 2>/dev/null; rm -rf "$WORK"' EXIT
+
+# A stub CLI whose `up` answers depend on exactly the flags it was called
+# with, and which records every call it receives, in order, to $STUB_LOG.
+# `debug prefs` answers from a before/after pair of fixtures, switching once
+# `up` has been called with the flags that are supposed to succeed — the
+# stand-in for the real CLI's observed side effect of clearing
+# AdvertiseServices on that exact call.
+write_ts_stub() {
+    cat > "$WORK/ts" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$STUB_LOG"
+
+if [ "$1" = "status" ]; then
+    # Always unhealthy, so every scenario below reaches step 2 the same way
+    # and nothing here depends on the final RECOVERED/STILL DOWN branch.
+    echo '{"BackendState":"Running","Self":{"Online":false}}'
+    exit 0
+fi
+
+case "$1" in
+    debug)
+        if [ -f "$STUB_STATE/cleared" ]; then
+            cat "$STUB_PREFS_AFTER"
+        else
+            cat "$STUB_PREFS_BEFORE"
+        fi
+        exit 0
+        ;;
+    up)
+        shift
+        if [ "$STUB_SCENARIO" = "default" ]; then
+            exit 0
+        fi
+        if [ "$*" = "--timeout=30s" ]; then
+            echo "changing settings via 'tailscale up' requires mentioning all non-default flags. To proceed, either re-run your command with --reset or use the command below to explicitly mention the current value of all non-default settings: tailscale up --timeout=30s $STUB_SUGGESTED"
+            exit 1
+        fi
+        if [ -n "$STUB_REQUIRED" ] && [ "$*" = "--timeout=30s $STUB_REQUIRED" ]; then
+            touch "$STUB_STATE/cleared"
+            exit 0
+        fi
+        echo "unexpected up args, should not have been run: $*" >&2
+        exit 1
+        ;;
+    serve)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+STUB
+    chmod +x "$WORK/ts"
+}
+
+# <dirname> <scenario> <prefs before> <prefs after> <suggested extra flags> <flags required for success>
+run_scenario() {
+    st="$WORK/$1"
+    mkdir -p "$st"
+    # Pre-seeded past THRESHOLD and past COOLDOWN, so this one run goes
+    # straight through to step 1 (which stands aside, above) and step 2,
+    # rather than needing three real ticks to get there.
+    echo 2 > "$st/consecutive-failures"
+    echo 0 > "$st/last-action"
+    stubstate="$WORK/stubstate-$1"
+    rm -rf "$stubstate"
+    mkdir -p "$stubstate"
+    STUB_LOG="$WORK/stublog-$1"
+    rm -f "$STUB_LOG"
+    STUB_STATE="$stubstate"
+    STUB_SCENARIO="$2"
+    STUB_PREFS_BEFORE="$3"
+    STUB_PREFS_AFTER="$4"
+    STUB_SUGGESTED="$5"
+    STUB_REQUIRED="$6"
+    export STUB_LOG STUB_STATE STUB_SCENARIO STUB_PREFS_BEFORE STUB_PREFS_AFTER STUB_SUGGESTED STUB_REQUIRED
+    write_ts_stub
+    TAILSCALE_WATCHDOG_CLI="$WORK/ts" TAILSCALE_WATCHDOG_STATE="$st" /bin/sh "$WATCHDOG" >/dev/null 2>&1
+}
+
+# -- an exit-node-shaped node: refused, rerun with exactly the suggested flag,
+#    then every cleared service is re-advertised ------------------------------
+run_scenario "exitnode" "exitnode" "$EXITNODE_PREFS_BEFORE" "$EXITNODE_PREFS_AFTER" \
+    "--advertise-exit-node" "--advertise-exit-node"
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-exitnode")
+expected=$(printf '%s\n' \
+    "debug prefs" \
+    "up --timeout=30s" \
+    "up --timeout=30s --advertise-exit-node" \
+    "debug prefs" \
+    "serve advertise svc:a" \
+    "serve advertise svc:b" \
+    "serve advertise svc:c" \
+    "serve advertise svc:d")
+assert_eq "$expected" "$calls" \
+    "an exit-node-shaped node: the exact rerun and re-advertise argv, in order"
+
+# -- a tag-shaped node: refused, rerun with exactly the suggested flag, and
+#    nothing to re-advertise since there were no services to begin with -------
+run_scenario "tagnode" "tag" "$TAG_PREFS" "$TAG_PREFS" \
+    "--advertise-tags=tag:apps" "--advertise-tags=tag:apps"
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-tagnode")
+expected=$(printf '%s\n' \
+    "debug prefs" \
+    "up --timeout=30s" \
+    "up --timeout=30s --advertise-tags=tag:apps" \
+    "debug prefs")
+assert_eq "$expected" "$calls" \
+    "a tag-shaped node: the exact rerun argv, in order, and nothing re-advertised"
+
+# -- a default node: bare `up` just succeeds; no rerun, no re-advertise -------
+run_scenario "defaultnode" "default" "$DEFAULT_PREFS" "$DEFAULT_PREFS" "" ""
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-defaultnode")
+expected=$(printf '%s\n' "debug prefs" "up --timeout=30s" "debug prefs")
+assert_eq "$expected" "$calls" "a default node: bare up succeeds, no rerun, no re-advertise"
+
+# -- a suggestion containing --reset: refused outright, never run -------------
+run_scenario "badreset" "badreset" "$EXITNODE_PREFS_BEFORE" "$EXITNODE_PREFS_BEFORE" \
+    "--reset --advertise-exit-node" ""
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-badreset")
+expected=$(printf '%s\n' "debug prefs" "up --timeout=30s" "debug prefs")
+assert_eq "$expected" "$calls" \
+    "a suggestion containing --reset: only the bare, refused up is ever run"
+# Anchored on RERUN_REFUSED, not just "--reset": that substring is also in the
+# CLI's raw refusal message, which the log holds either way, so a needle of
+# "--reset" alone would pass just as well against code with no allowlist at
+# all. RERUN_REFUSED is printed only by the allowlist check itself.
+assert_contains "$(cat "$WORK/badreset/watchdog.log" 2>/dev/null)" \
+    "RERUN_REFUSED: suggestion held a flag outside the allowlist: --reset" \
+    "...and the refusal names --reset as the disallowed flag"
+
+# -- a suggestion with a flag outside the allowlist: refused outright ---------
+run_scenario "badoutside" "badoutside" "$EXITNODE_PREFS_BEFORE" "$EXITNODE_PREFS_BEFORE" \
+    "--some-unlisted-flag" ""
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-badoutside")
+expected=$(printf '%s\n' "debug prefs" "up --timeout=30s" "debug prefs")
+assert_eq "$expected" "$calls" \
+    "a suggestion with a flag outside the allowlist: only the bare, refused up is ever run"
+assert_contains "$(cat "$WORK/badoutside/watchdog.log" 2>/dev/null)" \
+    "RERUN_REFUSED: suggestion held a flag outside the allowlist: --some-unlisted-flag" \
+    "...and the refusal names the disallowed flag"
+
+# -- a suggestion containing --operator: refused outright, never run. This flag
+#    sets which local user may operate tailscaled, not a restated node setting,
+#    so it must never be on ALLOWED_UP_FLAGS even though the CLI can suggest it
+#    on a node with a non-default operator. ------------------------------------
+run_scenario "badoperator" "badoperator" "$EXITNODE_PREFS_BEFORE" "$EXITNODE_PREFS_BEFORE" \
+    "--operator=synthetic-test-user" ""
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-badoperator")
+expected=$(printf '%s\n' "debug prefs" "up --timeout=30s" "debug prefs")
+assert_eq "$expected" "$calls" \
+    "a suggestion containing --operator: only the bare, refused up is ever run"
+assert_contains "$(cat "$WORK/badoperator/watchdog.log" 2>/dev/null)" \
+    "RERUN_REFUSED: suggestion held a flag outside the allowlist: --operator=synthetic-test-user" \
+    "...and the refusal names --operator as the disallowed flag"
+
+# -- a suggestion containing --exit-node: refused outright, never run. This flag
+#    sets the node's selected exit-node target, not a restated node setting, so
+#    it must never be on ALLOWED_UP_FLAGS even though the CLI can suggest it on
+#    a node with a non-default selected exit node. -----------------------------
+run_scenario "badexitnode" "badexitnode" "$EXITNODE_PREFS_BEFORE" "$EXITNODE_PREFS_BEFORE" \
+    "--exit-node=192.0.2.1" ""
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-badexitnode")
+expected=$(printf '%s\n' "debug prefs" "up --timeout=30s" "debug prefs")
+assert_eq "$expected" "$calls" \
+    "a suggestion containing --exit-node: only the bare, refused up is ever run"
+assert_contains "$(cat "$WORK/badexitnode/watchdog.log" 2>/dev/null)" \
+    "RERUN_REFUSED: suggestion held a flag outside the allowlist: --exit-node=192.0.2.1" \
+    "...and the refusal names --exit-node as the disallowed flag"
+
+# -- a suggestion holding a bare, non-flag token alongside allowlisted flags:
+#    refused outright by the non-flag-token branch, never the allowlist branch,
+#    and never run. -------------------------------------------------------------
+run_scenario "badtoken" "badtoken" "$EXITNODE_PREFS_BEFORE" "$EXITNODE_PREFS_BEFORE" \
+    "--advertise-exit-node example-word" ""
+calls=$(grep -E '^(debug|up|serve)' "$WORK/stublog-badtoken")
+expected=$(printf '%s\n' "debug prefs" "up --timeout=30s" "debug prefs")
+assert_eq "$expected" "$calls" \
+    "a suggestion holding a non-flag token: only the bare, refused up is ever run"
+assert_contains "$(cat "$WORK/badtoken/watchdog.log" 2>/dev/null)" \
+    "RERUN_REFUSED: suggestion held a non-flag token: example-word" \
+    "...and the refusal names the non-flag token"
+
+echo "== step 2 detects and recovers the exact 2026-10-15 App Store relaunch state =="
+#
+# At 06:43 MST on 2026-10-15 an App Store update to the system extension
+# relaunched Tailscale with the app process still running, the CLI's status
+# reporting BackendState "Stopped" (no NeedsLogin, no AuthURL — a
+# configuration fault, not an auth one), and WantRunning left false. That is
+# the shape step 1 cannot see, since the app never stopped; step 2 is what
+# must recognise it. This drives that shape through THRESHOLD separate
+# invocations from a clean state, the way the real watchdog ticks every
+# 60s, rather than pre-seeding past the threshold the way the scenarios
+# above do: the property under test is that detection reaches step 2 at the
+# right tick, not only that step 2 recovers once reached.
+
+ST="$WORK/appstore"; mkdir -p "$ST"
+_appstore_stubstate="$WORK/stubstate-appstore"
+rm -rf "$_appstore_stubstate"; mkdir -p "$_appstore_stubstate"
+STUB_LOG="$WORK/stublog-appstore"
+rm -f "$STUB_LOG"
+STUB_STATE="$_appstore_stubstate"
+STUB_PREFS_BEFORE="$EXITNODE_PREFS_BEFORE"
+STUB_PREFS_AFTER="$EXITNODE_PREFS_AFTER"
+STUB_SUGGESTED="--advertise-exit-node"
+STUB_REQUIRED="--advertise-exit-node"
+export STUB_LOG STUB_STATE STUB_PREFS_BEFORE STUB_PREFS_AFTER STUB_SUGGESTED STUB_REQUIRED
+
+cat > "$WORK/ts-appstore" <<'STUB'
+#!/bin/sh
+printf '%s\n' "$*" >> "$STUB_LOG"
+
+if [ "$1" = "status" ]; then
+    # The exact detection surface: BackendState "Stopped" while the app
+    # process is still running. Flips to Running only once the allowlisted
+    # rerun below has actually succeeded, standing in for the real recovery.
+    if [ -f "$STUB_STATE/cleared" ]; then
+        echo '{"BackendState":"Running","Self":{"Online":true}}'
+    else
+        echo '{"BackendState":"Stopped","Self":{"Online":false}}'
+    fi
+    exit 0
+fi
+
+case "$1" in
+    debug)
+        if [ -f "$STUB_STATE/cleared" ]; then
+            cat "$STUB_PREFS_AFTER"
+        else
+            cat "$STUB_PREFS_BEFORE"
+        fi
+        exit 0
+        ;;
+    up)
+        shift
+        if [ "$*" = "--timeout=30s" ]; then
+            echo "changing settings via 'tailscale up' requires mentioning all non-default flags. To proceed, either re-run your command with --reset or use the command below to explicitly mention the current value of all non-default settings: tailscale up --timeout=30s $STUB_SUGGESTED"
+            exit 1
+        fi
+        if [ -n "$STUB_REQUIRED" ] && [ "$*" = "--timeout=30s $STUB_REQUIRED" ]; then
+            touch "$STUB_STATE/cleared"
+            exit 0
+        fi
+        echo "unexpected up args, should not have been run: $*" >&2
+        exit 1
+        ;;
+    serve)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+STUB
+chmod +x "$WORK/ts-appstore"
+
+# Reuses the app process already running for the scenarios above (its full
+# command line matches step 1's pgrep pattern), rather than starting a
+# second one: the app staying up throughout is exactly the fixture step 1
+# needs to stand aside in every tick below.
+run_appstore_tick() {
+    TAILSCALE_WATCHDOG_CLI="$WORK/ts-appstore" TAILSCALE_WATCHDOG_STATE="$ST" /bin/sh "$WATCHDOG" >/dev/null 2>&1
+}
+
+run_appstore_tick   # check 1/3
+run_appstore_tick   # check 2/3
+log_pre=$(cat "$ST/watchdog.log" 2>/dev/null)
+assert_contains "$log_pre" "DOWN — check 1/3 failed" \
+    "appstore relaunch: the first bad observation is logged"
+assert_contains "$log_pre" "DOWN — check 2/3 failed" \
+    "appstore relaunch: the second bad observation is logged"
+case "$log_pre" in
+    *ACTION:*) _premature=yes ;;
+    *)         _premature=no ;;
+esac
+assert_eq "no" "$_premature" \
+    "appstore relaunch: nothing is done before the threshold is reached"
+
+run_appstore_tick   # check 3/3: the threshold, where step 2 must act
+log_act=$(cat "$ST/watchdog.log" 2>/dev/null)
+assert_contains "$log_act" "DOWN — check 3/3 failed" \
+    "appstore relaunch: the third observation reaches the threshold"
+case "$log_act" in
+    *"ACTION: app not running"*) _step1_ran=yes ;;
+    *)                            _step1_ran=no ;;
+esac
+assert_eq "no" "$_step1_ran" \
+    "appstore relaunch: step 1 is not taken, because the app process is running"
+assert_contains "$log_act" "ACTION: tailscale up --timeout=30s" \
+    "appstore relaunch: step 2 runs the bare up"
+assert_contains "$log_act" "RECOVERED after tailscale up" \
+    "appstore relaunch: step 2's allowlisted rerun recovers the node"
+case "$log_act" in
+    *"STILL DOWN"*) _needed_human=yes ;;
+    *)              _needed_human=no ;;
+esac
+assert_eq "no" "$_needed_human" \
+    "appstore relaunch: recovery inside the threshold attempt never says a human is needed"
+
+run_appstore_tick   # now healthy: must be quiet
+log_quiet=$(cat "$ST/watchdog.log" 2>/dev/null)
+assert_eq "$log_act" "$log_quiet" \
+    "appstore relaunch: once recovered, the next tick logs nothing new"
+
+calls=$(grep -E '^(status|debug|up|serve)' "$STUB_LOG")
+expected=$(printf '%s\n' \
+    "status --json" \
+    "status --json" \
+    "status --json" \
+    "debug prefs" \
+    "up --timeout=30s" \
+    "up --timeout=30s --advertise-exit-node" \
+    "debug prefs" \
+    "serve advertise svc:a" \
+    "serve advertise svc:b" \
+    "serve advertise svc:c" \
+    "serve advertise svc:d" \
+    "status --json" \
+    "status --json")
+assert_eq "$expected" "$calls" \
+    "appstore relaunch: the exact argv sequence across all four ticks, in order"
+
+echo "== the node's private key never reaches anything the watchdog writes =="
+
+# Positive control first: the same needle really is in the fixture that
+# legitimately holds it, so an empty result below means "absent", not "this
+# grep can't find anything."
+found_in_fixture=$(grep -l "PLACEHOLDER0000000000000000000000000000000000000000000000000000" \
+    "$EXITNODE_PREFS_BEFORE")
+assert_contains "$found_in_fixture" "$EXITNODE_PREFS_BEFORE" \
+    "sanity: the fixture itself holds the placeholder key (positive control)"
+
+leaked=$(grep -rl "PLACEHOLDER0000000000000000000000000000000000000000000000000000" \
+    "$WORK/exitnode" "$WORK/tagnode" "$WORK/defaultnode" "$WORK/badreset" "$WORK/badoutside" \
+    "$WORK/badoperator" "$WORK/badexitnode" "$WORK/badtoken" 2>/dev/null)
+assert_eq "" "$leaked" \
+    "no file under a run's STATE directory contains the fixture's placeholder private key"
+
 finish

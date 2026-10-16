@@ -8,18 +8,17 @@ import PackageDescription
 // path to a test-only key, and so the one external dependency (swift-nio-ssl,
 // D1 below) reaches only the networking targets that need it:
 //
-//   IndividuatorCore     — the identity core: MachineKey, SecureEnclaveMachineKey,
+//   IndividuatorCore     — the identity core: MachineKey, SoftwareMachineKey,
 //                           the CSR builder, certificate adoption, the Bosun
 //                           server-certificate check, and the root-owned config
-//                           reader. No test key type lives here, and no external
-//                           dependency: every certificate/CSR primitive is built
-//                           from Apple's own Security/CryptoKit plus this
-//                           package's own DER encoder.
+//                           reader. No external dependency: every certificate/
+//                           CSR primitive is built from Apple's own Security/
+//                           CryptoKit plus this package's own DER encoder.
 //   IndividuatorNetwork  — the mutual-TLS registration client. Depends on
-//                           swift-nio-ssl (D1) to present the Secure Enclave key
-//                           at the TLS handshake through `NIOSSLCustomPrivateKey`
-//                           without ever exporting it from the enclave or the
-//                           Keychain.
+//                           swift-nio-ssl (D1) to present the machine key at
+//                           the TLS handshake through `NIOSSLCustomPrivateKey`
+//                           without its raw bytes ever leaving `MachineKey`'s
+//                           own `signature(for:)`.
 //
 //   D1 (operator, 2026-10-12): before adding swift-nio-ssl, this slice checked
 //   whether `Network.framework`'s public API can present a Secure Enclave key
@@ -45,10 +44,9 @@ import PackageDescription
 //   IndividuatorCoreTests, IndividuatorNetworkTests — test targets. The
 //                           latter depends on IndividuatorCoreTests (itself a
 //                           target, not a product) purely to reuse its
-//                           SoftwareMachineKey/TestCertificateAuthority test
-//                           fixtures — a test-target-to-test-target
-//                           dependency SwiftPM allows precisely for this,
-//                           and still no product target can ever reach them.
+//                           TestCertificateAuthority test fixture — a
+//                           test-target-to-test-target dependency SwiftPM
+//                           allows precisely for this.
 let package = Package(
     name: "individuator",
     platforms: [.macOS(.v13)],

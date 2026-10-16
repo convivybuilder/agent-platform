@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
 
 /// A named reason a key blob's filesystem custody is refused — never a raw
 /// `errno` or a generic "could not read the file", because the operator
@@ -12,6 +17,7 @@ public enum KeyFileStoreError: Error, CustomStringConvertible, Equatable {
     case fileModeWrong(path: String, expected: UInt16, found: UInt16)
     case fileOwnerWrong(path: String, expected: uid_t, found: uid_t)
     case keyAlreadyExists(path: String)
+    case createFailed(path: String, errno: Int32)
 
     public var description: String {
         switch self {
@@ -29,6 +35,8 @@ public enum KeyFileStoreError: Error, CustomStringConvertible, Equatable {
             return "key file \(p) is owned by uid \(found), expected \(expected)"
         case .keyAlreadyExists(let p):
             return "a key already exists at \(p); refusing to overwrite it"
+        case .createFailed(let p, let err):
+            return "could not create key file \(p) (errno \(err))"
         }
     }
 }
@@ -39,12 +47,12 @@ public enum KeyFileStoreError: Error, CustomStringConvertible, Equatable {
 /// own uid, since nothing under `Tests/` may run as root or touch a real
 /// key, per this repo's operating rules).
 ///
-/// This type knows nothing about Secure Enclave or CryptoKit; it only
-/// stat()s and writes a directory and a file. `SecureEnclaveMachineKey`
-/// calls it before (`prepareForCreate`/`validateForLoad`) and after
-/// (`write`) touching the Enclave, so every custody check in the spec is
-/// exercised here, in isolation, by a test that never creates a real
-/// hardware key.
+/// This type knows nothing about key material; it only stat()s and writes a
+/// directory and a file. `SoftwareMachineKey` calls it before
+/// (`prepareForCreate`) and after (`createExclusive`) generating a key, and
+/// `DaemonKeyStartup`/the CLI subcommands call `validateFile`/`read` to load
+/// one back, so every custody check in the spec is exercised here, in
+/// isolation, by a test that never touches a real production key.
 public struct KeyFileStore {
     public let directory: URL
     public let fileName: String
@@ -131,5 +139,36 @@ public struct KeyFileStore {
     public func write(_ data: Data) throws {
         try data.write(to: fileURL, options: .atomic)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+    }
+
+    /// Creates the key file atomically at exactly 0600, with no window
+    /// where it is briefly readable at some other mode — unlike `write`,
+    /// which writes then `chmod`s. `O_CREAT|O_EXCL` makes the create
+    /// itself refuse outright (`keyAlreadyExists`) when the file is
+    /// already there, rather than ever overwriting one; the explicit 0600
+    /// passed to `open` cannot be widened by any process umask, which only
+    /// ever clears bits from the mode a caller requests.
+    public func createExclusive(_ data: Data) throws {
+        let fd = open(fileURL.path, O_CREAT | O_EXCL | O_WRONLY, 0o600)
+        guard fd >= 0 else {
+            if errno == EEXIST {
+                throw KeyFileStoreError.keyAlreadyExists(path: fileURL.path)
+            }
+            throw KeyFileStoreError.createFailed(path: fileURL.path, errno: errno)
+        }
+        defer { close(fd) }
+        // Qualified: this type's own `write(_:)` instance method would
+        // otherwise shadow the C library function of the same name.
+        #if canImport(Darwin)
+        let written = data.withUnsafeBytes { raw -> Int in Darwin.write(fd, raw.baseAddress, raw.count) }
+        #else
+        let written = data.withUnsafeBytes { raw -> Int in Glibc.write(fd, raw.baseAddress, raw.count) }
+        #endif
+        guard written == data.count else {
+            throw KeyFileStoreError.createFailed(path: fileURL.path, errno: errno)
+        }
+        guard fsync(fd) == 0 else {
+            throw KeyFileStoreError.createFailed(path: fileURL.path, errno: errno)
+        }
     }
 }

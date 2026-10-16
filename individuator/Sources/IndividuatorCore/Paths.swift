@@ -7,7 +7,18 @@ import Foundation
 /// operate on in the meantime, and a caller overrides it with `--key-dir`.
 public enum IndividuatorPaths {
     public static let defaultKeyDirectory = URL(fileURLWithPath: "/var/db/individuator")
+    /// The retired Secure Enclave key blob's file name (2026-10-15: a
+    /// launchd daemon cannot use the Secure Enclave at all, so this package
+    /// no longer reads or writes this file anywhere in its own code).
+    /// Named here only so `bin/install-individuator`'s last step, which
+    /// deletes this file by hand after a successful registration, has a
+    /// name to point at rather than a literal string duplicated in two
+    /// places.
     public static let keyFileName = "machine.key"
+    /// The software P-256 machine key's file name (2026-10-15, replacing
+    /// the Secure Enclave blob at `keyFileName`): the daemon creates and
+    /// holds this key itself, root-owned, through `KeyFileStore`.
+    public static let softwareKeyFileName = "software-machine-key.p256"
     public static let certificateFileName = "machine-cert.pem"
 
     /// The root-owned configuration `IndividuatorRootConfig` reads (CQ·447

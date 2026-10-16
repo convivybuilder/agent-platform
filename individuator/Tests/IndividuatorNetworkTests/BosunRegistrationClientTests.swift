@@ -1,13 +1,17 @@
+import NIOCore
+import NIOSSL
 import Testing
 @testable import IndividuatorCore
 @testable import IndividuatorNetwork
 
-/// Unit coverage for `BosunRegistrationClient.preferCapturedRefusal` — no
-/// socket, no TLS, no `RegistrationTransport` — the round-4 fix for a
-/// defect the integration test (which needs a real socket, and so only
-/// runs in CI) found: once the TLS verification callback has refused the
-/// Bosun's certificate, the generic error NIO raises afterward tearing
-/// down the still-failing handshake must never read as some OTHER,
+/// Unit coverage for `BosunRegistrationClient.preferCapturedRefusal` and
+/// `.preferRealCause` — no socket, no TLS, no `RegistrationTransport` —
+/// the round-4 and round-7 fixes for defects the integration test (which
+/// needs a real socket, and so only runs where the sandbox allows a
+/// loopback bind) found: once the TLS verification callback has refused
+/// the Bosun's certificate, or `_ResponseCollector.errorCaught` has
+/// already recorded a real cause, the generic error NIO raises afterward
+/// tearing down the still-failing handshake must never read as some OTHER,
 /// uninformative transport failure.
 private struct _DummyTransportError: Error, CustomStringConvertible {
     var description: String { "dummy transport failure" }
@@ -48,5 +52,46 @@ private struct _DummyTransportError: Error, CustomStringConvertible {
         }
 
         #expect(outcome == .serverCertificateRefused(refusal.reason))
+    }
+
+    @Test func preferRealCauseStillPrefersACapturedRefusalOverEverything() {
+        let refusal = BosunServerRefusal(reason: .missingServerAuth)
+        let result = BosunRegistrationClient.preferRealCause(
+            capturedRefusal: refusal, capturedTransportError: _DummyTransportError(), over: ChannelError.ioOnClosedChannel)
+
+        #expect(result as? BosunServerRefusal == refusal)
+    }
+
+    @Test func preferRealCausePrefersTheCapturedTransportErrorOverIOOnClosedChannel() {
+        let real = _DummyTransportError()
+        let result = BosunRegistrationClient.preferRealCause(
+            capturedRefusal: nil, capturedTransportError: real, over: ChannelError.ioOnClosedChannel)
+
+        #expect(result is _DummyTransportError)
+    }
+
+    @Test func preferRealCausePrefersTheCapturedTransportErrorOverUncleanShutdown() {
+        let real = _DummyTransportError()
+        let result = BosunRegistrationClient.preferRealCause(
+            capturedRefusal: nil, capturedTransportError: real, over: NIOSSLError.uncleanShutdown)
+
+        #expect(result is _DummyTransportError)
+    }
+
+    @Test func preferRealCauseKeepsTheOriginalErrorWhenItIsNotOneOfTheUninformativeShapes() {
+        let real = _DummyTransportError()
+        struct SomeOtherError: Error {}
+        let result = BosunRegistrationClient.preferRealCause(
+            capturedRefusal: nil, capturedTransportError: real, over: SomeOtherError())
+
+        #expect(result is SomeOtherError)
+    }
+
+    @Test func preferRealCauseFallsBackToTheOriginalErrorWhenNothingWasCaptured() {
+        let original = _DummyTransportError()
+        let result = BosunRegistrationClient.preferRealCause(
+            capturedRefusal: nil, capturedTransportError: nil, over: original)
+
+        #expect(result is _DummyTransportError)
     }
 }

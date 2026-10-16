@@ -8,9 +8,18 @@
     <!-- Every tracked repository's CI results, posted to the Library's Archives
          (CQ-455, issue_01M4J1ASMSFFPC6S0RQ6VVVT57), authenticating as the
          convivy-bosun GitHub App rather than `gh` under the operator's personal
-         account: this reader is fine lagging one capture interval. -->
+         account.
+
+         180s: the operator wants CI results landing within 3 minutes, the pace
+         the crews work at (2026-10-15, relayed by the steward). A steady-state
+         pass costs about 20 requests, one page for each of the 20 tracked
+         repo/workflow pairs; 20 passes an hour cost about 400 of the
+         convivy-bosun installation's 15,000-request-an-hour limit. launchd
+         skips a firing while the previous pass is still running
+         (launchd.plist(5), StartInterval), so passes never overlap and this
+         job needs no lock. -->
     <key>StartInterval</key>
-    <integer>900</integer>
+    <integer>180</integer>
 
     <!-- Deploy-pinned per platform/decisions/0059 rule 1
          (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is

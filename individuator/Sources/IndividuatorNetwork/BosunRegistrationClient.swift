@@ -51,6 +51,15 @@ public struct BosunRegistrationClient: RegistrationTransport {
     public let machineKey: any MachineKey
     public let clientCertificatePEM: String
     public let connectTimeoutSeconds: Int64
+    /// Bounds the TLS handshake, the request write (which cannot complete
+    /// until the handshake does, below), and the response together, as one
+    /// deadline from the moment the TCP connect succeeds — not only the
+    /// final wait for the Bosun's response, as a name read on its own might
+    /// suggest (round 8 finding: `connectTimeoutSeconds` bounds only the
+    /// initial TCP connect; a server that accepts that connection and then
+    /// never completes or continues the TLS handshake left the client
+    /// blocked in `channel.writeAndFlush(...).wait()` forever, with no
+    /// deadline covering that step at all).
     public let responseTimeoutSeconds: Int64
 
     public init(
@@ -126,6 +135,21 @@ public struct BosunRegistrationClient: RegistrationTransport {
 
         let responsePromise = group.next().makePromise(of: ByteBuffer.self)
         var capturedRefusal: BosunServerRefusal?
+        // Set by `_ResponseCollector.errorCaught` the moment NIO reports
+        // ANY error on this channel — not only a server-certificate
+        // refusal — before `responsePromise` itself is failed with it.
+        // Reading this plain `var` from the calling thread after one of
+        // the three `.wait()` calls below throws is the same non-blocking
+        // idiom `capturedRefusal` already uses (round 4): both closures
+        // run on `channel.eventLoop`, and by the time any of connect,
+        // write or the response wait can observe `ChannelError
+        // .ioOnClosedChannel`/`NIOSSLError.uncleanShutdown` on THIS
+        // channel, the close that produced it was already preceded, on
+        // that same event loop, by whichever `fireErrorCaught` call
+        // reported the real cause (`NIOSSLHandler` fires the private-key
+        // signing error, when there is one, before the generic handshake
+        // failure — see `MachineKeyNIOPrivateKey.sign`'s own doc comment).
+        var capturedTransportError: Error?
 
         let bootstrap = ClientBootstrap(group: group)
             .connectTimeout(.seconds(connectTimeoutSeconds))
@@ -151,7 +175,8 @@ public struct BosunRegistrationClient: RegistrationTransport {
                     let sslHandler = try NIOSSLClientHandler(
                         context: sslContext, serverHostname: nil, customVerificationCallback: verify)
                     try channel.pipeline.syncOperations.addHandler(sslHandler)
-                    try channel.pipeline.syncOperations.addHandler(_ResponseCollector(promise: responsePromise))
+                    try channel.pipeline.syncOperations.addHandler(
+                        _ResponseCollector(promise: responsePromise, onError: { capturedTransportError = $0 }))
                     return channel.eventLoop.makeSucceededVoidFuture()
                 } catch {
                     return channel.eventLoop.makeFailedFuture(error)
@@ -162,7 +187,28 @@ public struct BosunRegistrationClient: RegistrationTransport {
         do {
             channel = try bootstrap.connect(host: host, port: port).wait()
         } catch {
-            throw Self.preferCapturedRefusal(capturedRefusal, over: error)
+            throw Self.preferRealCause(
+                capturedRefusal: capturedRefusal, capturedTransportError: capturedTransportError, over: error)
+        }
+
+        // Covers the handshake, the write below (which cannot complete
+        // until the handshake does) and the response in one deadline,
+        // scheduled now rather than after the write — see
+        // `responseTimeoutSeconds`'s own doc comment (round 8). Firing
+        // closes the channel, which is what turns the write's or the
+        // response wait's own `.wait()` — whichever is in flight at the
+        // time — into a failure at all; without this, a peer that accepts
+        // the TCP connection and goes silent leaves either one blocked
+        // forever. `capturedTransportError` is set here, on this same
+        // event loop, exactly like `_ResponseCollector.errorCaught` already
+        // sets it, so whichever `.wait()` throws next prefers this named
+        // timeout over the generic `ChannelError.ioOnClosedChannel` the
+        // forced close itself produces (`preferRealCause`, below).
+        let timeout = BosunRegistrationTimeout(timeoutSeconds: responseTimeoutSeconds)
+        let timeoutTask = channel.eventLoop.scheduleTask(in: .seconds(responseTimeoutSeconds)) {
+            capturedTransportError = capturedTransportError ?? timeout
+            responsePromise.fail(timeout)
+            channel.close(promise: nil)
         }
 
         let bodyData = try JSONSerialization.data(withJSONObject: [
@@ -178,18 +224,19 @@ public struct BosunRegistrationClient: RegistrationTransport {
         do {
             try channel.writeAndFlush(request).wait()
         } catch {
-            throw Self.preferCapturedRefusal(capturedRefusal, over: error)
+            timeoutTask.cancel()
+            throw Self.preferRealCause(
+                capturedRefusal: capturedRefusal, capturedTransportError: capturedTransportError, over: error)
         }
 
-        let timeoutTask = channel.eventLoop.scheduleTask(in: .seconds(responseTimeoutSeconds)) {
-            responsePromise.fail(BosunRegistrationTimeout())
-        }
         let responseBuffer: ByteBuffer
         do {
             responseBuffer = try responsePromise.futureResult.wait()
         } catch {
+            timeoutTask.cancel()
             try? channel.close().wait()
-            throw Self.preferCapturedRefusal(capturedRefusal, over: error)
+            throw Self.preferRealCause(
+                capturedRefusal: capturedRefusal, capturedTransportError: capturedTransportError, over: error)
         }
         timeoutTask.cancel()
         try? channel.close().wait()
@@ -208,6 +255,43 @@ public struct BosunRegistrationClient: RegistrationTransport {
     /// every one of them must prefer the refusal the same way).
     static func preferCapturedRefusal(_ capturedRefusal: BosunServerRefusal?, over error: Error) -> Error {
         capturedRefusal ?? error
+    }
+
+    /// Round 7: once `_ResponseCollector.errorCaught` has already recorded
+    /// the real cause behind this connection's failure — our own machine
+    /// key's signing failure, surfacing via `MachineKeyNIOPrivateKey.sign`
+    /// during the handshake, is exactly such a cause — prefer that
+    /// recorded cause over whatever NIO raises next tearing down the
+    /// still-failing channel (`ChannelError.ioOnClosedChannel`,
+    /// `NIOSSLError.uncleanShutdown`), at every one of connect, write and
+    /// response-wait. Same precedence shape `preferCapturedRefusal` already
+    /// uses: a captured server-certificate refusal still wins over
+    /// everything, including this.
+    static func preferRealCause(
+        capturedRefusal: BosunServerRefusal?, capturedTransportError: Error?, over error: Error
+    ) -> Error {
+        if let capturedRefusal {
+            return capturedRefusal
+        }
+        if let capturedTransportError, Self.isUninformativeTeardown(error) {
+            return capturedTransportError
+        }
+        return error
+    }
+
+    /// The two error shapes that name nothing beyond "the channel was
+    /// already closing/closed" — the peer having already gone away without
+    /// a TLS alert, as far as the Swift client can see — never anything
+    /// more specific about WHY, which is exactly what a captured cause
+    /// above should take the place of when one was recorded.
+    private static func isUninformativeTeardown(_ error: Error) -> Bool {
+        if let channelError = error as? ChannelError, channelError == .ioOnClosedChannel {
+            return true
+        }
+        if let sslError = error as? NIOSSLError, sslError == .uncleanShutdown {
+            return true
+        }
+        return false
     }
 
     static func parseHTTPResponse(_ buffer: ByteBuffer) throws -> RegistrationOutcome {
@@ -249,7 +333,10 @@ public struct BosunRegistrationClient: RegistrationTransport {
 }
 
 struct BosunRegistrationTimeout: Error, CustomStringConvertible {
-    var description: String { "timed out waiting for the Bosun's response" }
+    let timeoutSeconds: Int64
+    var description: String {
+        "timed out after \(timeoutSeconds)s waiting for the TLS handshake, request, and response to complete"
+    }
 }
 
 /// Collects every byte received on the connection into one buffer, and
@@ -262,10 +349,12 @@ private final class _ResponseCollector: ChannelInboundHandler {
 
     private var buffer: ByteBuffer?
     private let promise: EventLoopPromise<ByteBuffer>
+    private let onError: (Error) -> Void
     private var finished = false
 
-    init(promise: EventLoopPromise<ByteBuffer>) {
+    init(promise: EventLoopPromise<ByteBuffer>, onError: @escaping (Error) -> Void) {
         self.promise = promise
+        self.onError = onError
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -285,6 +374,7 @@ private final class _ResponseCollector: ChannelInboundHandler {
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         guard !finished else { return }
         finished = true
+        onError(error)
         promise.fail(error)
     }
 }

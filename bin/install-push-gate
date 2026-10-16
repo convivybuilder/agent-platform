@@ -1,0 +1,142 @@
+#!/bin/sh
+# install-push-gate — install bin/push-content-gate as a pre-push hook in
+# each engine clone.
+#
+# WHY. On 2026-10-15 three commits reached GitHub through a raw `git push`
+# from crew sessions and skipped the content scan that refuses private names
+# and machine names. The operator ruled that the gate is a pre-push hook in
+# each engine clone and nothing else: `bin/push-content-gate` (installed by
+# an earlier PR) decides whether a push goes through; this installer puts
+# the hook that calls it in place.
+#
+# WHAT. Writes a small POSIX sh stub to `<clone>/.git/hooks/pre-push` for
+# each of agent-platform, library, convivy-orient and convivy-deck — the
+# clone's common hooks directory, so every worktree of that clone is gated
+# too. The stub execs the deploy area's pinned interpreter against the
+# deploy area's copy of bin/push-content-gate, passing git's own pre-push
+# arguments and stdin straight through; a missing interpreter or gate file
+# refuses the push rather than letting it through unscanned. A clone that
+# does not exist on this machine is skipped, not an error.
+#
+# write-better is deliberately not in the clone list: its hook waits for a
+# Shipwright change.
+#
+# UNLIKE THE SIBLING HOOK INSTALLERS (install-knowledge-main-guard,
+# install-agent-platform-primary-guard), a foreign pre-push hook — one
+# without this installer's marker — is not silently left alone and skipped
+# quietly: that clone would push ungated, so this prints which clone and
+# which file, keeps installing into the other clones, and exits non-zero
+# once every clone has been tried.
+#
+# Idempotent: a second run against an already-installed, byte-identical,
+# mode-0755 stub writes nothing and prints nothing for that clone. Never sets
+# core.hooksPath — that would disable agent-platform's existing pre-commit
+# primary guard, which lives in the same hooks directory. Run from
+# install.sh or by hand.
+set -eu
+
+# FOR TESTS ONLY: `--root-config FILE` names the machine's root through a
+# session-agent.env, the one way a test moves it (company/decisions/0008).
+# `--deploy-dir DIR` names the deploy area a test controls instead of the
+# real `~/.local/deploy/agent-platform-shared` install-agent-platform-shared
+# writes. install.sh passes neither.
+ROOT_CONFIG=""
+DEPLOY_DIR_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root-config)
+      [ $# -ge 2 ] || { echo "  ! --root-config requires a value" >&2; exit 1; }
+      ROOT_CONFIG=$2
+      shift 2
+      ;;
+    --deploy-dir)
+      [ $# -ge 2 ] || { echo "  ! --deploy-dir requires a value" >&2; exit 1; }
+      DEPLOY_DIR_ARG=$2
+      shift 2
+      ;;
+    *)
+      echo "  ! unrecognized argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# The engine clones live under the machine's root, printed by the
+# bin/builder-root beside this file's real path; one hop through a
+# ~/.local/bin link reaches it. HOME does not move it, and builder-root
+# refuses a config that names no root rather than printing the real one. An
+# unresolvable root exits 1, which install.sh reports with a loud WARNING
+# that the push content gate is not installed (install.sh keeps going).
+_self_path="$0"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+_builder_root="$(dirname "$_self_path")/builder-root"
+if [ -n "$ROOT_CONFIG" ]; then
+  ROOT="$("$_builder_root" --root --config "$ROOT_CONFIG")" || ROOT=""
+else
+  ROOT="$("$_builder_root" --root)" || ROOT=""
+fi
+if [ -z "$ROOT" ]; then
+  echo "  ! cannot resolve the machine's root (bin/builder-root --root)" >&2
+  exit 1
+fi
+
+# The same deploy area install-agent-platform-shared writes to by default
+# (its DEFAULT_DEPLOY_DIR) — resolved from $HOME at run time, same as that
+# installer, never a literal home directory baked in here.
+DEPLOY="${DEPLOY_DIR_ARG:-$HOME/.local/deploy/agent-platform-shared}"
+
+MARKER="# managed-by: agent-platform push-gate"
+CLONES="agent-platform library convivy-orient convivy-deck"
+
+status=0
+for repo in $CLONES; do
+  clone="$ROOT/$repo"
+  [ -d "$clone" ] || continue
+  hooks_dir="$clone/.git/hooks"
+  [ -d "$hooks_dir" ] || continue
+  hook="$hooks_dir/pre-push"
+
+  if [ -f "$hook" ] && ! grep -qF "$MARKER" "$hook" 2>/dev/null; then
+    echo "  ! $hook exists and is not ours — leaving it, NOT installing (this clone pushes UNGATED)" >&2
+    status=1
+    continue
+  fi
+
+  tmp=$(mktemp "$hooks_dir/.pre-push.XXXXXX")
+  cat >"$tmp" <<EOF
+#!/bin/sh
+$MARKER
+# $repo pre-push: run the content gate on every commit this push would send,
+# and refuse the push if it finds something, cannot run, or is misconfigured.
+# Installed by bin/install-push-gate — see that file for why.
+PY="$DEPLOY/venv/bin/python3"
+GATE="$DEPLOY/bin/push-content-gate"
+if [ ! -x "\$PY" ]; then
+  echo "push-gate: \$PY is missing or not executable" >&2
+  echo "nothing was sent" >&2
+  exit 1
+fi
+if [ ! -x "\$GATE" ]; then
+  echo "push-gate: \$GATE is missing or not executable" >&2
+  echo "nothing was sent" >&2
+  exit 1
+fi
+exec "\$PY" "\$GATE" "$repo" "\$@"
+EOF
+
+  if [ -f "$hook" ] && cmp -s "$tmp" "$hook" 2>/dev/null; then
+    rm -f "$tmp"
+    mode=$(stat -f '%Lp' "$hook" 2>/dev/null || stat -c '%a' "$hook" 2>/dev/null)
+    if [ "$mode" = "755" ]; then
+      continue
+    fi
+    chmod 0755 "$hook"
+    echo "  ✓ $hook (push-gate: $repo)"
+    continue
+  fi
+
+  chmod 0755 "$tmp"
+  mv "$tmp" "$hook"
+  echo "  ✓ $hook (push-gate: $repo)"
+done
+
+exit "$status"

@@ -10,11 +10,18 @@
 # component. This is the net under that.
 #
 # WHAT IT WILL NOT DO. It never changes Tailscale's configuration. Recovery is
-# "start the thing again", never `--reset`, never a flag that could re-point the
-# node or drop its auth. A watchdog that repairs connectivity by reconfiguring
-# the network is a watchdog that can lock you out faster than the fault it
-# treats. It also refuses to act more than once per COOLDOWN, so a persistent
-# fault produces a log to read rather than a restart loop.
+# "start the thing again": step 1 restarts a stopped app, and step 2's plain
+# `tailscale up` asks the already-configured daemon to connect. On a node with
+# non-default prefs the CLI refuses a plain `up` and prints the exact flags it
+# needs re-mentioned to proceed without resetting anything; step 2 re-runs with
+# only those flags, and only when every one of them is on a written allowlist
+# of settings that merely restate what the node already has (its advertised
+# exit-node, routes, tags and the like) — never `--reset`, `--force-reauth`,
+# `--login-server`, `--auth-key`, or any flag the CLI did not itself print
+# back. A watchdog that repairs connectivity by reconfiguring the network is a
+# watchdog that can lock you out faster than the fault it treats. It also
+# refuses to act more than once per COOLDOWN, so a persistent fault produces a
+# log to read rather than a restart loop.
 #
 # WHAT IT MUST SURVIVE. Every failure mode below was found in review, and they
 # share one shape: the watchdog breaking in a way that only shows up while
@@ -55,7 +62,7 @@ THRESHOLD=3
 COOLDOWN=600          # seconds between recovery attempts
 HEALTH_TIMEOUT=20     # seconds any single health probe may take
 UP_TIMEOUT=60         # outer bound on `tailscale up`, over the CLI's own 30s
-LOCK_STALE=300        # seconds after which a held lock is assumed abandoned
+LOCK_STALE=600        # seconds after which a held lock is assumed abandoned
 
 mkdir -p "$STATE" 2>/dev/null
 
@@ -67,6 +74,21 @@ log() { echo "$(date '+%Y-%m-%dT%H:%M:%S') $*" >> "$LOG"; }
 # not ship. A lock older than LOCK_STALE is assumed abandoned by a run that was
 # killed, since a watchdog that can be disabled forever by its own leftovers is
 # the failure this whole file exists to avoid.
+#
+# LOCK_STALE has to clear the slowest a genuine run can take, or a live run's
+# lock gets taken mid-recovery and the old and new runs both proceed, doubling
+# every action — the exact overlap this lock exists to prevent. Worst case,
+# every CLI call answering just inside its own bound, with N advertised
+# services: 40s (open, sleep 20, a timed-out healthy) + 20s (the first `debug
+# prefs`) + 60s (`up`) + 60s (the rerun) + 20s (the second `debug prefs`) +
+# 20s*N (`serve advertise`, once per missing service) + 30s (sleep 10, a
+# timed-out healthy) = 230 + 20*N seconds — 310s at the four services the
+# 2026-10-15 node had. LOCK_STALE=600 clears that with room for the service
+# count to grow, and it is set equal to COOLDOWN on purpose: $LAST is written
+# within seconds of the lock being taken, so a lock that is genuinely
+# abandoned does not become takeable any sooner than the cooldown would have
+# let the next tick act anyway — raising LOCK_STALE past the old 300s delays
+# no recovery.
 if ! mkdir "$LOCK" 2>/dev/null; then
     # PORTABLE MTIME, same BSD-vs-GNU trap as the gateway's mode read. On GNU
     # coreutils `-f` is `--file-system`, so `stat -f '%m' FILE` prints a
@@ -251,7 +273,9 @@ echo "$now" > "$LAST"
 
 # Step 1: start the app. On the macsys build this is what owns the tunnel, and
 # a stopped app is the likeliest reason the node is offline while the machine
-# is otherwise fine.
+# is otherwise fine. On 2026-10-15 the app stayed running and an App Store
+# update to the extension set WantRunning=false instead — a shape this step
+# does not see, which step 2 below is what covers.
 if ! /usr/bin/pgrep -f "Tailscale.app/Contents/MacOS/Tailscale$" >/dev/null 2>&1; then
     log "ACTION: app not running — open -a Tailscale"
     /usr/bin/open -a Tailscale 2>>"$LOG"
@@ -259,31 +283,143 @@ if ! /usr/bin/pgrep -f "Tailscale.app/Contents/MacOS/Tailscale$" >/dev/null 2>&1
     if healthy; then log "RECOVERED — app relaunch was enough"; echo 0 > "$FAILS"; exit 0; fi
 fi
 
-# Step 2: ask the backend to connect. No other flags: `up` with the node's
-# existing prefs, nothing that rewrites them.
+# Step 2: ask the backend to connect. On a node with default prefs this is
+# plain `up` — nothing that rewrites them. A node with non-default prefs (an
+# advertised exit-node, routes, tags, or services) gets a different answer: on
+# 2026-10-15 the CLI refused a bare `up` with "changing settings via
+# 'tailscale up' requires mentioning all non-default flags" and printed the
+# exact flags it wanted re-mentioned to proceed without resetting them. The
+# block below takes those flags from the CLI's OWN suggestion, never from a
+# guess, and only reruns `up` with them if every one is on ALLOWED_UP_FLAGS:
+# each entry there only restates a setting the node already has, so this
+# cannot re-point the node, drop its auth, or reset it.
 #
-# BOUNDED FROM OUTSIDE AS WELL AS IN. `--timeout=30s` is the CLI bounding
-# itself, and the reason the health probe stopped trusting that same CLI is that
-# a wedged daemon may never let its timeout logic run at all. This call talks to
-# the same daemon over the same socket, so it gets the same treatment: an outer
-# bound that does not depend on the thing being diagnosed.
+# AdvertiseServices (the `svc:` names re-exposed via `tailscale serve
+# advertise`) is read before the `up` call and compared after, because `up`
+# with those re-stated flags has been observed to clear it; whatever the
+# snapshot has that the post-`up` read does not is re-advertised. The snapshot
+# never leaves this process and nothing from it besides the service names is
+# ever logged or written to disk: `debug prefs` also prints
+# Config.PrivateNodeKey.
+#
+# BOUNDED FROM OUTSIDE AS WELL AS IN, same as `healthy`'s probe and for the
+# same reason: a wedged daemon may never let its own `--timeout` logic run.
 log "ACTION: tailscale up --timeout=30s"
-out=$(/usr/bin/python3 - "$TS" "$UP_TIMEOUT" <<'PY' 2>&1
+out=$(/usr/bin/python3 - "$TS" "$UP_TIMEOUT" "$HEALTH_TIMEOUT" <<'PY' 2>&1
+import json
 import subprocess
 import sys
 
-try:
-    done = subprocess.run(
-        [sys.argv[1], "up", "--timeout=30s"],
-        capture_output=True,
-        text=True,
-        timeout=float(sys.argv[2]),
-    )
-    sys.stdout.write((done.stdout or "") + (done.stderr or ""))
-except subprocess.TimeoutExpired:
-    sys.stdout.write("no answer within %ss — killed, the daemon is not talking" % sys.argv[2])
-except Exception as exc:
-    sys.stdout.write("could not run it: %s" % exc)
+TS = sys.argv[1]
+UP_TIMEOUT = float(sys.argv[2])
+PREFS_TIMEOUT = float(sys.argv[3])
+
+# Every flag here only restates a setting the node already has; none of them
+# can re-point the node, drop its auth, or reset it — unlike `--reset`,
+# `--force-reauth`, `--login-server` or `--auth-key`, none of which appear
+# here and none of which this script will ever run. `--timeout` is not a
+# prefs setting at all: the CLI echoes it back because it was part of the
+# original command, and it is listed only so that echo does not itself trip
+# the "outside the allowlist" refusal below.
+ALLOWED_UP_FLAGS = {
+    "--timeout": "echoed back from this call's own invocation, not a prefs setting",
+    "--advertise-exit-node": "restates the node's existing exit-node advertisement",
+    "--advertise-routes": "restates the node's existing advertised routes",
+    "--advertise-tags": "restates the node's existing tags",
+    "--advertise-connector": "restates the node's existing app-connector advertisement",
+    "--accept-dns": "restates the node's existing DNS-acceptance setting",
+    "--accept-routes": "restates the node's existing route-acceptance setting",
+    "--exit-node-allow-lan-access": "restates the node's existing LAN-access-while-exit-noding setting",
+    "--netfilter-mode": "restates the node's existing netfilter mode",
+    "--shields-up": "restates the node's existing shields setting",
+    "--snat-subnet-routes": "restates the node's existing SNAT setting",
+    "--stateful-filtering": "restates the node's existing stateful-filtering setting",
+    "--hostname": "restates the node's existing hostname",
+}
+
+REFUSAL = "requires mentioning all non-default flags"
+
+
+def read_services():
+    # Returns only the AdvertiseServices list. Everything else `debug prefs`
+    # prints — Config.PrivateNodeKey included — is read into this function's
+    # local variables and discarded right here; it is never returned, printed
+    # or logged.
+    try:
+        completed = subprocess.run(
+            [TS, "debug", "prefs"],
+            capture_output=True,
+            text=True,
+            timeout=PREFS_TIMEOUT,
+        )
+        prefs = json.loads(completed.stdout)
+        services = prefs.get("AdvertiseServices") or []
+        return [s for s in services if isinstance(s, str)]
+    except Exception as exc:
+        print("PREFS_READ_FAILED: %s" % exc)
+        return []
+
+
+def run_up(args):
+    try:
+        completed = subprocess.run(
+            [TS, "up"] + args,
+            capture_output=True,
+            text=True,
+            timeout=UP_TIMEOUT,
+        )
+        return (completed.stdout or "") + (completed.stderr or "")
+    except subprocess.TimeoutExpired:
+        return "no answer within %ss — killed, the daemon is not talking" % UP_TIMEOUT
+    except Exception as exc:
+        return "could not run it: %s" % exc
+
+
+services_before = read_services()
+
+out = run_up(["--timeout=30s"])
+print("UP: %s" % out.strip())
+
+if REFUSAL in out:
+    # The CLI's own suggested command is always the LAST "tailscale up " in the
+    # message — an earlier mention ("changing settings via 'tailscale up'
+    # requires...") is quoted prose, not a command to run. rfind, not the first
+    # match, is what tells those two apart.
+    idx = out.rfind("tailscale up ")
+    tokens = out[idx + len("tailscale up "):].split() if idx != -1 else []
+    if not tokens:
+        print("RERUN_REFUSED: no suggested command found in the refusal")
+    else:
+        non_flags = [t for t in tokens if not t.startswith("--")]
+        flag_names = [t.split("=", 1)[0] for t in tokens]
+        disallowed = sorted({
+            t for t, f in zip(tokens, flag_names) if f not in ALLOWED_UP_FLAGS
+        })
+        if non_flags:
+            print("RERUN_REFUSED: suggestion held a non-flag token: %s" % " ".join(non_flags))
+        elif disallowed:
+            print("RERUN_REFUSED: suggestion held a flag outside the allowlist: %s" % " ".join(disallowed))
+        else:
+            print("RERUN: tailscale up %s" % " ".join(tokens))
+            out2 = run_up(tokens)
+            print("RERUN_OUTPUT: %s" % out2.strip())
+
+services_after = read_services()
+missing = [s for s in services_before if s not in services_after]
+readvertised = []
+for svc in missing:
+    try:
+        subprocess.run(
+            [TS, "serve", "advertise", svc],
+            capture_output=True,
+            text=True,
+            timeout=PREFS_TIMEOUT,
+        )
+        readvertised.append(svc)
+    except Exception as exc:
+        print("READVERTISE_FAILED: %s: %s" % (svc, exc))
+if readvertised:
+    print("READVERTISED: %s" % " ".join(readvertised))
 PY
 )
 log "  -> ${out:-(no output)}"

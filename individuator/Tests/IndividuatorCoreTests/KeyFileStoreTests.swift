@@ -119,4 +119,31 @@ import Testing
             try store.read()
         }
     }
+
+    @Test func createExclusiveWritesExactly0600WithNoWiderWindow() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = KeyFileStore(directory: dir, fileName: "k", requiredOwnerUID: getuid())
+        try store.prepareForCreate()
+
+        try store.createExclusive(Data("blob".utf8))
+
+        var fileStat = stat()
+        #expect(stat(store.fileURL.path, &fileStat) == 0)
+        #expect(fileStat.st_mode & 0o777 == 0o600)
+        #expect(try store.read() == Data("blob".utf8))
+    }
+
+    @Test func createExclusiveRefusesAnExistingFileAndLeavesItsBytesUnchanged() throws {
+        let dir = makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = KeyFileStore(directory: dir, fileName: "k", requiredOwnerUID: getuid())
+        try store.prepareForCreate()
+        try store.createExclusive(Data("first".utf8))
+
+        #expect(throws: KeyFileStoreError.keyAlreadyExists(path: store.fileURL.path)) {
+            try store.createExclusive(Data("second".utf8))
+        }
+        #expect(try store.read() == Data("first".utf8))
+    }
 }

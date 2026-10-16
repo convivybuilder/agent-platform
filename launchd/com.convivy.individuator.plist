@@ -6,11 +6,12 @@
     <string>com.convivy.individuator</string>
 
     <!-- The Individuator's root daemon (platform/decisions/0092; CQ·447
-         slice 3): holds the machine's Secure Enclave key and registers this
-         machine's sessions with the Bosun over mutual TLS. Runs in the
-         SYSTEM domain, as root — the whole point of the design is that
-         nothing readable as a file from inside an operator-level process
-         (including a dispatched run) is sufficient to act as this key.
+         slice 3): holds the machine's root-owned software key file and
+         registers this machine's sessions with the Bosun over mutual TLS.
+         Runs in the SYSTEM domain, as root — the whole point of the design
+         is that nothing readable as a file from inside an operator-level
+         process (including a dispatched run) is sufficient to act as this
+         key.
 
          Deploy-pinned per platform/decisions/0059 rule 1: this plist and the
          binary it execs both live outside the agent-platform checkout.

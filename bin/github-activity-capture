@@ -1,0 +1,358 @@
+#!/usr/bin/env python3.11
+"""github-activity-capture — GitHub review verdicts, review comments,
+conversation comments and the merged-PR changelog, captured as signals (E25,
+issue_01M4ZB5C5ZX0MV206064MTRAE0), so Orient can retire its own GitHub
+capture (convivy-orient's github_capture.py, which rides the operator's
+personal `gh` login).
+
+AUTHENTICATES AS THE `convivy-bosun` GITHUB APP (app id 4666673), never `gh`,
+mirroring `bin/pr-state-capture` and `bin/ci-result-capture`. UNLIKE either
+sibling, this job's tokens carry NO `issues` permission at all (operator's
+ruling, 2026-10-15, relayed by the steward): work items live in the
+Library's corrections queue, GitHub issues are not a Convivy surface, and
+`issue_comment` is not one of this job's four kinds. `lib/agent-platform/
+github_activity.py` holds the four kinds' transforms and the per-repository
+read/post pass (`capture_repository`); this script is the launchd entry
+point that walks every installation's repositories and calls it.
+
+ONE INSTALLATION PER OWNER, READ FROM THE APP'S OWN INSTALLATION LIST, NOT
+FROM `config/projects.json`. `pr-state-capture.repos_to_capture()` derives
+its repo list from the registry because Deck's PR-ladder panel needs every
+registered repo covered even ones the App reaches only through a "selected
+repositories" installation; this job instead asks each installation
+directly which repositories it reaches (`list_installation_repos`, mirroring
+`pr-state-capture.installed_repos` but keeping the full repo object, not
+just its name) — a repo the App cannot read is never in that list, and
+nothing here needs the registry to notice a 404 on it the way that sibling
+does. `GA.installations` gives one entry per installation; a failure minting
+one installation's token is logged and costs only that installation's
+repos, not the whole pass.
+
+EXCLUDED FROM EVERY PASS: an archived repository (`archived` on the
+installation's own repo object); the two sandbox-tool repositories Orient's
+job also excludes (`SANDBOX_REPOS`, named directly rather than derived,
+mirroring how Orient's own job names them); and every repository of a BLACK
+BOX project (`projects.private_slugs()`, platform/decisions/0043). THIS
+THIRD EXCLUSION GOES BEYOND THE EPIC'S OWN TEXT (issue_01M4ZB5C5ZX0MV206064MTRAE0),
+which names only "every non-archived repository ... except the sandbox-tool
+repositories the job names." A private project's repository is never
+registered with a product the Library's signal store recognises, and
+`pr-state-capture.repos_to_capture()` already excludes private-project repos
+from ITS OWN capture for the identical reason (ADR-0043's wall: none of a
+black-box crew's content reaches a shared store). Without this exclusion, a
+private-project repo's pull requests would 404 against the Library's
+`POST /signals` every pass, and `capture_repository`'s own cursor rule holds
+a repo's cursor exactly where it was whenever any post in that pass fails —
+so every later pass would re-read and re-fail the same repository's full
+window forever, never advancing past it.
+
+REPO NAMES ARE NEVER ESCAPED BEFORE BUILDING A GITHUB URL. Every `repo`
+string this script and `github_activity.py` interpolate into a GitHub API
+URL comes from GitHub's own installation-repository listing (`full_name`)
+— never from `config/projects.json`, user input or any other source — and
+GitHub itself restricts a repository name to letters, digits, `.`, `-` and
+`_`. No other path in this change builds a URL from a repo name reaching it
+any other way, so no escaping or validation is added.
+
+POSTING CREDENTIAL HAS NO SHARED-TOKEN FALLBACK, UNLIKE EITHER SIBLING.
+`pr-state-capture.signal_token()`/`ci-result-capture.signal_token()` fall
+back to `signal_client.token()` (the shared `agent-platform` credential)
+with a one-time warning when their own token is absent. This job's absent
+credential REFUSES THE WHOLE PASS instead, before any GitHub read
+(`main()`'s credential check runs first): the shared token lacks the
+`signal.create_review` capability all four of this job's kinds need to post
+under, so posting under it would not degrade gracefully, it would 403 on
+every `review_verdict`, `review_comment` and `pr_comment` (only `changelog`,
+posted under `source: github`, would land) — a partial, silently-wrong
+capture is worse than a loud refusal. `signal_token()` resolves
+`GITHUB_ACTIVITY_CAPTURE_TOKEN` or the 0600 file
+`~/.orient-control/github-activity-capture-token`.
+
+ONE POSTING DEADLINE FOR THE WHOLE PASS (`_POST_DEADLINE_SECONDS`, 150s),
+mirroring `pr-state-capture._RUN_DEADLINE_SECONDS`'s reasoning: this job's
+own `StartInterval` is 180s, and a pass that runs long has its next
+scheduled fire skipped rather than overlapping it (launchd.plist(5)), so
+150s leaves headroom before the next firing instead of racing it.
+
+A TRANSPORT ERROR (A RAW `OSError`: `urllib.error.URLError`, a socket
+timeout, a connection reset) IS CAUGHT AT EVERY GITHUB CALL `main()` MAKES,
+NOT ONLY INSIDE `capture_repository`. `github_app.request` only catches
+`urllib.error.HTTPError`; a connection-level failure propagates uncaught
+through every other call built on it, which is exactly how
+`pr-state-capture` crashed on this machine: its own `main` called
+`list_pulls` called `github_app.request`, a `ConnectionResetError` reached
+nothing that caught it, and that pass ended with every owner after the
+failing one never read (review round on #916). This job makes the same
+four kinds of call and catches each at the cost it can afford:
+
+- `GA.installations`, before the per-owner loop, has no narrower scope to
+  fall back to: the error is logged and `main()` returns 1.
+- `GA.installation_token` and `list_installation_repos`, inside the loop,
+  cost only their owner: logged as `<owner>: transport error ...`,
+  `exit_code` set to 1, and the loop moves on to the next owner.
+- the `GET /rate_limit` read is diagnostic only: its failure is logged on
+  the existing "rate limit could not be read" line, naming the error
+  type, and does not by itself set `exit_code`.
+- `GACT.capture_repository`, per repository (the original catch, added in
+  the review round on #910 that added `capture_repository`): logged, that
+  repository's cursor is left exactly as it was, and the loop moves on to
+  the next repository.
+
+Usage:
+    github-activity-capture
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import builder_root as BR  # noqa: E402
+import github_activity as GACT  # noqa: E402
+import github_app as GA  # noqa: E402
+import projects  # noqa: E402
+import signal_client as SC  # noqa: E402
+
+# The convivy-bosun GitHub App (issue_01M2KV16ZRG3N49GRER8Q7545H, app id
+# 4666673), the same App `bin/pr-state-capture` and `bin/ci-result-capture`
+# already authenticate as. Re-derived per run, never stored.
+APP_ID = "4666673"
+
+# Read from the passwd home, never $HOME — see builder_root.real_account_home.
+KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
+
+# The token this script mints can only ever read pull requests (and their
+# reviews/comments, which live under the same `pull_requests` scope) and the
+# installation's own metadata — NO `issues` permission at all (see the
+# module docstring). A bug that tried to write, or to read a GitHub issue,
+# would be refused by GitHub itself.
+_READ_ONLY_PERMISSIONS = {"pull_requests": "read", "metadata": "read"}
+
+# This job's OWN POST /signals credential — see the module docstring's
+# "POSTING CREDENTIAL HAS NO SHARED-TOKEN FALLBACK" section for why `main()`
+# refuses the pass rather than falling back to the shared agent-platform
+# token the way `pr-state-capture`/`ci-result-capture` do.
+SIGNAL_TOKEN_ENV = "GITHUB_ACTIVITY_CAPTURE_TOKEN"
+SIGNAL_TOKEN_FILE = Path.home() / ".orient-control" / "github-activity-capture-token"
+
+# Named directly, not derived from the registry — the same two repositories
+# Orient's own capture (convivy-orient's github_capture.py) excludes, per the
+# epic's specification (issue_01M4ZB5C5ZX0MV206064MTRAE0). Both are under
+# `convivy`, this job's primary owner.
+SANDBOX_REPOS = {
+    "convivy/vivy-ownerrez-sandbox-tools",
+    "convivy/constance-sevenshifts-sandbox-tools",
+}
+
+# One deadline for the whole pass' signal posting, not per signal — see the
+# module docstring's "ONE POSTING DEADLINE FOR THE WHOLE PASS" section.
+_POST_DEADLINE_SECONDS = 150
+
+_PAGE_SIZE = 100
+# Bounds the installation-repository listing to 1000 repos per owner, so an
+# unexpectedly large installation degrades to "this pass saw its first 1000"
+# (loud, via GA.Unreadable) rather than an unbounded page loop.
+_MAX_PAGES = 10
+
+
+def signal_token() -> str | None:
+    """`SIGNAL_TOKEN_ENV` or the 0600 file `SIGNAL_TOKEN_FILE`, or `None`
+    when neither is set. Unlike `pr-state-capture.signal_token`/
+    `ci-result-capture.signal_token`, a `None` here is never papered over
+    with the shared agent-platform token — see the module docstring."""
+    tok = os.environ.get(SIGNAL_TOKEN_ENV, "").strip()
+    if tok:
+        return tok
+    try:
+        return SIGNAL_TOKEN_FILE.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def private_repo_slugs() -> set[str]:
+    """Lowercased `owner/repo` for every repository of a BLACK BOX project
+    (`projects.private_slugs()`, platform/decisions/0043) — see the module
+    docstring's "EXCLUDED FROM EVERY PASS" section for why this job excludes
+    them, beyond what the epic's own text names."""
+    private = projects.private_slugs()
+    return {projects.repo_github_slug(r, unit).lower()
+           for slug, unit in projects.load().items() if slug in private
+           for r in unit.get("repos", [])}
+
+
+def list_installation_repos(token: str, *, opener=urllib.request.urlopen) -> list[dict]:
+    """Every repository object the installation reaches — GitHub's own repo
+    object (carrying `full_name` and `archived`), not just a name, so
+    `archived` can be read off it directly rather than refetched per repo.
+    Mirrors `pr-state-capture.installed_repos`'s paging, but keeps the whole
+    object instead of reducing it to a lowercased name set."""
+    out: list[dict] = []
+    for page in range(1, _MAX_PAGES + 1):
+        code, payload = GA.request(
+            "GET", f"{GA.API}/installation/repositories?per_page={_PAGE_SIZE}&page={page}",
+            token, None, opener=opener)
+        repos = payload.get("repositories") if isinstance(payload, dict) else None
+        if code != 200 or not isinstance(repos, list):
+            raise GA.Unreadable(f"the installation's repositories could not be read ({code})")
+        out.extend(repos)
+        if len(repos) < _PAGE_SIZE:
+            return out
+    raise GA.Unreadable(f"the installation lists more than {_MAX_PAGES * _PAGE_SIZE} "
+                        f"repositories; refusing to treat an unread page as absence")
+
+
+def main() -> int:
+    argparse.ArgumentParser(
+        description="Capture GitHub review verdicts, review comments, "
+                    "conversation comments and the merged-PR changelog as "
+                    "signals, authenticating as the convivy-bosun GitHub App."
+    ).parse_args()
+
+    pass_start_monotonic = time.monotonic()
+    pass_start_wall = dt.datetime.now(dt.timezone.utc)
+
+    # Checked BEFORE any GitHub read — see the module docstring's "POSTING
+    # CREDENTIAL HAS NO SHARED-TOKEN FALLBACK" section.
+    sig_tok = signal_token()
+    if not sig_tok:
+        print(f"github-activity-capture: no {SIGNAL_TOKEN_FILE} and no "
+             f"${SIGNAL_TOKEN_ENV}; refusing to read GitHub without this "
+             f"job's own posting credential (no fallback to the shared "
+             f"agent-platform token: it lacks the signal.create_review "
+             f"capability this job's kinds need)", file=sys.stderr)
+        return 1
+
+    problem = GA.key_problem(KEY_PATH, label="the convivy-bosun App")
+    if problem:
+        print(f"github-activity-capture: {problem}", file=sys.stderr)
+        return 1
+    try:
+        jwt = GA.app_jwt(KEY_PATH, APP_ID)
+    except GA.Unreadable as e:
+        print(f"github-activity-capture: {e}", file=sys.stderr)
+        return 1
+
+    # Counts every GitHub request this pass makes, across every installation
+    # and every repository — logged in the per-pass summary line below.
+    request_count = [0]
+
+    def counting_opener(req, timeout=None):
+        request_count[0] += 1
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    try:
+        installations = GA.installations(jwt, opener=counting_opener)
+    except GA.Unreadable as e:
+        print(f"github-activity-capture: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"github-activity-capture: transport error reading the App's "
+             f"installations: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+
+    excluded = private_repo_slugs() | SANDBOX_REPOS
+    cursor = GACT.load_cursor()
+    # Shared across every post this pass makes — see the module docstring's
+    # "ONE POSTING DEADLINE FOR THE WHOLE PASS" section.
+    post_deadline = time.monotonic() + _POST_DEADLINE_SECONDS
+
+    def poster(payload: dict) -> str:
+        return SC.post_signal(payload, tok=sig_tok, timeout=SC._DELIVERY_TIMEOUT,
+                              deadline=post_deadline)
+
+    exit_code = 0
+    for inst in sorted(installations,
+                       key=lambda i: ((i.get("account") or {}).get("login") or "")):
+        owner = ((inst.get("account") or {}).get("login")) or "?"
+        inst_id = str(inst.get("id") or "")
+        try:
+            if not inst_id:
+                raise GA.Unreadable("the installation carries no id")
+            token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS,
+                                          opener=counting_opener)
+        except GA.Unreadable as e:
+            print(f"github-activity-capture: {owner}: {e}", file=sys.stderr)
+            exit_code = 1
+            continue
+        except OSError as e:
+            print(f"github-activity-capture: {owner}: transport error minting "
+                 f"an installation token: {type(e).__name__}: {e}", file=sys.stderr)
+            exit_code = 1
+            continue
+
+        try:
+            repos = list_installation_repos(token, opener=counting_opener)
+        except GA.Unreadable as e:
+            print(f"github-activity-capture: {owner}: {e}", file=sys.stderr)
+            exit_code = 1
+            continue
+        except OSError as e:
+            print(f"github-activity-capture: {owner}: transport error listing "
+                 f"the installation's repositories: {type(e).__name__}: {e}", file=sys.stderr)
+            exit_code = 1
+            continue
+
+        # GET /rate_limit does not itself count against the installation's
+        # own rate limit (GitHub's documented behaviour) — read once per
+        # owner so the DoD's hour-long sample has a per-owner trace in the
+        # job's own log. Diagnostic only: a transport error here costs
+        # nothing but this one log line — see the module docstring's "A
+        # TRANSPORT ERROR ... IS CAUGHT" section.
+        try:
+            rate_code, rate_payload = GA.request("GET", f"{GA.API}/rate_limit", token, None,
+                                                 opener=counting_opener)
+        except OSError as e:
+            print(f"github-activity-capture: {owner}: rate limit could not be "
+                 f"read (transport error: {type(e).__name__}: {e})", file=sys.stderr)
+        else:
+            core = ((rate_payload.get("resources") or {}).get("core")
+                   if rate_code == 200 and isinstance(rate_payload, dict) else None)
+            if isinstance(core, dict):
+                print(f"github-activity-capture: {owner}: core.used={core.get('used')} "
+                     f"core.limit={core.get('limit')}")
+            else:
+                print(f"github-activity-capture: {owner}: rate limit could not be "
+                     f"read ({rate_code})", file=sys.stderr)
+
+        for repo_obj in sorted(repos, key=lambda r: (r.get("full_name") or "").lower()):
+            full_name = repo_obj.get("full_name") or ""
+            if not full_name or repo_obj.get("archived") or full_name.lower() in excluded:
+                continue
+            try:
+                result = GACT.capture_repository(
+                    full_name, cursor.get(full_name), token, poster, pass_start_wall,
+                    opener=counting_opener)
+            except OSError as e:
+                # See the module docstring's "A TRANSPORT ERROR ... IS
+                # CAUGHT HERE" section: this repo's cursor is left exactly
+                # where it was (never written below), the next repository
+                # still gets its turn, and the pass is marked failed.
+                print(f"github-activity-capture: {full_name}: transport error "
+                     f"reading GitHub: {type(e).__name__}: {e}", file=sys.stderr)
+                exit_code = 1
+                continue
+            # Saved after every repository, not once at the end of the pass:
+            # a deadline or a crash partway through still keeps every
+            # already-finished repository's cursor advance.
+            cursor[full_name] = result["new_cursor"]
+            GACT.save_cursor(cursor)
+            if not result["may_advance"]:
+                exit_code = 1
+
+    pass_end_wall = dt.datetime.now(dt.timezone.utc)
+    elapsed = time.monotonic() - pass_start_monotonic
+    print(f"github-activity-capture: pass start={pass_start_wall.isoformat()} "
+         f"end={pass_end_wall.isoformat()} elapsed={elapsed:.1f}s "
+         f"requests={request_count[0]}")
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

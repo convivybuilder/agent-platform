@@ -581,6 +581,16 @@ def ci_result_capture():
 
 
 @pytest.fixture(scope="session")
+def github_activity_capture():
+    """The `bin/github-activity-capture` module (E25,
+    issue_01M4ZB5C5ZX0MV206064MTRAE0) — the Bosun's read-only,
+    convivy-bosun-App-authenticated GitHub review/comment/changelog signal
+    capture, calling `lib/agent-platform/github_activity.py`'s
+    `capture_repository` per installation's repository."""
+    return _load_cli("github-activity-capture")
+
+
+@pytest.fixture(scope="session")
 def co_working_on():
     """The `bin/co-working-on` module — the writer for Deck's cockpit "working
     on" line, whose reader is `session_state.working_on`."""

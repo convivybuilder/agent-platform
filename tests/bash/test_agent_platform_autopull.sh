@@ -883,5 +883,240 @@ case "$(log_of "$H")" in
 esac
 rm -rf "$H"
 
+# --- 19. the push-gate installer runs on the QUIET path -----------------------
+# A stub records its own invocation; the real installer is exercised
+# separately (tests 21-22 below).
+_seed_push_gate_stub() { # <repo> <marker-path>
+    local repo=$1 marker=$2
+    mkdir -p "$repo/bin"
+    cat > "$repo/bin/install-push-gate" <<EOF
+#!/bin/sh
+echo "push-gate installer called: \$*" >> "$marker"
+exit 0
+EOF
+    chmod +x "$repo/bin/install-push-gate"
+    git -C "$repo" add -A
+    git -C "$repo" commit -qm "add push-gate installer stub"
+    git -C "$repo" push -q origin main
+}
+
+H=$(setup)
+MARKER="$H/.push-gate-called-quiet"
+_seed_push_gate_stub "$H/Convivy/agent-platform" "$MARKER"
+rc=$(run_autopull "$H")
+assert_rc 0 "$rc" "quiet path with a push-gate installer present still exits 0"
+assert_eq "1" "$(test -f "$MARKER" && echo 1 || echo 0)" \
+    "the quiet path invokes install-push-gate"
+rm -rf "$H"
+
+# --- 20. the push-gate installer runs on the AFTER-PULL path -------------------
+H=$(setup)
+MARKER="$H/.push-gate-called-afterpull"
+_seed_push_gate_stub "$H/Convivy/agent-platform" "$MARKER"
+advance_origin "$H"
+rc=$(run_autopull "$H")
+assert_rc 0 "$rc" "after-pull path with a push-gate installer present still exits 0"
+assert_eq "1" "$(test -f "$MARKER" && echo 1 || echo 0)" \
+    "the after-pull path invokes install-push-gate"
+rm -rf "$H"
+
+# --- 21. a clone created AFTER one tick gets the push-gate hook on the NEXT
+#         tick, against the REAL bin/install-push-gate -------------------------
+# $REPO/bin/install-push-gate is a symlink to THIS checkout's real installer
+# (install-push-gate resolves `readlink` on a symlinked $0 to find its own
+# builder-root and lib/ beside it — the same indirection a real ~/.local/bin
+# install gives it), pointed at the fixture's root via --root-config so it
+# never reads or writes the real machine's session-agent.env or clones.
+H=$(setup)
+mkdir -p "$H/Convivy/agent-platform/bin"
+ln -s "$REPO_ROOT/bin/install-push-gate" "$H/Convivy/agent-platform/bin/install-push-gate"
+mkdir -p "$H/Convivy/library"
+git -C "$H/Convivy/library" init -q
+
+rc=$(run_autopull "$H")
+assert_rc 0 "$rc" "tick 1 (the later clone does not exist yet) exits 0"
+assert_eq "yes" "$([ -x "$H/Convivy/agent-platform/.git/hooks/pre-push" ] && echo yes || echo no)" \
+    "tick 1: agent-platform's own clone gets the hook"
+assert_eq "yes" "$([ -x "$H/Convivy/library/.git/hooks/pre-push" ] && echo yes || echo no)" \
+    "tick 1: library gets the hook"
+assert_eq "no" "$([ -e "$H/Convivy/convivy-orient" ] && echo yes || echo no)" \
+    "tick 1: convivy-orient does not exist yet"
+
+mkdir -p "$H/Convivy/convivy-orient"
+git -C "$H/Convivy/convivy-orient" init -q
+
+rc=$(run_autopull "$H")
+assert_rc 0 "$rc" "tick 2 (the clone now exists) exits 0"
+assert_eq "yes" "$([ -x "$H/Convivy/convivy-orient/.git/hooks/pre-push" ] && echo yes || echo no)" \
+    "tick 2: the newly created clone gets the hook"
+rm -rf "$H"
+
+# --- 22. a push-gate installer failure logs ACTION NEEDED, attempts the
+#         alert, and does not change the tick's own exit code -----------------
+H=$(setup)
+mkdir -p "$H/Convivy/agent-platform/bin"
+cat > "$H/Convivy/agent-platform/bin/install-push-gate" <<'EOF'
+#!/bin/sh
+echo "install-push-gate: deliberately broken for this test" >&2
+exit 1
+EOF
+chmod +x "$H/Convivy/agent-platform/bin/install-push-gate"
+git -C "$H/Convivy/agent-platform" add -A
+git -C "$H/Convivy/agent-platform" commit -qm "add broken push-gate installer"
+git -C "$H/Convivy/agent-platform" push -q origin main
+
+SIGNAL_MARKER="$H/.signal-push-gate-failure"
+mkdir -p "$H/.local/bin"
+cat > "$H/.local/bin/python3" <<EOF
+#!/bin/bash
+if [ "\$1" = "-" ]; then
+    echo "\$@" >> $SIGNAL_MARKER
+    cat >> $SIGNAL_MARKER
+    exit 0
+fi
+exec /usr/bin/python3 "\$@"
+EOF
+chmod +x "$H/.local/bin/python3"
+rc=$(HOME="$H" PATH="$H/.local/bin:$PATH" /bin/zsh "$AUTOPULL" --root-config "$(co_root_config "$H")" >/dev/null 2>&1; echo $?)
+assert_rc 0 "$rc" "a broken push-gate installer does not change the tick's own exit code"
+case "$(log_of "$H")" in
+    *"ACTION NEEDED"*"push-gate installer failed"*) _PASS=$((_PASS + 1));;
+    *) _FAIL=$((_FAIL + 1)); echo "  FAIL: push-gate failure not logged as ACTION NEEDED";;
+esac
+assert_eq "1" "$(test -f "$SIGNAL_MARKER" && echo 1 || echo 0)" \
+    "a failed push-gate install invokes the alert function"
+case "$(cat "$SIGNAL_MARKER" 2>/dev/null)" in
+    *"post_alert"*) _PASS=$((_PASS + 1));;
+    *) _FAIL=$((_FAIL + 1)); echo "  FAIL: alert does not reference signal_client.post_alert";;
+esac
+rm -rf "$H"
+
+# --- 23. the Shipwright checkout's origin ref moves after a tick, and its
+#         HEAD, branch and working tree stay untouched --------------------------
+H=$(setup)
+SW_BARE="$H/shipwright-origin.git"
+git init -q --bare -b main "$SW_BARE"
+
+SW_SEED=$(mktemp -d)
+git clone -q "$SW_BARE" "$SW_SEED/w"
+_git_ident "$SW_SEED/w"
+echo seed > "$SW_SEED/w/f.txt"
+git -C "$SW_SEED/w" add -A
+git -C "$SW_SEED/w" commit -qm seed
+git -C "$SW_SEED/w" push -q origin main
+rm -rf "$SW_SEED"
+
+git clone -q "$SW_BARE" "$H/Convivy/shipwright"
+before_head=$(git -C "$H/Convivy/shipwright" rev-parse HEAD)
+before_branch=$(git -C "$H/Convivy/shipwright" rev-parse --abbrev-ref HEAD)
+
+SW_PUSH=$(mktemp -d)
+git clone -q "$SW_BARE" "$SW_PUSH/w"
+_git_ident "$SW_PUSH/w"
+echo more >> "$SW_PUSH/w/f.txt"
+git -C "$SW_PUSH/w" add -A
+git -C "$SW_PUSH/w" commit -qm advance
+git -C "$SW_PUSH/w" push -q origin main
+new_remote_head=$(git -C "$SW_PUSH/w" rev-parse HEAD)
+rm -rf "$SW_PUSH"
+
+rc=$(run_autopull "$H")
+assert_rc 0 "$rc" "a tick with a shipwright checkout present still exits 0"
+assert_eq "$new_remote_head" "$(git -C "$H/Convivy/shipwright" rev-parse origin/main 2>/dev/null)" \
+    "the shipwright checkout's origin/main moved to the bare remote's new commit"
+assert_eq "$before_head" "$(git -C "$H/Convivy/shipwright" rev-parse HEAD)" \
+    "the shipwright checkout's own HEAD is unchanged (fetch only, never merged)"
+assert_eq "$before_branch" "$(git -C "$H/Convivy/shipwright" rev-parse --abbrev-ref HEAD)" \
+    "the shipwright checkout's branch is unchanged"
+assert_eq "" "$(git -C "$H/Convivy/shipwright" status --porcelain)" \
+    "the shipwright checkout's working tree is clean"
+rm -rf "$H"
+
+# --- 24. a missing shipwright directory is skipped BEFORE git is ever
+#         invoked for it, not just silently on the output ---------------------
+# A git fetch against a nonexistent -C directory also fails quietly (its
+# error matches none of the LOCAL-error patterns), so a log-is-empty
+# assertion alone cannot tell "the guard skipped it" from "the guard is gone
+# and git failed anyway". A PATH git spy that only logs a `-C <shipwright>`
+# invocation (and execs the real git for everything else) can.
+_write_git_spy() { # <bindir> <marker> <watched-dir>
+    mkdir -p "$1"
+    cat > "$1/git" <<EOF
+#!/bin/bash
+if [ "\$1" = "-C" ] && [ "\$2" = "$3" ]; then
+    echo "git called for shipwright: \$*" >> "$2"
+fi
+exec /usr/bin/git "\$@"
+EOF
+    chmod +x "$1/git"
+}
+
+H=$(setup)
+SPY="$H/.git-spy-shipwright-missing"
+_write_git_spy "$H/.local/bin" "$SPY" "$H/Convivy/shipwright"
+rc=$(HOME="$H" PATH="$H/.local/bin:$PATH" /bin/zsh "$AUTOPULL" --root-config "$(co_root_config "$H")" >/dev/null 2>&1; echo $?)
+assert_rc 0 "$rc" "a missing shipwright directory does not fail the tick"
+assert_eq "" "$(log_of "$H")" "a missing shipwright directory produces no log output"
+assert_eq "0" "$(test -f "$SPY" && echo 1 || echo 0)" \
+    "a missing shipwright directory is skipped before git is ever invoked for it"
+rm -rf "$H"
+
+# --- 24b. a shipwright directory that EXISTS but is not a git checkout is
+#          also skipped before git is invoked for it ---------------------------
+H=$(setup)
+mkdir -p "$H/Convivy/shipwright"
+SPY="$H/.git-spy-shipwright-notgit"
+_write_git_spy "$H/.local/bin" "$SPY" "$H/Convivy/shipwright"
+rc=$(HOME="$H" PATH="$H/.local/bin:$PATH" /bin/zsh "$AUTOPULL" --root-config "$(co_root_config "$H")" >/dev/null 2>&1; echo $?)
+assert_rc 0 "$rc" "a shipwright directory with no .git does not fail the tick"
+assert_eq "0" "$(test -f "$SPY" && echo 1 || echo 0)" \
+    "a shipwright directory with no .git is skipped before git is invoked for it"
+rm -rf "$H"
+
+# --- 25. a second tick on an already-installed set of temp clones logs no
+#         push-gate line, against the REAL bin/install-push-gate -------------
+# $REPO/bin/install-push-gate is a symlink to THIS checkout's real installer,
+# same indirection test 21 uses, pointed at the fixture's root so it never
+# touches the real machine's clones.
+H=$(setup)
+mkdir -p "$H/Convivy/agent-platform/bin"
+ln -s "$REPO_ROOT/bin/install-push-gate" "$H/Convivy/agent-platform/bin/install-push-gate"
+mkdir -p "$H/Convivy/library"
+git -C "$H/Convivy/library" init -q
+
+rc=$(run_autopull "$H")   # tick 1: installs into both clones
+assert_rc 0 "$rc" "tick 1 (fresh install) exits 0"
+before_lines=$(log_of "$H" | wc -l | tr -d ' ')
+
+rc=$(run_autopull "$H")   # tick 2: nothing changed
+assert_rc 0 "$rc" "tick 2 (nothing changed) exits 0"
+tick2_log=$(log_of "$H" | tail -n "+$((before_lines + 1))")
+assert_eq "no" "$(printf '%s' "$tick2_log" | grep -qi "push-gate" && echo yes || echo no)" \
+    "tick 2: no push-gate line is logged when nothing changed"
+rm -rf "$H"
+
+# --- 26. a tick after one clone's hook was deleted logs exactly that
+#         clone's line, against the REAL bin/install-push-gate ---------------
+H=$(setup)
+mkdir -p "$H/Convivy/agent-platform/bin"
+ln -s "$REPO_ROOT/bin/install-push-gate" "$H/Convivy/agent-platform/bin/install-push-gate"
+mkdir -p "$H/Convivy/library"
+git -C "$H/Convivy/library" init -q
+
+run_autopull "$H" >/dev/null   # tick 1: installs into both clones
+before_lines=$(log_of "$H" | wc -l | tr -d ' ')
+rm -f "$H/Convivy/library/.git/hooks/pre-push"
+
+rc=$(run_autopull "$H")   # tick 2: library's hook is gone, agent-platform's is not
+assert_rc 0 "$rc" "tick 2 (one clone's hook deleted) exits 0"
+tick2_log=$(log_of "$H" | tail -n "+$((before_lines + 1))")
+assert_contains "$tick2_log" "push-gate: library" \
+    "tick 2: library's line is logged (its hook was missing)"
+assert_eq "no" "$(printf '%s' "$tick2_log" | grep -q "push-gate: agent-platform" && echo yes || echo no)" \
+    "tick 2: agent-platform's line is NOT logged (its hook was untouched)"
+assert_eq "yes" "$([ -x "$H/Convivy/library/.git/hooks/pre-push" ] && echo yes || echo no)" \
+    "tick 2: library's hook is reinstalled"
+rm -rf "$H"
+
 echo "  $_PASS passed, $_FAIL failed"
 [ "$_FAIL" -eq 0 ]

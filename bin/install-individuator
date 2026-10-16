@@ -2,15 +2,28 @@
 # install-individuator — build and deploy-pin the Individuator's root daemon
 # (platform/decisions/0092; CQ·447 slice 3).
 #
-# WHY. The Individuator's machine key lives in the Secure Enclave and is
-# usable only by the root daemon that generated it — 0092's whole point is
-# that nothing readable as a file from an operator-level process (a
-# dispatched run included) can act as this key. That means the daemon
-# itself must run as root, from a root-owned binary, with a root-owned
-# config naming the Bosun host and the operator uid its Unix socket
-# accepts a `register` request from — none of which this script may read
-# from, or write into, the agent-platform checkout itself (ADR-0059's
-# deploy-pinning rules apply here just as they do to a per-user daemon).
+# WHY. The Individuator's machine key is usable only by the root daemon
+# that holds it — 0092's whole point is that nothing readable as a file
+# from an operator-level process (a dispatched run included) can act as
+# this key. That means the daemon itself must run as root, from a
+# root-owned binary, with a root-owned config naming the Bosun host and the
+# operator uid its Unix socket accepts a `register` request from — none of
+# which this script may read from, or write into, the agent-platform
+# checkout itself (ADR-0059's deploy-pinning rules apply here just as they
+# do to a per-user daemon).
+#
+# The key itself is a software P-256 key the DAEMON creates and self-tests
+# on its own first start, in its own launchd context (2026-10-15, replacing
+# a Secure Enclave key this script used to generate and self-test itself,
+# via `individuator keygen`/`individuator self-test`, right here, inside
+# root's own `sudo` session). That is a DIFFERENT context than the one the
+# daemon actually runs in, and that difference is exactly what masked a
+# real production failure: the daemon's Secure Enclave signing was refused
+# at its very first registration, because a launchd daemon cannot use the
+# Secure Enclave at all — unsupported, not a configuration mistake — while
+# this script's own `individuator self-test`, run inside the operator's
+# login session moments earlier, had already passed. Running the self-test
+# in the daemon's own process, every time it starts, closes that gap.
 #
 # WHAT THIS DOES:
 #   1. Refuses outright unless running as root (`id -u` is 0) — every step
@@ -32,15 +45,30 @@
 #      directory (refusing to clobber a live one that has drifted from the
 #      template, unless --force — the same idiom install.sh phase 4 and
 #      install-run-register-api use) and bootstraps the job in the SYSTEM
-#      domain.
-#   6. Runs `individuator keygen` — unless a key is already present at
-#      the key directory, in which case this run skips keygen entirely
-#      rather than ever asking the CLI to regenerate one. Running this
-#      script twice must not overwrite an existing key.
-#   7. Runs `individuator self-test` (sign, verify, reload the key from
-#      its blob, sign again), then prints the CSR and the public-key
-#      fingerprint for the operator's Touch ID certificate-signing
-#      ceremony with the Library.
+#      domain — which, with the plist's own RunAtLoad, is what makes the
+#      daemon create (or load, if a prior install already left one) and
+#      self-test its key.
+#   6. Waits for the daemon's own self-test line in --daemon-log (never
+#      runs `individuator keygen` or `individuator self-test` itself —
+#      see WHY above), then prints the CSR for the operator's signing
+#      ceremony with the Library. The fingerprint for that ceremony comes
+#      from the daemon's own self-test line, never recomputed by this
+#      script: the whole point is that the number the operator hands the
+#      Library is provably the daemon's own.
+#
+# The operator's remaining steps, after this script finishes, are not run
+# by this script because no caller here can automate them yet: enroll the
+# printed fingerprint with the Library under custody "root-file" —
+# `enroll_machine.py issue <machine-name> <fingerprint> --custody
+# root-file` — adopt the certificate it issues (`individuator adopt-cert`),
+# and let the daemon register. That enroll call re-enrolls <machine-name>
+# and so revokes its current "hardware" row in the same Library transaction;
+# do not revoke it separately first. Once a registration succeeds, delete
+# the retired Secure Enclave blob this script no longer writes or reads,
+# /var/db/individuator/machine.key, by hand — never automated here, since
+# nothing in this script can confirm a registration actually succeeded.
+# The full operator procedure is the knowledge-base runbook
+# agent-platform/runbooks/installing-the-individuator-with-a-root-file-key.
 #
 # Must stay bash-3.2-safe (no `declare -A`, `mapfile`, `${var,,}`, `&>>`):
 # tests/bash/lint.sh parses every bin/ script with a bash-or-/bin/sh
@@ -56,7 +84,8 @@ usage: install-individuator [--ref=<git-ref>] [--repo=<path>] [--allow-non-main]
                              [--machine-name=<name>]
                              [--key-dir=<path>] [--install-dir=<path>]
                              [--config-path=<path>] [--launch-daemons-dir=<path>]
-                             [--socket-dir=<path>]
+                             [--socket-dir=<path>] [--daemon-log=<path>]
+                             [--self-test-wait-seconds=<n>]
 
 Must be run as root (sudo).
 
@@ -89,6 +118,11 @@ Must be run as root (sudo).
   --socket-dir=<path>        Where the root daemon's Unix socket directory
                               is pre-created (default: /var/db/individuator-daemon,
                               matching IndividuatorPaths.defaultDaemonSocketPath).
+  --daemon-log=<path>        Where the daemon's own self-test line is read from
+                              (default: /var/log/individuator.out.log, the
+                              plist's own StandardOutPath).
+  --self-test-wait-seconds=<n> How long to wait for that line to appear before
+                              continuing anyway with a warning (default: 5).
 EOF
   exit 2
 }
@@ -109,6 +143,8 @@ INSTALL_DIR="/usr/local/libexec/individuator"
 CONFIG_PATH="/etc/individuator/config.json"
 LAUNCH_DAEMONS_DIR="/Library/LaunchDaemons"
 SOCKET_DIR="/var/db/individuator-daemon"
+DAEMON_LOG="/var/log/individuator.out.log"
+SELF_TEST_WAIT_SECONDS=5
 # FOR TESTS ONLY: skips the git-archive + `swift build` step entirely and
 # installs whatever is already at --build-dir/individuator{,-daemon} —
 # the bash test suite stubs those two binaries rather than compiling a
@@ -141,6 +177,8 @@ for arg in "$@"; do
     --config-path=*) CONFIG_PATH="${arg#--config-path=}" ;;
     --launch-daemons-dir=*) LAUNCH_DAEMONS_DIR="${arg#--launch-daemons-dir=}" ;;
     --socket-dir=*) SOCKET_DIR="${arg#--socket-dir=}" ;;
+    --daemon-log=*) DAEMON_LOG="${arg#--daemon-log=}" ;;
+    --self-test-wait-seconds=*) SELF_TEST_WAIT_SECONDS="${arg#--self-test-wait-seconds=}" ;;
     # FOR TESTS ONLY, same shape as install-run-register-api's --root-config.
     --root-config=*) ROOT_CONFIG="${arg#--root-config=}" ;;
     --skip-build) SKIP_BUILD=1 ;;
@@ -319,22 +357,7 @@ mkdir -p "$SOCKET_DIR"
 chown root:wheel "$SOCKET_DIR" 2>/dev/null || true
 chmod 755 "$SOCKET_DIR"
 
-# --- the key: generate once, never regenerate over an existing one. Run
-# before the plist is bootstrapped below, so a freshly-installed daemon's
-# first (KeepAlive) start can at least get past loading the key — it still
-# cannot start without the adopted certificate the operator's Touch ID
-# ceremony with the Library produces afterward, which is expected and
-# printed at the end of this script. ----------------------------------------
 INDIVIDUATOR_BIN="$INSTALL_DIR/individuator"
-if [ -f "$KEY_DIR/machine.key" ]; then
-  say "Machine key already present at $KEY_DIR/machine.key — not regenerating"
-else
-  say "Generating the machine key (individuator keygen)"
-  "$INDIVIDUATOR_BIN" keygen --key-dir "$KEY_DIR"
-fi
-
-say "Running the self-test (sign, verify, reload from the blob, sign again)"
-"$INDIVIDUATOR_BIN" self-test --key-dir "$KEY_DIR"
 
 # --- the root-owned configuration (IndividuatorRootConfig's own shape) ------
 if [ -n "$BOSUN_HOST" ]; then
@@ -397,8 +420,9 @@ fi
 
 # --- bootstrap the job in the SYSTEM domain. Non-fatal: a job already
 # loaded, or a launchctl this machine refuses for its own reasons, must not
-# abort an otherwise-successful install — the keygen, self-test and CSR
-# below are worth running regardless. ----------------------------------------
+# abort an otherwise-successful install — the self-test wait and CSR below
+# are worth running regardless. RunAtLoad means this is also what makes the
+# daemon create (or load) and self-test its own key. -------------------------
 launchctl bootout system/com.convivy.individuator >/dev/null 2>&1 || true
 BOOTSTRAP_ERR="$(mktemp "${TMPDIR:-/tmp}/individuator-bootstrap-err.XXXXXX")"
 if launchctl bootstrap system "$PLIST_LIVE" 2>"$BOOTSTRAP_ERR"; then
@@ -409,8 +433,32 @@ else
 fi
 rm -f "$BOOTSTRAP_ERR"
 
+# --- wait for the daemon's own self-test line in $DAEMON_LOG, rather than
+# ever running `individuator self-test` or `individuator fingerprint`
+# ourselves (see WHY, above). Bounded: the daemon normally creates and
+# self-tests its key within moments of RunAtLoad starting it, but this
+# script must not hang forever if the job never actually started (the
+# warning above already covers that case; this one is distinct — the job
+# loaded but hasn't logged yet). A timeout here is non-fatal: the CSR below
+# still runs, and fails loudly on its own if the key truly never appeared. -
+say "Waiting up to ${SELF_TEST_WAIT_SECONDS}s for the daemon's self-test line in $DAEMON_LOG"
+waited=0
+self_test_line=""
+while [ "$waited" -lt "$SELF_TEST_WAIT_SECONDS" ]; do
+  if [ -f "$DAEMON_LOG" ]; then
+    self_test_line="$(grep 'machine key self-test' "$DAEMON_LOG" 2>/dev/null | tail -1)"
+    [ -n "$self_test_line" ] && break
+  fi
+  sleep 1
+  waited=$((waited + 1))
+done
+if [ -n "$self_test_line" ]; then
+  say "Daemon self-test: $self_test_line"
+else
+  warn "no self-test line from the daemon in $DAEMON_LOG after ${SELF_TEST_WAIT_SECONDS}s"
+  warn "check 'launchctl print system/com.convivy.individuator' and $DAEMON_LOG by hand before continuing"
+fi
+
 MACHINE_NAME="${MACHINE_NAME:-$(hostname -s 2>/dev/null || hostname)}"
-say "Certificate signing request for '$MACHINE_NAME' (for the operator's Touch ID ceremony with the Library):"
+say "Certificate signing request for '$MACHINE_NAME' (for the operator's enrollment ceremony with the Library, custody \"root-file\"):"
 "$INDIVIDUATOR_BIN" csr --machine-name "$MACHINE_NAME" --key-dir "$KEY_DIR"
-say "Public-key fingerprint:"
-"$INDIVIDUATOR_BIN" fingerprint --key-dir "$KEY_DIR"

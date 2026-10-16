@@ -74,6 +74,10 @@
 
 # test_agent_platform_autopull.sh — the script under test
 ^bin/agent-platform-autopull$
+# tests 21, 25 and 26 exec the REAL bin/install-push-gate (symlinked into the
+# fixture's $H/Convivy/agent-platform/bin) and assert on what it actually
+# installs, leaves alone on a no-op tick, and re-installs after a hook is lost
+^bin/install-push-gate$
 
 # every one of the four sources this for its assertion helpers and REPO_ROOT
 ^tests/bash/lib\.sh$

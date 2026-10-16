@@ -468,6 +468,7 @@ say "Phase 4b: decision-record hooks"
 bash "$REPO/bin/install-decision-hooks" || say "  decision-record hooks skipped (non-fatal)"
 sh "$REPO/bin/install-knowledge-main-guard" || say "  knowledge-main guard skipped (non-fatal)"
 sh "$REPO/bin/install-agent-platform-primary-guard" || say "  agent-platform primary guard skipped (non-fatal)"
+sh "$REPO/bin/install-push-gate" || say "  WARNING: the push content gate is NOT installed in one or more engine clones (all of them if the machine's root could not be resolved) — a push from an ungated clone skips the content scan. Re-run bin/install-push-gate and read its output above."
 sh "$REPO/bin/install-rollover-policy" || say "  rollover policy seed skipped (non-fatal)"
 
 # One inbox per PROJECT, not per directory (ARCH-426). Best-effort like the rest

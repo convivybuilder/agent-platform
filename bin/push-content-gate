@@ -1,0 +1,148 @@
+#!/usr/bin/env python3.11
+"""push-content-gate — the pre-push-time half of the content gate.
+
+A later PR installs a small `sh` stub as `.git/hooks/pre-push` in each engine
+clone (agent-platform, library, convivy-orient, convivy-deck). That stub
+prepends the clone's own repository name and passes git's own `pre-push`
+arguments and stdin straight through to this program:
+
+    push-content-gate <repo> <remote-name> <remote-url>
+
+`<remote-name>` and `<remote-url>` are exactly what git hands a `pre-push`
+hook as `$1` and `$2` (githooks(5)); stdin carries one line per ref being
+pushed: `<local ref> <local sha1> <remote ref> <remote sha1>`.
+
+This program decides which commits that stdin describes are NEW to the
+remote, resolves `wt` (the worktree running the push) and hands every one of
+them, oldest first, to `publish_scan.scan_commits` — the same Builder
+content scan `agentctl publish` already runs on the tip of a push, extended
+here to run on EVERY commit a push sends, not only its tip: a name added in
+one commit and removed by a later one in the same push must still be
+refused, since the finding reached a ref on `origin` the instant the first
+commit did.
+
+FAILS CLOSED, WITH NO SKIP PATH. A finding, a scan that could not run, a
+malformed `pre-push` line, or any other failure here all read the same way:
+the push does not go through. `scan_commits` already fails closed on a scan
+it could not run; this program adds no further judgment about when that is
+acceptable.
+"""
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import publish_scan as PS  # noqa: E402
+
+
+def _all_zero(sha: str) -> bool:
+    """True for git's own all-zero sha, meaning "no commit" — on the local
+    side, a branch deletion; on the remote side, a ref that does not exist
+    there yet. Checked by content rather than length, since git uses a
+    40-character all-zero sha1 or a 64-character all-zero sha256 depending
+    on the repository's object format."""
+    return set(sha) <= {"0"}
+
+
+def _peel(sha: str) -> str:
+    """`<sha>^{commit}`: the commit `sha` names, resolving an annotated tag
+    object to the commit it points at. A no-op for a sha that already names
+    a commit, so every rev-list call below can use this unconditionally
+    rather than special-casing a tag ref by name."""
+    return sha + "^{commit}"
+
+
+def _git(wt: Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", str(wt), *args], capture_output=True, text=True)
+
+
+def _rev_list(wt: Path, args: list[str]) -> list[str]:
+    result = _git(wt, "rev-list", "--reverse", *args)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git rev-list {' '.join(args)} failed: {result.stderr.strip()}"
+        )
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _commit_exists(wt: Path, sha: str) -> bool:
+    return _git(wt, "cat-file", "-e", _peel(sha)).returncode == 0
+
+
+def _shas_for_line(wt: Path, local_sha: str, remote_sha: str, remote_name: str) -> list[str]:
+    """The commits one `pre-push` stdin line adds to the remote, oldest
+    first. A deletion (`local_sha` all zero) adds nothing. A new ref
+    (`remote_sha` all zero), or an update whose remote sha is not present in
+    this worktree at all (a force-push, or a remote this worktree has never
+    fetched), is scanned as everything reachable from `local_sha` that is
+    not already on some ref under `remote_name`. An ordinary update is
+    scanned as the range between the two."""
+    if _all_zero(local_sha):
+        return []
+    if _all_zero(remote_sha) or not _commit_exists(wt, remote_sha):
+        return _rev_list(wt, [_peel(local_sha), "--not", f"--remotes={remote_name}"])
+    return _rev_list(wt, [f"{_peel(remote_sha)}..{_peel(local_sha)}"])
+
+
+def _commits_to_scan(wt: Path, remote_name: str, stdin_text: str) -> list[str]:
+    """Every commit `stdin_text`'s ref lines send to the remote, oldest
+    first and de-duplicated across lines (the same commit reachable from two
+    pushed refs is scanned once)."""
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for line in stdin_text.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split()
+        if len(parts) != 4:
+            raise RuntimeError(f"malformed pre-push input line: {line!r}")
+        _local_ref, local_sha, _remote_ref, remote_sha = parts
+        for sha in _shas_for_line(wt, local_sha, remote_sha, remote_name):
+            if sha not in seen:
+                seen.add(sha)
+                ordered.append(sha)
+    return ordered
+
+
+def _show_toplevel() -> Path:
+    result = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git rev-parse --show-toplevel failed: {result.stderr.strip()}"
+        )
+    return Path(result.stdout.strip())
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 4:
+        print(
+            "push-content-gate: usage: push-content-gate <repo> <remote-name> <remote-url>",
+            file=sys.stderr,
+        )
+        print("nothing was sent", file=sys.stderr)
+        return 1
+
+    repo_name, remote_name = argv[1], argv[2]
+    try:
+        wt = _show_toplevel()
+        shas = _commits_to_scan(wt, remote_name, sys.stdin.read())
+        if shas:
+            PS.scan_commits(repo_name, wt, shas)
+    except PS.PublishScanRefused as exc:
+        print(f"push refused by the content gate: {exc}", file=sys.stderr)
+        print("nothing was sent", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"push-content-gate: {exc}", file=sys.stderr)
+        print("nothing was sent", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -2,12 +2,18 @@ import CryptoKit
 import Foundation
 import IndividuatorCore
 
-// The Individuator's identity-core CLI (CQ·447 slices 2 and 3). `keygen`,
-// `csr`, `adopt-cert` and `status` are slice 2; `self-test` and
-// `fingerprint` are slice 3, for `bin/install-individuator`'s own use —
-// neither opens a network connection or a Unix socket, so this executable
-// still depends on IndividuatorCore alone, and there is still no path from
-// it to the test-only `SoftwareMachineKey`.
+// The Individuator's identity-core CLI (CQ·447 slices 2 and 3). `csr`,
+// `adopt-cert` and `status` are slice 2; `self-test` and `fingerprint` are
+// slice 3. This executable depends on IndividuatorCore alone, and there is
+// still no path from it to the test-only fixtures under `Tests/`.
+//
+// There is no `keygen` subcommand (2026-10-15, retiring
+// `SecureEnclaveMachineKey`): the root daemon creates and self-tests its
+// own software machine key on first start, in its own launchd context,
+// rather than this CLI generating one in whatever context an operator
+// happens to run it from — see `individuator-daemon`'s own entry point and
+// `IndividuatorDaemonCore.DaemonKeyStartup`. Every subcommand below loads
+// that same key through `IndividuatorPaths.softwareKeyFileName`.
 
 func printErr(_ s: String) {
     FileHandle.standardError.write((s + "\n").data(using: .utf8)!)
@@ -18,8 +24,6 @@ func usage() -> String {
     usage: individuator <subcommand> [options]
 
     subcommands:
-      keygen                                  generate the machine key in the Secure Enclave
-        [--key-dir PATH]
       csr --machine-name NAME                 build this machine's certificate signing request
         [--key-dir PATH] [--out PATH]
       adopt-cert --cert PATH --root PATH      adopt a certificate the Library issued for this key
@@ -45,26 +49,14 @@ func keyDirectory(from args: [String]) -> URL {
     return IndividuatorPaths.defaultKeyDirectory
 }
 
-func runKeygen(_ args: [String]) -> Int32 {
-    let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.keyFileName)
-    do {
-        _ = try SecureEnclaveMachineKey.create(store: store)
-        print("created machine key at \(store.fileURL.path)")
-        return 0
-    } catch {
-        printErr("keygen refused: \(error)")
-        return 1
-    }
-}
-
 func runCSR(_ args: [String]) -> Int32 {
     guard let machineName = option(args, "--machine-name") else {
         printErr("csr requires --machine-name NAME")
         return 2
     }
-    let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.keyFileName)
+    let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.softwareKeyFileName)
     do {
-        let key = try SecureEnclaveMachineKey.load(store: store)
+        let key = try SoftwareMachineKey.load(store: store)
         let (_, pem) = try CertificateSigningRequest.build(machineName: machineName, key: key)
         if let outPath = option(args, "--out") {
             try pem.write(toFile: outPath, atomically: true, encoding: .utf8)
@@ -85,9 +77,9 @@ func runAdoptCert(_ args: [String]) -> Int32 {
         return 2
     }
     let dir = keyDirectory(from: args)
-    let keyStore = KeyFileStore(directory: dir, fileName: IndividuatorPaths.keyFileName)
+    let keyStore = KeyFileStore(directory: dir, fileName: IndividuatorPaths.softwareKeyFileName)
     do {
-        let key = try SecureEnclaveMachineKey.load(store: keyStore)
+        let key = try SoftwareMachineKey.load(store: keyStore)
         let certPEM = try String(contentsOfFile: certPath, encoding: .utf8)
         let rootPEM = try String(contentsOfFile: rootPath, encoding: .utf8)
         let adopted = try CertificateAdoption.adopt(certificatePEM: certPEM, rootPEM: rootPEM, machineKey: key)
@@ -104,7 +96,7 @@ func runAdoptCert(_ args: [String]) -> Int32 {
 
 func runStatus(_ args: [String]) -> Int32 {
     let dir = keyDirectory(from: args)
-    let keyStore = KeyFileStore(directory: dir, fileName: IndividuatorPaths.keyFileName)
+    let keyStore = KeyFileStore(directory: dir, fileName: IndividuatorPaths.softwareKeyFileName)
     let certStore = KeyFileStore(directory: dir, fileName: IndividuatorPaths.certificateFileName)
     var ok = true
 
@@ -128,21 +120,24 @@ func runStatus(_ args: [String]) -> Int32 {
     return ok ? 0 : 1
 }
 
-/// `bin/install-individuator`'s own self-test (CQ·447 slice 3): signs a
-/// fixed message, verifies the signature against the key's own public key,
-/// RELOADS the key fresh from its on-disk blob (closing over whatever bug
-/// class a signature that only ever used the in-memory key from `keygen`
-/// could hide — a blob that failed to persist correctly, or one
-/// `SecureEnclave.P256.Signing.PrivateKey(dataRepresentation:)` cannot
-/// reconstitute), and signs once more. Exits non-zero at the first step
+/// A manual diagnostic, run by hand against the key the daemon already
+/// created: signs a fixed message, verifies the signature against the
+/// key's own public key, RELOADS the key fresh from its on-disk blob
+/// (closing over whatever bug class a signature that only ever used the
+/// in-memory key could hide — a blob that failed to persist correctly, or
+/// one `P256.Signing.PrivateKey(rawRepresentation:)` cannot reconstitute),
+/// and signs once more. The daemon itself runs this same self-test, in its
+/// own launchd context, on every start — see
+/// `IndividuatorDaemonCore.DaemonKeyStartup`; this subcommand exists only
+/// for an operator to re-run it by hand. Exits non-zero at the first step
 /// that fails, naming which one.
 func runSelfTest(_ args: [String]) -> Int32 {
-    let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.keyFileName)
+    let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.softwareKeyFileName)
     let message = Data("individuator self-test".utf8)
 
-    let key: SecureEnclaveMachineKey
+    let key: SoftwareMachineKey
     do {
-        key = try SecureEnclaveMachineKey.load(store: store)
+        key = try SoftwareMachineKey.load(store: store)
     } catch {
         printErr("self-test refused: could not load the key: \(error)")
         return 1
@@ -159,9 +154,9 @@ func runSelfTest(_ args: [String]) -> Int32 {
         return 1
     }
 
-    let reloaded: SecureEnclaveMachineKey
+    let reloaded: SoftwareMachineKey
     do {
-        reloaded = try SecureEnclaveMachineKey.load(store: store)
+        reloaded = try SoftwareMachineKey.load(store: store)
     } catch {
         printErr("self-test refused: could not reload the key from its blob: \(error)")
         return 1
@@ -183,9 +178,9 @@ func runSelfTest(_ args: [String]) -> Int32 {
 }
 
 func runFingerprint(_ args: [String]) -> Int32 {
-    let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.keyFileName)
+    let store = KeyFileStore(directory: keyDirectory(from: args), fileName: IndividuatorPaths.softwareKeyFileName)
     do {
-        let key = try SecureEnclaveMachineKey.load(store: store)
+        let key = try SoftwareMachineKey.load(store: store)
         print(CertificateSigningRequest.publicKeyFingerprintHex(key.publicKey))
         return 0
     } catch {
@@ -203,7 +198,6 @@ let rest = Array(allArgs.dropFirst())
 
 let exitCode: Int32
 switch subcommand {
-case "keygen": exitCode = runKeygen(rest)
 case "csr": exitCode = runCSR(rest)
 case "adopt-cert": exitCode = runAdoptCert(rest)
 case "status": exitCode = runStatus(rest)

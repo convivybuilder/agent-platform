@@ -81,6 +81,12 @@ set -u
 # above). The script's own directory is captured here instead, because it is a
 # parameter expansion, and because inside a function zsh's $0 names the function.
 REPO=""
+# Set by main() when it was invoked with --root-config FILE (tests only).
+# install_push_gate forwards this to bin/install-push-gate so that script
+# resolves the SAME root main() did, rather than the real machine's
+# session-agent.env (builder-root's root() ignores $HOME, so without this a
+# test run would read and write the real machine's clones).
+_ROOT_CONFIG=""
 _AUTOPULL_BIN=${0:A:h}
 # The library this checkout ships, preferred over the installed farm for the
 # same reason bin/knowledge-watcher prefers it: this script and the library it
@@ -200,6 +206,7 @@ main() {
             return 1
         fi
         root_args+=(--config "$2")
+        _ROOT_CONFIG=$2
     fi
     local root
     root=$("$_AUTOPULL_BIN/builder-root" "${root_args[@]}") && [[ -n $root ]] || {
@@ -272,6 +279,8 @@ main() {
         # path costs nothing.
         check_and_fix_farm
         refresh_deploy_area
+        install_push_gate
+        fetch_shipwright $root
         return 0
     fi
 
@@ -339,6 +348,8 @@ main() {
     report_manual_steps $head HEAD
     check_and_fix_farm
     refresh_deploy_area
+    install_push_gate
+    fetch_shipwright $root
 
     return 0
 }
@@ -590,6 +601,147 @@ sc.post_alert(
     product='agent-platform',
     body=body,
     dedup_key=f'agent-platform-autopull-deploy-refresh-failure-{_dt.date.today().isoformat()}',
+)
+PYEOF
+}
+
+# Keep the content gate's pre-push hook installed in every engine clone
+# (bin/install-push-gate), so a clone created later, or a hook someone
+# removed, is re-gated within one tick rather than waiting for the next hand
+# run of install.sh. Runs on BOTH the quiet path and just after a pull, same
+# as refresh_deploy_area, and after it, so the hook's deploy-area-pinned
+# interpreter and gate file are the ones this tick just refreshed.
+#
+# Best-effort like refresh_deploy_area: a failure here must not mask the
+# pull's own exit code, which already succeeded (or was correctly refused)
+# by the time this runs.
+#
+# install-push-gate has its own idempotent fast path: it prints "✓ ..." for a
+# clone only when it wrote or fixed that clone's hook, and nothing at all for
+# a clone whose hook is already byte-identical at mode 0755. "✓" is itself
+# the installer's own marker for a write, not a sign that something changed
+# since last tick by some other measure. Logged on that marker rather than
+# on bare non-empty output, so an unrelated future line added to its success
+# output does not get treated as a write it never claimed to be.
+install_push_gate() {
+    local installer=$REPO/bin/install-push-gate
+    [[ -x $installer ]] || return 0
+
+    local -a args
+    args=()
+    [[ -n $_ROOT_CONFIG ]] && args=(--root-config "$_ROOT_CONFIG")
+
+    local out rc
+    out=$("$installer" "${args[@]}" 2>&1)
+    rc=$?
+
+    if (( rc != 0 )); then
+        log "  ACTION NEEDED: push-gate installer failed (exit $rc) — a push from some engine clone may be skipping the content scan:"
+        print -r -- "$out" | while read -r line; do
+            log "      $line"
+        done
+        alert_push_gate_failure "$out" "$rc"
+    elif print -r -- "$out" | grep -q '✓'; then
+        log "  push-gate installed/refreshed:"
+        print -r -- "$out" | while read -r line; do
+            log "      $line"
+        done
+    fi
+    # Silent when there is nothing to report (no clones on this machine).
+}
+
+# Best-effort alert, same shape as alert_deploy_refresh_failure: install-push-
+# gate exits non-zero only when some clone's existing pre-push hook is
+# foreign (not ours), and that clone keeps pushing ungated every tick until a
+# person resolves it by hand — cron cannot retry its way out of this one.
+alert_push_gate_failure() {
+    local detail=$1 rc=$2
+    AP_LIB_DIR=$_LIB_DIR python3 - "$detail" "$rc" <<'PYEOF' 2>/dev/null || true
+import sys, os, datetime as _dt
+sys.path.insert(0, os.environ['AP_LIB_DIR'])
+import signal_client as sc
+detail = "\n".join(sc.sanitise(line) for line in sys.argv[1].splitlines() if line.strip())
+rc = sys.argv[2]
+body = (
+    "agent-platform-autopull could not keep the content gate's pre-push hook "
+    "installed in every engine clone (bin/install-push-gate), exit " + rc + ". "
+    "A push from some engine clone is skipping the content scan until this is "
+    "fixed. Details:\n" + detail +
+    "\nFix: run bin/install-push-gate by hand and read its output."
+)
+sc.post_alert(
+    stream='agent-platform-autopull',
+    product='agent-platform',
+    body=body,
+    dedup_key=f'agent-platform-autopull-push-gate-failure-{_dt.date.today().isoformat()}',
+)
+PYEOF
+}
+
+# Keep the Shipwright checkout's origin/main current (<root>/shipwright).
+# bin/push-content-gate's publish_scan reads the engine from THAT CHECKOUT'S
+# origin/main (`git archive origin/main`), and nothing else on this machine
+# fetches it — it has otherwise only ever been fetched by hand. A stale ref
+# still fails closed (an engine without --scan-only exits 2, and the gate
+# refuses on any non-zero exit), but it would scan with old rules, so this
+# tick is what keeps the rules current without a person. The operator chose
+# this job over fetching on every push, where two concurrent pushes would
+# contend for the same ref lock in one shared checkout.
+#
+# FETCH ONLY. Never merges, checks out, or changes any branch or working
+# tree here: the checkout is shared with the Shipwright crew.
+#
+# Treats its own fetch failure exactly like main()'s own origin fetch above:
+# a LOCAL git error is loud (logged, plus a daily alert), offline or a
+# transient GitHub failure is a quiet no-op. Never changes autopull's own
+# exit code or _FAILURE_REASON: the pull itself already succeeded, or was
+# correctly refused, by the time this runs.
+fetch_shipwright() {
+    local root=$1
+    local sw=$root/shipwright
+    [[ -d $sw/.git ]] || return 0
+
+    local out rc
+    out=$(git -C "$sw" fetch origin --quiet 2>&1)
+    rc=$?
+
+    if (( rc != 0 )); then
+        if print -r -- "$out" | grep -Eq \
+                'bad object|does not point to a valid object|did not send all necessary objects|fatal: loose object'; then
+            log "ERROR: git fetch failed on a LOCAL git error in $sw (not offline — not a quiet no-op):"
+            print -r -- "$out" | while read -r line; do
+                log "    $line"
+            done
+            alert_shipwright_fetch_failure "$out" "$sw"
+        fi
+        # Otherwise quiet: offline or a transient GitHub failure, same as
+        # main()'s own fetch above.
+    fi
+    return 0
+}
+
+# Best-effort alert, same shape as alert_deploy_refresh_failure.
+alert_shipwright_fetch_failure() {
+    local detail=$1 sw=$2
+    AP_LIB_DIR=$_LIB_DIR python3 - "$detail" "$sw" <<'PYEOF' 2>/dev/null || true
+import sys, os, datetime as _dt
+sys.path.insert(0, os.environ['AP_LIB_DIR'])
+import signal_client as sc
+detail = "\n".join(sc.sanitise(line) for line in sys.argv[1].splitlines() if line.strip())
+sw = sys.argv[2]
+body = (
+    "agent-platform-autopull could not fetch the Shipwright checkout's origin "
+    "(" + sw + ") on a LOCAL git error (not offline). bin/push-content-gate's "
+    "publish_scan reads this checkout's origin/main to scan every push, so a "
+    "broken ref here means it scans with rules that are not current — it "
+    "still fails closed, but on stale rules. Details:\n" + detail +
+    "\nFix: run `git -C " + sw + " fetch origin` by hand and read what it says."
+)
+sc.post_alert(
+    stream='agent-platform-autopull',
+    product='agent-platform',
+    body=body,
+    dedup_key=f'agent-platform-autopull-shipwright-fetch-failure-{_dt.date.today().isoformat()}',
 )
 PYEOF
 }

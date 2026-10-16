@@ -810,7 +810,9 @@ def test_an_unknown_fingerprint_claiming_a_live_machines_name_leaves_its_session
 
 # ============================================================================
 # custody refusal (operator decision D2, 2026-10-12, amending 0092 decision
-# #4 — 0092 itself accepted a file-held key in stage one)
+# #4 — 0092 itself accepted a file-held key in stage one; the allowlist
+# widened 2026-10-15 to add "root-file" for the Individuator's own
+# software-held machine key, kept distinct from plain "file")
 # ============================================================================
 
 
@@ -834,15 +836,17 @@ def _stub_verify(monkeypatch, result: "BRG.LookupResult"):
     monkeypatch.setattr(BRG, "library_machine_verify", lambda *a, **k: result)
 
 
-@pytest.mark.parametrize("custody", ["file", None, "", "Hardware"],
-                         ids=["file", "none", "empty", "wrong-case"])
-def test_handle_registration_refuses_every_custody_other_than_hardware(
+@pytest.mark.parametrize("custody", ["file", None, "", "Hardware", "Root-File", "root_file"],
+                         ids=["file", "none", "empty", "wrong-case-hardware",
+                              "wrong-case-root-file", "wrong-separator-root-file"])
+def test_handle_registration_refuses_every_custody_not_in_the_allowlist(
         root, token_file, monkeypatch, custody):
-    """Required test (this slice's brief): `"file"`, `None`, `""` and a
-    differently-cased spelling are all refused the same way —
-    `REQUIRED_CUSTODY` is compared for exact string equality, so nothing
-    here needs its own special case. No session row is added for any of
-    them."""
+    """Required test (this slice's brief): `"file"` (a key the operator
+    account can read — deliberately kept out even though `"root-file"` is
+    now in), `None`, `""`, and a differently-cased or differently-punctuated
+    spelling of either allowed value are all refused the same way —
+    `REQUIRED_CUSTODY` is compared for exact membership, so nothing here
+    needs its own special case. No session row is added for any of them."""
     root_key, root_cert = root
     _key, cert = make_machine_cert(root_key, root_cert, machine=MACHINE)
     d = der(cert)
@@ -889,6 +893,27 @@ def test_handle_registration_registers_a_hardware_custody_machine_and_records_it
     session, reason = BRG.check_session_binding(outcome.session_token, fp)
     assert reason is None
     assert session["custody"] == "hardware"
+
+
+def test_handle_registration_registers_a_root_file_custody_machine_and_records_it(
+        root, token_file, monkeypatch):
+    """`"root-file"` (a software key in a file only root can read — the
+    Individuator's own machine key, 2026-10-15) registers a session the
+    same as `"hardware"` does, and the session row's `custody` column
+    reads back exactly `"root-file"`."""
+    root_key, root_cert = root
+    _key, cert = make_machine_cert(root_key, root_cert, machine=MACHINE)
+    d = der(cert)
+    fp = BRG.fingerprint_sha256_der(d)
+    _stub_verify(monkeypatch, BRG.LookupResult(
+        True, status="active", machine=MACHINE, custody="root-file"))
+
+    outcome = BRG.handle_registration(d, _body())
+
+    assert outcome.ok is True
+    session, reason = BRG.check_session_binding(outcome.session_token, fp)
+    assert reason is None
+    assert session["custody"] == "root-file"
 
 
 def test_handle_registration_reports_the_earlier_refusal_reason_even_when_custody_is_also_wrong(

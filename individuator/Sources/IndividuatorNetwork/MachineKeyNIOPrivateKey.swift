@@ -5,9 +5,15 @@ import NIOSSL
 
 enum MachineKeyNIOPrivateKeyError: Error, CustomStringConvertible {
     case decryptionNotSupported
+    case signingFailed(underlying: Error)
 
     var description: String {
-        "this is a P-256 signing key for TLS 1.3; RSA decryption is not supported"
+        switch self {
+        case .decryptionNotSupported:
+            return "this is a P-256 signing key for TLS 1.3; RSA decryption is not supported"
+        case .signingFailed(let underlying):
+            return "machine key signing failed: \(underlying)"
+        }
     }
 }
 
@@ -39,7 +45,7 @@ struct MachineKeyNIOPrivateKey: NIOSSLCustomPrivateKey, Hashable {
             out.writeBytes(signature.derRepresentation)
             promise.succeed(out)
         } catch {
-            promise.fail(error)
+            promise.fail(MachineKeyNIOPrivateKeyError.signingFailed(underlying: error))
         }
         return promise.futureResult
     }

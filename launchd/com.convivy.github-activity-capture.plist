@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.github-activity-capture</string>
+
+    <!-- GitHub review verdicts, review comments, conversation comments and the
+         merged-PR changelog, captured as signals (E25, issue_01M4ZB5C5ZX0MV206064MTRAE0),
+         authenticating as the convivy-bosun GitHub App rather than `gh` under the
+         operator's personal account — the same posture bin/pr-state-capture and
+         bin/ci-result-capture already take.
+
+         180s (3 min): the operator wants GitHub-derived activity to land within
+         3 minutes, the pace the crews work at (2026-10-15, relayed by the
+         steward) — the same interval bin/pr-state-capture's plist states this
+         reasoning for. launchd skips a StartInterval firing while the previous
+         pass is still running (launchd.plist(5)), so passes cannot overlap and
+         no lock is needed. -->
+    <key>StartInterval</key>
+    <integer>180</integer>
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of github-activity-capture, not someone working on it, so
+         this reads a COPY installed from `main` into
+         ~/.local/deploy/agent-platform-shared/ (rules 2, 6, 7) instead of the
+         ~/.local/bin symlink into the checkout — that symlink still exists and
+         still reaches the tree, for the person who re-invokes
+         github-activity-capture interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH.
+
+         NOT INSTALLED BY THIS CHANGE: this plist is committed so its shape and
+         interval are reviewable; the orchestrator loads it after merge
+         (`launchctl load`/`kickstart`) rather than this PR touching
+         ~/Library/LaunchAgents or ~/.local. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/github-activity-capture</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/github-activity-capture.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/github-activity-capture.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ~/.local/bin is not load-bearing here (no subprocess call anywhere
+             in this script) but is kept for parity with this repo's other
+             deploy-pinned jobs, same as com.convivy.ci-result-capture.plist. -->
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

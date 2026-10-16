@@ -488,6 +488,12 @@ jobs:
     needs: changes
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     runs-on: macos-latest
+    # The default is 6 hours; this run's own occurrence (2026-10-15) was a
+    # `swift test` hang that ran 59 minutes before someone cancelled it by
+    # hand. 20 minutes is well above main's own ~1.5-minute run, so a
+    # future hang like this one fails on its own instead of waiting for a
+    # person to notice and cancel it.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - name: record tree-equality skip
@@ -537,4 +543,13 @@ jobs:
           # that install silently broke, exactly what left this job green
           # while mTLS went untested the first time.
           INDIVIDUATOR_REQUIRE_MTLS_INTEGRATION_TEST: "1"
-        run: swift test
+        # Swift Testing's own output is block-buffered once stdout is a
+        # pipe (which a workflow step's stdout always is), so a hang here
+        # used to print nothing until the process exited — on this run's
+        # own occurrence (2026-10-15, run 38787155779/116602087817) that
+        # left `timeout-minutes: 20` killing a job whose log named no test
+        # at all. `script -q -e /dev/null` gives `swift test` a pty, so its
+        # per-test progress streams to this step's log as it happens; `-e`
+        # makes `script`'s own exit status `swift test`'s, so this step
+        # still fails exactly when `swift test` does.
+        run: script -q -e /dev/null swift test

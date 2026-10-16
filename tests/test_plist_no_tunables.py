@@ -159,3 +159,14 @@ def test_an_agent_spawning_job_puts_local_bin_on_path():
             f"{path.name} spawns agents but omits ~/.local/bin from PATH, so "
             f"`agentctl spawn` cannot exec claude and every run fails to start one")
     assert checked, "no agent-spawning plists matched — the spawner list has rotted"
+
+
+def test_ci_result_capture_runs_every_three_minutes():
+    """CI results should land within 3 minutes of landing on GitHub (operator
+    ruling 2026-10-15, relayed by the steward), so `StartInterval` is 180, not
+    the 900 (15 min) cadence this job started with."""
+    path = LAUNCHD / "com.convivy.ci-result-capture.plist"
+    data = plistlib.loads(path.read_bytes())
+    assert data["StartInterval"] == 180, (
+        f"{path.name}'s StartInterval is {data['StartInterval']}, not 180 — "
+        f"CI results would lag the crews' 3-minute pace")

@@ -16884,9 +16884,12 @@ def test_content_scan_gate_blocks_when_publish_scan_is_unlinked(agentctl, tmp_pa
 
 def test_content_scan_gate_skips_a_repo_publish_engine_does_not_export(
         agentctl, tmp_path, monkeypatch):
-    """Mirrors `scan_commit`'s own contract: returning None (not raising) for a
-    repository `publish-engine` does not know about is what lets the gate pass
-    through — `cmd_publish` must never block an unrelated repository's push."""
+    """Mirrors `scan_commit`'s own contract: it returns None (not raising)
+    when publish-engine's own argparse rejects the repository as a choice it
+    has never heard of, since `cmd_publish` runs this gate against every
+    repository it pushes, not only the five publish-engine scans — a
+    repository outside that five is not this gate's business, and must
+    never block the push."""
     monkeypatch.setattr(agentctl.PS, "scan_commit", lambda repo, wt, head: None)
     assert agentctl._content_scan_gate(tmp_path, "sous-chef", "abc123") == 0
 
