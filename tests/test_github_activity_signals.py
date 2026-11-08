@@ -18,7 +18,7 @@ def test_signal_from_review_approved():
         "html_url": "https://github.com/acme/widget/pull/42#pullrequestreview-9001",
         "submitted_at": "2026-10-01T12:00:00Z",
     }
-    assert ga.signal_from_review("widget", 42, review) == {
+    assert ga.signal_from_review("acme/widget", 42, review) == {
         "source": "github_review",
         "kind": "review_verdict",
         "product": "widget",
@@ -29,15 +29,22 @@ def test_signal_from_review_approved():
                  "url": "https://github.com/acme/widget/pull/42#pullrequestreview-9001"},
         "meta": {"state": "APPROVED"},
         "produced_at": "2026-10-01T12:00:00Z",
-        "dedup_key": "gh:widget:pr42:review:9001",
+        "dedup_key": "gh:acme/widget:pr42:review:9001",
     }
 
 
-def test_signal_from_review_dedup_key_format():
+def test_signal_from_review_dedup_key_keeps_the_owner_repo_form():
+    """`dedup_key` keeps `owner/repo` even though `product`/`stream` are now
+    the bare basename (CQ·605) — every stored row already carries the
+    `owner/repo` form there, and the Library's backfill of existing rows
+    leaves `dedup_key` untouched, so shortening it would make an overlap
+    re-read write a second row for every row already stored."""
     review = {"id": 123, "state": "APPROVED", "body": "ok",
                "user": {"login": "a"}, "html_url": "", "submitted_at": ""}
-    sig = ga.signal_from_review("some-repo", 7, review)
-    assert sig["dedup_key"] == "gh:some-repo:pr7:review:123"
+    sig = ga.signal_from_review("example-org/some-repo", 7, review)
+    assert sig["dedup_key"] == "gh:example-org/some-repo:pr7:review:123"
+    assert sig["product"] == "some-repo"
+    assert sig["stream"] == "some-repo#7"
 
 
 def test_signal_from_review_commented_empty_body_is_none():
@@ -76,7 +83,7 @@ def test_signal_from_merge():
         "merged_at": "2026-10-02T08:30:00Z",
         "html_url": "https://github.com/acme/widget/pull/55",
     }
-    assert ga.signal_from_merge("widget", pr) == {
+    assert ga.signal_from_merge("acme/widget", pr) == {
         "source": "github",
         "kind": "changelog",
         "stream": "widget",
@@ -87,15 +94,17 @@ def test_signal_from_merge():
                  "merged_at": "2026-10-02T08:30:00Z", "author": "widget-author"},
         "meta": {},
         "produced_at": "2026-10-02T08:30:00Z",
-        "dedup_key": "gh:widget:pr55:merged",
+        "dedup_key": "gh:acme/widget:pr55:merged",
     }
 
 
-def test_signal_from_merge_dedup_key_format():
+def test_signal_from_merge_dedup_key_keeps_the_owner_repo_form():
     pr = {"number": 9, "user": {"login": "a"}, "title": "t", "body": "",
           "merged_at": "2026-10-02T08:30:00Z", "html_url": ""}
-    sig = ga.signal_from_merge("other-repo", pr)
-    assert sig["dedup_key"] == "gh:other-repo:pr9:merged"
+    sig = ga.signal_from_merge("example-org/other-repo", pr)
+    assert sig["dedup_key"] == "gh:example-org/other-repo:pr9:merged"
+    assert sig["product"] == "other-repo"
+    assert sig["stream"] == "other-repo"
 
 
 def test_signal_from_merge_unmerged_pr_is_none():
@@ -134,7 +143,7 @@ def test_signal_from_review_comment():
         "created_at": "2026-10-01T11:00:00Z",
         "path": "src/widget.py",
     }
-    assert ga.signal_from_review_comment("widget", rc) == {
+    assert ga.signal_from_review_comment("acme/widget", rc) == {
         "source": "github_review",
         "kind": "review_comment",
         "product": "widget",
@@ -146,7 +155,7 @@ def test_signal_from_review_comment():
                  "path": "src/widget.py"},
         "meta": {},
         "produced_at": "2026-10-01T11:00:00Z",
-        "dedup_key": "gh:widget:pr42:rc:777",
+        "dedup_key": "gh:acme/widget:pr42:rc:777",
     }
 
 
@@ -163,11 +172,13 @@ def test_signal_from_review_comment_no_path():
     assert "path" not in sig["refs"]
 
 
-def test_signal_from_review_comment_dedup_key_format():
+def test_signal_from_review_comment_dedup_key_keeps_the_owner_repo_form():
     rc = {"id": 42, "pull_request_url": "https://api.github.com/repos/acme/widget/pulls/9",
           "body": "x", "user": {"login": "a"}, "html_url": "", "created_at": ""}
-    sig = ga.signal_from_review_comment("some-repo", rc)
-    assert sig["dedup_key"] == "gh:some-repo:pr9:rc:42"
+    sig = ga.signal_from_review_comment("example-org/some-repo", rc)
+    assert sig["dedup_key"] == "gh:example-org/some-repo:pr9:rc:42"
+    assert sig["product"] == "some-repo"
+    assert sig["stream"] == "some-repo#9"
 
 
 def test_signal_from_review_comment_empty_body_is_none():
@@ -191,7 +202,7 @@ def test_signal_from_issue_comment_on_a_pull_request():
         "html_url": "https://github.com/acme/widget/pull/42#issuecomment-555",
         "created_at": "2026-10-01T10:00:00Z",
     }
-    assert ga.signal_from_issue_comment("widget", ic) == {
+    assert ga.signal_from_issue_comment("acme/widget", ic) == {
         "source": "github_review",
         "kind": "pr_comment",
         "product": "widget",
@@ -201,8 +212,19 @@ def test_signal_from_issue_comment_on_a_pull_request():
         "refs": {"pr": 42, "url": "https://github.com/acme/widget/pull/42#issuecomment-555"},
         "meta": {},
         "produced_at": "2026-10-01T10:00:00Z",
-        "dedup_key": "gh:widget:pr42:ic:555",
+        "dedup_key": "gh:acme/widget:pr42:ic:555",
     }
+
+
+def test_signal_from_issue_comment_dedup_key_keeps_the_owner_repo_form():
+    ic = {"id": 557, "issue_url": "https://api.github.com/repos/acme/widget/issues/42",
+          "body": "x", "user": {"login": "a"},
+          "html_url": "https://github.com/acme/widget/pull/42#issuecomment-557",
+          "created_at": ""}
+    sig = ga.signal_from_issue_comment("example-org/some-repo", ic)
+    assert sig["dedup_key"] == "gh:example-org/some-repo:pr42:ic:557"
+    assert sig["product"] == "some-repo"
+    assert sig["stream"] == "some-repo#42"
 
 
 def test_signal_from_issue_comment_on_an_issue_is_none():
@@ -227,3 +249,21 @@ def test_signal_from_issue_comment_no_number_in_url_is_none():
     ic = {"id": 1, "issue_url": "", "body": "x",
           "user": {"login": "a"}, "html_url": "", "created_at": ""}
     assert ga.signal_from_issue_comment("widget", ic) is None
+
+
+# --- is_safe_basename: the security review round 1 guard (CQ·605) ----------
+
+
+def test_is_safe_basename_rejects_dot():
+    """`example-org/.`'s basename is `.` — the exact path-traversal case
+    `worktrees._is_safe_segment` (reused here) already rejects for
+    `is_dispatch_target`'s own segments."""
+    assert ga.is_safe_basename("example-org/.") is False
+
+
+def test_is_safe_basename_rejects_dot_dot():
+    assert ga.is_safe_basename("example-org/..") is False
+
+
+def test_is_safe_basename_accepts_an_ordinary_repo():
+    assert ga.is_safe_basename("example-org/widget-repo") is True

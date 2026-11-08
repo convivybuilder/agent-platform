@@ -423,12 +423,15 @@ class ClaudeSession:
         without this module needing to look it up a second time."""
         return (self._pwent.pw_uid, self._pwent.pw_gid)
 
-    def env(self, *, claude_config_dir: Path, home: Path) -> "dict[str, str]":
+    def env(self, *, claude_config_dir: Path, home: Path, repo: str,
+           review_sha: str, draft_dir: Path, registry_path: Path) -> "dict[str, str]":
         try:
             token = self._oauth_token_path.read_text().strip()
         except OSError:
             token = ""
-        return RL.session_env(claude_config_dir=claude_config_dir, oauth_token=token, home=home)
+        return RL.session_env(claude_config_dir=claude_config_dir, oauth_token=token, home=home,
+                              repo=repo, review_sha=review_sha, draft_dir=draft_dir,
+                              registry_path=registry_path)
 
     def run(self, *, cmd: "list[str]", env: "dict[str, str]", cwd: Path) -> "tuple[int, str | None]":
         """Runs `cmd` as `self._account` and reads the session's verdict

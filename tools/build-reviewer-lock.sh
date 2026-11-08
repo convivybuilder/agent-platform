@@ -3,11 +3,12 @@
 #
 # Why a separate lock rather than hashes in requirements.txt itself
 # (platform/decisions/0090-builder-runs-as-two-dedicated-accounts-and-github-holds-the-gate):
-# root installs the REVIEWER venv with `pip --require-hashes` from a commit it
+# root installs the REVIEWER venv with `pip --require-hashes --only-binary :all:`
+# (installs from wheels only; never builds an sdist) from a commit it
 # confirms is on agent-platform's main, so every byte it installs for a
 # reviewer or security-reviewer session is pinned by hash. requirements.txt
 # stays the unhashed top-level set for every OTHER install (knowledge-watcher,
-# notion-migrate, the dev/test venv); this lock covers only what the reviewer
+# notify.py, the dev/test venv); this lock covers only what the reviewer
 # tooling actually imports (see the header this script writes).
 #
 # PINS TO WHAT THIS REPO'S OWN LOCK ALREADY SAYS, NEVER TO WHATEVER PyPI
@@ -46,6 +47,7 @@ cat > "$WORK/reviewer.in" <<'EOF'
 mcp==1.28.1
 PyYAML==6.0.3
 cryptography==50.0.1
+certifi==2026.10.23
 EOF
 
 # Constrain the TRANSITIVE packages to the versions the EXISTING lock already
@@ -96,8 +98,9 @@ cat > "$OUT" <<HEADER
 # requirements-reviewer.lock.txt — hash-pinned lock for the reviewer tooling's
 # venv (platform/decisions/0090-builder-runs-as-two-dedicated-accounts-and-
 # github-holds-the-gate): root installs the reviewer/security-reviewer venv
-# with \`pip install --require-hashes -r requirements-reviewer.lock.txt\`, so
-# every byte it installs is pinned by hash. Regenerate with:
+# with \`pip install --require-hashes --only-binary :all: -r
+# requirements-reviewer.lock.txt\` (installs from wheels only; never builds an
+# sdist), so every byte it installs is pinned by hash. Regenerate with:
 #   tools/build-reviewer-lock.sh
 #
 # Reviewer tooling's import surface, derived from the review path:
@@ -115,16 +118,16 @@ cat > "$OUT" <<HEADER
 # agentctl's own review commands (review-status, spawn, wait, result, status,
 # pr-open) are stdlib-only and need nothing from this lock.
 # NOT included, though requirements.txt carries them for other installs:
-# watchdog (knowledge-watcher only) and requests (notion-migrate only) — ask
+# watchdog (knowledge-watcher only) and requests (notify.py only) — ask
 # lib/agent-platform/venv_bootstrap.py's module docstring who needs what if
 # this surface is ever in question.
 #
 # Transitive versions are pinned to what THIS FILE already said before the
 # regeneration that produced it (tools/build-reviewer-lock.sh constrains
-# pip-compile to its own prior output); only mcp, PyYAML and cryptography can
-# move, and only by editing the pins in that script. Transitive hashes below
-# are pip-compile's (sha256 wheel + sdist for every platform PyPI publishes),
-# not hand-computed.
+# pip-compile to its own prior output); only mcp, PyYAML, cryptography and
+# certifi can move, and only by editing the pins in that script. Transitive
+# hashes below are pip-compile's (sha256 wheel + sdist for every platform
+# PyPI publishes), not hand-computed.
 HEADER
 cat "$WORK/reviewer.lock.body.txt" >> "$OUT"
 

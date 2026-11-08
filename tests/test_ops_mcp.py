@@ -12,6 +12,7 @@ import io
 import json
 import os
 import re
+import tempfile
 import urllib.error
 import urllib.parse
 from pathlib import Path
@@ -32,48 +33,114 @@ def _fake_urlopen(module, monkeypatch, *, payload=None, error=None, capture=None
     monkeypatch.setattr(module.urllib.request, "urlopen", fake)
 
 
-def _with_token(module, monkeypatch):
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "test-token")
+def _with_token(module, monkeypatch, text="test-token\n"):
+    """Point the server at a fresh crew token file holding `text` and return the
+    module. `ORIENT_OPS_CREW_TOKEN_FILE` is the only credential path the server
+    reads now (platform/contracts/library-protocol §2.5) — the same file on a read
+    and a write, a co's or not; this server does not tell the two apart. A bare
+    `tempfile.mkstemp()` location, new each call, so one test's file is never the
+    one a later test's unset/missing-file case reads back."""
+    fd, raw = tempfile.mkstemp()
+    os.close(fd)
+    f = Path(raw)
+    f.write_text(text)
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(f))
     return module
 
 
 @pytest.fixture(autouse=True)
-def _no_co_credential_in_the_caller_environment(monkeypatch):
+def _no_crew_credential_in_the_caller_environment(monkeypatch):
     """A variable exported in the caller's shell would reach a suite run through the
     environment, and a test could then see a credential path the Library may not have
-    issued. Clear it, and let each test that needs the co credential set its own.
+    issued. Clear it, and let each test that needs a crew credential set its own.
     bin/co no longer exports it (it names the path only in the ops server's MCP config),
     so no co session carries it into this suite. This guards a hand-exported value, and
-    no failure on this head depends on it: conftest pins the Orient plane for every test."""
-    monkeypatch.delenv("ORIENT_OPS_CO_TOKEN_FILE", raising=False)
+    no failure on this head depends on it."""
+    monkeypatch.delenv("ORIENT_OPS_CREW_TOKEN_FILE", raising=False)
 
 
 # --- token resolution -----------------------------------------------------------
 
 
-def test_token_env_wins_over_file(mcp_ops_server, tmp_path, monkeypatch):
-    f = tmp_path / "ops-mcp-token"
-    f.write_text("file-token\n")
-    monkeypatch.setattr(mcp_ops_server, "TOKEN_FILE", f)
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "env-token")
-    assert mcp_ops_server._token() == "env-token"
-    monkeypatch.delenv("ORIENT_OPS_TOKEN")
-    assert mcp_ops_server._token() == "file-token"
+def test_token_reads_the_named_files_stripped_contents(mcp_ops_server, tmp_path, monkeypatch):
+    f = tmp_path / "crew-token"
+    f.write_text("  file-token  \n")
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(f))
+    assert mcp_ops_server._token() == ("file-token", None)
 
 
-def test_missing_token_yields_readable_error(mcp_ops_server, tmp_path, monkeypatch):
-    monkeypatch.setattr(mcp_ops_server, "TOKEN_FILE", tmp_path / "absent")
-    monkeypatch.delenv("ORIENT_OPS_TOKEN", raising=False)
-    assert mcp_ops_server._token() is None
+def test_unset_variable_refuses_with_no_path_to_name(mcp_ops_server, monkeypatch):
+    monkeypatch.delenv("ORIENT_OPS_CREW_TOKEN_FILE", raising=False)
+    tok, err = mcp_ops_server._token()
+    assert tok is None
+    assert "unset" in err["error"]
+
+
+@pytest.mark.parametrize("text", [None, "", "  \n"], ids=["missing", "empty", "blank"])
+def test_missing_empty_or_blank_file_refuses_and_names_the_path(
+        mcp_ops_server, tmp_path, monkeypatch, text):
+    f = tmp_path / "crew-token"
+    if text is not None:
+        f.write_text(text)
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(f))
+    tok, err = mcp_ops_server._token()
+    assert tok is None
+    assert str(f) in err["error"]
+
+
+def test_an_unreadable_file_refuses_and_names_the_path(mcp_ops_server, tmp_path, monkeypatch):
+    f = tmp_path / "crew-token"
+    f.write_text("secret\n")
+    f.chmod(0o000)
+    try:
+        monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(f))
+        tok, err = mcp_ops_server._token()
+        assert tok is None
+        assert str(f) in err["error"]
+    finally:
+        f.chmod(0o600)
+
+
+def test_missing_token_yields_readable_error_with_no_request(
+        mcp_ops_server, tmp_path, monkeypatch):
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(tmp_path / "absent"))
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload={"signals": []})
     out = json.loads(mcp_ops_server.signal_search("anything"))
-    assert "no ops token" in out["error"]
+    assert str(tmp_path / "absent") in out["error"]
+    assert seen == []  # the refusal is decided before any request is built
+
+
+def test_unset_variable_yields_readable_error_with_no_request(mcp_ops_server, monkeypatch):
+    monkeypatch.delenv("ORIENT_OPS_CREW_TOKEN_FILE", raising=False)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload={"signals": []})
+    out = json.loads(mcp_ops_server.signal_search("anything"))
+    assert "unset" in out["error"]
+    assert seen == []
+
+
+def test_the_shared_file_beside_a_missing_crew_file_is_never_presented(
+        mcp_ops_server, tmp_path, monkeypatch):
+    """There is no shared fallback file any more: a legacy `ops-mcp-token` sitting
+    right beside the named (but missing) crew file must never be read, let alone
+    presented — the whole point of removing `TOKEN_FILE`/`_grant_token`'s fallback."""
+    shared = tmp_path / "ops-mcp-token"
+    shared.write_text("shared-secret\n")
+    crew_file = tmp_path / "ops-some-crew-token"  # named, but never written
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(crew_file))
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload={"signals": []})
+    out = json.loads(mcp_ops_server.signal_search("anything"))
+    assert "error" in out and "shared-secret" not in json.dumps(out)
+    assert seen == []
 
 
 # --- item shaping ---------------------------------------------------------------
 
 
 def test_shape_clips_search_bodies_but_not_full(mcp_ops_server):
-    item = {"id": "sig_1", "product": "vivy", "body": "x" * 5000,
+    item = {"id": "sig_1", "product": "widget", "body": "x" * 5000,
             "refs": {"url": "https://github.com/x"}, "distance": 0.42,
             "produced_at": None, "ingested_at": "2026-07-16T00:00:00"}
     shaped = mcp_ops_server._shape_item(item)
@@ -99,6 +166,28 @@ def test_shape_omits_absent_url_and_distance(mcp_ops_server):
     assert "url" not in shaped and "distance" not in shaped
 
 
+def test_shape_with_meta_carries_the_librarys_meta_through(mcp_ops_server):
+    shaped = mcp_ops_server._shape_item(
+        {"id": "sig_4", "body": "b", "refs": {},
+         "meta": {"mergeable": "CLEAN", "review_decision": "APPROVED"}},
+        full_body=True, with_meta=True)
+    assert shaped["meta"] == {"mergeable": "CLEAN", "review_decision": "APPROVED"}
+
+
+def test_shape_with_meta_omits_the_key_when_the_library_sent_none(mcp_ops_server):
+    shaped = mcp_ops_server._shape_item({"id": "sig_5", "body": "b", "refs": {}},
+                                        full_body=True, with_meta=True)
+    assert "meta" not in shaped
+
+
+def test_shape_without_with_meta_never_carries_meta_even_when_present(mcp_ops_server):
+    # signal_search's snippet view: meta is present on the item but with_meta
+    # defaults to False, so a 50-row search page does not grow.
+    shaped = mcp_ops_server._shape_item(
+        {"id": "sig_6", "body": "b", "refs": {}, "meta": {"a": 1}})
+    assert "meta" not in shaped
+
+
 # --- request building + error translation ----------------------------------------
 
 
@@ -108,11 +197,11 @@ def test_search_builds_params_and_shapes(mcp_ops_server, monkeypatch):
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"signals": [{"id": "sig_9", "body": "b", "refs": {}}]})
     out = json.loads(mcp_ops_server.signal_search(
-        "race condition", limit=5, product="vivy"))
+        "race condition", limit=5, product="widget"))
     assert out["count"] == 1 and out["items"][0]["id"] == "sig_9"
     url = seen[0].full_url
     assert "/api/signals/search?" in url and "q=race+condition" in url
-    assert "limit=5" in url and "product=vivy" in url
+    assert "limit=5" in url and "product=widget" in url
     assert "source=" not in url  # None params are dropped, not sent as "None"
     assert "offset=" not in url  # offset=0 default is dropped, like issue_list
     assert seen[0].headers["Authorization"] == "Bearer test-token"
@@ -183,6 +272,18 @@ def test_search_omits_truncation_fields_on_legacy_server(mcp_ops_server, monkeyp
     assert "filtered_out" not in out
 
 
+def test_search_does_not_carry_meta_even_when_the_library_sends_it(
+        mcp_ops_server, monkeypatch):
+    """The search snippet view stays as it is: carrying `meta` here would grow
+    a 50-row search page, which signal_get and signal_list exist to avoid."""
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch, payload={
+        "signals": [{"id": "sig_9", "body": "b", "refs": {},
+                    "meta": {"mergeable": "CLEAN"}}]})
+    out = json.loads(mcp_ops_server.signal_search("q"))
+    assert "meta" not in out["items"][0]
+
+
 def test_search_rejects_negative_offset(mcp_ops_server, monkeypatch):
     _with_token(mcp_ops_server, monkeypatch)
     seen = []
@@ -199,13 +300,13 @@ def test_log_posts_payload_and_returns_id(mcp_ops_server, monkeypatch):
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "sig_new", "idempotent": False})
     out = json.loads(mcp_ops_server.signal_log(
-        kind="note", body="finding", product="vivy", actor="steward",
-        stream="vivy#9", url="https://github.com/x", dedup_key="k:1"))
+        kind="note", body="finding", product="widget", actor="steward",
+        stream="widget#9", url="https://github.com/x", dedup_key="k:1"))
     assert out == {"id": "sig_new", "idempotent": False}
     sent = json.loads(seen[0].data)
     assert sent["source"] == "agent" and sent["actor"] == "steward"
     assert sent["refs"] == {"url": "https://github.com/x"}
-    assert sent["stream"] == "vivy#9" and sent["dedup_key"] == "k:1"
+    assert sent["stream"] == "widget#9" and sent["dedup_key"] == "k:1"
 
 
 def test_get_routes_by_id_and_keeps_full_body(mcp_ops_server, monkeypatch):
@@ -315,6 +416,25 @@ def test_get_percent_encodes_slashes_in_id(mcp_ops_server, monkeypatch):
     assert "a%2F..%2Fb" in seen[0].full_url
 
 
+def test_get_returns_meta_when_the_library_sends_it(mcp_ops_server, monkeypatch):
+    """A post-merge check reads a pr_state row's `mergeable`/`review_decision`
+    (CQ·636) from `meta`; signal_get must carry it through."""
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch, payload={
+        "id": "sig_1", "body": "b", "refs": {},
+        "meta": {"mergeable": "CLEAN", "review_decision": "APPROVED"}})
+    out = json.loads(mcp_ops_server.signal_get("sig_1"))
+    assert out["meta"] == {"mergeable": "CLEAN", "review_decision": "APPROVED"}
+
+
+def test_get_omits_meta_key_when_the_library_sends_none(mcp_ops_server, monkeypatch):
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch,
+                  payload={"id": "sig_1", "body": "b", "refs": {}})
+    out = json.loads(mcp_ops_server.signal_get("sig_1"))
+    assert "meta" not in out
+
+
 # --- signal_list (the Library's GET /signals: one kind, one product, newest first) ---
 
 
@@ -352,7 +472,7 @@ def _record(sig_id, kind, product, ingested_at, body="b"):
 _HANDOFF_STORE = [
     _record("sig_old", "handoff", "bosun", "2026-10-05T10:00:00Z", body="old " * 500),
     _record("sig_note", "note", "bosun", "2026-10-06T12:00:00Z"),
-    _record("sig_vivy", "handoff", "vivy", "2026-10-06T11:00:00Z"),
+    _record("sig_widget", "handoff", "widget", "2026-10-06T11:00:00Z"),
     _record("sig_new", "handoff", "bosun", "2026-10-06T09:00:00Z"),
     _record("sig_mid", "handoff", "bosun", "2026-10-06T01:00:00Z"),
 ]
@@ -396,7 +516,7 @@ def test_signal_list_applies_the_product_filter(mcp_ops_server, monkeypatch):
     monkeypatch.setattr(mcp_ops_server.urllib.request, "urlopen",
                         _library_listing(_HANDOFF_STORE, []))
     out = json.loads(mcp_ops_server.signal_list("handoff", "bosun"))
-    assert "sig_vivy" not in [i["id"] for i in out["items"]]
+    assert "sig_widget" not in [i["id"] for i in out["items"]]
     assert all(i["product"] == "bosun" for i in out["items"])
 
 
@@ -423,6 +543,24 @@ def test_signal_list_passes_a_library_refusal_through_as_an_error(
     _fake_urlopen(mcp_ops_server, monkeypatch, payload={"signals": [], "count": 0})
     empty = json.loads(mcp_ops_server.signal_list("handoff", "bosun"))
     assert empty == {"count": 0, "items": []}
+
+
+def test_signal_list_returns_meta_per_item(mcp_ops_server, monkeypatch):
+    """A pr_state row's `mergeable`/`review_decision` (CQ·636) lives in `meta`
+    and nowhere else a caller of signal_list can read it back from."""
+    _with_token(mcp_ops_server, monkeypatch)
+    store = [
+        {**_record("sig_pr_1", "pr_state", "widget", "2026-10-06T09:00:00Z"),
+         "meta": {"mergeable": "CLEAN", "review_decision": "APPROVED"}},
+        {**_record("sig_pr_2", "pr_state", "widget", "2026-10-06T01:00:00Z"),
+         "meta": {"mergeable": "CONFLICTING", "review_decision": None}},
+    ]
+    monkeypatch.setattr(mcp_ops_server.urllib.request, "urlopen",
+                        _library_listing(store, []))
+    out = json.loads(mcp_ops_server.signal_list("pr_state", "widget"))
+    metas = {i["id"]: i["meta"] for i in out["items"]}
+    assert metas["sig_pr_1"] == {"mergeable": "CLEAN", "review_decision": "APPROVED"}
+    assert metas["sig_pr_2"] == {"mergeable": "CONFLICTING", "review_decision": None}
 
 
 def test_signal_list_clamps_limit_to_the_library_page_cap(mcp_ops_server, monkeypatch):
@@ -490,12 +628,12 @@ def test_issue_create_posts_payload_and_returns_id(mcp_ops_server, monkeypatch):
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "bug_new", "url": "/bugs/bug_new", "state": "open"})
     out = json.loads(mcp_ops_server.issue_create(
-        product="vivy", title="crash", body="trace", severity="high",
+        product="widget", title="crash", body="trace", severity="high",
         url="https://github.com/x/9", once_key="k:9"))
     assert out["id"] == "bug_new" and out["state"] == "open"
     sent = json.loads(seen[0].data)
     assert seen[0].full_url.endswith("/api/issues")
-    assert sent["product"] == "vivy" and sent["title"] == "crash"
+    assert sent["product"] == "widget" and sent["title"] == "crash"
     assert sent["severity"] == "high" and sent["once_key"] == "k:9"
     assert sent["refs"] == {"url": "https://github.com/x/9"}
 
@@ -508,7 +646,7 @@ def test_issue_create_sends_no_type_key_by_default(mcp_ops_server, monkeypatch):
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "issue_a", "state": "open"})
-    mcp_ops_server.issue_create(product="vivy", title="t", severity="low")
+    mcp_ops_server.issue_create(product="widget", title="t", severity="low")
     assert "type" not in json.loads(seen[0].data)
 
 
@@ -517,7 +655,7 @@ def test_issue_create_sends_type_epic_when_passed_epic(mcp_ops_server, monkeypat
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "issue_a", "state": "open"})
-    mcp_ops_server.issue_create(product="vivy", title="t", severity="low", type="epic")
+    mcp_ops_server.issue_create(product="widget", title="t", severity="low", type="epic")
     assert json.loads(seen[0].data)["type"] == "epic"
 
 
@@ -532,7 +670,7 @@ def test_issue_create_refuses_a_non_epic_type_before_any_request(
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "issue_a", "state": "open"})
     out = json.loads(mcp_ops_server.issue_create(
-        product="vivy", title="t", severity="low", type="bug"))
+        product="widget", title="t", severity="low", type="bug"))
     assert "error" in out and "epic" in out["error"]
     assert seen == [], "a refused type must not reach the Library"
 
@@ -545,7 +683,7 @@ def test_bug_create_sends_no_type_key(mcp_ops_server, monkeypatch):
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "bug_a", "state": "open"})
-    mcp_ops_server.bug_create(product="vivy", title="t", severity="low")
+    mcp_ops_server.bug_create(product="widget", title="t", severity="low")
     assert "type" not in json.loads(seen[0].data)
 
 
@@ -571,129 +709,74 @@ def test_no_tool_description_names_a_retired_type_value(mcp_ops_server):
             f"{name}'s description still names a retired type")
 
 
-# --- the co credential (item creation is the grant-only write) -------------------
+# --- the crew credential: one file, presented on every call, reads and writes
+# --- alike (platform/contracts/library-protocol §2.5). item_create is a WRITE
+# --- this server does not single out: it presents whichever file was named, the
+# --- same as every other tool, and the grant lives in the file, not here.
 # The credential file's name is kept out of this file by
 # tests/test_ops_co_credential_confined.py, so these use a neutral name.
 
 
-def _co_credential(module, tmp_path, monkeypatch, text="co-secret\n", library_plane=True):
-    """Point the server at a co credential file holding `text` (None = absent).
-    The co credential is a Library grant, so these run on the Library plane unless
-    `library_plane` says otherwise."""
-    f = tmp_path / "co-credential"
-    if text is not None:
-        f.write_text(text)
-    monkeypatch.setenv("ORIENT_OPS_CO_TOKEN_FILE", str(f))
-    monkeypatch.setattr(module.vault_plane, "VAULTS_ON_LIBRARY", library_plane)
-    return f
-
-
-def test_co_session_files_an_item_with_the_co_credential(mcp_ops_server, tmp_path, monkeypatch):
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "agent-secret")
-    _co_credential(mcp_ops_server, tmp_path, monkeypatch)
-    seen = []
-    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
-                  payload={"id": "iss_co", "state": "open"})
-    out = json.loads(mcp_ops_server.issue_create(product="vivy", title="t", severity="low"))
-    assert out["id"] == "iss_co"
-    assert seen[0].get_header("Authorization") == "Bearer co-secret"
-
-
-def test_outside_a_co_session_item_creation_keeps_the_agent_token(
-        mcp_ops_server, monkeypatch):
-    monkeypatch.delenv("ORIENT_OPS_CO_TOKEN_FILE", raising=False)
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "agent-secret")
+def test_a_write_presents_the_named_files_token_same_as_a_read(
+        mcp_ops_server, tmp_path, monkeypatch):
+    f = tmp_path / "crew-credential"
+    f.write_text("crew-secret\n")
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(f))
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "iss_1", "state": "open"})
-    mcp_ops_server.issue_create(product="vivy", title="t", severity="low")
-    assert seen[0].get_header("Authorization") == "Bearer agent-secret"
+    out = json.loads(mcp_ops_server.issue_create(product="widget", title="t", severity="low"))
+    assert out["id"] == "iss_1"
+    write_auth = seen[0].get_header("Authorization")
+    assert write_auth == "Bearer crew-secret"
 
-
-@pytest.mark.parametrize("text", [None, "", "  \n"], ids=["absent", "empty", "blank"])
-def test_co_session_without_its_credential_refuses_and_names_the_file(
-        mcp_ops_server, tmp_path, monkeypatch, text):
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "agent-secret")
-    f = _co_credential(mcp_ops_server, tmp_path, monkeypatch, text=text)
-    seen = []
-    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
-                  payload={"id": "iss_agent", "state": "open"})
-    out = json.loads(mcp_ops_server.issue_create(product="vivy", title="t", severity="low"))
-    assert str(f) in out["error"] and "Nothing was filed" in out["error"]
-    # No request went out at all, so the agent token never filed it.
-    assert seen == []
-
-
-def test_co_session_without_its_credential_still_reads_on_the_agent_token(
-        mcp_ops_server, tmp_path, monkeypatch):
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "agent-secret")
-    _co_credential(mcp_ops_server, tmp_path, monkeypatch, text=None)
-    seen = []
+    seen.clear()
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload={"signals": []})
-    out = json.loads(mcp_ops_server.signal_search("anything"))
-    assert out["count"] == 0 and "error" not in out
-    assert seen[0].get_header("Authorization") == "Bearer agent-secret"
+    json.loads(mcp_ops_server.signal_search("anything"))
+    # The SAME file's token, on a read — there is no second token for the write.
+    assert seen[0].get_header("Authorization") == write_auth
 
 
-@pytest.mark.parametrize("value", ["", "   "], ids=["empty", "blank"])
-def test_a_set_but_empty_co_variable_refuses_and_never_falls_back(
-        mcp_ops_server, monkeypatch, value):
-    """A variable set to nothing names no file. It must refuse like a missing file, not
-    fall through to the agent token, which the docstring says never happens."""
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "agent-secret")
-    monkeypatch.setenv("ORIENT_OPS_CO_TOKEN_FILE", value)
-    # The suite pins the Orient plane (conftest _pin_the_plane), where no co grant applies.
-    monkeypatch.setattr(mcp_ops_server.vault_plane, "VAULTS_ON_LIBRARY", True)
+@pytest.mark.parametrize("text", [None, "", "  \n"], ids=["missing", "empty", "blank"])
+def test_item_create_refuses_a_missing_empty_or_blank_file_and_names_it(
+        mcp_ops_server, tmp_path, monkeypatch, text):
+    f = tmp_path / "crew-credential"
+    if text is not None:
+        f.write_text(text)
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", str(f))
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "iss_agent", "state": "open"})
-    out = json.loads(mcp_ops_server.issue_create(product="vivy", title="t", severity="low"))
-    assert "Nothing was filed" in out["error"]
+    out = json.loads(mcp_ops_server.issue_create(product="widget", title="t", severity="low"))
+    assert str(f) in out["error"]
+    # No request went out at all.
     assert seen == []
 
 
-def test_orient_plane_item_creation_presents_the_agent_token_even_in_a_co_session(
-        mcp_ops_server, tmp_path, monkeypatch):
-    """Orient has no grant model, and VAULTS_ON_LIBRARY=0 is the operator's rollback.
-    Orient's _human_gate refuses every non-human identity, so the agent token never filed
-    through that route. Presenting the agent token keeps this plane as it was and opens
-    nothing new."""
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "agent-secret")
-    _co_credential(mcp_ops_server, tmp_path, monkeypatch, library_plane=False)
+def test_item_create_refuses_an_unset_variable_with_no_request(mcp_ops_server, monkeypatch):
+    monkeypatch.delenv("ORIENT_OPS_CREW_TOKEN_FILE", raising=False)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
-                  payload={"id": "iss_orient", "state": "open"})
-    out = json.loads(mcp_ops_server.issue_create(product="vivy", title="t", severity="low"))
-    assert out["id"] == "iss_orient"
-    assert seen[0].get_header("Authorization") == "Bearer agent-secret"
-
-
-def test_orient_plane_ignores_a_missing_co_credential_rather_than_refusing(
-        mcp_ops_server, tmp_path, monkeypatch):
-    monkeypatch.setenv("ORIENT_OPS_TOKEN", "agent-secret")
-    _co_credential(mcp_ops_server, tmp_path, monkeypatch, text=None, library_plane=False)
-    seen = []
-    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
-                  payload={"id": "iss_orient", "state": "open"})
-    out = json.loads(mcp_ops_server.issue_create(product="vivy", title="t", severity="low"))
-    assert "error" not in out
-    assert seen[0].get_header("Authorization") == "Bearer agent-secret"
+                  payload={"id": "iss_agent", "state": "open"})
+    out = json.loads(mcp_ops_server.issue_create(product="widget", title="t", severity="low"))
+    assert "unset" in out["error"]
+    assert seen == []
 
 
 def test_issue_list_shapes_and_filters(mcp_ops_server, monkeypatch):
     _with_token(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload={"items": [
-        {"id": "bug_1", "url": "/bugs/bug_1", "product": "vivy", "title": "A",
+        {"id": "bug_1", "url": "/bugs/bug_1", "product": "widget", "title": "A",
          "severity": "high", "state": "open", "body": "b",
          "created_at": "2026-07-17T00:00:00Z",
          "refs": {"github_issue": "https://github.com/x/9"}}]})
-    out = json.loads(mcp_ops_server.issue_list(product="vivy", state="open"))
+    out = json.loads(mcp_ops_server.issue_list(product="widget", state="open"))
     assert out["count"] == 1
     item = out["items"][0]
     assert item["id"] == "bug_1" and item["severity"] == "high"
     assert item["github_issue"] == "https://github.com/x/9"
-    assert "product=vivy" in seen[0].full_url and "state=open" in seen[0].full_url
+    assert "product=widget" in seen[0].full_url and "state=open" in seen[0].full_url
 
 
 def test_issue_list_forwards_total_and_truncated_from_new_server(mcp_ops_server, monkeypatch):
@@ -770,10 +853,10 @@ def test_issue_shape_passes_created_by_kind_through(mcp_ops_server, monkeypatch)
     (wait on a decision). ARCH-403 Tier 1.2."""
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch, payload={"items": [
-        {"id": "f_1", "product": "vivy", "title": "human ask", "type": "feature",
+        {"id": "f_1", "product": "widget", "title": "human ask", "type": "feature",
          "state": "open", "created_at": "2026-07-24T00:00:00Z",
          "created_by_kind": "human"}]})
-    item = json.loads(mcp_ops_server.issue_list(product="vivy"))["items"][0]
+    item = json.loads(mcp_ops_server.issue_list(product="widget"))["items"][0]
     assert item["created_by_kind"] == "human"
 
 
@@ -784,9 +867,9 @@ def test_issue_shape_defaults_created_by_kind_to_agent_when_absent(mcp_ops_serve
     feature request."""
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch, payload={"items": [
-        {"id": "f_2", "product": "vivy", "title": "pre-field issue", "type": "feature",
+        {"id": "f_2", "product": "widget", "title": "pre-field issue", "type": "feature",
          "state": "open", "created_at": "2026-07-24T00:00:00Z"}]})
-    item = json.loads(mcp_ops_server.issue_list(product="vivy"))["items"][0]
+    item = json.loads(mcp_ops_server.issue_list(product="widget"))["items"][0]
     assert item["created_by_kind"] == "agent"
 
 
@@ -850,9 +933,9 @@ def test_issue_reconcile_pr_sends_the_owner_when_supplied(mcp_ops_server, monkey
     _with_token(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
-                  payload={"id": "issue_a", "state": "pr-open", "needs": "operator"})
-    mcp_ops_server.issue_reconcile_pr("issue_a", "abandoned", owner="co-a")
-    assert json.loads(seen[0].data) == {"outcome": "abandoned", "owner": "co-a"}
+                  payload={"id": "issue_a", "state": "open"})
+    mcp_ops_server.issue_reconcile_pr("issue_a", "merged", owner="co-a")
+    assert json.loads(seen[0].data) == {"outcome": "merged", "owner": "co-a"}
 
 
 def test_issue_reconcile_pr_omits_owner_when_absent(mcp_ops_server, monkeypatch):
@@ -896,19 +979,19 @@ def test_issue_link_pr_posts_and_shapes_outcome(mcp_ops_server, monkeypatch):
                            # (convivy-orient#127), so a realistic response carries
                            # it alongside `url` rather than only the bare number.
                            "refs": {"pr": 42,
-                                    "url": "https://github.com/convivy/vivy/pull/42",
-                                    "repo": "convivy/vivy"}})
+                                    "url": "https://github.com/convivy/widget/pull/42",
+                                    "repo": "convivy/widget"}})
     out = json.loads(mcp_ops_server.issue_link_pr("bug_1", "42",
-                                                url="https://github.com/convivy/vivy/pull/42"))
+                                                url="https://github.com/convivy/widget/pull/42"))
     assert out["state"] == "pr-open" and out["pr"] == 42  # _shape_bug surfaces refs.pr
     # The two fields a reconciliation sweep needs to identify the repo. Asserted
     # here because `pr` alone is the bug: a bare number resolved against `product`
     # can name a different repo's PR entirely.
-    assert out["pr_url"] == "https://github.com/convivy/vivy/pull/42"
-    assert out["pr_repo"] == "convivy/vivy"
+    assert out["pr_url"] == "https://github.com/convivy/widget/pull/42"
+    assert out["pr_repo"] == "convivy/widget"
     assert seen[0].full_url.endswith("/api/issues/bug_1/link-pr")
     sent = json.loads(seen[0].data)
-    assert sent == {"pr": "42", "url": "https://github.com/convivy/vivy/pull/42"}
+    assert sent == {"pr": "42", "url": "https://github.com/convivy/widget/pull/42"}
 
 
 def test_shaped_issue_omits_pr_fields_when_the_refs_are_absent(mcp_ops_server, monkeypatch):
@@ -958,7 +1041,7 @@ def test_issue_get_returns_unclipped_body_and_the_thread(mcp_ops_server, monkeyp
     _with_token(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload={
-        "id": "issue_1", "product": "vivy", "title": "A", "state": "open",
+        "id": "issue_1", "product": "widget", "title": "A", "state": "open",
         "body": "x" * 5000,
         "comments": [{"id": 1, "actor": "bug-investigator", "kind": "diagnosis",
                       "body": "root cause: stale fixture"}]})
@@ -975,7 +1058,7 @@ def test_issue_get_returns_the_epic_fields(mcp_ops_server, monkeypatch):
     has no route left to read the text being approved."""
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch, payload={
-        "id": "issue_1", "product": "vivy", "state": "open", "body": "b",
+        "id": "issue_1", "product": "widget", "state": "open", "body": "b",
         "specification": "do X then Y", "definition_of_done": "X and Y both land",
         "maturity": "proposed", "parent_id": "issue_parent"})
     out = json.loads(mcp_ops_server.issue_get("issue_1"))
@@ -992,7 +1075,7 @@ def test_issue_get_passes_a_long_thread_through_whole(mcp_ops_server, monkeypatc
     worst case, not a clip here."""
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch, payload={
-        "id": "issue_1", "product": "vivy", "state": "claimed", "body": "b",
+        "id": "issue_1", "product": "widget", "state": "claimed", "body": "b",
         "comments": [{"id": i, "kind": "note", "body": "y" * 3000} for i in range(200)]})
     out = json.loads(mcp_ops_server.issue_get("issue_1"))
     assert len(out["comments"]) == 200
@@ -1090,7 +1173,7 @@ def test_deprecated_bug_aliases_delegate_to_issue_implementations(mcp_ops_server
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "bug_new", "url": "/engineering/issues/bug_new",
                            "state": "open"})
-    out = json.loads(mcp_ops_server.bug_create(product="vivy", title="t", severity="high"))
+    out = json.loads(mcp_ops_server.bug_create(product="widget", title="t", severity="high"))
     assert out["id"] == "bug_new"
     assert seen[0].full_url.endswith("/api/issues"), \
         "the deprecated alias must hit the NEW path, proving it delegates"
@@ -1131,14 +1214,14 @@ def test_issue_create_requires_explicit_severity(mcp_ops_server):
     """severity has no default — omitting it raises TypeError, so no caller can
     silently file the value the API now rejects."""
     with pytest.raises(TypeError):
-        mcp_ops_server.issue_create(product="vivy", title="t")
+        mcp_ops_server.issue_create(product="widget", title="t")
 
 
 def test_bug_create_requires_explicit_severity(mcp_ops_server):
     """The deprecated alias must carry the same requirement — it delegates to
     issue_create, so both surfaces must enforce it."""
     with pytest.raises(TypeError):
-        mcp_ops_server.bug_create(product="vivy", title="t")
+        mcp_ops_server.bug_create(product="widget", title="t")
 
 
 @pytest.mark.parametrize("sev", ["high", "medium", "low"])
@@ -1148,7 +1231,7 @@ def test_issue_create_valid_severities_pass_through(mcp_ops_server, monkeypatch,
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "issue_new", "url": "/issues/issue_new", "state": "open"})
-    mcp_ops_server.issue_create(product="vivy", title="t", severity=sev)
+    mcp_ops_server.issue_create(product="widget", title="t", severity=sev)
     assert json.loads(seen[0].data)["severity"] == sev
 
 
@@ -1157,7 +1240,7 @@ def test_issue_create_valid_severities_pass_through(mcp_ops_server, monkeypatch,
 
 def _lease(**over):
     d = {"id": "lease_1", "root_id": "issue_epic", "root_url": "/engineering/issues/issue_epic",
-         "taken_for": "issue_a", "holder": "co-vivy-0930", "run_id": "run-7f3a91",
+         "taken_for": "issue_a", "holder": "co-widget-0930", "run_id": "run-7f3a91",
          "taken_at": "2026-08-05T10:00:00Z", "heartbeat_at": "2026-08-05T10:00:00Z",
          "expires_at": "2026-08-05T14:00:00Z", "dead": False,
          "released_at": None, "release_reason": None, "released_by": None, "note": None}
@@ -1175,13 +1258,13 @@ def test_issue_checkout_sends_the_owner_and_returns_the_lease(mcp_ops_server, mo
                   payload={"item": {"id": "issue_a", "state": "claimed"},
                            "lease": _lease(fences=["issue_epic", "issue_a", "issue_b"]),
                            "policy": {"grace_seconds": 14400}})
-    out = json.loads(mcp_ops_server.issue_checkout("issue_a", owner="co-vivy-0930",
+    out = json.loads(mcp_ops_server.issue_checkout("issue_a", owner="co-widget-0930",
                                                    run_id="run-7f3a91"))
     assert seen[0].full_url.endswith("/api/issues/issue_a/checkout")
     sent = json.loads(seen[0].data)
-    assert sent == {"owner": "co-vivy-0930", "run_id": "run-7f3a91"}
+    assert sent == {"owner": "co-widget-0930", "run_id": "run-7f3a91"}
     assert out["issue"]["state"] == "claimed"
-    assert out["lease"]["holder"] == "co-vivy-0930"
+    assert out["lease"]["holder"] == "co-widget-0930"
     assert out["lease"]["expires_at"] == "2026-08-05T14:00:00Z"
     assert out["lease"]["fences"] == ["issue_epic", "issue_a", "issue_b"]
     assert out["policy"]["grace_seconds"] == 14400
@@ -1189,13 +1272,44 @@ def test_issue_checkout_sends_the_owner_and_returns_the_lease(mcp_ops_server, mo
 
 def test_issue_checkout_omits_run_id_when_absent(mcp_ops_server, monkeypatch):
     """An empty `run_id` must not be sent — the API rejects a blank one, and an
-    interactive co has no run id at all."""
+    interactive co has no run id at all, and no AGENTCTL_RUN_ID in its environment
+    either."""
     _with_token(mcp_ops_server, monkeypatch)
+    monkeypatch.delenv("AGENTCTL_RUN_ID", raising=False)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"item": {"id": "issue_a"}, "lease": _lease(), "policy": {}})
     mcp_ops_server.issue_checkout("issue_a", owner="co-a")
     assert json.loads(seen[0].data) == {"owner": "co-a"}
+
+
+def test_issue_checkout_stamps_run_id_from_the_environment_when_absent(
+        mcp_ops_server, monkeypatch):
+    """A dispatched run's MCP servers inherit `AGENTCTL_RUN_ID` from the run's own
+    environment (bin/agentctl sets it at spawn time), so a run that never passes
+    `run_id` itself still leaves one on the lease — the gap CQ·519
+    (issue_01M5BW8G53V9SPK7A6B3BBKPD8) names: a finished run's lease with no
+    `run_id` can never be matched back to it at finalize."""
+    _with_token(mcp_ops_server, monkeypatch)
+    monkeypatch.setenv("AGENTCTL_RUN_ID", "run-3e9b0a10")
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"item": {"id": "issue_a"}, "lease": _lease(), "policy": {}})
+    mcp_ops_server.issue_checkout("issue_a", owner="co-a")
+    assert json.loads(seen[0].data) == {"owner": "co-a", "run_id": "run-3e9b0a10"}
+
+
+def test_issue_checkout_explicit_run_id_wins_over_the_environment(
+        mcp_ops_server, monkeypatch):
+    """An explicit `run_id` argument is a deliberate choice by the caller and must
+    not be overridden by whatever the process environment happens to carry."""
+    _with_token(mcp_ops_server, monkeypatch)
+    monkeypatch.setenv("AGENTCTL_RUN_ID", "run-from-env")
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload={"item": {"id": "issue_a"}, "lease": _lease(), "policy": {}})
+    mcp_ops_server.issue_checkout("issue_a", owner="co-a", run_id="run-explicit")
+    assert json.loads(seen[0].data) == {"owner": "co-a", "run_id": "run-explicit"}
 
 
 def test_a_refused_checkout_surfaces_the_holder_and_expiry(mcp_ops_server, monkeypatch):
@@ -1289,8 +1403,8 @@ def test_lease_list_filters_and_shapes(mcp_ops_server, monkeypatch):
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"leases": [_lease(), _lease(id="lease_2", dead=True)],
                            "policy": {"grace_seconds": 14400}})
-    out = json.loads(mcp_ops_server.lease_list(holder="co-vivy-0930"))
-    assert "holder=co-vivy-0930" in seen[0].full_url
+    out = json.loads(mcp_ops_server.lease_list(holder="co-widget-0930"))
+    assert "holder=co-widget-0930" in seen[0].full_url
     assert "state=live" in seen[0].full_url
     assert [x["id"] for x in out["leases"]] == ["lease_1", "lease_2"]
     assert out["leases"][1]["dead"] is True, (
@@ -1303,7 +1417,7 @@ def test_lease_shape_keeps_the_fields_a_refusal_is_read_from(mcp_ops_server):
     shaping function that clipped either would leave the 409 message as the only
     place they appear, which no caller can parse reliably."""
     out = mcp_ops_server._shape_lease(_lease())
-    assert out["holder"] == "co-vivy-0930"
+    assert out["holder"] == "co-widget-0930"
     assert out["expires_at"] == "2026-08-05T14:00:00Z"
     assert out["root_id"] == "issue_epic"
     assert out["taken_for"] == "issue_a"
@@ -1320,10 +1434,10 @@ def _adjacency(**over):
     d = {"available": True,
          "neighbours": [
              {"id": "issue_x", "url": "/engineering/issues/issue_x", "title": "same thing",
-              "product": "vivy", "state": "open", "resolution": None,
+              "product": "widget", "state": "open", "resolution": None,
               "similarity": 0.9612, "relation": "same-product"},
              {"id": "issue_y", "url": "/engineering/issues/issue_y", "title": "same shape",
-              "product": "constance", "state": "fixed", "resolution": "fixed",
+              "product": "globex", "state": "fixed", "resolution": "fixed",
               "similarity": 0.9331, "relation": "cross-product"},
          ],
          # COPIED FROM THE SERVER'S OWN CONSTANTS (convivy-orient adjacency.py
@@ -1361,7 +1475,7 @@ def test_checkout_passes_the_adjacency_briefing_through_whole(mcp_ops_server, mo
     adj = out["adjacency"]
     assert adj["available"] is True
     assert [n["relation"] for n in adj["neighbours"]] == ["same-product", "cross-product"]
-    assert adj["neighbours"][1]["product"] == "constance", (
+    assert adj["neighbours"][1]["product"] == "globex", (
         "the cross-product neighbour must survive to the agent — filtering it out "
         "is the failure mode the split exists to prevent")
     # THE VALUES, not merely the presence. `guidance` is the machine-readable twin
@@ -1511,9 +1625,9 @@ def test_the_checkout_docstring_tells_an_agent_what_each_relation_means(mcp_ops_
 
 
 def _course(**over):
-    d = {"id": "course_1", "product": "vivy", "title": "Road to the bead",
+    d = {"id": "course_1", "product": "widget", "title": "Road to the bead",
          "status": "live", "entries": ["issue_e1", "issue_e2"], "count": 2,
-         "version": 3, "created_by": "co-vivy-0930",
+         "version": 3, "created_by": "co-widget-0930",
          "created_at": "2026-08-06T09:00:00Z"}
     d.update(over)
     return d
@@ -1525,8 +1639,8 @@ def test_course_list_filters_and_shapes(mcp_ops_server, monkeypatch):
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"courses": [_course(), _course(id="course_2",
                                                           status="superseded")]})
-    out = json.loads(mcp_ops_server.course_list(product="vivy", status="all"))
-    assert "product=vivy" in seen[0].full_url
+    out = json.loads(mcp_ops_server.course_list(product="widget", status="all"))
+    assert "product=widget" in seen[0].full_url
     assert "status=all" in seen[0].full_url
     assert [c["id"] for c in out["courses"]] == ["course_1", "course_2"]
     assert out["courses"][1]["status"] == "superseded"
@@ -1556,7 +1670,7 @@ def test_course_get_returns_the_expansion_and_the_history(mcp_ops_server, monkey
                          "type": "epic", "state": "open",
                          "maturity": "approved"},
                         {"id": "issue_e2", "missing": True}]),
-        "events": [{"actor": "co-vivy-0930", "action": "reordered",
+        "events": [{"actor": "co-widget-0930", "action": "reordered",
                     "entries": ["issue_e1", "issue_e2"], "at": "2026-08-06T09:05:00Z"}]})
     out = json.loads(mcp_ops_server.course_get("course_1"))
     assert seen[0].full_url.endswith("/api/courses/course_1")
@@ -1572,10 +1686,10 @@ def test_course_create_sends_the_order_it_was_given(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload=_course())
-    mcp_ops_server.course_create("vivy", "Road to the bead",
+    mcp_ops_server.course_create("widget", "Road to the bead",
                                  entries=["issue_e1", "issue_e2"])
     assert json.loads(seen[0].data) == {
-        "product": "vivy", "title": "Road to the bead",
+        "product": "widget", "title": "Road to the bead",
         "entries": ["issue_e1", "issue_e2"]}
 
 
@@ -1587,7 +1701,7 @@ def test_course_create_sends_an_empty_order_rather_than_null(mcp_ops_server, mon
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload=_course(entries=[], count=0))
-    mcp_ops_server.course_create("vivy", "Road to the bead")
+    mcp_ops_server.course_create("widget", "Road to the bead")
     assert json.loads(seen[0].data)["entries"] == []
 
 
@@ -1633,10 +1747,10 @@ def test_a_refused_create_names_the_course_that_already_exists(mcp_ops_server, m
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch, error=urllib.error.HTTPError(
         "u", 409, "Conflict", {}, io.BytesIO(json.dumps({
-            "error": "vivy already has a live Course", "course_id": "course_1",
+            "error": "widget already has a live Course", "course_id": "course_1",
             "hint": "reorder it, or supersede it first if this is a new route",
         }).encode())))
-    out = json.loads(mcp_ops_server.course_create("vivy", "A second route"))
+    out = json.loads(mcp_ops_server.course_create("widget", "A second route"))
     assert out["course_id"] == "course_1"
 
 
@@ -1773,7 +1887,7 @@ def test_every_single_course_verb_shapes_the_flat_response_the_library_actually_
 
     for label, call in (
             ("course_get", lambda: mcp_ops_server.course_get("course_1")),
-            ("course_create", lambda: mcp_ops_server.course_create("vivy", "T")),
+            ("course_create", lambda: mcp_ops_server.course_create("widget", "T")),
             ("course_set_order", lambda: mcp_ops_server.course_set_order(
                 "course_1", entries=["issue_e1"], version=6)),
             ("course_supersede", lambda: mcp_ops_server.course_supersede("course_1")),
@@ -1781,7 +1895,7 @@ def test_every_single_course_verb_shapes_the_flat_response_the_library_actually_
         _fake_urlopen(mcp_ops_server, monkeypatch, payload=dict(flat))
         shaped = json.loads(call())["course"]
         assert shaped["id"] == "course_1", f"{label} lost id"
-        assert shaped["product"] == "vivy", f"{label} lost product"
+        assert shaped["product"] == "widget", f"{label} lost product"
         assert shaped["version"] == 7, (
             f"{label} lost version — a caller that never sees one cannot reorder")
         assert not all(v is None for v in shaped.values()), (
@@ -1797,7 +1911,7 @@ def test_course_list_keeps_its_wrapper_because_the_list_endpoint_really_sends_on
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch,
                   payload={"courses": [_course(), _course(id="course_2")]})
-    out = json.loads(mcp_ops_server.course_list(product="vivy"))
+    out = json.loads(mcp_ops_server.course_list(product="widget"))
     assert [c["id"] for c in out["courses"]] == ["course_1", "course_2"]
     assert out["courses"][0]["version"] == 3
 
@@ -1823,7 +1937,7 @@ def test_issue_checkout_reads_the_item_key_the_library_actually_sends(
     against the broken code."""
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch,
-                  payload={"item": {"id": "issue_a", "product": "vivy",
+                  payload={"item": {"id": "issue_a", "product": "widget",
                                     "title": "A real title", "state": "claimed"},
                            "lease": _lease(), "policy": {}})
     out = json.loads(mcp_ops_server.issue_checkout("issue_a", owner="co-a"))
@@ -1883,15 +1997,15 @@ def _item(**over):
     what the verb under test expects. Built from the fields in that function
     rather than from `_shape_issue`'s narrower selection, so a field the shaping
     helper drops is a fixture bug the test can catch rather than one it bakes in."""
-    d = {"id": "issue_a", "url": "/engineering/issues/issue_a", "product": "vivy",
+    d = {"id": "issue_a", "url": "/engineering/issues/issue_a", "product": "widget",
          "title": "Fix the thing", "body": "It is broken.", "type": "bug",
          "state": "claimed", "severity": "medium", "needs": "agent",
          "maturity": "proposed", "parent_id": "issue_epic", "topics": [],
          "refs": {}, "specification": None, "definition_of_done": None,
          "resolution": None, "resolved_by": None, "outcome_note": None,
-         "claimed_by": "co-vivy-0930", "claimed_at": "2026-08-22T09:00:00Z",
+         "claimed_by": "co-widget-0930", "claimed_at": "2026-08-22T09:00:00Z",
          "claim_expires_at": "2026-08-22T13:00:00Z", "claim_expired": False,
-         "resolved_at": None, "created_by": "co-vivy-0930",
+         "resolved_at": None, "created_by": "co-widget-0930",
          "created_by_kind": "agent", "created_at": "2026-08-20T09:00:00Z",
          "run_id": "run-7f3a91", "park_reason": None, "unpark_condition": None,
          "parked_at": None}
@@ -1905,11 +2019,11 @@ def test_issue_revise_sends_owner_and_only_the_fields_given(mcp_ops_server, monk
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"item": _item(title="New title"), "lease": _lease()})
     out = json.loads(mcp_ops_server.issue_revise(
-        "issue_a", owner="co-vivy-0930", title="New title"))
+        "issue_a", owner="co-widget-0930", title="New title"))
     assert seen[0].full_url.endswith("/api/issues/issue_a/revision")
-    assert json.loads(seen[0].data) == {"owner": "co-vivy-0930", "title": "New title"}
+    assert json.loads(seen[0].data) == {"owner": "co-widget-0930", "title": "New title"}
     assert out["item"]["title"] == "New title"
-    assert out["lease"]["holder"] == "co-vivy-0930"
+    assert out["lease"]["holder"] == "co-widget-0930"
 
 
 def test_issue_revise_sends_an_explicit_null_to_clear_a_field(mcp_ops_server, monkeypatch):
@@ -2000,13 +2114,13 @@ def test_issue_revise_shapes_the_real_item_lease_and_adjacency_wrapper(
         "lease": _lease(),
         "adjacency": {"available": True, "neighbours": []}})
     out = json.loads(mcp_ops_server.issue_revise(
-        "issue_a", owner="co-vivy-0930", maturity="approved"))
+        "issue_a", owner="co-widget-0930", maturity="approved"))
     item = out["item"]
     assert item["maturity"] == "approved"
     assert item["specification"] == "Do the thing."
     assert item["definition_of_done"] == "Tests pass."
     assert item["parent_id"] == "issue_epic"
-    assert out["lease"]["holder"] == "co-vivy-0930"
+    assert out["lease"]["holder"] == "co-widget-0930"
     assert out["adjacency"]["available"] is True
 
 
@@ -2067,6 +2181,36 @@ def test_issue_correct_sends_only_the_fields_given(mcp_ops_server, monkeypatch):
     mcp_ops_server.issue_correct("issue_a", type="nit")
     assert seen[0].full_url.endswith("/api/issues/issue_a/correct")
     assert json.loads(seen[0].data) == {"type": "nit"}
+
+
+def test_issue_correct_sends_needs_when_given(mcp_ops_server, monkeypatch):
+    """A call naming only `needs` sends exactly one real field, which is what
+    lets it pass the Library's at-least-one check on its own (CQ·251)."""
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
+                  payload=_item(needs="operator"))
+    mcp_ops_server.issue_correct("issue_a", needs="operator")
+    assert json.loads(seen[0].data) == {"needs": "operator"}
+
+
+def test_issue_correct_omits_needs_when_absent(mcp_ops_server, monkeypatch):
+    _with_token(mcp_ops_server, monkeypatch)
+    seen = []
+    _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen, payload=_item(type="nit"))
+    mcp_ops_server.issue_correct("issue_a", type="nit")
+    assert "needs" not in json.loads(seen[0].data)
+
+
+def test_issue_correct_surfaces_an_invalid_needs_refusal(mcp_ops_server, monkeypatch):
+    """No client-side check on the value — the Library refuses it (400) and this
+    route only has to surface that refusal."""
+    _with_token(mcp_ops_server, monkeypatch)
+    _fake_urlopen(mcp_ops_server, monkeypatch, error=urllib.error.HTTPError(
+        "u", 400, "Bad Request", {}, io.BytesIO(json.dumps({
+            "error": "needs must be one of agent, operator, either"}).encode())))
+    out = json.loads(mcp_ops_server.issue_correct("issue_a", needs="sometimes"))
+    assert "error" in out and "needs must be one of" in out["error"]
 
 
 def test_issue_correct_sends_an_explicit_null_to_detach_the_parent(mcp_ops_server, monkeypatch):
@@ -2156,7 +2300,7 @@ def test_issue_correct_surfaces_a_reparent_while_leased_refusal(mcp_ops_server, 
         }).encode())))
     out = json.loads(mcp_ops_server.issue_correct("issue_a", parent_id="issue_epic2"))
     assert "error" in out and "re-parenting" in out["error"]
-    assert out["lease"]["holder"] == "co-vivy-0930"
+    assert out["lease"]["holder"] == "co-widget-0930"
 
 
 def test_issue_revise_and_correct_percent_encode_the_item_id(mcp_ops_server, monkeypatch):
@@ -2259,16 +2403,16 @@ def test_issue_move_product_posts_to_the_product_route(mcp_ops_server, monkeypat
     _with_token(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
-                  payload={"item": _item(product="selector"),
+                  payload={"item": _item(product="beacon"),
                            "moved": [{"id": "issue_a", "old_key": "E9·4",
                                       "new_key": "E3·4"}],
-                           "left_courses": ["course_vivy"]})
-    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+                           "left_courses": ["course_widget"]})
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "beacon"))
     assert seen[0].full_url.endswith("/api/issues/issue_a/product")
-    assert json.loads(seen[0].data) == {"product": "selector"}
-    assert out["item"]["product"] == "selector"
+    assert json.loads(seen[0].data) == {"product": "beacon"}
+    assert out["item"]["product"] == "beacon"
     assert out["moved"] == [{"id": "issue_a", "old_key": "E9·4", "new_key": "E3·4"}]
-    assert out["left_courses"] == ["course_vivy"]
+    assert out["left_courses"] == ["course_widget"]
 
 
 def test_issue_move_product_sends_the_owner_when_supplied(mcp_ops_server, monkeypatch):
@@ -2276,8 +2420,8 @@ def test_issue_move_product_sends_the_owner_when_supplied(mcp_ops_server, monkey
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"item": _item(), "moved": [], "left_courses": []})
-    mcp_ops_server.issue_move_product("issue_a", "selector", owner="co-a")
-    assert json.loads(seen[0].data) == {"product": "selector", "owner": "co-a"}
+    mcp_ops_server.issue_move_product("issue_a", "beacon", owner="co-a")
+    assert json.loads(seen[0].data) == {"product": "beacon", "owner": "co-a"}
 
 
 def test_issue_move_product_omits_owner_when_absent(mcp_ops_server, monkeypatch):
@@ -2287,7 +2431,7 @@ def test_issue_move_product_omits_owner_when_absent(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"item": _item(), "moved": [], "left_courses": []})
-    mcp_ops_server.issue_move_product("issue_a", "selector")
+    mcp_ops_server.issue_move_product("issue_a", "beacon")
     assert "owner" not in json.loads(seen[0].data)
 
 
@@ -2296,7 +2440,7 @@ def test_issue_move_product_ids_are_percent_encoded(mcp_ops_server, monkeypatch)
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"item": _item(), "moved": [], "left_courses": []})
-    mcp_ops_server.issue_move_product("a/b", "selector")
+    mcp_ops_server.issue_move_product("a/b", "beacon")
     assert "a%2Fb" in seen[0].full_url
     assert "/a/b/" not in seen[0].full_url
 
@@ -2310,9 +2454,9 @@ def test_issue_move_product_surfaces_a_held_refusal(mcp_ops_server, monkeypatch)
             "error": "held by co-other", "reason": "held",
             "lease": _lease(),
         }).encode())))
-    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "beacon"))
     assert out["reason"] == "held"
-    assert out["lease"]["holder"] == "co-vivy-0930"
+    assert out["lease"]["holder"] == "co-widget-0930"
     assert "HTTP 409" in out["error"]
 
 
@@ -2329,7 +2473,7 @@ def test_issue_move_product_surfaces_a_found_during_crossing_refusal(
             "moving_away_from_their_epic": ["issue_b"],
             "left_behind_naming_a_moved_epic": ["issue_c"],
         }).encode())))
-    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "beacon"))
     assert "error" in out and "found_during" in out["error"]
     assert out["moving_away_from_their_epic"] == ["issue_b"]
     assert out["left_behind_naming_a_moved_epic"] == ["issue_c"]
@@ -2639,7 +2783,7 @@ def test_issue_list_forwards_topics_and_sort(mcp_ops_server, monkeypatch):
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"items": [], "total": 0})
-    mcp_ops_server.issue_list(product="vivy", state="open",
+    mcp_ops_server.issue_list(product="widget", state="open",
                               topics="DESIGN", sort="topic")
     url = seen[0].full_url
     assert "topics=DESIGN" in url, f"topics never reached the request: {url}"
@@ -2688,14 +2832,14 @@ def test_issue_create_can_file_into_a_group(mcp_ops_server, monkeypatch):
     seen = []
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "i2", "state": "open"})
-    mcp_ops_server.issue_create(product="vivy", title="t", severity="low",
+    mcp_ops_server.issue_create(product="widget", title="t", severity="low",
                                 topics=["DESIGN"])
     assert json.loads(seen[0].data)["topics"] == ["DESIGN"]
 
     seen.clear()
     _fake_urlopen(mcp_ops_server, monkeypatch, capture=seen,
                   payload={"id": "i3", "state": "open"})
-    mcp_ops_server.issue_create(product="vivy", title="t", severity="low")
+    mcp_ops_server.issue_create(product="widget", title="t", severity="low")
     assert "topics" not in json.loads(seen[0].data)
 
 
@@ -2731,10 +2875,11 @@ def test_prerequisites_and_blocked_survive_the_shaping(mcp_ops_server):
     dropped in translation is the worst version, because the reader has no way to
     be right.
 
-    `blocked` is the worst yet. The Library refuses checkout and claim on a blocked
-    item with a 409, so nothing unsafe happens — but a caller reading this tool saw
-    an ordinary open item, took it, and got a 409 with nothing in the response that
-    could explain it. Measured 2026-09-11 on issue_01KZH5N13V5VM9S6FPZAM77M6T:
+    `blocked` is the worst yet. Claim refuses a blocked item with a 409; checkout
+    takes the lease on it without claiming (platform/decisions/0079) — either way,
+    a caller reading this tool saw an ordinary open item, took it, and got a 409
+    or an unclaimed lease with nothing in the response that could explain it.
+    Measured 2026-09-11 on issue_01KZH5N13V5VM9S6FPZAM77M6T:
     state "open", a comment recording the prerequisite being set, and neither field
     in the output.
     """
@@ -2912,7 +3057,7 @@ def test_an_unset_field_is_left_off_the_row(mcp_ops_server, empty):
 
 
 def test_the_withheld_fields_never_reach_a_caller(mcp_ops_server, monkeypatch):
-    full = _item(created_by="co-vivy-0930", resolved_by="co-vivy-0930",
+    full = _item(created_by="co-widget-0930", resolved_by="co-widget-0930",
                  refs={"pr": 42, "url": "https://github.com/convivy/x/pull/42"})
     for shaped in (mcp_ops_server._shape_issue(full),
                    mcp_ops_server._shape_issue_detail(full)):
@@ -2924,7 +3069,7 @@ def test_the_withheld_fields_never_reach_a_caller(mcp_ops_server, monkeypatch):
     _with_token(mcp_ops_server, monkeypatch)
     _fake_urlopen(mcp_ops_server, monkeypatch,
                   payload={"item": full, "moved": [], "left_courses": []})
-    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "selector"))
+    out = json.loads(mcp_ops_server.issue_move_product("issue_a", "beacon"))
     assert not {"created_by", "resolved_by", "refs"} & set(out["item"]), out["item"]
 
 
@@ -3015,10 +3160,10 @@ def test_shape_issue_passes_a_work_items_model_choice_through(mcp_ops_server):
 def handoff_home(tmp_path, monkeypatch):
     """A temporary HOME for the pointer files and BUILDER_ROOT for the runs root, so
     nothing reaches the real agent-runs tree. The working directory is a folder
-    named `vivy`, the product `handoff_write` derives from it."""
+    named `widget`, the product `handoff_write` derives from it."""
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("BUILDER_ROOT", str(tmp_path / "data"))
-    product_dir = tmp_path / "vivy"
+    product_dir = tmp_path / "widget"
     product_dir.mkdir()
     monkeypatch.chdir(product_dir)
     return tmp_path
@@ -3049,7 +3194,7 @@ def test_handoff_write_refuses_a_recorded_directory_outside_the_runs_root(
     """The pointer is writable by any process of this user, so a pointer that
     names another checkout must be refused, with nothing written into it."""
     _as_claude_session(monkeypatch, "sess-ops-outside")
-    outside = handoff_home / "constance"
+    outside = handoff_home / "globex"
     outside.mkdir()
     pointer = (handoff_home / "home" / ".local" / "state" / "convivy" / "session-dirs"
                / "sess-ops-outside")

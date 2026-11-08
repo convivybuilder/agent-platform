@@ -48,7 +48,8 @@ _seed_repo() { # <path> -> commits on main
     _git_ident "$repo"
     printf '#!/usr/bin/env python3\nprint("v1")\n' > "$repo/bin/bosun-server"
     chmod +x "$repo/bin/bosun-server"
-    for dep in bosun_registration.py bosun_authz.py builder_root.py vault_plane.py; do
+    for dep in bosun_registration.py bosun_authz.py builder_root.py vault_plane.py \
+               forwarding_transport.py; do
         echo "# $dep" > "$repo/lib/agent-platform/$dep"
     done
     printf 'cryptography==50.0.1\n' > "$repo/requirements.txt"
@@ -131,9 +132,10 @@ assert_eq "1" "$(test -x "$H$DEPLOY/venv/bin/python3" && echo 1 || echo 0)" \
     "an interpreter is staged inside the deploy area (rule 4)"
 
 # bin/bosun-server's whole import closure must travel with it (the installer's
-# own `git archive` list, above) — a deploy area missing one of these four
+# own `git archive` list, above) — a deploy area missing one of these five
 # fails to import at process start, not at review time.
-for dep in bosun_registration.py bosun_authz.py builder_root.py vault_plane.py; do
+for dep in bosun_registration.py bosun_authz.py builder_root.py vault_plane.py \
+           forwarding_transport.py; do
     assert_eq "1" "$(test -f "$H$DEPLOY/lib/agent-platform/$dep" && echo 1 || echo 0)" \
         "$dep is deployed alongside the daemon script"
     assert_eq "0" "$(test -L "$H$DEPLOY/lib/agent-platform/$dep" && echo 1 || echo 0)" \

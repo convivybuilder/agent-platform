@@ -10,7 +10,7 @@ are independently tracked findings, and a dirty tree is only a finding when it
 touches a file outside `.claude/` that is actually TRACKED (not merely
 untracked noise).
 
-CFO is a black-box crew, so a separate group of tests pins that no test here
+LEDGER is a black-box crew, so a separate group of tests pins that no test here
 ever needs a file's CONTENT to pass — only its path and a one/two-letter
 status code, which is the whole design constraint stated in the script's own
 docstring.
@@ -52,12 +52,12 @@ def csc():
 @pytest.fixture(autouse=True)
 def _no_private_crews(csc, monkeypatch):
     """Every test in this file except the ones under "private-crew gating"
-    below is about something other than CFO's own registry entry, and none
+    below is about something other than LEDGER's own registry entry, and none
     of them should depend on whether the REAL machine's
     `~/Convivy/agent-platform/config/projects.json` happens to be readable.
     `_is_private_checkout` delegates to `private_crew.private_home_for`,
     which fails CLOSED (`UNKNOWN`) when it cannot read that registry at
-    all — true on this dev box (readable, real CFO entry) and true
+    all — true on this dev box (readable, real LEDGER entry) and true
     differently on the Linux CI runner (`~/Convivy` does not exist there),
     so an un-neutralized test suite would file bugs locally and silently
     stop filing them on CI, for a reason with nothing to do with what each
@@ -209,7 +209,7 @@ def test_a_plist_with_an_xml_comment_containing_a_double_dash_is_still_read(csc,
     """THE BUG THIS PINS. `plistlib`'s strict XML parser raises `ExpatError` on a
     `--` sequence inside a `<!-- comment -->` — several real plists on this
     machine have exactly that in their own header comments, documentation, not
-    the directive. `com.selector-backend.api` was the ONLY plist naming that
+    the directive. `com.beacon-backend.api` was the ONLY plist naming that
     checkout, so a stricter reader than `plutil` (what this prefers) made an
     entire real, currently-running service invisible to this check, not just
     undercounted its label list.
@@ -310,8 +310,8 @@ def test_main_files_one_finding_for_all_unparseable_plists(csc, tmp_path, capsys
 def test_the_unparseable_bug_never_names_a_filename(csc, tmp_path, monkeypatch):
     """THE FOLLOW-UP FIX (security-reviewer, PR #423 round 2, non-blocking,
     picked up immediately per the steward's direction rather than deferred).
-    A plist's own filename can name a crew — `com.convivy.cfo-review.plist`
-    genuinely contains "cfo" — and this check cannot resolve privacy for a
+    A plist's own filename can name a crew — `com.convivy.ledger-review.plist`
+    genuinely contains "ledger" — and this check cannot resolve privacy for a
     file it cannot parse at all (confirmed directly: `plutil -extract` fails
     identically to `plutil -lint` on a genuinely corrupt file, so there is no
     partial WorkingDirectory to hand `_is_private_checkout`). So neither the
@@ -320,7 +320,7 @@ def test_the_unparseable_bug_never_names_a_filename(csc, tmp_path, monkeypatch):
     local stderr log (pinned by the test above)."""
     la = tmp_path / "LaunchAgents"
     la.mkdir()
-    (la / "com.convivy.cfo-review-broken.plist").write_text("not a plist\x00", encoding="utf-8")
+    (la / "com.convivy.ledger-review-broken.plist").write_text("not a plist\x00", encoding="utf-8")
 
     calls = []
     original = csc._post_signal
@@ -334,8 +334,8 @@ def test_the_unparseable_bug_never_names_a_filename(csc, tmp_path, monkeypatch):
     assert len(calls) == 1
     _product, title, body, dedup_key = calls[0]
     for field in (title, body, dedup_key):
-        assert "com.convivy.cfo-review-broken.plist" not in field
-        assert "cfo" not in field.lower()
+        assert "com.convivy.ledger-review-broken.plist" not in field
+        assert "ledger" not in field.lower()
 
 
 def test_the_dedup_key_cannot_be_used_to_confirm_which_plist_broke(csc, tmp_path):
@@ -370,10 +370,10 @@ def test_the_dedup_key_cannot_be_used_to_confirm_which_plist_broke(csc, tmp_path
             csc._post_signal = original
         return seen[0]
 
-    key_a = _run_once(tmp_path / "LA1", ["com.convivy.cfo-review.plist"])
+    key_a = _run_once(tmp_path / "LA1", ["com.convivy.ledger-review.plist"])
     key_b = _run_once(tmp_path / "LA2", ["com.convivy.unrelated-thing.plist"])
     assert key_a == key_b, "same count must produce the identical key regardless of which plist"
-    assert "cfo" not in key_a.lower()
+    assert "ledger" not in key_a.lower()
 
 
 def test_the_dedup_key_varies_by_date_so_a_resolved_incident_cannot_silence_a_later_one(
@@ -491,9 +491,9 @@ def test_dirty_claude_individuation_is_not_a_finding(csc, tmp_path):
 
 
 def test_a_modified_tracked_file_outside_claude_is_a_dirty_finding(csc, tmp_path):
-    """THE CFO CASE. A modified, TRACKED file outside `.claude/` — this is the
+    """THE LEDGER CASE. A modified, TRACKED file outside `.claude/` — this is the
     finding the noise-filtering exists to still catch."""
-    repo = _repo(tmp_path, "cfo")
+    repo = _repo(tmp_path, "ledger")
     (repo / "schema.sql").write_text("create table x (id int);\n")
     _run(repo, "add", "-A")
     _run(repo, "commit", "-q", "-m", "schema")
@@ -507,10 +507,10 @@ def test_a_modified_tracked_file_outside_claude_is_a_dirty_finding(csc, tmp_path
 def test_an_untracked_file_outside_claude_is_not_a_finding(csc, tmp_path):
     """Untracked is a different situation from modified-and-committed-once: it
     is something nobody has committed yet, not something that drifted from a
-    reviewed state. CFO's real incident had untracked `agent-runs/`,
+    reviewed state. LEDGER's real incident had untracked `agent-runs/`,
     `hook-log/`, `webapp/` directories alongside its real (modified-tracked)
     finding, and only the modified files were the point."""
-    repo = _repo(tmp_path, "cfo")
+    repo = _repo(tmp_path, "ledger")
     (repo / "generated-output").mkdir()
     (repo / "generated-output" / "run.log").write_text("x")
     assert csc.check(repo) == []
@@ -534,18 +534,18 @@ def test_branch_and_dirty_are_two_independent_findings_when_both_occur(csc, tmp_
 #
 # THE BUG (security-reviewer, PR #423, run-0d72a1e3). A finding's own
 # EXISTENCE in the shared, multi-reader issue queue is a leak for a
-# black-box crew independent of how little it says — filing "CFO is on
+# black-box crew independent of how little it says — filing "LEDGER is on
 # branch `x` with these changed files" is exactly what
 # `platform/decisions/0043` forbids, even though this check never reads a
-# line of CFO's own code. These tests override this file's
+# line of LEDGER's own code. These tests override this file's
 # `_no_private_crews` default, since that default exists for every OTHER
 # test in this file.
 
 
 def test_a_private_checkouts_finding_is_not_filed(csc, tmp_path, monkeypatch, capsys):
-    repo = _repo(tmp_path, "cfo", branch="feat/x")
+    repo = _repo(tmp_path, "ledger", branch="feat/x")
     la = tmp_path / "LaunchAgents"
-    _plist(la, "com.convivy.cfo-review.plist", label="com.convivy.cfo-review",
+    _plist(la, "com.convivy.ledger-review.plist", label="com.convivy.ledger-review",
           working_directory=str(repo))
     monkeypatch.setattr(csc, "_is_private_checkout", lambda repo_dir: True)
 
@@ -560,7 +560,7 @@ def test_a_private_checkouts_finding_is_not_filed(csc, tmp_path, monkeypatch, ca
     assert bug_calls == [], "a private crew's finding must never reach _post_signal"
     assert rc == 2, "the finding still counts — a real problem on a private checkout is still real"
     err = capsys.readouterr().err
-    assert "cfo" in err and "not logged" in err, "still visible locally, just not shared"
+    assert "ledger" in err and "not logged" in err, "still visible locally, just not shared"
 
 
 def test_a_non_private_checkouts_finding_is_still_filed(csc, tmp_path, monkeypatch, capsys):
@@ -627,8 +627,8 @@ def test_is_private_checkout_delegates_to_the_shared_private_crew_module(
     registry lookup `session_state.py`/`tmux_transcript.py` already use, not
     a second implementation), using a real fake registry rather than a
     monkeypatched boolean. Also pins the case-sensitivity trap a naive fix
-    would hit: the checkout directory here is capital-`CFO`, the registry
-    slug is lower-case `cfo` — a bare string/slug comparison would silently
+    would hit: the checkout directory here is capital-`LEDGER`, the registry
+    slug is lower-case `ledger` — a bare string/slug comparison would silently
     never match.
     """
     import importlib.util as iu
@@ -638,16 +638,16 @@ def test_is_private_checkout_delegates_to_the_shared_private_crew_module(
     private_crew = iu.module_from_spec(spec)
     spec.loader.exec_module(private_crew)
 
-    crew_home = tmp_path / "CFO"
+    crew_home = tmp_path / "LEDGER"
     crew_home.mkdir()
     cfg = tmp_path / "config"
     cfg.mkdir()
     registry = cfg / "projects.json"
-    registry.write_text(f'{{"cfo": {{"home_dir": "{crew_home}", "private": true}}}}')
+    registry.write_text(f'{{"ledger": {{"home_dir": "{crew_home}", "private": true}}}}')
     monkeypatch.setattr(private_crew, "_REGISTRY", str(registry))
     monkeypatch.setitem(sys.modules, "private_crew", private_crew)
 
-    ordinary = tmp_path / "not-cfo"
+    ordinary = tmp_path / "not-ledger"
     ordinary.mkdir()
     assert csc._is_private_checkout_real(crew_home) is True
     assert csc._is_private_checkout_real(ordinary) is False
@@ -671,17 +671,17 @@ def test_is_private_checkout_fails_closed_when_the_registry_is_unreadable(
     assert csc._is_private_checkout_real(tmp_path / "anything") is True
 
 
-# --- content safety (CFO is a black box) -----------------------------------
+# --- content safety (LEDGER is a black box) -----------------------------------
 
 
 def test_the_check_never_reads_file_content(csc, tmp_path, monkeypatch):
-    """CFO is a black-box crew (platform/decisions/0043) — this check must work
+    """LEDGER is a black-box crew (platform/decisions/0043) — this check must work
     from git metadata alone. Pins it behaviourally: `Path.read_text`/`read_bytes`
     and `git show`/`git diff`/`git log -p` must never be invoked by `check()`,
     even though a file with genuinely sensitive-looking content sits in the
     dirty set.
     """
-    repo = _repo(tmp_path, "cfo")
+    repo = _repo(tmp_path, "ledger")
     (repo / "financials.csv").write_text("acct,amount\n1234,500\n")
     _run(repo, "add", "-A")
     _run(repo, "commit", "-q", "-m", "seed2")
@@ -710,13 +710,13 @@ def test_the_check_never_reads_file_content(csc, tmp_path, monkeypatch):
 def test_the_alert_body_never_contains_file_content(csc, tmp_path):
     """The same property, checked at the `main()` boundary that actually
     builds the bug body a human reads."""
-    repo = _repo(tmp_path, "cfo")
+    repo = _repo(tmp_path, "ledger")
     (repo / "financials.csv").write_text("acct,amount\n1234,500\n")
     _run(repo, "add", "-A")
     _run(repo, "commit", "-q", "-m", "seed2")
     (repo / "financials.csv").write_text("acct,amount\n1234,999999-SECRET-BALANCE\n")
     la = tmp_path / "LaunchAgents"
-    _plist(la, "com.convivy.cfo-review.plist", label="com.convivy.cfo-review",
+    _plist(la, "com.convivy.ledger-review.plist", label="com.convivy.ledger-review",
           working_directory=str(repo))
 
     bodies = []
@@ -866,7 +866,7 @@ def test_serving_checkout_present_absent_present_logs_again_on_the_later_day(
 # operator account hit its per-user process limit and every `git`/`plutil`
 # call this script makes failed with EAGAIN (errno 35). This check read that
 # the same way it reads a genuinely broken checkout — an `unreadable` finding
-# against each repository it happened to be checking — and the selector crew
+# against each repository it happened to be checking — and the beacon crew
 # had to close those findings by hand. `HostForkExhausted` makes that
 # condition abandon the whole pass instead: no per-repository finding, one
 # stderr line, exit 0, and the next 900s launchd tick retries.

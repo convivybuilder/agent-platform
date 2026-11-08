@@ -7,8 +7,8 @@ its done-when requires the derivation spawn no `gh` process in Deck
 (issue_01M0NWVW4YS8E04A657JD04QQD). This reads that inventory and emits one
 signal per (repo, pr, head sha, state, draft flag, title) transition.
 
-AUTHENTICATES AS THE `convivy-bosun` GITHUB APP (app id 4666673), never `gh`.
-`gh` on this machine rides the operator's personal token, which carries
+AUTHENTICATES AS THE INSTALL'S OWN GITHUB APP (`github_app.installed_app()`), never
+`gh`. `gh` on this machine rides the operator's personal token, which carries
 `repo` and `workflow` WRITE scopes org-wide — reading PR state for a dashboard
 does not need that reach, and platform/decisions/0051 already commits to every
 `gh` call moving off it. The Bosun's own gates (draft/mergeability/CI checks at
@@ -25,7 +25,7 @@ making exactly that mistake. See `lib/agent-platform/github_app.py`'s docstring
 for the shared authentication code both paths could in principle use — sharing
 the JWT/token plumbing is fine; sharing the READ is not.
 
-READ-ONLY. The `convivy-bosun` App holds `pull_requests:write` and
+READ-ONLY. The install's own App holds `pull_requests:write` and
 `contents:write` for other reasons (its own merge/gate duties elsewhere); this
 script mints its OWN installation tokens, one per GitHub owner it reads
 (see "ONE INSTALLATION PER OWNER" below), each scoped to `pull_requests: read`
@@ -41,7 +41,7 @@ ONE INSTALLATION PER OWNER, NOT ONE FOR THE WHOLE RUN. `repos_to_capture()`
 returns `owner/repo` for every registered repo via
 `projects.repo_github_slug`, and most of those repos are `convivy/...` — but
 not all: Shipwright's `homebrew-tap` is registered under the `convivybuilder`
-GitHub owner (`config/projects.json`'s `repo_owners`), its own GitHub App
+GitHub owner (the project registry's `repo_owners`), its own GitHub App
 installation, separate from `convivy`'s. `main()` groups the repos by owner
 and resolves each owner's installation and token independently, so a
 failure resolving one owner costs only that owner's repos rather than the
@@ -56,7 +56,7 @@ catches `GA.NotInstalled` ahead of `GA.Unreadable`, prints one notice naming
 the owner and its registered-repo count, and moves on without setting
 `exit_code` — the same "skip only what's confirmed absent" posture
 `installed_repos`'s docstring already describes for one repo within an
-installed owner. `config/projects.json` registers three projects under a
+installed owner. The project registry registers three projects under a
 personal GitHub account that the App has no installation on; since the
 owner-grouping change deployed on 2026-10-15 (launchd run 464 onward),
 every pass exited 1 on exactly that owner, every time — the same shape of
@@ -155,20 +155,84 @@ base branch is not in the key because it is not in the row at all: Deck's
 panel does not render it (see the field list two paragraphs up), so this
 script does not capture it and there is nothing to go stale.
 
-REPOSITORY LIST is derived from `config/projects.json` (`lib/agent-platform/
+REPOSITORY LIST is derived from the project registry (`lib/agent-platform/
 projects.py`) — every repo belonging to a registered, non-private project,
 each expanded to its own `owner/repo` by `projects.repo_github_slug` (so a
 repo registered under a non-`convivy` owner, like `homebrew-tap`, resolves to
 its real slug rather than being read under the wrong owner's installation) —
 rather than hardcoded here. A project's repos change as the registry changes,
 and a hardcoded list would silently drift from it. Repos of `private: true`
-(black-box) projects are excluded, the same wall ADR-0043 draws for their other
+(black-box, ADR-0043) and `walled_off: true` (platform/decisions/0100)
+projects are excluded, the same wall each decision draws for its crew's other
 output: none of their content reaches a shared store.
 
 NOT IN SCOPE, AND NOT ABSORBED HERE: Orient's existing capture of PR reviews,
 comments and the changelog feed, which still authenticates as the operator's personal account.
 That is a separate, larger migration (platform/decisions/0051) and a different
-item; this script covers pull-request STATE alone.
+item; this script covers pull-request STATE alone — WIDENED, 2026-11-02
+(CQ·636, for Orient's merge-queue and code-health pages), to also cover two
+sibling read-only shapes that reuse this same per-owner installation/token
+loop rather than a third script: each open PR's `mergeable`/`review_decision`
+(folded into the PR-state row itself — see `fetch_open_pr_decisions`), and
+each CODE-HEALTH repo's (`projects.code_health_repos()`, a subset of this
+script's own repo list) latest `ci.yml` workflow runs (`list_ci_runs`,
+`rows_from_ci_runs`), captured as a second signal kind
+(`_CI_RUN_KIND`/`_CI_RUN_STREAM`) with its own identity-diff dedup
+(`_ci_run_identity`/`_changed_ci_runs`), mirroring the PR-row mechanism in a
+separate state file per repo so the two kinds' delivered-state records never
+collide or affect each other. The code-health phase mints a SEPARATE
+installation token (`_CODE_HEALTH_PERMISSIONS`) rather than widening the
+PR-state token every owner already depends on, so an owner whose
+installation does not grant `actions: read` loses only its code-health
+capture, logged, not its PR-state capture.
+
+CQ·636's fourth item — each code-health repo's CI coverage figure — lands
+here too, stacked on the PR that added the above: a third signal kind
+(`_COVERAGE_KIND`/`_COVERAGE_STREAM`), read from the newest non-expired
+`coverage`-named Actions artifact on each code-health repo
+(`capture_coverage`), over the SAME `ch_token` the CI-run phase already
+mints — `actions: read` already covers artifacts, not only workflow runs,
+so no third token. Deduplicated on the artifact id alone, in its own state
+file (`load_delivered_coverage`/`save_delivered_coverage`), mirroring the
+CI-run mechanism. An owner whose installation grants `actions: read` but
+refuses artifact reads on one particular repo (GitHub 403) is caught by
+name (`ArtifactsPermissionDenied`) and logged, skipping only that repo's
+coverage, the same posture `GA.NotInstalled` already gets for a whole
+missing installation. See `capture_coverage`'s own docstring for the
+untrusted-archive handling (a size cap before download, a capped read, an
+in-memory zip parse that never extracts to disk, and a root-only,
+suffix-filtered, size-capped choice of member) and `_NoRedirect`'s for why
+the App's bearer token is never resent to the third-party URL GitHub's zip
+endpoint redirects to.
+
+AN ARTIFACT ONLY COUNTS WHEN IT RODE THE REPO'S DEFAULT BRANCH ON A
+SUCCESSFUL `ci.yml` RUN (CQ·636, steward ruling 2026-11-02, fixing the
+Library's CQ·253 plain latest-per-repo read: on 2026-11-02 23:41Z, 5 of 6
+coverage rows Orient read were feature-branch builds, because this phase
+used to take the newest unexpired `coverage` artifact with no filter at
+all). `list_coverage_artifacts`'s own `workflow_run.head_branch` is
+compared against `repo_default_branch`'s fresh `GET /repos/{repo}` read —
+never assumed to be `main` — and the surviving candidates' runs are
+checked newest-first via `_run_is_successful_ci_run` (`GET .../actions/
+runs/{id}`, since the generic run endpoint is not scoped to one workflow
+the way `list_ci_runs`'s `.../workflows/ci.yml/runs` URL already is, so
+this checks the run's own `path`) until one is both a `ci.yml` run and
+`conclusion == "success"`. This candidate walk is capped at
+`_COVERAGE_RUN_CANDIDATES_MAX`: `list_ci_runs`'s own already-fetched runs
+are NOT reused here, even though it reads the same repo moments earlier in
+`main()`'s loop — its window (`_CI_RUN_WINDOW` latest, across all branches,
+plus the same count filtered to the literal branch `"main"`) has no
+guarantee of covering the specific run behind the newest default-branch
+artifact, so treating a miss there as "does not qualify" would wrongly
+skip a real candidate. `repo_default_branch` costs one GET per code-health
+repo per pass, skipped entirely when `list_coverage_artifacts` already
+found nothing to filter; each candidate run check costs at most one
+further GET, stopping at the first qualifying candidate, so the common
+case (the newest artifact is already on the default branch from a
+successful run) costs exactly two GETs beyond the listing itself. No
+qualifying candidate means no coverage row this pass (logged, not a
+failure) — the existing rows the Library already has stand; this phase
+never deletes or overwrites a row GitHub didn't in fact produce.
 
 SIGNAL POSTING USES ITS OWN CREDENTIAL, SEPARATE FROM THE GITHUB APP TOKEN
 ABOVE (issue_01M3VY56TWPFFHQ50QTFM5P07K). `POST /signals` rate-limits each
@@ -195,43 +259,100 @@ import os
 import sys
 import time
 import unicodedata
+import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 
-import builder_root as BR  # noqa: E402
 import github_app as GA  # noqa: E402
 import projects  # noqa: E402
 import signal_client as SC  # noqa: E402
 
-# The convivy-bosun GitHub App (issue_01M2KV16ZRG3N49GRER8Q7545H, verified
-# 2026-09-15: GET /app returned slug convivy-bosun as app id 4666673),
-# installed on more than one GitHub owner (org-wide on `convivy`; also on
-# `convivybuilder`, for homebrew-tap — see the module docstring's "ONE
-# INSTALLATION PER OWNER" section). Each owner's installation is derived and
-# checked on every run, never stored — the same posture
-# kb_merge.knowledge_installation takes for convivy-library.
-APP_ID = "4666673"
-
-# Read from the passwd home, never $HOME, as every trust anchor is
-# (company/decisions/0008) — see builder_root.real_account_home.
-KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
+# The install's own GitHub App (issue_01M2KV16ZRG3N49GRER8Q7545H), installed on
+# more than one GitHub owner (org-wide on `convivy`; also on `convivybuilder`,
+# for homebrew-tap — see the module docstring's "ONE INSTALLATION PER OWNER"
+# section). Resolved fresh through `GA.installed_app()`, never a literal. Each
+# owner's installation is derived and checked on every run, never stored — the
+# same posture kb_merge.knowledge_installation takes for convivy-library.
 
 # The token this script mints can only ever read, whatever the App itself holds
 # — see the module docstring's READ-ONLY section.
 _READ_ONLY_PERMISSIONS = {"pull_requests": "read", "metadata": "read"}
 
+# A SEPARATE token, minted only for owners that have at least one
+# `code_health` repo (CQ·636) — never folded into `_READ_ONLY_PERMISSIONS`
+# above. `actions: read` is a new ask this script never needed before; a
+# second, narrower token means an installation that does not grant it costs
+# only the code-health phase for that owner (logged, not fatal — see
+# `main()`), rather than widening the PR-state token every owner already
+# depends on and risking PR-state capture itself on a permission it never
+# needed. `verdict`'s own `VERB_PERMISSIONS` entry in `github_app.py` already
+# asks this same App for `actions: read` successfully, so this is using more
+# of what the install already grants, not asking GitHub to grant it something
+# new.
+_CODE_HEALTH_PERMISSIONS = {"actions": "read", "metadata": "read"}
+
 _KIND = "pr_state"
 _STREAM = "pr-state"
+
+# A code-health repo's captured `ci.yml` run, one signal per run id whose
+# status or conclusion is new since the last post (CQ·636) — a different
+# kind from `_KIND` above: this is a workflow run, not a pull request.
+_CI_RUN_KIND = "ci_workflow_run"
+_CI_RUN_STREAM = "ci-workflow-run"
+
+# Orient's own CI_WINDOW (code_health_build.py), relayed by the steward
+# 2026-11-02 superseding this item's original "trailing window" framing: a
+# COUNT, not a time window. A quiet repo's latest 20 runs can reach back
+# months; capturing by count rather than by age is what lets a quiet repo's
+# code-health page show anything at all.
+_CI_RUN_WINDOW = 20
+
+# A code-health repo's own coverage figure (CQ·636's fourth item), one
+# signal per artifact id whose id is new since the last post — a third kind,
+# distinct from both `_KIND` and `_CI_RUN_KIND` above: this is a coverage
+# reading, not a pull request or a workflow run.
+_COVERAGE_KIND = "code_coverage"
+_COVERAGE_STREAM = "code-coverage"
+
+# The coverage artifact's own reported `size_in_bytes` must not exceed this
+# before anything is downloaded (`_artifact_within_cap`) — refused outright,
+# logged, with no coverage record for that repo this pass. A coverage.py or
+# Istanbul-style JSON report, even for a large monorepo, is a few hundred KB;
+# 20 MiB is headroom for a report nobody here has reason to expect, not a
+# budget this is meant to spend.
+_COVERAGE_ARTIFACT_MAX_BYTES = 20_000_000
+
+# Independent of `size_in_bytes` above: the bytes actually read off the wire
+# are capped at the same limit (`download_artifact_zip`), since the artifact
+# is otherwise untrusted and could under-report its own size.
+_COVERAGE_DOWNLOAD_MAX_BYTES = _COVERAGE_ARTIFACT_MAX_BYTES
+
+# One zip member's own uncompressed size, capped far below the archive cap
+# above (`parse_coverage_zip`) — a single coverage.json has no reason to
+# approach the archive's own cap, and capping the DECOMPRESSED READ (not the
+# entry's reported `file_size`) is what defuses a zip bomb: an entry that
+# claims to be small can still decompress to far more than this if the read
+# itself is not capped too.
+_COVERAGE_MEMBER_MAX_BYTES = 5_000_000
+
+# Bounds how many of a repo's own default-branch coverage artifacts
+# `latest_qualifying_coverage_artifact` checks the run of (one GET each,
+# `_run_is_successful_ci_run`) before giving up on this pass. The common
+# case is 1: the newest default-branch artifact's own run already
+# qualifies. A repo whose last several default-branch runs all failed
+# costs up to this many GETs rather than one per artifact it has ever kept.
+_COVERAGE_RUN_CANDIDATES_MAX = 5
 
 # This job's OWN POST /signals credential (library#176 — 120 signals/minute is
 # per authenticated actor, and this job alone peaked at 1,878/minute, so it
 # needs its own actor and its own bucket rather than sharing the
 # agent-platform token every other sender presents). Resolved the same way
-# signal_client.token() resolves the shared one. Unrelated to KEY_PATH above,
-# which is the convivy-bosun GitHub App's key for reading GitHub, not for
-# posting signals.
+# signal_client.token() resolves the shared one. Unrelated to the install's
+# own GitHub App key (`GA.installed_app()`), which is for reading GitHub, not
+# for posting signals.
 SIGNAL_TOKEN_ENV = "PR_STATE_CAPTURE_TOKEN"
 SIGNAL_TOKEN_FILE = Path.home() / ".orient-control" / "pr-state-capture-token"
 
@@ -285,21 +406,32 @@ _RUN_DEADLINE_SECONDS = 600
 _PAGE_SIZE = 100
 # Bounds one repo's read to 1000 PRs per pass, so a large repo degrades to "this
 # pass saw its newest-updated 1000" (logged) rather than an unbounded page loop.
-# convivy/vivy passed it on 2026-09-16 with 1,135 PRs. The cap then fell at
-# 2026-05-08 while its least recently updated open PR was touched 2026-09-14, so
-# only long-closed PRs were left out; an open PR idle past the cap would be too.
+# The busiest product repo passed it on 2026-09-16 with 1,135 PRs. The cap then
+# fell at 2026-05-08 while its least recently updated open PR was touched
+# 2026-09-14, so only long-closed PRs were left out; an open PR idle past the
+# cap would be too.
 _MAX_PAGES = 10
 
 
 def repos_to_capture() -> list[str]:
-    """`owner/repo` for every repo of a registered, non-private project, each
+    """`owner/repo` for every repo of a registered project that is neither
+    private (ADR-0043's wall) nor walled off (platform/decisions/0100), each
     expanded by `projects.repo_github_slug` — the one expansion every other
     owner/repo call site in this repository uses, so a repo registered under
     a non-`convivy` owner (homebrew-tap, under Builder's own `convivybuilder`
-    account) resolves to its real slug rather than defaulting to `convivy`."""
-    private = projects.private_slugs()
+    account) resolves to its real slug rather than defaulting to `convivy`.
+
+    `private_slugs()` and `walled_off_slugs()` are read in one `try`, the
+    same fail-closed step `run-register-api` reads them in on every route:
+    either raising returns [] rather than a subset computed against a
+    partial exclusion set, since this list feeds data this process posts
+    outward."""
+    try:
+        excluded = projects.private_slugs() | projects.walled_off_slugs()
+    except Exception:
+        return []
     out = {projects.repo_github_slug(r, unit)
-           for slug, unit in projects.load().items() if slug not in private
+           for slug, unit in projects.load().items() if slug not in excluded
            for r in unit.get("repos", [])}
     return sorted(out)
 
@@ -354,6 +486,126 @@ def list_pulls(repo: str, token: str, *, opener=urllib.request.urlopen) -> list[
     print(f"pr-state-capture: {repo}: stopped at the {_MAX_PAGES * _PAGE_SIZE}-PR page "
           f"cap for this pass; older PRs are not captured this time", file=sys.stderr)
     return out
+
+
+# One GraphQL call (paginated past 100 open PRs) rather than a REST GET per
+# open PR for `mergeable_state` plus a second source for `review_decision`:
+# REST's list endpoint omits `mergeable_state` entirely (only the single-PR
+# GET carries it), and REST has no `review_decision` field at all — GitHub
+# computes it server-side from branch-protection rules a read-only
+# `pull_requests: read` token cannot itself re-derive. GraphQL's
+# `mergeStateStatus` is GitHub's own GraphQL name for the exact value REST
+# calls `mergeable_state` (the same value space: clean, dirty, blocked,
+# behind, unstable, draft, has_hooks, unknown — see Orient's own correction
+# on this issue, CQ·636, flagging that the route must say which vocabulary
+# it serves: this is REST's, read through GraphQL's equivalent field).
+_DECISIONS_QUERY = """
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(states: OPEN, first: 100, after: $after) {
+      nodes { number mergeStateStatus reviewDecision }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
+
+def fetch_open_pr_decisions(repo: str, token: str,
+                            *, opener=urllib.request.urlopen) -> dict[int, dict]:
+    """{number: {"mergeable": str | None, "review_decision": str | None}} for
+    every pull request GitHub currently reports OPEN on `repo` — see
+    `_DECISIONS_QUERY`'s comment for why this is one GraphQL call rather than
+    a REST read.
+
+    `mergeable` folds GraphQL's `"UNKNOWN"` (lowercased: `"unknown"`) to
+    `None`: GitHub computes this lazily, so a brand-new PR's first read can
+    come back with no real answer yet. Recording `None` rather than retrying
+    in a loop is deliberate (CQ·636) — the NEXT capture pass rereads it, and
+    `_changed_rows`'s identity diff (which now includes both fields) emits
+    the real value the moment GitHub resolves it, the same self-heal
+    `_changed_rows` already gives a missed pass. `review_decision` passes
+    `reviewDecision` straight through (`None`, `"APPROVED"`,
+    `"CHANGES_REQUESTED"` or `"REVIEW_REQUIRED"` — GraphQL's own enum, no
+    translation needed)."""
+    owner, name = repo.split("/", 1)
+    out: dict[int, dict] = {}
+    after = None
+    for _ in range(_MAX_PAGES):
+        data = GA.graphql(_DECISIONS_QUERY, {"owner": owner, "name": name, "after": after},
+                          token, opener=opener)
+        conn = ((data.get("repository") or {}).get("pullRequests") or {})
+        for node in conn.get("nodes") or []:
+            number = node.get("number")
+            if number is None:
+                continue
+            state = (node.get("mergeStateStatus") or "").lower()
+            out[number] = {
+                "mergeable": state if state and state != "unknown" else None,
+                "review_decision": node.get("reviewDecision"),
+            }
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return out
+        after = page_info.get("endCursor")
+    print(f"pr-state-capture: {repo}: stopped at the {_MAX_PAGES}-page GraphQL cap "
+          f"reading open PR decisions this pass; some open PRs' mergeable/"
+          f"review_decision are not captured this time", file=sys.stderr)
+    return out
+
+
+def list_ci_runs(repo: str, token: str, *, branch: str | None = None,
+                 opener=urllib.request.urlopen) -> list[dict]:
+    """The latest `_CI_RUN_WINDOW` `ci.yml` runs for `repo` — across every
+    branch when `branch` is None, else only on `branch` — whatever their age
+    (a COUNT window, not a time one; see `_CI_RUN_WINDOW`'s comment). One
+    GET, no pagination: `per_page` IS the window."""
+    qs = f"per_page={_CI_RUN_WINDOW}"
+    if branch:
+        qs += f"&branch={urllib.parse.quote(branch)}"
+    code, payload = GA.request(
+        "GET", f"{GA.API}/repos/{repo}/actions/workflows/ci.yml/runs?{qs}",
+        token, None, opener=opener)
+    runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
+    if code != 200 or not isinstance(runs, list):
+        raise GA.Unreadable(f"{repo}: ci.yml runs could not be read ({code})")
+    return runs
+
+
+def rows_from_ci_runs(repo: str, runs: list[dict]) -> list[dict]:
+    """One row per run id, deduplicated across however many `list_ci_runs`
+    reads were merged into `runs` (a `main` run appears in both the
+    all-branches and the main-only read, so the caller passing both through
+    here must not double-count it).
+
+    `branch` (`head_branch`) and `event` are GitHub-authored free text, the
+    same untrusted-output contract `rows_from_pulls` enforces for `title`/
+    `author` (see that function's docstring): any collaborator who can push a
+    branch controls `head_branch`, and `event` reflects `repository_dispatch`'s
+    caller-supplied `event_type` for a run triggered that way. Both go through
+    `SC.sanitise` here, at the one point this script turns GitHub's payload
+    into its own row, so `emit_ci_run`'s body string and `meta` dict only ever
+    see the sanitised value. `status`/`conclusion` are not sanitised: GitHub
+    draws both from its own fixed vocabulary, never from caller-supplied
+    text. `head_sha` is not sanitised either, for the reason `rows_from_pulls`
+    gives: git constrains an object id to lowercase hex."""
+    by_id: dict[int, dict] = {}
+    for run in runs:
+        run_id = run.get("id")
+        if run_id is None:
+            continue
+        by_id[run_id] = {
+            "repo": repo,
+            "run_id": run_id,
+            "branch": SC.sanitise(run.get("head_branch") or "", max_len=200),
+            "head_sha": run.get("head_sha") or "",
+            "event": SC.sanitise(run.get("event") or "", max_len=200),
+            "status": run.get("status") or "",
+            "conclusion": run.get("conclusion"),
+            "created_at": run.get("created_at") or "",
+            "updated_at": run.get("updated_at") or "",
+        }
+    return list(by_id.values())
 
 
 def _state(pr: dict) -> str:
@@ -420,7 +672,22 @@ def rows_from_pulls(repo: str, pulls: list[dict]) -> list[dict]:
     display `title` and not of plain `SC.sanitise` output — see the module
     docstring's section on the signal's own identity and `_identity_title`'s
     own docstring for why `dedup_key_for` keys on this instead of either of
-    those."""
+    those.
+
+    `created_at` and `merged_at` (CQ·636, for Orient's open-PR-age and
+    merged-count figures) come straight off the same list-endpoint payload
+    this function already reads — GitHub includes both there, so no second
+    read. Neither moves after a PR is created (GitHub never un-merges one),
+    so neither belongs in the dedup identity (`_delivered_identity`) the way
+    `head_sha`/`state`/`draft`/`title_hash` do; a PR's `merged_at` going from
+    falsy to set always arrives together with `state` moving to `MERGED`,
+    already in that identity.
+
+    `mergeable` and `review_decision` default to `None` here — this function
+    reads only the list-endpoint payload, which carries neither (see
+    `fetch_open_pr_decisions`'s docstring). `main()` overlays the real values
+    for every OPEN row after a separate GraphQL read; a CLOSED or MERGED
+    row's `mergeable`/`review_decision` has no meaning and stays `None`."""
     rows = []
     for pr in pulls:
         raw_title = pr.get("title") or ""
@@ -435,6 +702,10 @@ def rows_from_pulls(repo: str, pulls: list[dict]) -> list[dict]:
             "head_sha": ((pr.get("head") or {}).get("sha")) or "",
             "state": _state(pr),
             "updated_at": pr.get("updated_at") or "",
+            "created_at": pr.get("created_at") or "",
+            "merged_at": pr.get("merged_at") or None,
+            "mergeable": None,
+            "review_decision": None,
         })
     return rows
 
@@ -442,11 +713,21 @@ def rows_from_pulls(repo: str, pulls: list[dict]) -> list[dict]:
 def _delivered_identity(row: dict) -> dict:
     """The subset of *row* that `dedup_key_for` keys on, as a plain dict a
     JSON record can compare against byte for byte. Everything else in *row*
-    (`title`, `author`, `updated_at`) can change with no transition
-    `dedup_key_for` would recognise, so it must not make `_changed_rows`
-    treat the row as changed when it isn't."""
+    (`title`, `author`, `updated_at`, `created_at`, `merged_at`) can change
+    with no transition `dedup_key_for` would recognise, so it must not make
+    `_changed_rows` treat the row as changed when it isn't.
+
+    `mergeable` and `review_decision` (CQ·636) ARE in this identity: a
+    change in either must count as a change and re-post, per this item's own
+    spec. Deploying this addition makes every row with a non-`None` value in
+    either field look "changed" on the first pass after rollout (an old
+    delivered-state record has no entry for either key, so the comparison
+    differs) — a one-time full re-emit per affected repo, the same self-heal
+    property a missing or wiped `STATE_DIR` already has (see the module
+    docstring)."""
     return {"head_sha": row["head_sha"], "state": row["state"],
-            "draft": row["draft"], "title_hash": row["title_hash"]}
+            "draft": row["draft"], "title_hash": row["title_hash"],
+            "mergeable": row["mergeable"], "review_decision": row["review_decision"]}
 
 
 def _changed_rows(rows: list[dict], delivered: dict) -> list[dict]:
@@ -504,6 +785,497 @@ def save_delivered(repo: str, delivered: dict) -> None:
     os.replace(tmp, path)
 
 
+def _ci_run_identity(row: dict) -> dict:
+    """The subset of a CI-run row that counts as a transition: a run's
+    `status`/`conclusion` moving (queued -> in_progress -> completed,
+    success/failure/cancelled/...) is the only thing this item's spec asks
+    to be re-posted on. `branch`, `head_sha`, `event`, `created_at` and
+    `updated_at` are immutable or derivable from the run id alone once it
+    exists, so none belongs here."""
+    return {"status": row["status"], "conclusion": row["conclusion"]}
+
+
+def _changed_ci_runs(rows: list[dict], delivered: dict) -> list[dict]:
+    """*rows* (one repo's captured `ci.yml` runs) whose status or conclusion
+    differs from what *delivered* (`load_delivered_ci_runs`'s result) last
+    recorded — mirrors `_changed_rows`'s identity-diff dedup for PR rows,
+    keyed by run id instead of PR number."""
+    return [row for row in rows
+           if delivered.get(str(row["run_id"])) != _ci_run_identity(row)]
+
+
+def _ci_run_state_path(repo: str) -> Path:
+    return STATE_DIR / f"{repo.replace('/', '__')}__ci-runs.json"
+
+
+def load_delivered_ci_runs(repo: str) -> dict:
+    """The last-delivered `_ci_run_identity` per run id for *repo*, keyed by
+    the run id as a string, or `{}` with one stderr line when nothing has
+    been recorded yet or the record cannot be read — mirrors
+    `load_delivered`'s self-heal for the PR-row state file, in a separate
+    file (`_ci_run_state_path`) so a corrupt or missing CI-run record never
+    affects PR-row delivery state or vice versa."""
+    path = _ci_run_state_path(repo)
+    try:
+        raw = path.read_text()
+    except OSError:
+        print(f"pr-state-capture: {repo}: no delivered CI-run record yet; "
+              f"emitting every captured run for this repo this pass", file=sys.stderr)
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        print(f"pr-state-capture: {repo}: delivered CI-run record at {path} is "
+              f"corrupt; emitting every captured run for this repo this pass",
+              file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_delivered_ci_runs(repo: str, delivered: dict) -> None:
+    """Atomic write of *delivered* for *repo*'s CI runs — mirrors
+    `save_delivered`'s atomic write, into the separate CI-run state file."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    path = _ci_run_state_path(repo)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(delivered, sort_keys=True))
+    os.replace(tmp, path)
+
+
+def ci_run_dedup_key_for(row: dict) -> str:
+    """The transition identity for a captured CI run: a repeated capture of
+    the SAME (repo, run id, status, conclusion) reuses this key, mirroring
+    `dedup_key_for`'s role for PR rows."""
+    return (f"ci-workflow-run:{row['repo']}:{row['run_id']}:"
+            f"{row['status']}:{row['conclusion'] or 'none'}")
+
+
+# --- coverage (CQ·636's fourth item) -----------------------------------------
+
+
+class ArtifactsPermissionDenied(Exception):
+    """GitHub answered 403 reading *repo*'s Actions artifacts — a narrower
+    refusal than `GA.Unreadable`: the App's installation does not grant
+    this repo artifact read access, a confirmed permission gap rather than
+    a failed read. `main()` catches this ahead of `GA.Unreadable`, the same
+    posture `GA.NotInstalled` already gets for an owner with no
+    installation at all (see the module docstring's "AN OWNER THE APP IS
+    NOT INSTALLED ON IS SKIPPED, NOT FAILED" section) — logged by name and
+    skipped, widening nothing, rather than failing the pass."""
+
+
+def list_coverage_artifacts(repo: str, token: str,
+                            *, opener=urllib.request.urlopen) -> list[dict]:
+    """Every non-expired artifact named `coverage` for *repo*, paginated the
+    same way `list_pulls`/`installed_repos` are (`_MAX_PAGES`/`_PAGE_SIZE`).
+    Each entry carries its own `workflow_run` object (`id`, `head_sha`,
+    `head_branch`) straight from this one read, so `capture_coverage` never
+    makes a second call to resolve the run that produced it.
+
+    Raises `ArtifactsPermissionDenied` on a 403 and `GA.Unreadable` on any
+    other non-200."""
+    out: list[dict] = []
+    for page in range(1, _MAX_PAGES + 1):
+        code, payload = GA.request(
+            "GET", f"{GA.API}/repos/{repo}/actions/artifacts?per_page={_PAGE_SIZE}&page={page}",
+            token, None, opener=opener)
+        if code == 403:
+            raise ArtifactsPermissionDenied(
+                f"{repo}: the App cannot read Actions artifacts here (403)")
+        artifacts = payload.get("artifacts") if isinstance(payload, dict) else None
+        if code != 200 or not isinstance(artifacts, list):
+            raise GA.Unreadable(f"{repo}: artifacts could not be read ({code})")
+        out.extend(a for a in artifacts
+                   if a.get("name") == "coverage" and not a.get("expired"))
+        if len(artifacts) < _PAGE_SIZE:
+            return out
+    print(f"pr-state-capture: {repo}: stopped at the {_MAX_PAGES * _PAGE_SIZE}-artifact "
+          f"page cap for this pass; an older coverage artifact is not considered "
+          f"this time", file=sys.stderr)
+    return out
+
+
+def repo_default_branch(repo: str, token: str, *, opener=urllib.request.urlopen) -> str:
+    """*repo*'s default branch, read fresh (`GET /repos/{repo}`) rather
+    than assumed to be `main` (CQ·636) — a coverage artifact only counts
+    when it rode this exact branch (`latest_qualifying_coverage_artifact`).
+
+    Raises `GA.Unreadable` on a non-200, or when the response carries no
+    non-empty `default_branch` string — GitHub's documented repository
+    response always has one for a repository that exists at all, so a
+    response missing it means this read could not be trusted, not that the
+    repo happens to have no default branch."""
+    code, payload = GA.request("GET", f"{GA.API}/repos/{repo}", token, None, opener=opener)
+    branch = payload.get("default_branch") if isinstance(payload, dict) else None
+    if code != 200 or not isinstance(branch, str) or not branch:
+        raise GA.Unreadable(f"{repo}: default branch could not be read ({code})")
+    return branch
+
+
+def _run_is_successful_ci_run(repo: str, run_id: int, token: str,
+                              *, opener=urllib.request.urlopen) -> bool:
+    """Whether workflow run *run_id* on *repo* is a `ci.yml` run whose
+    conclusion is `success` — read fresh via the generic run endpoint
+    (`GET /repos/{repo}/actions/runs/{run_id}`). That endpoint is not
+    scoped to one workflow the way `list_ci_runs`'s own `.../workflows/
+    ci.yml/runs` URL already is, so the run's own `path` (e.g.
+    `.github/workflows/ci.yml`) is checked here instead.
+
+    Raises `GA.Unreadable` on a non-200 — including a 404, since that
+    reflects a read this pass could not complete (the run vanished between
+    the artifact listing and this check), not a confirmed non-match."""
+    code, payload = GA.request(
+        "GET", f"{GA.API}/repos/{repo}/actions/runs/{run_id}", token, None, opener=opener)
+    if code != 200 or not isinstance(payload, dict):
+        raise GA.Unreadable(f"{repo}: run {run_id} could not be read ({code})")
+    path = payload.get("path") or ""
+    return path.rsplit("/", 1)[-1] == "ci.yml" and payload.get("conclusion") == "success"
+
+
+def latest_qualifying_coverage_artifact(
+    repo: str, artifacts: list[dict], default_branch: str, token: str,
+    *, opener=urllib.request.urlopen,
+) -> dict | None:
+    """The newest of *artifacts* whose `workflow_run.head_branch` is
+    *default_branch* AND whose run is a successful `ci.yml` run, or None
+    when no candidate qualifies — `capture_coverage`'s "take the newest
+    qualifying one" step (CQ·636, fixing the Library's plain
+    latest-per-repo read, CQ·253, from posting a feature-branch build or a
+    failed default-branch run as a repo's current coverage figure).
+
+    Candidates are *artifacts* filtered to `default_branch`, walked
+    newest-`created_at`-first; each costs at most one run check
+    (`_run_is_successful_ci_run`) until the first qualifies, capped at
+    `_COVERAGE_RUN_CANDIDATES_MAX` candidates actually checked — see that
+    constant's comment for why the window is bounded rather than
+    exhaustive."""
+    candidates = sorted(
+        (a for a in artifacts
+         if ((a.get("workflow_run") or {}).get("head_branch")) == default_branch),
+        key=lambda a: a.get("created_at") or "", reverse=True,
+    )
+    for artifact in candidates[:_COVERAGE_RUN_CANDIDATES_MAX]:
+        run_id = (artifact.get("workflow_run") or {}).get("id")
+        if run_id is None:
+            continue
+        if _run_is_successful_ci_run(repo, run_id, token, opener=opener):
+            return artifact
+    return None
+
+
+def _artifact_within_cap(artifact: dict, *, max_bytes: int) -> bool:
+    """Whether *artifact*'s own reported `size_in_bytes` is small enough to
+    download at all — checked BEFORE any download, never raising. A
+    `size_in_bytes` that is absent, a bool, negative or not a number is
+    treated as exceeding the cap: an artifact this script cannot vouch for
+    the size of is refused the same as one confirmed too large, rather than
+    downloaded on trust."""
+    size = artifact.get("size_in_bytes")
+    if isinstance(size, bool) or not isinstance(size, (int, float)):
+        return False
+    return 0 <= size <= max_bytes
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses to auto-follow a redirect — used only for the artifact-zip
+    download below. GitHub answers that endpoint with a 302 to its own
+    time-limited, pre-signed download URL; `urlopen`'s DEFAULT redirect
+    handling resends every request header, Authorization included, to
+    wherever a redirect points, host included (CPython's
+    `HTTPRedirectHandler.redirect_request` copies `req.headers` verbatim
+    bar `content-length`/`content-type`; it does not drop `Authorization`
+    on a cross-host redirect). Returning None here refuses the redirect;
+    `download_artifact_zip` then follows it BY HAND, over a plain,
+    unauthenticated request, so this App's bearer token is never sent to
+    that second host."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+# Built once, at import time — this handler carries no per-request state, so
+# one opener instance is reused by every call rather than rebuilt per request.
+_ZIP_OPENER = urllib.request.build_opener(_NoRedirect).open
+
+
+def _get_raw(url: str, auth: str | None, *, opener, max_bytes: int) -> tuple[int, object, bytes]:
+    """One GET, read as raw bytes rather than JSON (`GA.request`'s own
+    shape, for a caller that needs the body unparsed) — the shared half of
+    `download_artifact_zip`'s two requests (the signed zip endpoint, then,
+    on a redirect, the download URL it points to). Capped at
+    `max_bytes + 1` bytes actually read, on either the success path's
+    `resp.read()` or a non-2xx response's own `e.read()`, since a redirect
+    response or an error page can be oversized too. Returns
+    `(status, headers, body)` for every response GitHub (or the redirect
+    target) answers with — a non-2xx arrives as `urllib.error.HTTPError`
+    here exactly as it does through plain `urlopen`, and is folded back
+    into this same three-tuple shape rather than left to propagate, so the
+    one caller below can read a 302's `Location` off `headers` whichever
+    path produced it."""
+    headers = {"X-GitHub-Api-Version": "2022-11-28"}
+    if auth:
+        headers["Authorization"] = auth
+        headers["Accept"] = "application/vnd.github+json"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with opener(req, timeout=30) as resp:
+            return resp.status, resp.headers, resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read(max_bytes + 1)
+        except OSError:
+            body = b""
+        return e.code, e.headers, body
+
+
+def download_artifact_zip(repo: str, artifact_id: int, token: str, *,
+                          max_bytes: int, opener=_ZIP_OPENER) -> bytes | None:
+    """The artifact's zip archive, over the REST zip endpoint
+    (`GET repos/<repo>/actions/artifacts/<id>/zip`) — never `gh`. `opener`
+    defaults to `_ZIP_OPENER`, which refuses to auto-follow GitHub's 302 to
+    its own pre-signed download URL; this function follows it itself, over
+    a SECOND, unauthenticated request (see `_NoRedirect`'s docstring for
+    why the App's bearer token must not reach that second host).
+
+    Returns None, never raising, the moment more than `max_bytes` bytes
+    have actually been read off either response's body — independent of
+    what the artifact's own `size_in_bytes` claimed (`_artifact_within_cap`
+    is the check against THAT; this is the read-time backstop against an
+    artifact that under-reports its own size). Raises `GA.Unreadable` on a
+    redirect with no `Location`, or on any response that is neither a
+    redirect nor 200."""
+    url = f"{GA.API}/repos/{repo}/actions/artifacts/{artifact_id}/zip"
+    status, headers, body = _get_raw(url, f"Bearer {token}", opener=opener, max_bytes=max_bytes)
+    if status in (301, 302, 303, 307):
+        location = headers.get("Location") if headers else None
+        if not location:
+            raise GA.Unreadable(
+                f"{repo}: artifact {artifact_id} zip redirected with no Location")
+        status, _, body = _get_raw(location, None, opener=opener, max_bytes=max_bytes)
+    if status != 200:
+        raise GA.Unreadable(f"{repo}: artifact {artifact_id} zip could not be read ({status})")
+    if len(body) > max_bytes:
+        return None
+    return body
+
+
+def _coverage_percent_from_json(obj) -> tuple[float | None, str | None]:
+    """The 0-100 coverage percentage *obj* (already-parsed JSON) reports,
+    and which of coverage.py's native shape or the `pct` shape produced it
+    — or `(None, None)` when neither shape is present, the value is not a
+    number, the value falls outside 0 to 100, or *obj* is not even a JSON
+    object. Matches Orient's own two accepted shapes exactly
+    (code_health_build.py, relayed in CQ·636's body), including which it
+    tries first."""
+    if not isinstance(obj, dict):
+        return None, None
+    totals = obj.get("totals")
+    if isinstance(totals, dict) and "percent_covered" in totals:
+        value, source = totals["percent_covered"], "totals.percent_covered"
+    elif "pct" in obj:
+        value, source = obj["pct"], "pct"
+    else:
+        return None, None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None, None
+    if not (0 <= value <= 100):
+        return None, None
+    return float(value), source
+
+
+def parse_coverage_zip(data: bytes,
+                       *, member_max_bytes: int) -> tuple[float | None, str | None]:
+    """The 0-100 coverage percentage inside *data* (an artifact's zip
+    archive, downloaded and otherwise untrusted), and which JSON shape
+    produced it, or `(None, None)` on ANY refusal or parse failure — never
+    raises. Refused, each silently folding into that same `(None, None)`:
+
+    - *data* is not a valid zip (`zipfile.BadZipFile`);
+    - no member sits at the archive root (no `/` or `\\` in its name — a
+      nested path and a traversal-looking name are both excluded this way;
+      a zip directory entry's name always ends in `/`, so this same check
+      excludes one too, with nothing further needed) AND ends in `.json`;
+    - every such candidate's own reported `file_size` exceeds
+      `member_max_bytes`;
+    - the chosen member (named exactly `coverage.json` if one candidate is,
+      else the first candidate in the archive's own order) decompresses to
+      more than `member_max_bytes` bytes once actually read — capped on the
+      READ itself (`ZipExtFile.read(member_max_bytes + 1)`), not on the
+      entry's own reported size, since a crafted archive can under-report
+      that and still decompress to far more (a zip bomb);
+    - the chosen member's bytes do not parse as JSON, or parse but match
+      neither of `_coverage_percent_from_json`'s two shapes.
+
+    Reads ONLY the chosen member, in memory (`ZipFile.open`/`.read`, never
+    `extract`/`extractall` — nothing here ever touches disk)."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        return None, None
+    try:
+        candidates = [info for info in zf.infolist()
+                     if "/" not in info.filename
+                     and "\\" not in info.filename
+                     and info.filename.endswith(".json")
+                     and info.file_size <= member_max_bytes]
+        if not candidates:
+            return None, None
+        chosen = next((c for c in candidates if c.filename == "coverage.json"), candidates[0])
+        with zf.open(chosen) as fh:
+            raw = fh.read(member_max_bytes + 1)
+        if len(raw) > member_max_bytes:
+            return None, None
+        try:
+            obj = json.loads(raw)
+        except ValueError:
+            return None, None
+        return _coverage_percent_from_json(obj)
+    finally:
+        zf.close()
+
+
+def rows_from_coverage(repo: str, artifact: dict, percent: float, source: str) -> dict:
+    """The one row `capture_coverage` emits for *repo*'s newest coverage
+    artifact — `head_sha`/`branch`/`workflow_run_id` come straight off the
+    artifact's own `workflow_run` object (`list_coverage_artifacts`'s
+    docstring), not a second GitHub read. `source` names which of
+    `_coverage_percent_from_json`'s two shapes produced `percent`.
+
+    `branch` (`head_branch`) is GitHub-authored free text, the same
+    untrusted-output contract `rows_from_ci_runs` enforces for its own
+    `branch` (see that function's docstring): any collaborator who can push
+    a branch controls `head_branch`. It goes through `SC.sanitise` here, at
+    the one point this script turns the artifact's `workflow_run` object
+    into its own row, so `emit_coverage`'s body string and `meta` dict only
+    ever see the sanitised value. `head_sha` is not sanitised, for the
+    reason `rows_from_ci_runs` gives: git constrains an object id to
+    lowercase hex."""
+    wr = artifact.get("workflow_run") or {}
+    return {
+        "repo": repo,
+        "percent": percent,
+        "source": source,
+        "artifact_id": artifact.get("id"),
+        "workflow_run_id": wr.get("id"),
+        "head_sha": wr.get("head_sha") or "",
+        "branch": SC.sanitise(wr.get("head_branch") or "", max_len=200),
+        "artifact_created_at": artifact.get("created_at") or "",
+    }
+
+
+def capture_coverage(repo: str, token: str,
+                     *, opener=urllib.request.urlopen) -> dict | None:
+    """*repo*'s coverage row for this pass, or None when there is nothing to
+    report this pass — no coverage artifact at all, no artifact qualifies
+    (none rode *repo*'s default branch on a successful `ci.yml` run —
+    `latest_qualifying_coverage_artifact`), or the one that does qualify is
+    refused (oversized by its own metadata, oversized once actually read,
+    not a valid zip, no usable JSON member, or its value matches neither of
+    Orient's two shapes). None is the same `null` outcome Orient's own
+    reader gives today for every one of those cases (CQ·636's body); it is
+    not a failure and `main()` does not count it as one. Existing rows the
+    Library already holds are untouched either way — this function only
+    ever decides whether THIS pass has a new row to add.
+
+    Raises `ArtifactsPermissionDenied` only from the LISTING read
+    (`list_coverage_artifacts`). Raises `GA.Unreadable` from that same
+    listing read, from `repo_default_branch`, or from a candidate's run
+    check (`_run_is_successful_ci_run`) — every one a genuine inability to
+    read GitHub, as opposed to a coverage artifact this script read but
+    could not use or a candidate that simply does not qualify."""
+    artifacts = list_coverage_artifacts(repo, token, opener=opener)
+    if not artifacts:
+        return None
+    default_branch = repo_default_branch(repo, token, opener=opener)
+    artifact = latest_qualifying_coverage_artifact(repo, artifacts, default_branch, token,
+                                                   opener=opener)
+    if artifact is None:
+        print(f"pr-state-capture: {repo}: no coverage artifact from a successful ci.yml "
+              f"run on {default_branch}; no coverage record this pass", file=sys.stderr)
+        return None
+    if not _artifact_within_cap(artifact, max_bytes=_COVERAGE_ARTIFACT_MAX_BYTES):
+        print(f"pr-state-capture: {repo}: coverage artifact {artifact.get('id')} "
+              f"reports size_in_bytes={artifact.get('size_in_bytes')!r}, over the "
+              f"{_COVERAGE_ARTIFACT_MAX_BYTES}-byte cap; refused before downloading",
+              file=sys.stderr)
+        return None
+    data = download_artifact_zip(repo, artifact["id"], token,
+                                 max_bytes=_COVERAGE_DOWNLOAD_MAX_BYTES)
+    if data is None:
+        print(f"pr-state-capture: {repo}: coverage artifact {artifact['id']} read over "
+              f"the {_COVERAGE_DOWNLOAD_MAX_BYTES}-byte cap; refused", file=sys.stderr)
+        return None
+    percent, source = parse_coverage_zip(data, member_max_bytes=_COVERAGE_MEMBER_MAX_BYTES)
+    if percent is None:
+        print(f"pr-state-capture: {repo}: coverage artifact {artifact['id']} carried no "
+              f"usable coverage figure; no coverage record this pass", file=sys.stderr)
+        return None
+    return rows_from_coverage(repo, artifact, percent, source)
+
+
+def coverage_dedup_key_for(row: dict) -> str:
+    """The transition identity for a captured coverage figure: a repeated
+    capture of the SAME (repo, artifact id) reuses this key — dedup is on
+    the artifact id alone (this item's own spec: "post only when the
+    artifact id changes"), not on the percentage, so a repeat read of the
+    SAME artifact never re-posts even if a parse somehow gave a different
+    number the second time."""
+    return f"coverage:{row['repo']}:{row['artifact_id']}"
+
+
+def _coverage_state_path(repo: str) -> Path:
+    return STATE_DIR / f"{repo.replace('/', '__')}__coverage.json"
+
+
+def load_delivered_coverage(repo: str) -> dict:
+    """The last-delivered `{"artifact_id": ...}` for *repo*, or `{}` with one
+    stderr line when nothing has been recorded yet or the record cannot be
+    read — mirrors `load_delivered`/`load_delivered_ci_runs`'s self-heal, in
+    its own file (`_coverage_state_path`) so a corrupt or missing coverage
+    record never affects either sibling kind's delivery state or vice
+    versa."""
+    path = _coverage_state_path(repo)
+    try:
+        raw = path.read_text()
+    except OSError:
+        print(f"pr-state-capture: {repo}: no delivered coverage record yet; "
+              f"this pass's coverage artifact (if any) will be posted", file=sys.stderr)
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        print(f"pr-state-capture: {repo}: delivered coverage record at {path} is "
+              f"corrupt; this pass's coverage artifact (if any) will be posted",
+              file=sys.stderr)
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_delivered_coverage(repo: str, delivered: dict) -> None:
+    """Atomic write of *delivered* for *repo*'s coverage state — mirrors
+    `save_delivered`/`save_delivered_ci_runs`'s atomic write, into the
+    separate coverage state file."""
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    path = _coverage_state_path(repo)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.unlink()
+    except OSError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(json.dumps(delivered, sort_keys=True))
+    os.replace(tmp, path)
+
+
 def dedup_key_for(row: dict) -> str:
     """The transition identity: a repeated capture of the SAME (repo, pr, head
     sha, state, draft flag, title) reuses this key, so the store's own dedup
@@ -513,10 +1285,17 @@ def dedup_key_for(row: dict) -> str:
     `title_hash` (the title's identity form, hashed — see `_identity_title`)
     rather than the 200-char `title` field. `_delivered_identity` mirrors
     this same field set for the local send-state record, deliberately —
-    anything that moves this key must move that record's identity too."""
+    anything that moves this key must move that record's identity too.
+
+    `mergeable`/`review_decision` (CQ·636) are appended rather than
+    `None`-omitted, so a PR whose only change is one of these two fields
+    resolving still mints a distinct key from its prior row."""
     draft_flag = "draft" if row["draft"] else "ready"
+    mergeable = row["mergeable"] or "none"
+    review_decision = row["review_decision"] or "none"
     return (f"pr-state:{row['repo']}#{row['number']}:{row['head_sha']}:"
-            f"{row['state']}:{draft_flag}:{row['title_hash']}")
+            f"{row['state']}:{draft_flag}:{row['title_hash']}:"
+            f"{mergeable}:{review_decision}")
 
 
 def emit(row: dict, *, tok: str | None = None, deadline: float | None = None,
@@ -551,17 +1330,46 @@ def emit(row: dict, *, tok: str | None = None, deadline: float | None = None,
                               deadline=deadline, sleep=sleep, tok=tok)
 
 
+def emit_ci_run(row: dict, *, tok: str | None = None, deadline: float | None = None,
+               sleep=time.sleep) -> str:
+    concl = f"/{row['conclusion']}" if row["conclusion"] else ""
+    body = (f"{row['repo']} ci.yml run {row['run_id']} on "
+            f"{row['branch'] or '?'}: {row['status']}{concl}")
+    product = projects.project_for_repo(row["repo"].split("/", 1)[-1])
+    return SC.post_structured(_CI_RUN_KIND, _CI_RUN_STREAM, body, product=product, meta=row,
+                              dedup_key=ci_run_dedup_key_for(row),
+                              produced_at=row["updated_at"] or None,
+                              deadline=deadline, sleep=sleep, tok=tok)
+
+
+def emit_coverage(row: dict, *, tok: str | None = None, deadline: float | None = None,
+                  sleep=time.sleep) -> str:
+    body = (f"{row['repo']} coverage {row['percent']:.2f}% (artifact "
+            f"{row['artifact_id']}, run {row['workflow_run_id']})")
+    product = projects.project_for_repo(row["repo"].split("/", 1)[-1])
+    return SC.post_structured(_COVERAGE_KIND, _COVERAGE_STREAM, body, product=product,
+                              meta=row, dedup_key=coverage_dedup_key_for(row),
+                              produced_at=row["artifact_created_at"] or None,
+                              deadline=deadline, sleep=sleep, tok=tok)
+
+
 def main() -> int:
     argparse.ArgumentParser(
         description="Capture per-repository pull-request state as signals, "
-                    "authenticating as the convivy-bosun GitHub App.").parse_args()
+                    "authenticating as the install's own GitHub App.").parse_args()
 
-    problem = GA.key_problem(KEY_PATH, label="the convivy-bosun App")
+    try:
+        app = GA.installed_app()
+    except GA.Unreadable as e:
+        print(f"pr-state-capture: {e}", file=sys.stderr)
+        return 1
+
+    problem = GA.key_problem(app.key_path, label="the install's GitHub App")
     if problem:
         print(f"pr-state-capture: {problem}", file=sys.stderr)
         return 1
     try:
-        jwt = GA.app_jwt(KEY_PATH, APP_ID)
+        jwt = GA.app_jwt(app.key_path, app.app_id)
     except GA.Unreadable as e:
         print(f"pr-state-capture: {e}", file=sys.stderr)
         return 1
@@ -588,17 +1396,29 @@ def main() -> int:
     # not set exit_code (see the module docstring's "AN OWNER THE APP IS NOT
     # INSTALLED ON IS SKIPPED, NOT FAILED" section); any other owner-level
     # failure is still a plain GA.Unreadable and still fails the pass.
+    # The code-health repos (CQ·636), read once from the registry — a
+    # SUBSET of repos_to_capture() (code_health_repos_for's own validation
+    # refuses a code_health entry outside its unit's repos, and both
+    # exclude private-project repos the same way), so every code-health
+    # repo is also visited by the ordinary PR-state loop below under the
+    # same owner.
+    code_health_set = set(projects.code_health_repos())
+
     pending: list[dict] = []
+    pending_ci: list[dict] = []
+    pending_coverage: list[dict] = []
     delivered_by_repo: dict[str, dict] = {}
+    delivered_ci_by_repo: dict[str, dict] = {}
+    delivered_coverage_by_repo: dict[str, dict] = {}
     for owner, repos in sorted(_by_owner(repos_to_capture()).items()):
         try:
-            inst = GA.installation_for_owner(jwt, owner, label="the convivy-bosun App")
+            inst = GA.installation_for_owner(jwt, owner, label="the install's GitHub App")
             inst_id = str(inst.get("id") or "")
             if not inst_id:
                 raise GA.Unreadable("the installation carries no id")
             token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS)
         except GA.NotInstalled:
-            print(f"pr-state-capture: {owner}: the convivy-bosun App is not "
+            print(f"pr-state-capture: {owner}: the install's GitHub App is not "
                   f"installed on this owner; its {len(repos)} registered repos "
                   f"are skipped", file=sys.stderr)
             continue
@@ -621,6 +1441,23 @@ def main() -> int:
                       file=sys.stderr)
                 exit_code = 1
 
+        # A SEPARATE token for the code-health phase (CQ·636), minted only
+        # when this owner actually has a code-health repo — see
+        # `_CODE_HEALTH_PERMISSIONS`'s comment for why this is not folded
+        # into the token above. A refusal here (the installation does not
+        # grant `actions: read`) costs only this owner's code-health
+        # capture, logged, not fatal to this owner's PR-state capture
+        # (which already has its own token) and not fatal to the pass.
+        ch_token = None
+        owner_code_health_repos = [r for r in repos if r in code_health_set]
+        if owner_code_health_repos:
+            try:
+                ch_token = GA.installation_token(jwt, inst_id,
+                                                 permissions=_CODE_HEALTH_PERMISSIONS)
+            except GA.Unreadable as e:
+                print(f"pr-state-capture: {owner}: code-health capture skipped "
+                      f"for {len(owner_code_health_repos)} repo(s): {e}", file=sys.stderr)
+
         for repo in repos:
             if present is not None and repo.lower() not in present:
                 print(f"pr-state-capture: {repo}: not on GitHub (the installation covers "
@@ -632,14 +1469,70 @@ def main() -> int:
                 print(f"pr-state-capture: {e}", file=sys.stderr)
                 exit_code = 1
                 continue
+            rows = rows_from_pulls(repo, pulls)
+            # Open-PR mergeable/review_decision (CQ·636): one GraphQL call,
+            # only when this repo has an open PR, reusing the SAME
+            # read-only token every other read in this loop already holds
+            # (no new permission needed for this one).
+            if any(row["state"] == "OPEN" for row in rows):
+                try:
+                    decisions = fetch_open_pr_decisions(repo, token)
+                except GA.Unreadable as e:
+                    print(f"pr-state-capture: {e}", file=sys.stderr)
+                    exit_code = 1
+                    decisions = {}
+                for row in rows:
+                    d = decisions.get(row["number"])
+                    if d:
+                        row["mergeable"] = d["mergeable"]
+                        row["review_decision"] = d["review_decision"]
             delivered = load_delivered(repo)
             delivered_by_repo[repo] = delivered
-            pending.extend(_changed_rows(rows_from_pulls(repo, pulls), delivered))
+            pending.extend(_changed_rows(rows, delivered))
+
+            if ch_token is not None and repo in owner_code_health_repos:
+                try:
+                    runs = (list_ci_runs(repo, ch_token)
+                           + list_ci_runs(repo, ch_token, branch="main"))
+                except GA.Unreadable as e:
+                    print(f"pr-state-capture: {e}", file=sys.stderr)
+                    exit_code = 1
+                else:
+                    ci_delivered = load_delivered_ci_runs(repo)
+                    delivered_ci_by_repo[repo] = ci_delivered
+                    pending_ci.extend(_changed_ci_runs(
+                        rows_from_ci_runs(repo, runs), ci_delivered))
+
+                # Coverage (CQ·636's fourth item), the SAME `ch_token` —
+                # `actions: read` already covers artifacts, not only
+                # workflow runs. A permission gap confirmed by name
+                # (403, `ArtifactsPermissionDenied`) is logged and skips
+                # only this repo's coverage; any other read failure is a
+                # plain `GA.Unreadable` and still fails the pass, exactly
+                # like the CI-run read above. `capture_coverage` returning
+                # None (no artifact, or one refused/unusable) is neither —
+                # it is this pass's `null`, not a failure.
+                try:
+                    cov_row = capture_coverage(repo, ch_token)
+                except ArtifactsPermissionDenied as e:
+                    print(f"pr-state-capture: {e}; no coverage capture for "
+                          f"this repo this pass", file=sys.stderr)
+                except GA.Unreadable as e:
+                    print(f"pr-state-capture: {e}", file=sys.stderr)
+                    exit_code = 1
+                else:
+                    if cov_row is not None:
+                        cov_delivered = load_delivered_coverage(repo)
+                        delivered_coverage_by_repo[repo] = cov_delivered
+                        if cov_delivered.get("artifact_id") != cov_row["artifact_id"]:
+                            pending_coverage.append(cov_row)
 
     # Phase 2: newest-updated first, across every repo together — not
     # repo-by-repo — so a fresh merge in one repo is never queued behind an
     # older repo's backlog.
     pending.sort(key=lambda row: row["updated_at"], reverse=True)
+    pending_ci.sort(key=lambda row: row["updated_at"], reverse=True)
+    pending_coverage.sort(key=lambda row: row["artifact_created_at"], reverse=True)
 
     # Phase 3: emit, stopping the WHOLE pass — every remaining row in every
     # repo, not just the one being posted — the first time a 429 survives
@@ -679,10 +1572,76 @@ def main() -> int:
     for repo in touched:
         save_delivered(repo, delivered_by_repo[repo])
 
+    # Same stop-on-429 contract as the PR-row loop above, sharing the one
+    # `rate_limited` flag: a 429 hit while emitting PR rows means the
+    # Library's per-submitter bucket is already spent for this pass, so the
+    # CI-run loop below no-ops for the rest of this pass too rather than
+    # spending the same 429 again for no gain.
+    sent_ci = 0
+    touched_ci: set[str] = set()
+    for row in pending_ci:
+        if rate_limited:
+            continue
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = emit_ci_run(row, tok=sig_tok, deadline=deadline)
+        if result == "error:429":
+            rate_limited = True
+            continue
+        captured = buf.getvalue()
+        if captured:
+            sys.stderr.write(captured)
+        if result.startswith("error"):
+            print(f"pr-state-capture: {row['repo']} ci.yml run {row['run_id']} "
+                  f"NOT delivered: {result}", file=sys.stderr)
+            exit_code = 1
+            continue
+        if result in ("created", "duplicate"):
+            sent_ci += 1
+            delivered_ci_by_repo[row["repo"]][str(row["run_id"])] = _ci_run_identity(row)
+            touched_ci.add(row["repo"])
+
+    for repo in touched_ci:
+        save_delivered_ci_runs(repo, delivered_ci_by_repo[repo])
+
+    # Same stop-on-429 contract, sharing the one `rate_limited` flag — a 429
+    # hit while emitting PR rows or CI runs means the Library's per-submitter
+    # bucket is already spent for this pass, so this loop no-ops for the
+    # rest of this pass too.
+    sent_coverage = 0
+    touched_coverage: set[str] = set()
+    for row in pending_coverage:
+        if rate_limited:
+            continue
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            result = emit_coverage(row, tok=sig_tok, deadline=deadline)
+        if result == "error:429":
+            rate_limited = True
+            continue
+        captured = buf.getvalue()
+        if captured:
+            sys.stderr.write(captured)
+        if result.startswith("error"):
+            print(f"pr-state-capture: {row['repo']} coverage artifact "
+                  f"{row['artifact_id']} NOT delivered: {result}", file=sys.stderr)
+            exit_code = 1
+            continue
+        if result in ("created", "duplicate"):
+            sent_coverage += 1
+            delivered_coverage_by_repo[row["repo"]] = {"artifact_id": row["artifact_id"]}
+            touched_coverage.add(row["repo"])
+
+    for repo in touched_coverage:
+        save_delivered_coverage(repo, delivered_coverage_by_repo[repo])
+
     if rate_limited:
         print(f"pr-state-capture: stopped on the Library's rate limit: sent "
-              f"{sent}, {len(pending) - sent} change(s) left pending for the "
-              f"next pass", file=sys.stderr)
+              f"{sent} PR row(s), {sent_ci} CI run(s) and {sent_coverage} "
+              f"coverage record(s); {len(pending) - sent} PR row(s), "
+              f"{len(pending_ci) - sent_ci} CI run(s) and "
+              f"{len(pending_coverage) - sent_coverage} coverage record(s) left "
+              f"pending for the next pass", file=sys.stderr)
 
     return exit_code
 

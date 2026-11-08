@@ -49,6 +49,17 @@ def _commit_doc(repo: Path, body: str, msg: str) -> None:
     assert _git(repo, "commit", "--quiet", "-m", msg).returncode == 0
 
 
+def _admit_library_post(path, name, body):
+    """Default stub for `agentctl._library_post`: admits every
+    `/reference/admission` ask (CQ·531). This module is about which ref a `kb
+    apply`/`kb sync` read resolves, not the admission gate, so every test here
+    keeps testing what it tested before that gate existed."""
+    assert path == "/reference/admission", f"unexpected Library POST: {path}"
+    return 200, {"may_land": True, "errors": [],
+                "clauses_checked": ["frontmatter", "checkout"], "clauses_refused": [],
+                "clauses_waived": []}
+
+
 @pytest.fixture
 def repos(tmp_path, monkeypatch, agentctl, library_identity):
     """origin, a seed clone that pushes to it, and the shared checkout."""
@@ -78,6 +89,7 @@ def repos(tmp_path, monkeypatch, agentctl, library_identity):
     monkeypatch.setattr(indexer, "DB", tmp_path / "index.db")
     monkeypatch.setattr(indexer, "SCHEMA", REPO / "lib" / "knowledge" / "schema.sql")
     monkeypatch.setattr(agentctl, "_kb_indexer", lambda: indexer)
+    monkeypatch.setattr(agentctl, "_library_post", _admit_library_post)
     kw.ensure_db()
     return Namespace(origin=origin, seed=seed, checkout=checkout)
 
@@ -242,11 +254,11 @@ def test_session_view_reads_the_remote_tracking_ref(repos, monkeypatch):
     assert "FORGED" not in content
 
 
-def test_vivy_reset_lands_on_the_remote_tracking_ref(repos):
-    import vivy_main_suite
+def test_main_suite_reset_lands_on_the_remote_tracking_ref(repos):
+    import main_suite
     forged = _plant_decoys(repos)
     real = _advance_origin(repos, "Real body.")
-    assert vivy_main_suite.reset_to_origin_main(repos.checkout) == real
+    assert main_suite.reset_to_origin_main(repos.checkout) == real
     head = _git(repos.checkout, "rev-parse", "HEAD").stdout.strip()
     assert head == real
     assert head != forged
@@ -338,17 +350,17 @@ def test_session_view_refuses_when_the_ref_is_absent(repos, agentctl, monkeypatc
         session_view._read_js_module(SEEDED)
 
 
-def test_vivy_reset_refuses_when_the_ref_is_absent(repos, agentctl, monkeypatch):
-    import vivy_main_suite
+def test_main_suite_reset_refuses_when_the_ref_is_absent(repos, agentctl, monkeypatch):
+    import main_suite
     forged = _absent_ref_with_decoys(repos, agentctl, monkeypatch)
     before = _git(repos.checkout, "rev-parse", "HEAD").stdout.strip()
     real_run = subprocess.run
     # The real `fetch origin main` would restore the ref from the remote's main.
-    monkeypatch.setattr(vivy_main_suite.subprocess, "run", lambda cmd, **kw: (
+    monkeypatch.setattr(main_suite.subprocess, "run", lambda cmd, **kw: (
         subprocess.CompletedProcess(cmd, 0, b"", b"") if cmd[1] == "fetch"
         else real_run(cmd, **kw)))
     with pytest.raises(RuntimeError, match="refs/remotes/origin/main does not exist"):
-        vivy_main_suite.reset_to_origin_main(repos.checkout)
+        main_suite.reset_to_origin_main(repos.checkout)
     assert _git(repos.checkout, "rev-parse", "HEAD").stdout.strip() == before != forged
 
 

@@ -47,6 +47,7 @@ were exactly that, up to 6,253s.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -307,8 +308,8 @@ def _hook_log(session_id: str, cwd: str | None = None, days: int = SEARCH_DAYS) 
 
     Reading this by local date silently returned YESTERDAY'S file for the whole
     evening in a negative-offset zone, since local-today is UTC-yesterday there.
-    Every session then reported a state up to a day old: `svc` showed as blocked
-    on a question answered hours earlier, and none of it looked like an error —
+    Every session then reported a state up to a day old: one crew's session showed
+    as blocked on a question answered hours earlier, and none of it looked like an error —
     the file existed, parsed, and produced a confident wrong answer. Caught on
     2026-07-23 only because the operator knew what his own session was actually doing.
     """
@@ -334,7 +335,7 @@ def _hook_log_root(cwd: str | None) -> tuple[Path | None, str | None]:
 
     Calls the SAME `private_home_for` the writer (`session-event-log.py`) calls
     to decide where to WRITE, so the two can never disagree — the gap that left
-    a healthy CFO session reading `unknown` for three days after the writer
+    a healthy private-crew session reading `unknown` for three days after the writer
     learned to route a private crew's log to its own directory and nothing told
     this reader (agent-platform#421 / issue_01M0GVMBXCX10F0R3ZAGHGEKFZ).
 
@@ -493,17 +494,51 @@ CREWS_ROOT = BR.root()
 
 
 def _product_under_root(cwd, root):
-    """The first path segment of `cwd` below `root`, or None when `cwd` is not
-    under it. Both are resolved first, the containment idiom the session agent's
-    create-dir floor uses against the same resolver, so a symlinked cwd scopes the
-    same as the real directory it names (review, PR 539)."""
+    """The project directory `cwd` lives under `root`: the registry's own
+    `home_dir` for it when one contains `cwd` (preferring the longest, most
+    specific match — `projects.home_path`, the same registry lookup
+    `bin/knowledge-ctx`'s `detect_product` uses), else the first path segment
+    of `cwd` below `root`. `None` when `cwd` is not under `root` at all.
+
+    The registry lookup is what keeps this scoping a project nested below
+    the root (`<root>/acme/acme-west`) to its own directory rather than
+    to the umbrella segment above it (`acme`) — the first-segment answer a
+    dispatched run's own `repo` field never carries. Both `cwd` and `root`
+    are resolved first, the containment idiom the session agent's create-dir
+    floor uses against the same resolver, so a symlinked cwd scopes the same
+    as the real directory it names (review, PR 539). A registry that can't be
+    loaded at all, or a single row whose `home_dir` can't be resolved (a
+    `crew register` write that skipped `projects._expand_own_home`'s
+    validation), costs nothing beyond that one row: the first-segment answer
+    is tried only when no OTHER row's `home_dir` matches either, exactly as
+    before the registry lookup existed."""
     if not cwd:
         return None
     try:
-        rel = Path(cwd).resolve().relative_to(Path(root).resolve())
+        resolved_cwd = Path(cwd).resolve()
+        rel = resolved_cwd.relative_to(Path(root).resolve())
     except (TypeError, ValueError, OSError, RuntimeError):
         return None
-    return rel.parts[0] if rel.parts else None
+    if not rel.parts:
+        return None
+    try:
+        slugs = list(projects.load())
+    except Exception:  # noqa: BLE001 - fall back, never block the badge
+        slugs = []
+    best = None
+    for slug in slugs:
+        try:
+            home = projects.home_path(slug)
+        except Exception:  # noqa: BLE001 - skip this row, not every row
+            continue
+        if home is None:
+            continue
+        if resolved_cwd != home and home not in resolved_cwd.parents:
+            continue
+        depth = len(home.parts)
+        if best is None or depth > best[0]:
+            best = (depth, home.name)
+    return best[1] if best is not None else rel.parts[0]
 
 
 ACTIVE_JSON = AGENT_RUNS_ROOT / "active.json"
@@ -636,7 +671,7 @@ def _agent_run_detail(run: dict) -> dict:
     **A PRIVATE CREW'S `task` NEVER LEAVES THE MACHINE, AND THIS IS THE FIELD
     ADR-0043 NAMES.** `active.json` is machine-wide, so a fleet-wide read (a
     `cwd` outside a product, where `scoped` is False) walks EVERY registry
-    entry — CFO's and any other `private: true` crew's included. This payload
+    entry — every `private: true` crew's included. This payload
     is then rendered by Deck on the laptop, so an unredacted `task` would carry
     a black-box crew's dispatch prompt off the machine, which is exactly the
     content ADR-0043 exists to keep inside the crew's own directory
@@ -817,9 +852,9 @@ def _crew_is_shareable(run: dict, agent_source: str | None = None) -> bool:
 
     **`repo` ALONE IS NOT ENOUGH**, the same bypass `_dispatched_by` closes one
     gate over. `resolve_agent()` (bin/agentctl) honours `--agents-dir` before it
-    ever looks at `repo`, so `--on constance --agents-dir
-    <root>/CFO/.claude/agents` writes `repo: "constance"` (a public slug)
-    while loading a CFO agent — a repo-only check missed it (security-reviewer,
+    ever looks at `repo`, so `--on acme --agents-dir
+    <root>/acme-private/.claude/agents` writes `repo: "acme"` (a public slug)
+    while loading a private crew's agent — a repo-only check missed it (security-reviewer,
     round 5 of this PR). `projects.dispatch_is_private` is the SAME comparison
     `_dispatched_by` and `bin/agentctl`'s `_is_private_dispatch` both delegate
     to, checking `agent_source` (the file `resolve_agent()` actually resolved
@@ -832,7 +867,7 @@ def _crew_is_shareable(run: dict, agent_source: str | None = None) -> bool:
 
     **THE CHARSET CHECK RUNS BEFORE THE REGISTRY LOOKUP, AND IS NOT
     DECORATION.** `repo` is untrusted registry data, and a value like
-    `"../CFO"` is not a registry slug, so the lookup would answer "not
+    `"../acme-private"` is not a registry slug, so the lookup would answer "not
     private" — while still naming the crew to anyone reading the row. Evading
     the gate and identifying the crew are not mutually exclusive, which is what
     an earlier version of this comment assumed. Anything that is not a bare
@@ -1692,9 +1727,9 @@ def _dispatched_by(session_id: str) -> list[dict]:
         #
         # BOTH SIGNALS `projects.dispatch_is_private` checks, not `repo` alone —
         # `resolve_agent()` (bin/agentctl) honours `--agents-dir` before it ever
-        # looks at `repo`, so `--on constance --agents-dir
-        # <root>/CFO/.claude/agents` loads a CFO agent while `repo` stays
-        # "constance"; a repo-only check misses it (security-reviewer,
+        # looks at `repo`, so `--on acme --agents-dir
+        # <root>/acme-private/.claude/agents` loads a private crew's agent while
+        # `repo` stays "acme"; a repo-only check misses it (security-reviewer,
         # run-089d9dca, round 2 of this PR). `meta["agent_source"]` (written by
         # `write_meta` since agent-platform#465) is the file `resolve_agent()`
         # actually read, so it can be checked against every private crew's
@@ -1709,7 +1744,7 @@ def _dispatched_by(session_id: str) -> list[dict]:
         try:
             private = projects.dispatch_is_private(repo, meta.get("agent_source"))
         except Exception:
-            # The registry (`config/projects.json`) is unreadable or corrupt.
+            # The registry (a local file, or the Library) is unreadable or corrupt.
             # Cannot tell whether THIS run is a black box's, so it is excluded
             # — fail closed, matching `_crew_may_share`'s posture on the
             # identical uncertainty one gate over (security-reviewer,
@@ -2025,6 +2060,231 @@ def state_from_events(events: list[dict]) -> dict:
     }
 
 
+# --- clients: who is attached to this session's tmux, for Deck's cockpit
+# (CQ·521, producer half of convivy-deck CQ·172) -----------------------------
+
+# Apple's split-sshd design runs each connection's session under its own
+# `sshd-session` child; older macOS and most Linux hosts still parent it
+# directly under `sshd`. Either one ancestor means the client is remote.
+_SSHD_NAMES = {"sshd", "sshd-session"}
+
+# Deck's exact attach invocation (convivy-deck Sources/Deck/Transport/
+# SSHTarget.swift:221): `tmux new-session -A -D -s <session>`, with an
+# optional `-c <dir>`. Matched on the whole command line so an operator's
+# own hand-typed `tmux attach -d -t <session>` — covered by the tests below —
+# never reads as Deck.
+_DECK_ATTACH_RE = re.compile(r"^tmux new-session -A -D -s \S+(?: -c .+)?$")
+
+# `clients_for_session`'s `table` default. A pre-fetched batch table is a
+# real value this function must use as-is EVEN WHEN IT IS `None` — a `None`
+# passed down from `session_states()` means the whole batch's `tmux
+# list-clients` failed, and re-fetching per session here would both defeat
+# the one-call-per-batch point of passing it down at all and paper over a
+# failure every other row in the same batch is seeing too. `None` the
+# default instead would make "not supplied" and "supplied, and it is None"
+# indistinguishable, so a distinct sentinel marks "not supplied."
+_UNSET = object()
+
+
+def _ps_self(pid: int) -> "tuple[int, str] | None":
+    """This pid's own `(ppid, comm)`, or None if `ps` cannot see it."""
+    out = TT.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)])
+    if not out:
+        return None
+    parts = out.strip().split(None, 1)
+    if len(parts) != 2 or not parts[0].isdigit():
+        return None
+    return int(parts[0]), parts[1]
+
+
+def _ssh_ancestor(pid: int, max_depth: int = 20) -> "tuple[bool, int | None]":
+    """(`ok`, `sshd_pid`) from walking `pid`'s own parent chain upward, `pid`
+    itself included.
+
+    `ok` is False only when `ps` could not be read partway through the
+    walk — the caller then cannot tell local from remote at all, which
+    `_client_via_label` turns into `via: None, label: None` rather than
+    guessing either answer. `ok` is True with `sshd_pid` set to the nearest
+    `sshd`/`sshd-session` ancestor's pid, or True with `sshd_pid` None once
+    the walk reaches the root with no such ancestor — the confident "local"
+    answer.
+    """
+    current = pid
+    seen: set[int] = set()
+    for _ in range(max_depth):
+        if current <= 1 or current in seen:
+            return True, None
+        seen.add(current)
+        info = _ps_self(current)
+        if info is None:
+            return False, None
+        ppid, comm = info
+        if Path(comm.strip()).name in _SSHD_NAMES:
+            return True, current
+        current = ppid
+    return True, None
+
+
+def _ssh_peer_ip(sshd_pid: int) -> "str | None":
+    """The remote address of `sshd_pid`'s one established TCP connection, or
+    None. `-Fn` emits one `n<name>` line per socket; an sshd process serving
+    a single ssh connection has exactly one established TCP socket to read.
+
+    `-n -P` keep `lsof` from resolving the peer to a reverse-DNS hostname or
+    the port to a service name, so the field this parses is always the
+    literal address, never a name a DNS answer could substitute. The parsed
+    result is validated with `ipaddress` before being returned — a line
+    this parsing got wrong, or a value that is not actually an IPv4/IPv6
+    literal, degrades to `None` here rather than reaching `tailscale whois`
+    as an unvalidated string.
+    """
+    out = TT.run(["lsof", "-a", "-p", str(sshd_pid), "-iTCP", "-sTCP:ESTABLISHED",
+                  "-n", "-P", "-Fn"])
+    if not out:
+        return None
+    for line in out.splitlines():
+        if not line.startswith("n") or "->" not in line:
+            continue
+        remote = line[1:].rsplit("->", 1)[1]
+        if remote.startswith("["):
+            # A bracketed IPv6 literal, `[::1]:22`.
+            if "]" not in remote:
+                return None
+            remote = remote[1:remote.index("]")]
+        else:
+            remote = remote.rsplit(":", 1)[0]
+        if not remote:
+            return None
+        try:
+            ipaddress.ip_address(remote)
+        except ValueError:
+            return None
+        return remote
+    return None
+
+
+def _tailscale_device(ip: str, cache: "dict | None" = None) -> "str | None":
+    """`tailscale whois`'s `.Node.ComputedName` for `ip`, or None when the
+    command fails, the peer is not a Tailscale node, or the field is absent.
+
+    `cache`, when given, is keyed by peer address and shared across one
+    `session_states()` batch (threaded down via `clients_for_session` and
+    `_client_via_label`), so several clients whose ssh peer resolves to the
+    same device cost one `tailscale whois` subprocess, not one per client.
+    `None` — the default, for a direct caller outside a batch — skips the
+    cache entirely and always calls through.
+    """
+    if cache is not None and ip in cache:
+        return cache[ip]
+    out = TT.run(["tailscale", "whois", "--json", ip])
+    result = None
+    if out:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
+        node = data.get("Node") if isinstance(data, dict) else None
+        name = node.get("ComputedName") if isinstance(node, dict) else None
+        result = name if isinstance(name, str) and name else None
+    if cache is not None:
+        cache[ip] = result
+    return result
+
+
+def _full_command(pid: int) -> "str | None":
+    """The client process's own command line, for matching against Deck's
+    exact attach argv."""
+    return TT.run(["ps", "-o", "command=", "-p", str(pid)]) or None
+
+
+def _is_deck_attach(cmdline: "str | None") -> bool:
+    return bool(cmdline) and bool(_DECK_ATTACH_RE.fullmatch(cmdline.strip()))
+
+
+def _client_via_label(pid: int, cmdline: "str | None",
+                       machine_name: "str | None",
+                       whois_cache: "dict | None" = None) -> "tuple[str | None, str | None]":
+    """(`via`, `label`) for one tmux client pid, per CQ·521's rules. Every
+    failed step degrades to `label: None` with `via` set as far as the walk
+    got — never a guessed name.
+
+    `machine_name` is this machine's own name (`TT.local_machine_name()`),
+    resolved by the caller rather than here so a batch read shares one
+    `scutil`/hostname lookup across every local client in the same way
+    `table` and `client_table` already share one `tmux` call each. `None`
+    degrades the local label to `None` too, rather than naming the machine
+    "None".
+
+    `whois_cache`, when given, is passed straight through to
+    `_tailscale_device` — see that function and `clients_for_session` for
+    where it comes from and why.
+    """
+    ok, sshd_pid = _ssh_ancestor(pid)
+    if not ok:
+        return None, None
+    if sshd_pid is None:
+        return "local", (f"a terminal on {machine_name}" if machine_name else None)
+
+    via = "ssh"
+    ip = _ssh_peer_ip(sshd_pid)
+    if ip is None:
+        return via, None
+    # `tailscale whois` resolving the peer is the common case; an unresolved
+    # peer falls back to the raw address rather than leaving the label null,
+    # for both the Deck and the plain-ssh label — the rule the spec states
+    # explicitly for the plain-ssh case applies the same way to either.
+    device = _tailscale_device(ip, whois_cache) or ip
+    if _is_deck_attach(cmdline):
+        return via, f"Deck on {device}"
+    return via, f"SSH from {device}"
+
+
+def clients_for_session(name: str, table=_UNSET, machine_name=_UNSET,
+                         whois_cache=_UNSET) -> "list[dict] | None":
+    """Every tmux client attached to `name`'s session, each as `{pid, via,
+    label}`, or None if the read could not be done at all — distinct from
+    the positively-empty `[]` a session with no clients gets.
+
+    `table`, when given, is a pre-fetched `TT.client_table()`: `session_states`
+    resolves it once per batch and hands it to every row, the same pattern
+    `session_table` already uses for `TT.claude_pane` (session_state.py:2050,
+    the docstring on `session_states` below). Left unset (the `_UNSET`
+    default, not `None`), this fetches its own — the right default for a
+    single lookup, and distinct from a batch explicitly passing `None`
+    because its own `TT.client_table()` call failed.
+
+    `machine_name`, when given, is a pre-fetched `TT.local_machine_name()` —
+    the same one-read-per-batch pattern `table` follows, threaded down to
+    `_client_via_label` for the local-client label. Left unset, this fetches
+    its own.
+
+    `whois_cache`, when given, is the dict `session_states()` shares across
+    its whole batch so repeated `tailscale whois` lookups for the same peer
+    cost one subprocess call, not one per client. Left unset, a dict scoped
+    to this one call is used instead — still de-duplicates several clients
+    of the SAME session sharing a peer, which `table`/`machine_name`'s
+    per-call fallback already costs a fresh subprocess call for anyway.
+    """
+    if table is _UNSET:
+        table = TT.client_table()
+    if table is None:
+        return None
+    entries = table.get(name, [])
+    # Resolved only once there is at least one client to label: a session
+    # with positively no clients has no local one either, so there is
+    # nothing here for `scutil`/the hostname fallback to answer.
+    if entries and machine_name is _UNSET:
+        machine_name = TT.local_machine_name()
+    if whois_cache is _UNSET:
+        whois_cache = {}
+    out = []
+    for entry in entries:
+        pid = entry["pid"]
+        via, label = _client_via_label(pid, _full_command(pid), machine_name, whois_cache)
+        out.append({"pid": pid, "via": via, "label": label})
+    return out
+
+
 def session_states(names: list[str], days: int = SEARCH_DAYS) -> dict:
     """A brief state for each of several sessions, keyed by name, in one call.
 
@@ -2053,15 +2313,34 @@ def session_states(names: list[str], days: int = SEARCH_DAYS) -> dict:
     that is N identical `list-sessions` calls for N rail rows every refresh.
     Resolving the table once here and handing it to every row removes the
     duplication without touching the exact-match fix itself.
+
+    ONE `list-clients` FOR THE WHOLE BATCH TOO, for the same reason and the
+    same way: `clients_for_session` resolves `TT.client_table()` on its own
+    when nothing is passed in, so without this a rail refresh over N rows
+    would issue N identical `list-clients` calls.
+
+    ONE MACHINE-NAME READ FOR THE WHOLE BATCH TOO: `TT.local_machine_name()`
+    answers the same way for every row (it is this machine, not the
+    session's), so it is resolved once here rather than once per local
+    client across the batch.
     """
     # Outside the per-name try/except below: relies on TT.run() never raising
     # (it swallows subprocess failures), so a raise here would sink the whole
     # batch instead of degrading one name.
     table = TT.session_table()
+    client_table = TT.client_table(valid_sessions=set(table))
+    machine_name = TT.local_machine_name()
+    # Shared across every name in this batch: `_tailscale_device` keys into
+    # it by peer address, so N sessions whose clients come from the same
+    # Tailscale device cost one `tailscale whois`, not N (CQ·521 review).
+    whois_cache: dict = {}
     out = {}
     for name in names:
         try:
-            out[name] = session_state(name, days=days, brief=True, table=table)
+            out[name] = session_state(name, days=days, brief=True, table=table,
+                                       client_table=client_table,
+                                       machine_name=machine_name,
+                                       whois_cache=whois_cache)
         except Exception as e:  # noqa: BLE001 — one bad name must not sink the batch
             out[name] = {"session": name, "state": "unknown", "alive": False,
                          "reason": str(e), "agents": [], "agent_runs": [], "agents_fleet_wide": False,
@@ -2073,6 +2352,12 @@ def session_states(names: list[str], days: int = SEARCH_DAYS) -> dict:
                          # early seed in `session_state` rather than a KeyError.
                          "ctx_pct": None, "rollover": dict(_ROLLOVER_DEFAULT),
                          "permission_mode": None,
+                         # Unlike the fields above, `clients` does not depend
+                         # on anything this exception could have broken
+                         # partway through — but the exception means
+                         # `session_state` never returned at all, so there is
+                         # no value to carry over here either.
+                         "clients": None,
                          # The Slate is keyed by `name` alone (see
                          # `slate_counts`), so it resolves regardless of
                          # whatever broke the rest of this read.
@@ -2081,7 +2366,9 @@ def session_states(names: list[str], days: int = SEARCH_DAYS) -> dict:
 
 
 def session_state(name: str, days: int = SEARCH_DAYS, brief: bool = False,
-                   table: dict | None = None) -> dict:
+                   table: dict | None = None,
+                   client_table=_UNSET, machine_name=_UNSET,
+                   whois_cache=_UNSET) -> dict:
     """The full state of the co session in a tmux session, as one object.
 
     Degrades rather than lying: anything it cannot establish comes back as
@@ -2098,6 +2385,20 @@ def session_state(name: str, days: int = SEARCH_DAYS, brief: bool = False,
     share one `tmux list-sessions` instead of each triggering its own. A direct
     caller (the open pane, polling one session) leaves it unset and `claude_pane`
     resolves its own, which is what a single lookup wants.
+
+    `client_table`, when given, is a pre-fetched `TT.client_table()` — the
+    same batching `table` does, for `clients` instead of `agents`/`state`.
+
+    `machine_name`, when given, is a pre-fetched `TT.local_machine_name()`,
+    threaded through to `clients_for_session` the same way.
+
+    `whois_cache`, when given, is a dict `clients_for_session` and
+    `_client_via_label` key `tailscale whois` answers into by peer address —
+    `session_states()` creates one and shares it across its whole batch, so
+    several sessions with clients attached from the same device cost one
+    `tailscale whois` rather than one per client. Left unset, a fresh dict
+    is used for this call alone — still worth it when one session has
+    several clients from the same peer, and harmless when it has one.
     """
     # `agents` seeded here rather than filled in later, and that is load-bearing:
     # every early return below would otherwise emit a state object with the key
@@ -2119,6 +2420,13 @@ def session_state(name: str, days: int = SEARCH_DAYS, brief: bool = False,
         "alive": None, "progressing": None, "transcript_age": None,
         "agents": [], "agent_runs": [], "agents_fleet_wide": False,
         "working_on": working_on(name),
+        # `clients` is resolved in full here, not merely seeded, because it
+        # is the one field in this object that does not wait on anything
+        # else this function establishes: a tmux client is attached to
+        # `name`'s session whether or not a claude process is running in any
+        # of its panes, so there is no "early seed, real value once cwd is
+        # known" split the way `agents`/`ctx_pct` need.
+        "clients": clients_for_session(name, client_table, machine_name, whois_cache),
         # `cwd` IS NOT RESOLVED YET on this early seed, so the privacy gate
         # cannot tell a public session from a private one and fails closed to
         # absent — the same posture `_hook_log_root` already takes on an
@@ -2349,7 +2657,7 @@ def session_state(name: str, days: int = SEARCH_DAYS, brief: bool = False,
     # event to say so. Without this the session reads `blocked` from the moment
     # it asks until its turn ends. Judged against the main agent's own writes,
     # not the file mtime, so a queued message or a subagent finishing cannot
-    # clear a question that is still open — the bug that hid selector's picker.
+    # clear a question that is still open — the bug that hid a crew's picker.
     if out.get("state") == "blocked" and gate_is_stale(out.get("gate_ts"), main_agent_ts):
         out["state"] = "working"
         out["gate"] = None
@@ -2535,7 +2843,7 @@ def newest_main_agent_ts(transcript_path) -> "float | None":
     PICKER. A gate is judged answered when the transcript advances past it, but
     the FILE advances on writes the blocked agent did not make: a queued message
     (`queue-operation`), an `attachment`, a subagent's `isSidechain` records. A
-    selector session waiting on an AskUserQuestion had a queue-operation written
+    product-crew session waiting on an AskUserQuestion had a queue-operation written
     ~3 minutes after its gate; the raw mtime tripped the resolved-margin and the
     question vanished from the pane before the operator could answer it (2026-07-24).
 
@@ -3034,8 +3342,9 @@ def gate_is_stale(gate_ts: str | None, main_agent_ts: float | None) -> bool:
     ends — which can be an hour, and looks exactly like a session that is
     genuinely waiting.
 
-    Observed 2026-07-23: `steward` and `svc` both reported blocked on questions
-    already answered, their transcripts 19 and 68 minutes past their gates.
+    Observed 2026-07-23: `steward` and another crew both reported blocked on
+    questions already answered, their transcripts 19 and 68 minutes past their
+    gates.
 
     The main agent's own next write closes it, because a blocked agent writes no
     turn of its own. `main_agent_ts` is `newest_main_agent_ts`, NOT the file

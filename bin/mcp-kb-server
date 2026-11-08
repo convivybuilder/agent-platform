@@ -157,7 +157,7 @@ def kb_search(
         query: full-text search across title/body/topics. If omitted, the
             filters below run as a structured query.
         kind: filter by doc kind (e.g. 'architecture', 'decision').
-        project: filter by project ('constance', 'vivy', 'shared', 'utility').
+        project: filter by project ('widget', 'globex', 'shared', 'utility').
         audience: filter to docs that list this agent in their audience array.
         applies_to: filter to docs with this substring in any applies_to entry
             (matches glob patterns by substring; e.g. 'src/auth' matches
@@ -274,7 +274,7 @@ def kb_get(id: str) -> dict[str, Any] | None:
     """Fetch a full doc by its frontmatter id.
 
     Args:
-        id: the canonical doc id (e.g. 'constance/decisions/0001-foo').
+        id: the canonical doc id (e.g. 'widget/decisions/0001-foo').
 
     Returns:
         Full doc as a dict, or None if no such id is indexed. JSON-typed
@@ -573,13 +573,18 @@ def _ensure_library_checkout(doc_id: str, holder: str) -> tuple[dict | None, boo
         checkout unconditionally, same holder or not — confirmed against
         `reference_checkout.take`, which raises `CheckoutConflict` on any
         live row regardless of whose);
-      - none held, `holder` just took it -> `(checkout, True, None)`;
+      - none held, or held by someone else per the GET -> falls through to
+        `POST .../checkout` and lets the Library decide, since the GET's
+        answer can already be dead (`expires_at` in the past) and the POST
+        reclaims a dead hold rather than refusing on it. `holder` just took
+        it -> `(checkout, True, None)`;
       - a 404 (nothing in the Library's index names this id yet — its
         checkout route 404s against the index before taking anything) ->
         `(None, False, None)`: there is nothing here for another writer to
         hold, so the caller writes with no Library checkout at all;
-      - held by someone else, or the Library unreachable -> `(None, False,
-        refusal)`, and nothing is written.
+      - the POST answers 409 (a live checkout held by someone else), or the
+        Library is unreachable -> `(None, False, refusal)`, and nothing is
+        written.
     """
     try:
         status, body = _library_request("GET", _library_doc_path(doc_id) + "/checkout")
@@ -597,7 +602,9 @@ def _ensure_library_checkout(doc_id: str, holder: str) -> tuple[dict | None, boo
                 f"answered a checkout for {doc_id} with no holder recorded")
         if held["holder"] == holder:
             return held, False, None
-        return None, False, _library_held_refusal(doc_id, held)
+        # Held by someone else per the GET, which can be reporting a dead
+        # checkout on purpose — fall through to the POST and let the Library
+        # decide, rather than refuse on a hold that may no longer be live.
     try:
         status, body = _library_request("POST", _library_doc_path(doc_id) + "/checkout",
                                         {"owner": holder})
@@ -779,7 +786,11 @@ def _apply_through_library(id: str, build_args, owner: str | None = None) -> dic
         checkout, took_it, refusal = _ensure_library_checkout(doc_id, holder)
         if refusal:
             return refusal
-        holder_for_apply = checkout["holder"]
+        # `checkout` is None on the 404 case (nothing in the Library's index
+        # names this id yet) — the session's own `holder`, already the
+        # default above, is what writes then.
+        if checkout is not None:
+            holder_for_apply = checkout["holder"]
     result = _run_kb(*build_args(holder_for_apply), "--", id)
     if took_it:
         _release_library_checkout(doc_id, holder_for_apply)
@@ -865,7 +876,7 @@ def kb_create(id: str, content: str, provenance: str,
     the write in that case, the same as `kb_checkout` does.
 
     Args:
-        id: repo-relative path, e.g. 'projects/vivy/decisions/0069-thing.md'.
+        id: repo-relative path, e.g. 'projects/globex/decisions/0069-thing.md'.
         content: the full document, frontmatter included. It must satisfy the
             repo's own validate.py — the cage runs it before committing and
             refuses with error='invalid' rather than reddening knowledge CI.

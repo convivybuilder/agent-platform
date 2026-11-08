@@ -181,35 +181,6 @@ def test_making_review_rounds_code_optional_does_not_make_the_other_keys_optiona
     assert isinstance(got, ap.Fallback) and "has no line for policy" in got.reason
 
 
-def test_review_round_cap_sentence_names_both_caps_and_which_pull_requests_take_each():
-    got = ap.load(swap("review_rounds_per_role: 5\n", "review_rounds_per_role: 9\nreview_rounds_code: 13\n"))
-    assert ap.review_round_cap_sentence(got) == (
-        "The review-round cap is 13 rounds for a pull request that changes code or any file an agent is "
-        "instructed to act on, and 9 rounds for one that changes only documents. A pull request that "
-        "changes code or any file an agent is instructed to act on runs rounds past 9 only while no finding "
-        "in the latest round repeats one an earlier round raised."
-    )
-
-
-def test_review_round_cap_sentence_for_the_fallback_states_the_fallback_caps_without_the_progress_condition():
-    # Both caps are 5 here, so no round runs past the document cap. A progress clause would
-    # read as permission for rounds the fallback does not grant.
-    assert ap.review_round_cap_sentence(ap.load(None)) == (
-        "The review-round cap is 5 rounds for a pull request that changes code or any file an agent is "
-        "instructed to act on, and 5 rounds for one that changes only documents."
-    )
-
-
-def test_review_round_cap_sentence_for_the_decided_code_cap_states_eleven_and_seven_with_the_progress_condition():
-    got = ap.load(swap("review_rounds_per_role: 5\n", "review_rounds_per_role: 7\n"))
-    assert ap.review_round_cap_sentence(got) == (
-        "The review-round cap is 11 rounds for a pull request that changes code or any file an agent is "
-        "instructed to act on, and 7 rounds for one that changes only documents. A pull request that "
-        "changes code or any file an agent is instructed to act on runs rounds past 7 only while no finding "
-        "in the latest round repeats one an earlier round raised."
-    )
-
-
 def test_blank_lines_and_comments_are_ignored_anywhere():
     text = "\n# a comment\n   \n" + shipped() + "\n\n# more\n"
     assert isinstance(ap.load(text), ap.Policy)
@@ -348,6 +319,47 @@ def test_a_decision_for_team_only_is_not_an_instruction():
 def test_audience_counts_as_team_only_on_an_exact_line():
     for line in ("audience: [ team ]", "audience: [team] ", "audience: [team,]", "audience: [team]#x"):
         assert_instruction(DOC, fm("kind: decision", line))
+
+
+# --- _audience_split reads the live roster, not a module-level literal ----------
+#
+# Before this change, `_audience_split` checked a copy of `ALLOWED_AUDIENCE` taken
+# at import. These stub `knowledge._fetch_roster` directly (bypassing the autouse
+# `_library_roster_is_the_seed` fixture's own stub) to show the function reads the
+# roster fresh on every call, and that an unavailable roster marks every entry
+# unknown rather than "no agent role". Each fails against origin/main, where
+# `_audience_split` never calls `knowledge.audience_roster()` at all.
+
+def _stub_roster(monkeypatch, names):
+    monkeypatch.setattr(ap.knowledge, "_fetch_roster", lambda: frozenset(names))
+    monkeypatch.setattr(ap.knowledge, "_roster_cache", None)
+
+
+def test_audience_split_recognizes_a_role_the_live_roster_holds(monkeypatch):
+    _stub_roster(monkeypatch, {"a-fresh-crew-role", "team"})
+    roles, unknown = ap._audience_split("[a-fresh-crew-role]")
+    assert roles == ["a-fresh-crew-role"]
+    assert unknown == []
+
+
+def test_audience_split_treats_a_name_the_roster_lacks_as_unknown(monkeypatch):
+    # "coder" is a role under the old import-time literal. Excluding it from the
+    # stubbed roster shows the live roster decides membership now, not that literal:
+    # on origin/main this stub has no effect and "coder" still comes back a role.
+    _stub_roster(monkeypatch, {"team"})
+    roles, unknown = ap._audience_split("[coder, nobody-registered-this]")
+    assert roles == []
+    assert unknown == ["coder", "nobody-registered-this"]
+
+
+def test_audience_split_treats_every_entry_as_unknown_when_the_roster_is_unavailable(monkeypatch):
+    def _boom():
+        raise ap.knowledge.RosterUnavailable("GET /roster failed: connection refused")
+    monkeypatch.setattr(ap.knowledge, "_fetch_roster", _boom)
+    monkeypatch.setattr(ap.knowledge, "_roster_cache", None)
+    roles, unknown = ap._audience_split("[team, coder]")
+    assert roles == []
+    assert unknown == ["team", "coder"]
 
 
 @pytest.mark.parametrize("name", ["claude.md", "CLAUDE.md", "Claude.MD", "CLAUDE.local.md", "claude.LOCAL.md", "AGENTS.md", "agents.md"])
@@ -790,10 +802,10 @@ REFERENCE = "---\nkind: reference\ntitle: t\n---\nbody\n"
 DECISION_CODER = "---\nkind: decision\naudience: [team, coder]\ntitle: t\n---\nbody\n"
 # The operator marker, not a literal name: a decision naming it must read as a known
 # person, not an unknown entry, and the marker is per-operator config (CQ·428), read
-# from the same mirror `agent_policy` imports (`NON_AGENT_AUDIENCE`, less the three
-# fixed group names `consultant`/`team`/`contractor`), the same derivation
+# from `knowledge.NON_AGENT_AUDIENCE` (the module `agent_policy` reads the live roster
+# through, less the two fixed group names `team`/`contractor`), the same derivation
 # `tests/test_knowledge.py` uses.
-_OPERATOR_AUDIENCE_MEMBER = next(iter(ap.NON_AGENT_AUDIENCE - {"consultant", "team", "contractor"}))
+_OPERATOR_AUDIENCE_MEMBER = next(iter(ap.knowledge.NON_AGENT_AUDIENCE - {"team", "contractor"}))
 DECISION_TEAM = f"---\nkind: decision\naudience: [team, {_OPERATOR_AUDIENCE_MEMBER}]\ntitle: t\n---\nbody\n"
 DECISION_CONTRACTOR = "---\nkind: decision\naudience: [team, contractor]\ntitle: t\n---\nbody\n"
 DECISION_CONSULTANT = "---\nkind: decision\naudience: [consultant]\ntitle: t\n---\nbody\n"
@@ -829,10 +841,12 @@ DECISION_CODER_ZEBRA = "---\nkind: decision\naudience: [coder, zebra]\ntitle: t\
      "is a decision whose audience names no agent role"),
     (_added("projects/platform/decisions/0003-v.md", DECISION_CONTRACTOR), False,
      "is a decision whose audience names no agent role"),
-    (_added("projects/platform/decisions/0004-u.md", DECISION_CONSULTANT), False,
-     "is a decision whose audience names no agent role"),
-    (_added("projects/platform/decisions/0005-t.md", DECISION_CONSULTANT_OPERATOR), False,
-     "is a decision whose audience names no agent role"),
+    # consultant is a dispatchable agent (NON_AGENT_AUDIENCE dropped it, CQ·154), so a decision
+    # addressed to it is now an instruction an agent acts on, not an audience-only read.
+    (_added("projects/platform/decisions/0004-u.md", DECISION_CONSULTANT), True,
+     "is a decision whose audience names consultant"),
+    (_added("projects/platform/decisions/0005-t.md", DECISION_CONSULTANT_OPERATOR), True,
+     "is a decision whose audience names consultant"),
     (_added("projects/x/new.md", "hi\n"), False, ""),
     (_added("projects/x/fm.md", "---\nkind: reference\napplies_to:\n  - bin/x\n---\nbody\n"), False,
      "has front matter the rule cannot read"),

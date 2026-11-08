@@ -66,12 +66,13 @@ _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 # nothing may start on unknown state.
 _NO_SERVER = re.compile(r"no server running on .+")
 _NO_SOCKET = re.compile(r"error connecting to .+ \(No such file or directory\)")
-# ORIENT_OPS_CO_TOKEN_FILE is stripped because tmux gives a server's global environment,
-# and so every pane made on it, the environment of the process that starts the server.
-# A restore run with the path in its environment, which only a hand export can cause,
-# would otherwise hand it to every later pane, private crews included. Each restored crew
-# gets it in its own ops server's MCP config, from its own co launch.
-_STRIPPED_ENV = ("TMUX", "TMUX_PANE", "ORIENT_OPS_CO_TOKEN_FILE")
+# ORIENT_OPS_CREW_TOKEN_FILE is stripped because tmux gives a server's global
+# environment, and so every pane made on it, the environment of the process that
+# starts the server. A restore run with the path in its environment, which only a
+# hand export can cause, would otherwise hand ONE crew's co-only file to every later
+# pane, private crews and every other crew's own co included. Each restored crew
+# gets its own file named in its own ops server's MCP config, from its own co launch.
+_STRIPPED_ENV = ("TMUX", "TMUX_PANE", "ORIENT_OPS_CREW_TOKEN_FILE")
 
 
 class RestoreError(Exception):
@@ -375,11 +376,12 @@ def list_panes(tmux: list[str], env: Mapping[str, str]) -> list[tuple[str, str]]
 
 
 def ensure_server(env: Mapping[str, str], session_agent: str = "session-agent") -> None:
-    """Start the default tmux server through the GUI-session keeper, or refuse.
+    """Start the default tmux server, or refuse: on macOS through the
+    GUI-session keeper, off macOS by forking it directly.
 
-    Runs before any session is created. A server born over SSH cannot read the
-    login keychain, and every crew under it gets gh 401s. The refusal message is
-    session-agent's own stderr, passed through unchanged.
+    Runs before any session is created. On macOS, a server born over SSH
+    cannot read the login keychain, and every crew under it gets gh 401s. The
+    refusal message is session-agent's own stderr, passed through unchanged.
     """
     try:
         done = subprocess.run([session_agent, "ensure-server"], capture_output=True,

@@ -213,9 +213,9 @@ NO_PROJECT_MAPPING = 42
 #
 # Nothing discriminates on it today — `bin/co`'s three refresh branches take any
 # nonzero as fatal, its generic tail reads only `list`'s code, and `list` never
-# reaches this refusal. It is separated now because this PR anticipates an EA
-# branch in `bin/co`, and a branch written later to tell those two apart would
-# have got the wrong answer from a shared code (reviewer, PR #513).
+# reaches this refusal. It is separated now because this PR anticipates a
+# private-crew branch in `bin/co`, and a branch written later to tell those two
+# apart would have got the wrong answer from a shared code (reviewer, PR #513).
 PROFILE_NOT_ALLOWED = 43
 
 
@@ -226,22 +226,24 @@ PROFILE_NOT_ALLOWED = 43
 # agentctl; `projects.resolve_project` adds the `projects/<name>/` rule.
 
 
-# A directory may be restricted to a NAMED SET OF PROFILES. Absent from this
-# table means unrestricted, which is every directory but one, so this costs
-# nothing anywhere else.
+# A directory may be restricted to a NAMED SET OF PROFILES, through a
+# registered unit's own `kb_profile_allowlist` field (`projects.
+# profile_allowlist()`). Absent from a unit means unrestricted, which is every
+# unit but one today, so this costs nothing anywhere else.
 #
 # WHY IT KEYS ON THE DIRECTORY RATHER THAN THE PROJECT. Several directories share
-# one project — substrate and EA both map to `platform` — and a
-# constraint right for one is wrong for the others. `platform/daytime` is
+# one project — substrate and the personal-archive crew both map to `platform` —
+# and a constraint right for one is wrong for the others. `platform/daytime` is
 # substrate's own profile and must stay reachable there.
 #
 # THE OCCURRENCE IS AN OPERATOR AT A TERMINAL, and that is not the weaker case —
-# it is the only case. Nothing else reaches `EA/.claude/agents/` at all: a
-# dispatch on EA resolves its agents repo-locally and skips `activate_profile`
-# entirely (see `agentctl.LOCAL_AGENT_REPOS`), and no `bin/co` branch individuates
-# EA either, since it fails the `-r` git-toplevel gate and is absent from the
-# six-product `case`. **So `knowledge-ctx use` typed by hand is the path that puts
-# a profile in that directory, which makes it the path this guard exists for.**
+# it is the only case. Nothing else reaches the personal-archive crew's
+# `.claude/agents/` at all: a dispatch on it resolves its agents repo-locally
+# and skips `activate_profile` entirely (see `agentctl.LOCAL_AGENT_REPOS`), and
+# no `bin/co` branch individuates it either, since it fails the `-r`
+# git-toplevel gate and is absent from the six-product `case`. **So
+# `knowledge-ctx use` typed by hand is the path that puts a profile in that
+# directory, which makes it the path this guard exists for.**
 #
 # And the string a hand reaches for is `daytime`. It is the literal in all three
 # `bin/co` refresh branches and the habit of every co on this machine.
@@ -250,45 +252,127 @@ PROFILE_NOT_ALLOWED = 43
 # into the crew holding the operator's personal correspondence. `--force` rmtrees
 # `.claude/agents` and `.claude/skills` first, so the narrow profile is deleted by
 # the same call that installs the wide one. Measured before the guard existed:
-# `use daytime` from an EA-shaped directory individuated 31 files.
+# `use daytime` from that crew's directory individuated 31 files.
 #
-# AN EARLIER REVISION OF THIS COMMENT NAMED A FUTURE `bin/co` EA BRANCH as the
-# occurrence. That branch does not exist, and a guard justified by a hypothetical
-# is the shape this platform has a rule against. The `bin/co` literals still
-# matter — they are why `daytime` is the habitual string, and an EA branch written
-# by analogy with its siblings would inherit the hazard — but they are the reason
-# the operator reaches for that word, not the occurrence themselves
-# (reviewer and steward, PR #513).
+# AN EARLIER REVISION OF THIS COMMENT NAMED A FUTURE `bin/co` BRANCH FOR THAT
+# CREW as the occurrence. That branch does not exist, and a guard justified by
+# a hypothetical is the shape this platform has a rule against. The `bin/co`
+# literals still matter — they are why `daytime` is the habitual string, and a
+# branch for that crew written by analogy with its siblings would inherit the
+# hazard — but they are the reason the operator reaches for that word, not the
+# occurrence themselves (reviewer and steward, PR #513).
 #
 # IT FAILS CLOSED, and that is the whole point: an unlisted profile is refused,
 # never silently redirected to the right one. A silent redirect would make a
 # directory where typing one profile name gets you a different profile, which is
 # harder to reason about than the hazard, and it fails OPEN if the redirect is
-# ever dropped.
-_PROFILE_ALLOWLIST: dict[str, set[str]] = {
-    # EA is a black box (platform/decisions/0043) holding the operator's personal email and
-    # text archive. `projects/platform/profiles/ea-daytime.yaml` (knowledge#370) is
-    # the only profile it may individuate.
-    "EA": {"ea-daytime"},
-}
+# ever dropped — including the one way this table can now fail that a hardcoded
+# dict never could: an unreadable registry must refuse every directory rather
+# than report none restricted (`projects.profile_allowlist`'s own docstring).
+#
+# The one unit that carries the field today is a black-box crew
+# (platform/decisions/0043) holding the operator's personal email and text
+# archive, whose `kb_profile_allowlist` names its own role-specific daytime
+# profile (knowledge#370) as the only profile it may individuate.
+
+
+def _registry_home_match(cwd: Path) -> tuple[str, str] | None:
+    """`(name, slug)` for the registered project whose `home_dir` contains
+    `cwd`, preferring the longest (most specific) `home_dir` — the registry
+    lookup `lib/agent-platform/session_crews.py`'s `_candidate_homes`/
+    `_project_for` and `bin/co`'s private-crew check already use
+    (`projects.home_path`), rather than a second path walker.
+
+    `name` is the matched `home_dir`'s own basename, not the registry slug:
+    a canonical clone living directly under the root has always had its
+    product key equal to that basename (`<root>/agent-platform` for the
+    `bosun` project, whose slug and directory name differ), and a nested
+    `home_dir` (`<root>/globex/globex-studio`) must resolve the same way —
+    the directory's own name, wherever it sits. The longest match wins so a
+    project nested inside another project's home_dir (none today) would
+    still resolve to the more specific one.
+
+    `None` when the registry can't be read, or no `home_dir` contains `cwd`
+    — the caller falls back to today's first-path-segment behaviour either
+    way, so an unreadable or malformed registry costs nothing it doesn't
+    already fail on elsewhere.
+    """
+    try:
+        slugs = list(projects.load())
+    except Exception:
+        return None
+    best: tuple[int, str, str] | None = None
+    for slug in slugs:
+        try:
+            home = projects.home_path(slug)
+        except Exception:
+            continue
+        if home is None:
+            continue
+        if cwd != home and home not in cwd.parents:
+            continue
+        depth = len(home.parts)
+        if best is None or depth > best[0]:
+            best = (depth, home.name, slug)
+    return (best[1], best[2]) if best is not None else None
+
+
+def _worktree_registry_name(prefix: str) -> str:
+    """The `home_dir` basename for the project whose own slug or alias is
+    `prefix`, or `prefix` unchanged when the registry has no such project, its
+    `home_dir` can't be resolved, or the registry can't be read.
+
+    Only a slug or an alias counts — never a `repos` entry. A project's
+    `repos` list can name a physically separate checkout dispatched through
+    its crew (`globex-backend` under `globex`), which keeps its own
+    worktree identity; only an alias names the SAME directory under another
+    spelling (`globex-documentation` for `globex-docs`), which is what this
+    exists to fold back to the one worktree prefix that directory already
+    uses everywhere else.
+    """
+    try:
+        units = projects.load()
+    except Exception:
+        return prefix
+    for slug, unit in units.items():
+        names = [slug, *unit.get("aliases", [])]
+        if prefix not in names:
+            continue
+        try:
+            home = projects.home_path(slug)
+        except Exception:
+            return prefix
+        return home.name if home is not None else prefix
+    return prefix
 
 
 def detect_product(cwd: Path) -> tuple[str, str]:
     """The PRODUCT key for cwd, plus a label naming where it came from.
 
-    Split out of `detect_project` so `_PROFILE_ALLOWLIST` can key on the
-    DIRECTORY rather than on the project it maps to. See that table's comment
-    for why the distinction is load-bearing.
+    Split out of `detect_project` so the registry's `kb_profile_allowlist`
+    field can key on the DIRECTORY rather than on the project it maps to. See
+    that table's comment for why the distinction is load-bearing.
 
     Two cwd shapes are valid:
       <root>/<product>/...                        — canonical clone (daytime co)
       <root>/worktrees/<product>.<purpose>/...     — agentctl-allocated worktree
                                                       (overnight + agentctl spawn flow)
+
+    For the canonical-clone shape, `<product>` is resolved against the
+    registry's `home_dir` values first (`_registry_home_match`), so a project
+    nested below the root (`<root>/globex/globex-outpost`) resolves to its own
+    directory name rather than to the umbrella segment above it (`globex`). A
+    `cwd` no registered `home_dir` contains falls back to the first path
+    segment, exactly as before the registry lookup existed.
+
     For the worktree shape, the product is the prefix of the dirname before
-    the first `.` (e.g. `constance.overnight` → `constance`).
+    the first `.` (e.g. `widget.overnight` → `widget`), resolved
+    through the registry's slugs and aliases (`_worktree_registry_name`) so
+    an alias prefix folds to the directory its project actually uses.
     """
+    resolved_cwd = cwd.resolve()
     try:
-        rel = cwd.resolve().relative_to(CONVIVY.resolve())
+        rel = resolved_cwd.relative_to(CONVIVY.resolve())
     except ValueError:
         die(f"cwd {cwd} is not under {CONVIVY}; cannot detect product.",
             code=NO_PROJECT_MAPPING)
@@ -305,29 +389,41 @@ def detect_product(cwd: Path) -> tuple[str, str]:
             die(f"cwd is exactly {CONVIVY}/worktrees; expected a worktree subdir.",
                 code=NO_PROJECT_MAPPING)
         wt_dirname = parts[1]
-        return wt_dirname.split(".", 1)[0], f"worktree {wt_dirname}"
+        prefix = wt_dirname.split(".", 1)[0]
+        return _worktree_registry_name(prefix), f"worktree {wt_dirname}"
 
     # Canonical clone case: `<root>/<product>/...`
+    match = _registry_home_match(resolved_cwd)
+    if match is not None:
+        name, slug = match
+        return name, f"cwd {cwd} (registry home_dir for {slug!r})"
     return first, f"cwd {cwd} (under {CONVIVY}/{first})"
 
 
 def allowed_profiles(product: str) -> set[str] | None:
-    """The profiles `product` may individuate, or None when unrestricted."""
+    """The profiles `product` may individuate, or None when unrestricted.
+
+    Reads `projects.profile_allowlist()`, which raises on an unreadable
+    registry rather than returning an empty mapping — propagated here
+    uncaught, so a registry the Library can't serve makes this function
+    refuse to answer at all rather than report every directory unrestricted."""
     folded = product.casefold()
-    for key, profiles in _PROFILE_ALLOWLIST.items():
+    for key, profiles in projects.profile_allowlist().items():
         if key.casefold() == folded:
             return profiles
     return None
 
 
 def check_profile_allowed(product: str, profile_name: str) -> None:
-    """Refuse a profile this directory may not individuate. Fails closed."""
+    """Refuse a profile this directory may not individuate. Fails closed:
+    see `allowed_profiles`'s own docstring for why an unreadable registry
+    propagates instead of reading as unrestricted."""
     allowed = allowed_profiles(product)
     if allowed is None or profile_name in allowed:
         return
     die(f"profile {profile_name!r} is not permitted in {product} — "
         f"allowed here: {', '.join(sorted(allowed))}. This directory is "
-        f"restricted on purpose; see _PROFILE_ALLOWLIST in bin/knowledge-ctx.",
+        f"restricted on purpose; see kb_profile_allowlist in the project registry.",
         code=PROFILE_NOT_ALLOWED)
 
 
@@ -342,8 +438,21 @@ def detect_project(cwd: Path) -> str:
 
 def _default_refused(product: str) -> bool:
     """A private crew or a restricted directory never takes `platform/default`,
-    under any spelling (projects.default_profile_refused)."""
-    return projects.default_profile_refused(product, _PROFILE_ALLOWLIST)
+    under any spelling (projects.default_profile_refused).
+
+    `profile_allowlist()` fails closed by raising on an unreadable registry
+    (see its own docstring), unlike `default_profile_refused`'s own
+    `_private_crew_names()` call, which catches that case itself. Caught here
+    too, for the same fail-closed answer: refused, not an escaped exception —
+    this is the function `detect_project_or_default` calls before falling
+    back to the generic default profile, and the caller's own docstring and
+    `bin/co`/`bin/agentctl` both key on the clean `NO_PROJECT_MAPPING` exit
+    that follows."""
+    try:
+        allowlist = projects.profile_allowlist()
+    except Exception:
+        return True
+    return projects.default_profile_refused(product, allowlist)
 
 
 def _default_profile_available() -> bool:
@@ -751,8 +860,7 @@ def _frontmatter_from_disk(path: Path, indexer_mod) -> tuple[dict | None, bool]:
 
 
 # The largest real document under the knowledge checkout measured 96399 bytes
-# (projects/selector/decisions/0083-record-completeness-invariant.md,
-# 2026-10-01). 1 MiB is roughly 11x that.
+# (2026-10-01). 1 MiB is roughly 11x that.
 _MAX_SOURCE_BYTES = 1024 * 1024
 
 
@@ -1540,8 +1648,10 @@ def _library_profile_rows(profile: dict) -> tuple[list[dict], list[dict]]:
 # also observed (19.7s on 2026-09-22, issue_01M35DC5TJY5ZXM8MRZKPAWJDD), so a
 # refusal here must not assert which one occurred. Every refusal below names
 # the Library and states only what this client observed.
-LIBRARY_CLIENT_TOKENS = Path.home() / ".library" / "client-tokens.json"
 LIBRARY_CLIENT_NAME = "bosun"
+# The Library's own name for this file in its own identity.py, so an install
+# that sets it explicitly is honoured before either default location.
+LIBRARY_CLIENT_TOKENS_ENV = "LIBRARY_CLIENT_TOKENS"
 # 60s: a bundle render can wait behind another dispatch's concurrent render
 # (19.7s measured 2026-09-22, which a 15s timeout refused). Not derived from a
 # measured distribution of render times — raised past the one measured
@@ -1584,20 +1694,46 @@ def _vault_plane():
     return vault_plane
 
 
+def _library_client_tokens_candidates() -> list[Path]:
+    """Where this install's Library client-token file might live, tried by
+    `_library_token` in this order: the `LIBRARY_CLIENT_TOKENS` environment
+    variable, when set (the Library's own name for this file in its own
+    identity.py — an install that moved or renamed the file sets it
+    explicitly, and that wins outright); else `~/.library/client-tokens.json`
+    (this machine's own file lives there, with no state-dir copy); else
+    `~/.local/state/library/client-tokens.json` (the Library's state-dir
+    move).
+
+    Resolved HERE, at call time, rather than once into a module constant at
+    import — a dispatched run's own `HOME` can be redirected, and this must
+    still answer for the operator's real account home regardless, the same
+    way every other `BR.real_account_home()` caller in this codebase
+    resolves it fresh on every call (see its own docstring)."""
+    env = os.environ.get(LIBRARY_CLIENT_TOKENS_ENV)
+    if env:
+        return [Path(env)]
+    home = BR.real_account_home()
+    return [home / ".library" / "client-tokens.json",
+            home / ".local" / "state" / "library" / "client-tokens.json"]
+
+
 def _library_token() -> str:
     """The `bosun` client credential. Never included in a message or a log."""
+    candidates = _library_client_tokens_candidates()
+    path = next((c for c in candidates if c.exists()), candidates[-1])
     try:
-        tokens = json.loads(LIBRARY_CLIENT_TOKENS.read_text())
+        tokens = json.loads(path.read_text())
     except (OSError, ValueError) as e:
+        tried = ", ".join(str(c) for c in candidates)
         raise BundleRefused(
-            f"cannot read the Library credential at {LIBRARY_CLIENT_TOKENS}: "
+            f"cannot read the Library credential (tried {tried}): "
             f"{type(e).__name__}") from e
     if isinstance(tokens, dict):
         for token, entry in tokens.items():
             if isinstance(entry, dict) and entry.get("name") == LIBRARY_CLIENT_NAME:
                 return token
     raise BundleRefused(
-        f"{LIBRARY_CLIENT_TOKENS} has no client named {LIBRARY_CLIENT_NAME!r}")
+        f"{path} has no client named {LIBRARY_CLIENT_NAME!r}")
 
 
 def _library_request(method: str, path: str, body: dict | None = None) -> dict:
@@ -2262,13 +2398,65 @@ GENERIC_PART_MAX_BYTES = 9000
 GENERIC_PART_MAX_ENV = "KNOWLEDGE_CTX_PART_MAX_BYTES"
 
 # The parts of the generic bundle, split along the two inlined imports: a block
-# belongs to the part named for it here, and every other block is in `blocks`.
-# Keyed by the last segment of the block id, as _WRITING_STANDARD_BLOCKS is.
-GENERIC_PARTS = ("blocks", "write-better", "talk-better")
+# belongs to the part named for it here, and every other block packs into
+# `blocks`, `blocks-2`, `blocks-3`, ... (see `_blocks_part_sequence_number`),
+# as many as the cap forces. Keyed by the last segment of the block id, as
+# _WRITING_STANDARD_BLOCKS is.
+GENERIC_PARTS = ("blocks", "blocks-2", "write-better", "talk-better")
 _GENERIC_PART_OF_BLOCK = {
     "write-better-import": "write-better",
     "talk-better-import": "talk-better",
 }
+_BLOCKS_PART_RE = re.compile(r"^blocks-([0-9]+)$")
+
+
+def _blocks_part_sequence_number(part: str) -> int | None:
+    """1 for `blocks`, N for `blocks-N` (N >= 2), else None: PART names a
+    writing-standard part or isn't a recognized part at all."""
+    if part == "blocks":
+        return 1
+    m = _BLOCKS_PART_RE.match(part)
+    if m and int(m.group(1)) >= 2:
+        return int(m.group(1))
+    return None
+
+
+def _pack_blocks_into_parts(blocks: list[dict], cap: int) -> list[list[dict]]:
+    """BLOCKS packed, in order, into groups whose rendered text is at or under
+    CAP: `blocks`, `blocks-2`, `blocks-3`, ... Never splits a block. The first
+    block that would push a group over CAP starts the next group instead; a
+    block that alone exceeds CAP still becomes a group of one, so the caller
+    can refuse it by name rather than silently drop it."""
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    for block in blocks:
+        candidate = current + [block]
+        size = len(render_instruction_blocks_md(candidate).encode("utf-8"))
+        if not current or size <= cap:
+            current = candidate
+        else:
+            groups.append(current)
+            current = [block]
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _generic_bundle_parts(blocks: list[dict], cap: int) -> dict[str, list[dict]]:
+    """Every named part of the generic bundle mapped to its blocks: the fixed
+    `write-better` and `talk-better` parts, plus as many `blocks`/`blocks-N`
+    parts as `_pack_blocks_into_parts` produces."""
+    plain = [b for b in blocks if _GENERIC_PART_OF_BLOCK.get(
+        b["id"].rsplit("/", 1)[-1], "blocks") == "blocks"]
+    parts: dict[str, list[dict]] = {}
+    for i, group in enumerate(_pack_blocks_into_parts(plain, cap), start=1):
+        parts["blocks" if i == 1 else f"blocks-{i}"] = group
+    for name in ("write-better", "talk-better"):
+        selected = [b for b in blocks if _GENERIC_PART_OF_BLOCK.get(
+            b["id"].rsplit("/", 1)[-1]) == name]
+        if selected:
+            parts[name] = selected
+    return parts
 
 
 def render_generic_bundle(part: str | None = None) -> int:
@@ -2285,13 +2473,15 @@ def render_generic_bundle(part: str | None = None) -> int:
     Refuses an empty result for the reason `resolve_floor_blocks` does: a hook
     emitting nothing looks the same as a session that needed nothing.
 
-    With PART (one of GENERIC_PARTS) prints only that part's blocks, and refuses
-    with exit 1 and prints nothing when the text is over the byte cap or the
-    part holds no block. Exit 1 and never 2: a SessionStart hook's exit 2 has
-    its own meaning in Claude Code. An over-cap part is refused whole, never
-    truncated, because half a standard is worse than a named absence.
+    With PART (`blocks`, `blocks-2`, ..., `write-better` or `talk-better`)
+    prints only that part's blocks, packed by `_generic_bundle_parts`, and
+    refuses with exit 1 and prints nothing when the text is over the byte cap
+    or the part holds no block. Exit 1 and never 2: a SessionStart hook's exit
+    2 has its own meaning in Claude Code. An over-cap part is refused whole,
+    never truncated, because half a standard is worse than a named absence.
     """
-    if part is not None and part not in GENERIC_PARTS:
+    if (part is not None and part not in GENERIC_PARTS
+            and _blocks_part_sequence_number(part) is None):
         die(f"unknown generic bundle part {part!r}; expected one of "
             f"{', '.join(GENERIC_PARTS)}.")
     blocks = resolve_instruction_blocks(
@@ -2301,23 +2491,52 @@ def render_generic_bundle(part: str | None = None) -> int:
         die("the index holds no non-fleet instruction block an interactive "
             "session with no agent receives; refusing to print an empty bundle.")
     blocks = inline_block_imports(blocks)
+    cap = int(os.environ.get(GENERIC_PART_MAX_ENV) or GENERIC_PART_MAX_BYTES)
     if part is not None:
-        blocks = [b for b in blocks if _GENERIC_PART_OF_BLOCK.get(
-            b["id"].rsplit("/", 1)[-1], "blocks") == part]
-        if not blocks:
+        selected = _generic_bundle_parts(blocks, cap).get(part, [])
+        if not selected:
             die(f"generic bundle part {part!r} holds no instruction block; "
                 f"refusing to print an empty part.")
-    text = render_instruction_blocks_md(blocks)
-    if part is not None:
-        cap = int(os.environ.get(GENERIC_PART_MAX_ENV) or GENERIC_PART_MAX_BYTES)
+        text = render_instruction_blocks_md(selected)
         size = len(text.encode("utf-8"))
         # tools/generic-bundle-context.sh keys on "-byte cap; refusing" to tell
         # this refusal from every other exit 1; keep the phrase in step with it.
         if size > cap:
             die(f"generic bundle part {part!r} is {size} bytes, over the "
                 f"{cap}-byte cap; refusing to print it.")
+    else:
+        text = render_instruction_blocks_md(blocks)
     sys.stdout.write(text)
     return 0
+
+
+def list_generic_bundle_parts() -> int:
+    """Print each non-empty part of the generic bundle with its byte size,
+    one per line, in the order `render_generic_bundle` would pack them.
+    Exits 1 (after printing every line) when any part is over the cap, so one
+    command says which hook lines a `--part` deployment needs and whether any
+    of them would be refused."""
+    blocks = resolve_instruction_blocks(
+        fetch_instruction_blocks(), crew=None, agent=None,
+        session_kind="interactive", include_fleet=False)
+    if not blocks:
+        die("the index holds no non-fleet instruction block an interactive "
+            "session with no agent receives; refusing to print an empty bundle.")
+    blocks = inline_block_imports(blocks)
+    cap = int(os.environ.get(GENERIC_PART_MAX_ENV) or GENERIC_PART_MAX_BYTES)
+    parts = _generic_bundle_parts(blocks, cap)
+    blocks_names = sorted(
+        (n for n in parts if _blocks_part_sequence_number(n) is not None),
+        key=_blocks_part_sequence_number)
+    names = blocks_names + [n for n in ("write-better", "talk-better")
+                            if n in parts]
+    over_cap = False
+    for name in names:
+        size = len(render_instruction_blocks_md(parts[name]).encode("utf-8"))
+        if size > cap:
+            over_cap = True
+        print(f"{name}\t{size}")
+    return 1 if over_cap else 0
 
 
 # Claude Code expands an `@path` line in a CLAUDE.md but not in SessionStart
@@ -2597,9 +2816,9 @@ def _agent_md(row: dict, fm: dict, body: str) -> str:
     `_skill_md` does and for the same reason: `description:` is what Claude
     Code shows an orchestrator deciding WHICH subagent to invoke, so it has to
     say when to pick this one. A body-derived first sentence says what the agent
-    does, which is a different question — `cfo-ingest`'s hand-written trigger is
+    does, which is a different question — `widget-ingest`'s hand-written trigger is
     "use when the operator has a downloaded bank/card statement to load", while its first
-    paragraph is "You load a single statement file into cfo.db".
+    paragraph is "You load a single statement file into widget.db".
 
     Falls back to derivation for agents without `trigger:`, which is every agent
     authored in the KB to date — all 30 of them were written body-first with no
@@ -2991,8 +3210,8 @@ def individuate(
     # writing it sometimes. An operator or agent who hand-places notes there
     # — in a repo whose active profile composes nothing on this render —
     # must not have them removed by a `knowledge-ctx use` typed at a
-    # terminal, which `_PROFILE_ALLOWLIST` above establishes is a real and
-    # named occurrence rather than a weaker hypothetical one. So this clears
+    # terminal, which the `kb_profile_allowlist` table above establishes is a
+    # real and named occurrence rather than a weaker hypothetical one. So this clears
     # the same per-file gates `_orphan_gate_reason` applies to every other
     # file this tool deletes, which the orphan path earned over five rounds
     # of exactly this risk. A candidate that fails a gate is REPORTED and
@@ -3640,9 +3859,10 @@ def cmd_check(cwd: Path, record_path: Path | None = None) -> int:
         # it via `detect_project_or_default(cwd, ...)` and can never be
         # pointed at an attacker-chosen project at all. Pin it to that same
         # resolution before trusting it for anything below: an unrestricted
-        # workspace (any product with no `_PROFILE_ALLOWLIST` entry) could
-        # otherwise write a marker naming a DIFFERENT project — EA, the
-        # platform's black box (platform/decisions/0043) — and have `check`
+        # workspace (any product with no `kb_profile_allowlist` entry) could
+        # otherwise write a marker naming a DIFFERENT project — the
+        # personal-archive crew, the platform's black box
+        # (platform/decisions/0043) — and have `check`
         # fetch and print that project's own profile, which
         # `check_profile_allowed` cannot catch: it validates `profile_name`
         # against the CALLING directory's own allowlist entry, never
@@ -3656,9 +3876,10 @@ def cmd_check(cwd: Path, record_path: Path | None = None) -> int:
                   file=sys.stderr)
             return CHECK_CANNOT_TELL
         # Same refusal `cmd_use` applies via `check_profile_allowed`, and
-        # ahead of `load_profile` for the same reason: a directory on
-        # `_PROFILE_ALLOWLIST` (EA) must not resolve a wider profile even to
-        # diff it, and `profile_name` here comes from the workspace-writable
+        # ahead of `load_profile` for the same reason: a directory with a
+        # `kb_profile_allowlist` entry (the personal-archive crew) must not
+        # resolve a wider profile even to diff it, and `profile_name` here
+        # comes from the workspace-writable
         # `.active-profile` marker rather than a CLI argument (security-
         # reviewer, PR #835 round 1).
         check_profile_allowed(product, profile_name)
@@ -3776,10 +3997,15 @@ def main() -> int:
              "selected by omission")
     p_bundle.add_argument(
         "--part", default=None, metavar="NAME",
-        help="print one part of the bundle (blocks, write-better, talk-better) "
-             "so each fits the SessionStart hook-context limit; refused with "
-             "exit 1 when over the byte cap. Validated in code because "
-             "argparse's own refusal exits 2")
+        help="print one part of the bundle (blocks, blocks-2, ..., "
+             "write-better, talk-better) so each fits the SessionStart "
+             "hook-context limit; refused with exit 1 when over the byte "
+             "cap. Validated in code because argparse's own refusal exits 2")
+    p_bundle.add_argument(
+        "--list-parts", action="store_true",
+        help="print each non-empty part's name and byte size, one per "
+             "line, instead of a part's content; exits 1 when any part is "
+             "over the byte cap. Mutually exclusive with --part")
 
     sub.add_parser("active", help="print the currently-active profile in this repo")
     sub.add_parser("list", help="list profiles available for this repo's project")
@@ -3858,6 +4084,10 @@ def main() -> int:
                             dry_run=args.dry_run)
 
     if args.cmd == "bundle":
+        if args.list_parts:
+            if args.part is not None:
+                die("--list-parts and --part are mutually exclusive")
+            return list_generic_bundle_parts()
         return render_generic_bundle(args.part)
 
     # `use` path

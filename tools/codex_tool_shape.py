@@ -223,6 +223,28 @@ def classify(call):
             f"not the commands inside it")
 
 
+def tool_target_path(tool, args):
+    """The path field a file-touching INERT_TOOLS member's own call names, read
+    directly off that call's own tool_input — the shim's own payload, never a
+    guess at an output event's shape (that uncertainty belongs to the conformance
+    probe's own reading of the `--json` event stream, a different question; see
+    lib/agent-platform/codex_probe.py's own comment on `_tool_event_target`).
+    `apply_patch`-shaped input nests its target under `action`; every other
+    file-touching member this module knows about (the comment on INERT_TOOLS)
+    is assumed to carry it at the top level as `path`. None when neither is a
+    string — an unrecognised shape that the caller (the hook shim) cannot name
+    a target for, denied the same way an unreadable command already is."""
+    if not isinstance(args, dict):
+        return None
+    value = args.get("path")
+    if isinstance(value, str):
+        return value
+    action = args.get("action")
+    if isinstance(action, dict) and isinstance(action.get("path"), str):
+        return action["path"]
+    return None
+
+
 def _describe(args):
     if isinstance(args, str):
         return f"a string of {len(args)} characters"

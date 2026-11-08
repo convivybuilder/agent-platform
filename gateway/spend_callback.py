@@ -167,9 +167,9 @@ def _cache_tokens(usage, tokens_in: int) -> tuple[int | None, int | None]:
 # basename. Rates per token: in = cache-miss / full input; cache_read = cache-hit
 # input; out. MUST mirror gateway/config.yaml `model_info` — one entry per model
 # whose config block is marked "absent from the installed LiteLLM map" (glm /
-# mimo / kimi). Models LiteLLM DOES price (deepseek, kimi-k2.7-code) are
-# deliberately omitted: their response_cost is non-zero, so this fallback never
-# fires for them.
+# mimo / kimi), plus deepseek-flash: LiteLLM 1.86.2 has no deepseek-flash entry
+# either (litellm.get_model_info raises), and the deepseek-chat alias it used
+# to carry is retired.
 # Authoritative membership test: a model needs an entry here iff LiteLLM CANNOT
 # price it (litellm.get_model_info raises → response_cost 0). The config.yaml
 # "absent from the LiteLLM map" comments are NOT reliable for this (verified
@@ -177,8 +177,9 @@ def _cache_tokens(usage, tokens_in: int) -> tuple[int | None, int | None]:
 # truth with the gateway venv when adding a gateway model:
 #   .local/venv-llm-gateway/bin/python3 -c "import litellm; litellm.get_model_info('<provider/model>')"
 # Confirmed unpriced (need an entry): zai/glm-5.2, openai/mimo-v2.5-pro,
-# moonshot/kimi-k2.7-code. Priced by LiteLLM (no entry needed): deepseek-chat,
-# moonshot/kimi-k2.6. Rates per token, mirror config.yaml model_info.
+# moonshot/kimi-k2.7-code, deepseek/deepseek-flash, deepseek/deepseek-v4-pro.
+# Priced by LiteLLM (no entry needed): moonshot/kimi-k2.6. Rates per token,
+# mirror config.yaml model_info.
 _PINNED_PRICES = {
     # config.yaml model_name: glm   (zai/glm-5.2)
     "glm-5.2":          {"in": 0.0000014,    "cache_read": 0.00000026,   "out": 0.0000044},
@@ -186,6 +187,19 @@ _PINNED_PRICES = {
     "mimo-v2.5-pro":    {"in": 0.000000435,  "cache_read": 0.0000000036, "out": 0.00000087},
     # config.yaml model_name: kimi-code  (moonshot/kimi-k2.7-code — unpriced by LiteLLM)
     "kimi-k2.7-code":   {"in": 0.00000095,   "cache_read": 0.00000019,   "out": 0.000004},
+    # config.yaml model_name: deepseek  (deepseek/deepseek-flash). DeepSeek's
+    # billed PEAK rates (CQ·515, steward ruling 2026-10-19, derived from the
+    # 2026-10-18/19 billing export), pinned at peak so this fallback, like
+    # config.yaml's model_info, never undercounts.
+    "deepseek-flash":   {"in": 0.0000003,   "cache_read": 0.000000006,  "out": 0.0000012},
+    # Legacy id (still accepted by DeepSeek, no stated retirement date, renamed
+    # 2026-10-20): config.yaml no longer deploys it, but a gateway_spend.jsonl
+    # row recorded under it before the rename must still price the same way.
+    "deepseek-v4-flash": {"in": 0.0000003,   "cache_read": 0.000000006,  "out": 0.0000012},
+    # config.yaml model_name: deepseek-pro  (deepseek/deepseek-v4-pro). Model
+    # trial 2's second arm (CQ·524). DeepSeek's billed peak rates
+    # (api-docs.deepseek.com/quick_start/pricing, read 2026-10-20).
+    "deepseek-v4-pro":  {"in": 0.00000132,  "cache_read": 0.000000044, "out": 0.00000396},
 }
 
 

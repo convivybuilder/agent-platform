@@ -38,6 +38,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path.home() / ".local" / "lib" / "agent-platform"))
+import projects  # noqa: E402
 import registry as R  # noqa: E402
 import telemetry as T  # noqa: E402
 
@@ -53,7 +54,7 @@ CLAUDE_PROJECTS = Path.home() / ".claude" / "projects"
 # `origin` when an older meta.json predates the explicit origin field.
 _SCHEDULED_PROFILES = {"overnight", "full_monty", "scheduled"}
 
-# A ~/.claude/projects dir is a Convivy product's co-session transcript dir when its
+# A ~/.claude/projects dir is a registered product's co-session transcript dir when its
 # sanitized-cwd name carries this marker (every product lives under <root>/...). The
 # main-loop-only discovery scan in build_sessions uses it to find co sessions whose cost
 # lives only in their transcript (they dispatched no captured children), while skipping
@@ -248,58 +249,34 @@ def load_node(run_dir: Path) -> dict | None:
     }
 
 
-# Telemetry string → display, for the three NYH projects (ARCH-426 amendment). An
-# explicit table rather than the `nyh-*` prefix match it replaces: a prefix would
-# silently swallow a fourth property added later into whichever branch it happened
-# to hit, and a new building should appear as itself or not at all.
-_NYH_DISPLAY = {
-    "nyh-arch-tools": "NYH Arch Tools",
-    "nyh-etc": "East Texas Circle",
-    "nyh-park-villa": "Park Villa",
-    "nyh-architecture": "NYH Arch Tools",
-}
-
-
 def _canonical_product(product: str | None) -> str:
-    """Collapse a raw repo/product string to its canonical product bucket.
+    """Collapse a raw repo/product string to its canonical product bucket,
+    via the registry's own curated fold table (`projects.cost_fold_map()`):
+    a unit's own `cost_fold_aliases` strings fold to that unit's `display`.
+    This used to hand-maintain its own copy of that table — an umbrella
+    directory's handful of per-property repos, a product's legacy slugs
+    across a rename, a retired crew's alias onto the crew that inherited its
+    work — which is exactly the kind of scattered list `projects.py`'s module
+    docstring names and `cost_fold_map()` replaces; the project registry is
+    where a fold like that is recorded now, in a unit's own
+    `cost_fold_aliases`. A raw string with no fold is its own bucket — which
+    is every registered unit's own slug by default, unchanged from before
+    this read moved to the registry; a unit whose `display` is absent from
+    agent-activity-report's `_PUBLIC_TASK_PRODUCTS` stays data-local, so
+    task/label remain redacted on the shared surface for it.
 
-    The NYH repos under the <root>/nyh-architecture/ umbrella are THREE PROJECTS,
-    not one, and each reports for itself (ARCH-426 amendment). They were folded into
-    a single "NYH Studio" bucket while the umbrella directory was the only thing
-    holding them together; the operator's call is that per-property velocity and spend is the
-    more useful view, so the fold is gone. NYH Studio survives as the PRODUCT all
-    three build, which is where the family grouping now lives.
-
-    `nyh-architecture` — the bare umbrella directory — folds to NYH Arch Tools. It
-    is one historical co session from 2026-06-08, before the per-repo sessions
-    existed, and arch-tools is the studio-wide project of the three. Stating the
-    cost plainly: that single session is attributed to a project it may not have
-    been working on. The alternative was leaving it as a raw one-row sliver.
-
-    All three stay data-local: none of their displays is in agent-activity-report's
-    _PUBLIC_TASK_PRODUCTS, so task/label remain redacted on the shared surface.
-
-    Hollis (formerly "Personal Assistant", renamed 2026-07-01, ARCH-290) is
-    tagged three ways during and after the rename: "hollis" (the renamed
-    interactive co, by cwd basename), "personal-assistant" (the still-`pa`
-    overnight launcher's PRODUCT until the Wave-2 operational rename), and the
-    legacy "pa" alias. Fold all three into "Hollis" so the whole history and both
-    live sources land in one bucket. Like "NYH Studio", "Hollis" is data-local —
-    absent from _PUBLIC_TASK_PRODUCTS, so task/label stay redacted."""
+    A registry that cannot be read degrades to no fold at all (every raw
+    string is its own bucket) rather than raising: a cost report with
+    un-folded buckets is still useful, and this is report-only code no run's
+    outcome depends on."""
     p = product or "?"
-    if p in _NYH_DISPLAY:
-        return _NYH_DISPLAY[p]
-    if p in ("hollis", "personal-assistant", "pa"):
-        return "Hollis"
-    # The Keel split into two crews on 2026-08-17 (the operator), and its spend history is
-    # tagged `keel` — one string covering work that is now the Library's and the
-    # Bosun's. It folds to the Bosun, which inherits the platform code the Keel's
-    # runs overwhelmingly touched. Attribution before the split is therefore
-    # approximate in one direction, and saying so beats a raw `keel` sliver that
-    # rolls up to nothing.
-    if p == "keel":
-        return "Bosun"
-    return p
+    try:
+        fold = projects.cost_fold_map()
+    except OSError as e:
+        print(f"cost_join: cost_fold_map() could not read the registry "
+              f"({e}); reporting {p!r} unfolded.", file=sys.stderr)
+        return p
+    return fold.get(p, p)
 
 
 def _resolve_product(cwd: str | None) -> str:
@@ -336,7 +313,7 @@ def _uuid_transcript(uuid: str) -> Path | None:
 def _is_worker_session(uuid: str) -> bool:
     """True if this UUID is a dispatched worker, not a co session the operator drove.
 
-    A worker (a co's reviewer/coder, a pa-crew agent) runs in a git worktree, so its
+    A worker (a co's reviewer/coder, a crew-prefixed agent) runs in a git worktree, so its
     transcript dir is a sanitized `.../worktrees/...` path. Its Task subagents stamp
     parent_run=<worker UUID>, which would otherwise surface the worker as a phantom
     top-level `interactive` session with a garbage product (the worktree basename).
@@ -694,7 +671,7 @@ def build_sessions(start: datetime, end: datetime) -> list[dict]:
         main_loop = co_main_loop_node(uuid)
         if not kids and main_loop is None:
             continue
-        # SDK-worker case #3b misses via transcript-location: a pa-crew agent keyed by
+        # SDK-worker case #3b misses via transcript-location: a crew-prefixed agent keyed by
         # an `agent-<hex>` id leaves no product-root `<uuid>.jsonl`, so main_loop is
         # None. If every captured child is a Task subagent that ran in a git worktree,
         # this is a dispatched worker, not a co session the operator drove — suppress the phantom
@@ -705,8 +682,8 @@ def build_sessions(start: datetime, end: datetime) -> list[dict]:
             continue
         # Product = the co's OWN cwd-resolved product (authoritative), not a child's.
         # A child that ran in a worktree carried a worktree-basename product before the
-        # hook fix, and picking the first such child mislabeled the whole session (a PA
-        # co with pa-crew subagents showed product `agent-<hex>`). Prefer the main loop;
+        # hook fix, and picking the first such child mislabeled the whole session (a crew's
+        # co with crew-prefixed subagents showed product `agent-<hex>`). Prefer the main loop;
         # fall back to the kids' majority product when the transcript is pruned.
         if main_loop is not None and main_loop["product"] not in ("?", None):
             product = main_loop["product"]
@@ -806,7 +783,7 @@ def build_sessions(start: datetime, end: datetime) -> list[dict]:
     # dispatched no captured children never enters `interactive` above. The dominant co
     # cost is the main loop (ARCH-280), so dropping these under-reports spend badly
     # (operator 2026-06-30: four of five all-day sessions and ~$600 missing). Scan every
-    # Convivy product-root transcript dir — excluding worktree dirs (dispatched workers,
+    # product-root transcript dir — excluding worktree dirs (dispatched workers,
     # #3b) and agent-runs sidecars — bounded to transcripts *touched within the window*
     # so the 15-min producer never re-parses the whole multi-GB corpus. A uuid already
     # surfaced (it had children) is skipped before the read, so only genuinely
@@ -1042,6 +1019,25 @@ def _linked_items(node: dict, by_url: dict, by_number: dict) -> set[str]:
     if number is not None and node.get("repo"):
         found |= by_number.get((node["repo"], str(number)), set())
     return found
+
+
+def item_for_pr(pr_url: str | None, pr_number, repo: str | None, items: list[dict]) -> str | None:
+    """The single work item a run's PR resolves to, by `build_item_costs`' own
+    PR-match rule (`_linked_items`, over an index built here from `items`):
+    exactly one item links this PR, by URL or by (repo, number). None when no
+    item links it, or more than one does (the same "no-link"/"pr-ambiguous"
+    outcomes `build_item_costs` reports for a run's node) — never raises.
+
+    The one function the run-cost side (`build_item_costs`, through
+    `_linked_items`) and the ledger side (the Library posters in
+    `bin/agentctl` and `bin/model-scorecard`, through `ledger.resolve_item_id`)
+    both resolve a bare PR to an item through, so a run's meta.issue-less
+    attribution can't drift between the two (E16)."""
+    by_url, by_number = _index_prs(items)
+    linked = _linked_items(
+        {"pr_url": pr_url, "pr_number": pr_number, "pr": None, "repo": repo},
+        by_url, by_number)
+    return next(iter(linked)) if len(linked) == 1 else None
 
 
 def _plus(total: float | None, usd: float | None) -> float | None:
@@ -1388,8 +1384,9 @@ def build_course_costs(start: datetime, end: datetime, items: list[dict],
 # reconciliation compares the ledger's `usd` against `priced_usd`, never
 # against `usd`, for exactly this reason.
 #
-# A ledger entry's `lane` (`gateway`/`subscription`/null) and a run record's
-# `billing_source` (`subscription_credit`, `provider_api:openai`, ...) are two
+# A ledger entry's `lane` (`gateway`/`subscription`/`openai-subscription`/null)
+# and a run record's `billing_source` (`subscription_credit`,
+# `provider_api:openai`, ...) are two
 # different vocabularies describing the same underlying split, not one
 # shared key space — `post_ledger_entry` sends its own `lane` (E1·6), computed
 # by `model-scorecard` from the run's model string rather than read from
@@ -1493,9 +1490,26 @@ def reconcile_epic_cost(run_costs: dict[str, dict], ledger_entries: list[dict],
                            `ledger_only` or an unreachable Library; a caller
                            that could not even fetch `ledger_entries` reports
                            its own "unavailable" rather than calling this
-    """
+
+    One run_id can carry SEVERAL ledger rows, not just one: `agentctl`'s live
+    checkpoint posts under `dedup_key=f"{run_id}:live:{seq}"` (CQ·446) and its
+    at-finish/backstop entry posts under a separate `dedup_key=run_id` —
+    distinct rows the Library never merges. The ledger's own total for a run
+    is every one of those rows added together; a mapping that kept only one
+    row per run_id (whichever `list_ledger_entries` happened to return last —
+    in practice the at-finish row, so only the small remainder left over
+    after the live checkpoints already covered most of the run) would read as
+    a mismatch against the run's full recorded cost even when the Library's
+    own rows, summed, agree with it exactly."""
     live = [e for e in ledger_entries if not e.get("voided_at")]
-    ledger_by_run = {e["run_id"]: e for e in live if e.get("run_id")}
+    ledger_by_run: dict[str, list[dict]] = {}
+    for e in live:
+        rid = e.get("run_id")
+        if rid:
+            ledger_by_run.setdefault(rid, []).append(e)
+
+    def _ledger_usd(rid: str) -> float:
+        return round(sum(float(e.get("usd") or 0.0) for e in ledger_by_run[rid]), 6)
 
     run_ids = set(run_costs)
     ledger_ids = set(ledger_by_run)
@@ -1511,15 +1525,15 @@ def reconcile_epic_cost(run_costs: dict[str, dict], ledger_entries: list[dict],
 
     ledger_total_by_lane: dict[str, float] = {}
     for rid in both:
-        lane = ledger_by_run[rid].get("lane") or "unknown"
-        ledger_total_by_lane[lane] = round(
-            (ledger_total_by_lane.get(lane) or 0.0)
-            + float(ledger_by_run[rid].get("usd") or 0.0), 6)
+        for e in ledger_by_run[rid]:
+            lane = e.get("lane") or "unknown"
+            ledger_total_by_lane[lane] = round(
+                (ledger_total_by_lane.get(lane) or 0.0) + float(e.get("usd") or 0.0), 6)
 
     mismatches = []
     for rid in both:
         run_usd = round(float(run_costs[rid]["priced_usd"]), 6)
-        ledger_usd = round(float(ledger_by_run[rid].get("usd") or 0.0), 6)
+        ledger_usd = _ledger_usd(rid)
         if run_usd != ledger_usd:
             mismatches.append({"run_id": rid, "kind": "amount",
                                "run_usd": run_usd, "ledger_usd": ledger_usd})
@@ -1531,8 +1545,7 @@ def reconcile_epic_cost(run_costs: dict[str, dict], ledger_entries: list[dict],
                                "cost_join_epic_id": actual_epic, "ledger_epic_id": epic_id})
 
     run_only_usd = round(sum(run_costs[rid]["priced_usd"] for rid in run_only_ids), 6)
-    ledger_only_usd = round(
-        sum(float(ledger_by_run[rid].get("usd") or 0.0) for rid in ledger_only_ids), 6)
+    ledger_only_usd = round(sum(_ledger_usd(rid) for rid in ledger_only_ids), 6)
 
     return {
         "epic_id": epic_id,

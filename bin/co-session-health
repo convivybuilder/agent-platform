@@ -3,7 +3,7 @@
 co-session-health — Claude Code status line that warns BEFORE long-context
 tool-call degradation breaks a session.
 
-Background (ARCH-088): in a very long vivy co session, the model began emitting
+Background (ARCH-088): in a very long product-crew co session, the model began emitting
 malformed tool-call blocks — un-namespaced <invoke>/<parameter> tags (missing the
 antml: prefix), often preceded by a stray "court" token. The harness parser only
 recognizes the namespaced form, so the block leaks as literal text and the command
@@ -119,7 +119,7 @@ def _fmt_k(n):
     return f"{n/1000:.0f}K"
 
 
-# --- live detached-run indicator (sous-chef request 2026-07-05) ----------------
+# --- live detached-run indicator (a product crew's request, 2026-07-05) ----------------
 # A detached `agentctl spawn` has no shell pane and isn't a Task-tool agent, so the
 # operator's board can read empty while a full review wave runs — acute now that
 # detach is the default (ARCH-317). Surface the same live runs `agentctl list`
@@ -127,8 +127,8 @@ def _fmt_k(n):
 # a stale entry can't misreport.
 #
 # Scope to THIS co's product (from cwd), because active.json is machine-wide: an
-# unscoped count showed another product's coder on every co (constance reading
-# "coder in flight" when the coder was sous-chef's — operator 2026-07-05). Product co's
+# unscoped count showed another product's coder on every co (one product reading
+# "coder in flight" when the coder was another product's own — operator 2026-07-05). Product co's
 # see only their own repo's runs; the steward (substrate), which dispatches across
 # repos, keeps the fleet-wide view but labels it "(fleet)". Must never raise: a
 # broken read yields no segment, never a broken status line.
@@ -214,10 +214,10 @@ def _live_runs(cwd):
 # what it bills". That premise is wrong: `claude-sub use` swaps ONE machine-wide
 # Keychain item, and a session bills whatever that item holds at request time —
 # a launch token only survives until it refreshes or 401s (≤ its ~8h TTL), after
-# which the session follows the swap. So a session started on convivy, once its
-# launch token expired and the operator had switched to nyh, was billing nyh while its
-# frozen status line still read convivy — 7 sessions in that state on 2026-07-24,
-# all actually on nyh, and a per-session cache that never updated could not say
+# which the session follows the swap. So a session started on account A, once its
+# launch token expired and the operator had switched to account B, was billing B while its
+# frozen status line still read A — 7 sessions in that state on 2026-07-24,
+# all actually on B, and a per-session cache that never updated could not say
 # so. Since every live session shares the one credential, they all bill the same
 # account: there is a single live slot, not one per session (ARCH-407).
 #
@@ -374,7 +374,7 @@ def _sub_label(session_id=None):
         # produced nothing usable. Say it, rather than render `sub `.
         label = "?"
     slot, _, email = label.partition(" ")
-    # Slot id first — it is what the operator types (`claude-sub use nyh`) — then the
+    # Slot id first — it is what the operator types (`claude-sub use <slot>`) — then the
     # account's local part, so two slots on the same provider stay distinct.
     return f"{slot} ({email.split('@')[0]})" if email else slot
 

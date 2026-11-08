@@ -36,11 +36,11 @@ def test_append_writes_one_line_with_utc_ts(tmp_path, monkeypatch):
 def test_append_includes_caller_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTCTL_RUN_ID", "run-abc")
     monkeypatch.setenv("AGENTCTL_AGENT_NAME", "coder")
-    monkeypatch.setenv("AGENTCTL_REPO", "vivy")
+    monkeypatch.setenv("AGENTCTL_REPO", "widget")
     log = tmp_path / "q.jsonl"
     kb_telemetry.append(log, {"tool": "kb_search"})
     rec = json.loads(log.read_text().splitlines()[0])
-    assert rec["run_id"] == "run-abc" and rec["agent"] == "coder" and rec["repo"] == "vivy"
+    assert rec["run_id"] == "run-abc" and rec["agent"] == "coder" and rec["repo"] == "widget"
 
 
 def test_caller_env_empty_when_unset(monkeypatch):

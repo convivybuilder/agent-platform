@@ -109,7 +109,7 @@ def test_create_uses_the_empty_string_sha_as_its_precondition(srv):
     """A create must be refused as STALE if the doc already exists, rather than
     silently overwriting — which is the same lost-update the precondition exists
     to stop, in its most destructive form."""
-    _fn(srv.kb_create)("projects/vivy/decisions/0069-x.md", "body", "steward")
+    _fn(srv.kb_create)("projects/widget/decisions/0069-x.md", "body", "steward")
     cmd = srv._calls[-1]
     assert cmd[cmd.index("--base-sha") + 1] == hashlib.sha256(b"").hexdigest()
 
@@ -269,7 +269,7 @@ def test_content_that_names_a_real_file_is_still_sent_as_literal_text(srv, tmp_p
     if verb == "kb_update":
         fn("shared/reference/a", "sha", "in-session", content=str(draft))
     elif verb == "kb_create":
-        fn("projects/vivy/decisions/0069-x.md", str(draft), "in-session")
+        fn("projects/widget/decisions/0069-x.md", str(draft), "in-session")
     else:
         fn("shared/reference/a", "A title", content=str(draft))
 
@@ -322,7 +322,7 @@ def test_update_refuses_person_itself_and_names_the_editor(srv):
 
 
 def test_create_refuses_person_itself_and_names_the_editor(srv):
-    r = _fn(srv.kb_create)("projects/vivy/decisions/0069-x.md", "body", "person")
+    r = _fn(srv.kb_create)("projects/widget/decisions/0069-x.md", "body", "person")
     assert r["ok"] is False and r["error"] == "refused-policy"
     assert "Orient editor" in r["stderr"]
     assert srv._calls == []
@@ -391,11 +391,17 @@ def test_update_with_a_checkout_the_caller_already_holds_does_not_release_it(srv
 
 
 def test_update_refused_by_another_holders_checkout_makes_no_commit(srv):
+    """The GET's foreign holder falls through to the POST, which confirms the
+    hold is still live by answering 409 with the same checkout — that is what
+    makes this a genuine refusal rather than the GET's say alone."""
     def respond(method, path, body):
         if method == "GET":
             return 200, {"checkout": {"id": "co1", "holder": "session:other",
                                       "expires_at": "later"}}
-        raise AssertionError("no POST expected: the GET already found a live, foreign checkout")
+        if method == "POST" and path.endswith("/checkout"):
+            return 409, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "later"}}
+        raise AssertionError(f"unexpected call: {method} {path}")
 
     srv._fake_library.respond = respond
     out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
@@ -411,6 +417,32 @@ def test_the_same_call_with_the_checkout_free_commits(srv):
     out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
     assert out["ok"] is True
     assert _apply_call(srv)  # raises if no apply call landed
+
+
+@pytest.mark.parametrize("verb", ["kb_update", "kb_create"])
+def test_library_404s_the_checkout_status_writes_under_the_session_holder(srv, verb):
+    """A document that exists on origin/main but has no row in the Library's
+    index yet (CQ·512: merged during an outage, before the index healed)
+    answers the checkout-status GET with 404. `_ensure_library_checkout`
+    then returns `(None, False, None)` — nothing there for anyone to hold —
+    and the write must proceed under the session's own holder rather than
+    crash on `None["holder"]`."""
+    def respond(method, path, body):
+        if method == "GET" and path.endswith("/checkout"):
+            return 404, {}
+        raise AssertionError(f"unexpected call: {method} {path}")
+
+    srv._fake_library.respond = respond
+    srv._fake_holder = srv._session_holder()
+    if verb == "kb_update":
+        out = _fn(srv.kb_update)("shared/reference/a", "sha", "in-session", content="x")
+    else:
+        out = _fn(srv.kb_create)("projects/widget/decisions/0069-x.md", "body", "in-session")
+    assert out["ok"] is True
+    cmd = _apply_call(srv)
+    assert cmd[cmd.index("--holder") + 1] == srv._fake_holder
+    # Nothing was taken, so nothing is released either.
+    assert not any(p.endswith("/checkin") for m, p, b in srv._library_calls)
 
 
 def test_library_returns_a_differing_holder_kb_apply_receives_the_returned_value(srv):
@@ -515,8 +547,10 @@ def test_kb_update_without_owner_after_kb_checkout_with_owner_is_refused_as_leas
         if method == "GET":
             return 200, {"checkout": {"id": "co1", "holder": "co-library-0251",
                                       "expires_at": "later"}}
-        raise AssertionError("no POST expected: the GET already found a live, "
-                             "foreign checkout")
+        if method == "POST" and path.endswith("/checkout"):
+            return 409, {"checkout": {"id": "co1", "holder": "co-library-0251",
+                                      "expires_at": "later"}}
+        raise AssertionError(f"unexpected call: {method} {path}")
 
     srv._fake_library.respond = respond
     out = _fn(srv.kb_update)("shared/reference/a", "sha1", "in-session", content="x")
@@ -539,7 +573,10 @@ def test_kb_checkout_refused_by_another_holder_releases_the_lease_it_took(srv):
         if method == "GET":
             return 200, {"checkout": {"id": "co1", "holder": "session:other",
                                       "expires_at": "later"}}
-        raise AssertionError("no POST expected: the GET found a live, foreign checkout")
+        if method == "POST" and path.endswith("/checkout"):
+            return 409, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "later"}}
+        raise AssertionError(f"unexpected call: {method} {path}")
 
     srv._fake_library.respond = respond
     out = _fn(srv.kb_checkout)("shared/reference/a")
@@ -564,7 +601,10 @@ def test_kb_checkout_refused_leaves_a_pre_existing_lease_alone(srv):
         if method == "GET":
             return 200, {"checkout": {"id": "co1", "holder": "session:other",
                                       "expires_at": "later"}}
-        raise AssertionError("no POST expected: the GET found a live, foreign checkout")
+        if method == "POST" and path.endswith("/checkout"):
+            return 409, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "later"}}
+        raise AssertionError(f"unexpected call: {method} {path}")
 
     srv._fake_library.respond = respond
     out = _fn(srv.kb_checkout)("shared/reference/a")
@@ -598,7 +638,10 @@ def _foreign_holder_checkout_respond(method, path, body):
     if method == "GET":
         return 200, {"checkout": {"id": "co1", "holder": "session:other",
                                   "expires_at": "later"}}
-    raise AssertionError("no POST expected: the GET found a live, foreign checkout")
+    if method == "POST" and path.endswith("/checkout"):
+        return 409, {"checkout": {"id": "co1", "holder": "session:other",
+                                  "expires_at": "later"}}
+    raise AssertionError(f"unexpected call: {method} {path}")
 
 
 def test_kb_checkout_releases_the_lease_when_leases_exits_nonzero(srv):
@@ -649,6 +692,72 @@ def test_kb_checkout_releases_the_lease_when_leases_output_is_not_a_list(srv):
     assert out["ok"] is False and out["error"] == "leased"
     releases = [c for c in srv._calls if c[1:3] == ["kb", "release"]]
     assert len(releases) == 1, srv._calls
+
+
+# --- the GET's foreign holder does not get the final say (reclaiming a dead
+# --- checkout) ---------------------------------------------------------------
+
+
+def test_a_dead_checkout_reported_by_get_is_reclaimed_via_the_post(srv):
+    """The Library's GET reports a dead checkout (`expires_at` in the past)
+    on purpose rather than hiding it; treating that report as final refuses a
+    write nothing still holds. Before this fix, `_ensure_library_checkout`
+    returned the held refusal here without ever trying the POST; after it,
+    the POST reclaims the dead hold and the call reports `took_it`."""
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": {"id": "co1", "holder": "session:other",
+                                      "expires_at": "2020-01-01T00:00:00Z"}}
+        if method == "POST" and path.endswith("/checkout"):
+            owner = (body or {}).get("owner")
+            return 200, {"checkout": {"id": "co2", "holder": owner,
+                                      "expires_at": "later"}}
+        raise AssertionError(f"unexpected call: {method} {path}")
+
+    srv._fake_library.respond = respond
+    checkout, took_it, refusal = srv._ensure_library_checkout("doc-x", "session:me")
+    assert refusal is None
+    assert took_it is True
+    assert checkout["holder"] == "session:me"
+
+
+def test_a_live_checkout_the_post_confirms_still_refuses(srv):
+    """Twin: the GET's foreign holder is confirmed still live by the POST's
+    409, carrying the same checkout record. The refusal text must be the
+    SAME `_library_held_refusal` this function already produced when the GET
+    alone decided it — this assertion holds both before and after the fix,
+    which is what shows the live case did not weaken."""
+    held = {"id": "co1", "holder": "session:other", "expires_at": "later"}
+
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": dict(held)}
+        if method == "POST" and path.endswith("/checkout"):
+            return 409, {"checkout": dict(held)}
+        raise AssertionError(f"unexpected call: {method} {path}")
+
+    srv._fake_library.respond = respond
+    checkout, took_it, refusal = srv._ensure_library_checkout("doc-x", "session:me")
+    assert checkout is None
+    assert took_it is False
+    assert refusal == srv._library_held_refusal("doc-x", held)
+
+
+def test_a_checkout_already_held_by_the_caller_is_reused_with_no_post(srv):
+    """The same-holder path never reaches the POST at all: `respond` would
+    raise if it did."""
+    held = {"id": "co1", "holder": "session:me", "expires_at": "later"}
+
+    def respond(method, path, body):
+        if method == "GET":
+            return 200, {"checkout": dict(held)}
+        raise AssertionError(f"no POST expected: already held by the caller: {method} {path}")
+
+    srv._fake_library.respond = respond
+    checkout, took_it, refusal = srv._ensure_library_checkout("doc-x", "session:me")
+    assert checkout == held
+    assert took_it is False
+    assert refusal is None
 
 
 # --- a checkout record with no holder is unparseable, not a crash -----------

@@ -49,7 +49,7 @@ to skip.
 `audit`/`render` above: not who wrote to `knowledge/main`, but who COULD —
 collaborators, teams, the repo's default workflow-token permissions, any
 workflow file granting itself `contents: write`, and every GitHub App installed
-on the `convivy` org (issue_01KZQA9FK7F6GZS4E4NCQRH0YB, split from the write-audit
+on the audited org (issue_01KZQA9FK7F6GZS4E4NCQRH0YB, split from the write-audit
 issue because two of its controls were verified once on 2026-08-11 and nothing
 has watched them since). The expected state is a literal snapshot from that
 verification (comments 298 and 307 on the issue), not a live derivation — a
@@ -71,7 +71,7 @@ flow — the operator's personal token is neither and was refused with
 `GET /user/installations/{id}/repositories` → 403 (verified live, 2026-10-07).
 So this checks `repository_selection` and `permissions` against the recorded
 baseline and nothing more: a `selected` installation that is re-granted
-`convivy/knowledge` while its `repository_selection` field stays `"selected"`
+the audited repo while its `repository_selection` field stays `"selected"`
 would not be caught. That is a real gap in what this check can see, not a
 guard this module could add — no credential exists yet to build the check
 that would close it.
@@ -89,6 +89,7 @@ import kb_writes
 import builder_root as BR
 import git_refs
 import operator_config
+import projects
 
 KNOWLEDGE = BR.root() / "knowledge"
 
@@ -97,7 +98,7 @@ KNOWLEDGE = BR.root() / "knowledge"
 
 
 def _expected_collaborators() -> "frozenset[tuple[str, str]] | None":
-    """The one collaborator GitHub should ever report on convivy/knowledge:
+    """The one collaborator GitHub should ever report on the audited repo:
     `(operator_config.get("github_login"), "admin")`. `None` when the operator
     config has no `github_login` — `audit_access` treats that as unreadable,
     never as a clean read, so a missing login is never mistaken for an
@@ -108,7 +109,7 @@ def _expected_collaborators() -> "frozenset[tuple[str, str]] | None":
         return None
     return frozenset({(login, "admin")})
 
-# convivy/knowledge's own default-workflow-token grant. `can_approve_pull_request_reviews`
+# The audited repo's own default-workflow-token grant. `can_approve_pull_request_reviews`
 # was flipped `true` -> `false` on 2026-08-11 in the same decision: it had let a
 # workflow approve a pull request even without `contents: write`.
 EXPECTED_WORKFLOW_PERMISSIONS = {
@@ -116,8 +117,8 @@ EXPECTED_WORKFLOW_PERMISSIONS = {
     "can_approve_pull_request_reviews": False,
 }
 
-# Every GitHub App installed on the `convivy` org that can reach, or is recorded
-# as NOT reaching, `convivy/knowledge` — keyed by `app_slug`. `permissions` only
+# Every GitHub App installed on the audited org that can reach, or is recorded
+# as NOT reaching, the audited repo — keyed by `app_slug`. `permissions` only
 # carries the fields this checklist actually watches (`contents`, `workflows`);
 # comparing GitHub's full permissions dict would flag every unrelated permission
 # GitHub adds to an App over time as if it were a KB-relevant drift.
@@ -128,7 +129,7 @@ EXPECTED_INSTALLATIONS = {
                "permissions": {"contents": "read", "workflows": "write"}},
     "claude-design-import": {"suspended": False,
                              "permissions": {"contents": "read"}},
-    # Does not reach convivy/knowledge (verified 2026-08-11) — see the module
+    # Does not reach the audited repo (verified 2026-08-11) — see the module
     # docstring's note on why that fact is not re-derived live every run.
     "cloudflare-workers-and-pages": {"repository_selection": "selected", "suspended": False,
                                      "permissions": {"contents": "write"}},
@@ -463,7 +464,7 @@ def _flatten(value) -> str:
     return " ".join(str(value).splitlines())
 
 
-def audit_access(get, *, org: str = "convivy", repo: str = "convivy/knowledge") -> dict:
+def audit_access(get, *, org: str, repo: str) -> dict:
     """Who COULD write to *repo*, per GitHub's live settings, against the
     recorded baseline above. `get(path) -> (status_code, payload)` is injected
     so this never makes a network call itself — the live GitHub client lives in
@@ -571,7 +572,7 @@ def audit_access(get, *, org: str = "convivy", repo: str = "convivy/knowledge") 
                     doc = yaml.safe_load(text)
                 except Exception as e:
                     # `e` is a `yaml.safe_load` error quoting the workflow
-                    # file's own bytes — content from convivy/knowledge, not
+                    # file's own bytes — content from the audited repo, not
                     # from this job — and PyYAML's own multi-line error text
                     # must not survive into the report as extra lines
                     # (security-reviewer, PR #803 round 2).
@@ -637,7 +638,7 @@ def render_access(result: dict) -> str:
     findings = sorted(result["findings"], key=lambda f: not f.get("critical"))
     unreadable = result["unreadable"]
 
-    lines = ["KB access audit — who could write to convivy/knowledge, per GitHub's "
+    lines = ["KB access audit — who could write to the audited repo, per GitHub's "
              "live settings"]
 
     if unreadable:
@@ -665,7 +666,7 @@ def main(argv: list[str] | None = None) -> int:
     `python3.11 kb_audit.py` process, separate from `audit`/`render` above,
     which agentctl's `kb audit` calls and which never touch the network.
 
-    Authenticates as the convivy-bosun GitHub App (github_app.py) — the
+    Authenticates as the install's own GitHub App (github_app.py) — the
     org-wide read credential this platform already mints scoped tokens from
     elsewhere (bin/pr-state-capture), never `gh`, which rides
     the operator's personal OAuth token and whose reach this job has no
@@ -679,18 +680,26 @@ def main(argv: list[str] | None = None) -> int:
     """
     import github_app as GA  # noqa: PLC0415 — only the live entry point needs it
 
-    key_path = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
-    app_id = "4666673"
-    owner = "convivy"
-    repo = "convivy/knowledge"
+    # The audited repo, from the project registry rather than a literal here —
+    # the Library's own unit is where `knowledge`'s owning org/repo is
+    # registered.
+    repo = projects.repo_github_slug("knowledge")
+    owner = repo.split("/")[0]
 
-    problem = GA.key_problem(key_path, label="the convivy-bosun App")
+    try:
+        app = GA.installed_app()
+    except GA.Unreadable as e:
+        print(f"kb access audit: {e}")
+        return 2
+    key_path, app_id = app.key_path, app.app_id
+
+    problem = GA.key_problem(key_path, label="the install's GitHub App")
     if problem:
         print(f"kb access audit: {problem}")
         return 2
     try:
         jwt = GA.app_jwt(key_path, app_id)
-        inst = GA.installation_for_owner(jwt, owner, label="the convivy-bosun App")
+        inst = GA.installation_for_owner(jwt, owner, label="the install's GitHub App")
         inst_id = str(inst.get("id") or "")
         if not inst_id:
             raise GA.Unreadable("the installation carries no id")
@@ -709,7 +718,7 @@ def main(argv: list[str] | None = None) -> int:
     def get(path: str):
         return GA.request("GET", f"{GA.API}{path}", token, None)
 
-    result = audit_access(get, repo=repo)
+    result = audit_access(get, org=owner, repo=repo)
     print(render_access(result))
     if result["unreadable"]:
         return 2

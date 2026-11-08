@@ -17,14 +17,25 @@ def cd(changelog_drain):
     return changelog_drain
 
 
-def _merge(pr, product="vivy", produced_at="2026-07-26T10:00:00Z"):
+@pytest.mark.rich_registry
+def test_explainer_donors_matches_the_registrys_own_donor_order(cd):
+    """Pinned against the registry's own accessor, not a copy of the slugs —
+    fails red if _EXPLAINER_DONORS drifts back to a hardcoded tuple. NOT
+    `shared_coverage_products()` (alphabetical): the donor order is a separate,
+    declared field (`explainer_donor_priority`), since "first that exists
+    wins" makes the order itself load-bearing."""
+    import projects
+    assert cd._EXPLAINER_DONORS == tuple(projects.explainer_donors())
+
+
+def _merge(pr, product="widget", produced_at="2026-07-26T10:00:00Z"):
     return {"product": product, "source": "github", "kind": "changelog",
             "refs": {"pr": pr, "url": f"https://github.com/convivy/{product}/pull/{pr}"},
             "body": f"feat: thing {pr}\n\n## Summary\n\nraw pr body",
             "produced_at": produced_at}
 
 
-def _entry(pr, product="vivy"):
+def _entry(pr, product="widget"):
     return {"product": product, "source": "co", "kind": "changelog",
             "refs": {"pr": pr}, "body": f"**Merged:** a thing. #{pr}"}
 
@@ -43,13 +54,13 @@ def test_a_merge_without_an_entry_is_pending(cd, monkeypatch):
 
 
 def test_the_same_pr_number_in_two_products_is_two_pieces_of_work(cd, monkeypatch):
-    """The key is (product, pr). Keying on the PR number alone would let vivy#7
-    suppress the entry for constance#7 — different work, same number."""
+    """The key is (product, pr). Keying on the PR number alone would let widget#7
+    suppress the entry for globex#7 — different work, same number."""
     _stub_reads(monkeypatch, cd,
-                [_merge(7, "vivy"), _merge(7, "constance")],
-                [_entry(7, "vivy")])
+                [_merge(7, "widget"), _merge(7, "globex")],
+                [_entry(7, "widget")])
     pending, _ = cd._pending("2026-07-26T00:00:00Z")
-    assert [(p["product"], p["refs"]["pr"]) for p in pending] == [("constance", 7)]
+    assert [(p["product"], p["refs"]["pr"]) for p in pending] == [("globex", 7)]
 
 
 def test_a_merge_captured_twice_yields_one_dispatch(cd, monkeypatch):
@@ -101,18 +112,24 @@ def test_a_capped_entries_read_refuses_the_pass(cd, monkeypatch):
     assert "incomplete" in str(exc.value)
 
 
-def test_a_stuck_explainer_is_one_failure_not_a_lost_pass(cd, monkeypatch):
+def test_a_stuck_explainer_is_one_failure_not_a_lost_pass(cd, monkeypatch, tmp_path):
     """Uncaught, TimeoutExpired aborted the whole loop: every merge behind the
     stuck one was skipped and the wrote/failed line never printed (code review,
     #250)."""
+    # `_spawn` resolves `_agents_dir()` before the (stubbed) subprocess call —
+    # off `BR.root()`, never `Path.home()` (see `test_the_pass_continues_past_
+    # a_stuck_explainer`), so an empty tmp root here keeps this test off the
+    # real machine's donor checkouts.
+    monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
+
     def _hang(*a, **k):
         raise cd.subprocess.TimeoutExpired(cmd="agentctl", timeout=1800)
 
     monkeypatch.setattr(cd.subprocess, "run", _hang)
-    assert cd._spawn("vivy", "1050", "a task") is None
+    assert cd._spawn("widget", "1050", "a task") is None
 
 
-def test_example_run_id_in_transcript_does_not_steal_the_real_one(cd, monkeypatch):
+def test_example_run_id_in_transcript_does_not_steal_the_real_one(cd, monkeypatch, tmp_path):
     """Regression for issue_01KYGCTN0MZQR531ZVN2APSB3V.
 
     PRs about agentctl itself quote example run-ids (run-7f3a91, run-abc123) in
@@ -125,6 +142,10 @@ def test_example_run_id_in_transcript_does_not_steal_the_real_one(cd, monkeypatc
     scenario here: stdout carries an example run-id before the real one, stderr
     carries the real one on the spawned line. The caller must return the real one.
     """
+    # Same reason as the test above: keep `_agents_dir()`'s `BR.root()` lookup
+    # off the real machine's donor checkouts.
+    monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
+
     class _Done:
         returncode = 0
         # stdout contains the streamed transcript — the agent echoed an example run-id
@@ -133,14 +154,14 @@ def test_example_run_id_in_transcript_does_not_steal_the_real_one(cd, monkeypatc
         stderr = "spawned run-deadbeef  pid=99 agent=explainer worktree=/tmp/x\n"
 
     monkeypatch.setattr(cd.subprocess, "run", lambda *a, **k: _Done())
-    assert cd._spawn("vivy", "243", "a task") == "run-deadbeef"
+    assert cd._spawn("widget", "243", "a task") == "run-deadbeef"
 
 
 def test_the_pass_continues_past_a_stuck_explainer(cd, monkeypatch, tmp_path):
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     # Checkouts resolve from builder_root.root(), which never reads Path.home().
     monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    (tmp_path / "Convivy" / "vivy" / ".git").mkdir(parents=True)
+    (tmp_path / "Convivy" / "widget" / ".git").mkdir(parents=True)
     _stub_reads(monkeypatch, cd, [_merge(1), _merge(2)], [])
     tried = []
 
@@ -166,9 +187,9 @@ def test_only_repos_with_a_primary_checkout_are_dispatchable(cd, monkeypatch, tm
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     # Checkouts resolve from builder_root.root(), which never reads Path.home().
     monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    (tmp_path / "Convivy" / "vivy" / ".git").mkdir(parents=True)
-    assert cd._dispatchable("vivy") is True
-    assert cd._dispatchable("selector-backend") is False
+    (tmp_path / "Convivy" / "widget" / ".git").mkdir(parents=True)
+    assert cd._dispatchable("widget") is True
+    assert cd._dispatchable("beacon-backend") is False
 
 
 def test_the_task_demands_a_pr_reference_and_a_bare_final_output(cd):
@@ -209,12 +230,13 @@ def test_the_task_writes_for_the_operator_not_for_the_pr_author(cd):
 def test_the_spawn_resolves_the_explainer_from_a_donor_dir(cd, monkeypatch, tmp_path):
     """Without --agents-dir the first backfill failed 40 of 88 merges: the five
     LOCAL_AGENT_REPOS resolve agents from their own .claude/agents/ but none
-    defines an explainer; selector-backend had no knowledge-ctx project mapping at
+    defines an explainer; beacon-backend had no knowledge-ctx project mapping at
     the time. agentctl treats a directory-resolved agent as local — reads the
     definition off disk, skips profile activation — so one donor dir covers both.
-    selector-backend gained a mapping in PR #267; this test guards the
+    beacon-backend gained a mapping in PR #267; this test guards the
     LOCAL_AGENT_REPOS explainer gap."""
-    donor = tmp_path / "Convivy" / "vivy" / ".claude" / "agents"
+    monkeypatch.setattr(cd, "_EXPLAINER_DONORS", ("finch", "harbor"))
+    donor = tmp_path / "Convivy" / "finch" / ".claude" / "agents"
     donor.mkdir(parents=True)
     (donor / "explainer.md").write_text("---\nname: explainer\n---\nbody")
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
@@ -238,7 +260,8 @@ def test_the_donor_is_passed_for_every_repo_not_just_the_broken_ones(cd, monkeyp
     """Branching on which repos are local would mean carrying a copy of
     agentctl's LOCAL_AGENT_REPOS here, to drift against the real one. One
     resolution path fleet-wide instead."""
-    donor = tmp_path / "Convivy" / "vivy" / ".claude" / "agents"
+    monkeypatch.setattr(cd, "_EXPLAINER_DONORS", ("finch", "harbor"))
+    donor = tmp_path / "Convivy" / "finch" / ".claude" / "agents"
     donor.mkdir(parents=True)
     (donor / "explainer.md").write_text("---\nname: explainer\n---\nbody")
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
@@ -252,7 +275,7 @@ def test_the_donor_is_passed_for_every_repo_not_just_the_broken_ones(cd, monkeyp
 
     monkeypatch.setattr(cd.subprocess, "run",
                         lambda cmd, *a, **k: (seen.update(cmd=cmd), _Done())[1])
-    cd._spawn("vivy", "1050", "a task")      # an index-resolving repo
+    cd._spawn("finch", "1050", "a task")      # an index-resolving repo
     assert "--agents-dir" in seen["cmd"]
 
 
@@ -271,18 +294,19 @@ def test_a_missing_donor_does_not_take_the_drain_down(cd, monkeypatch, tmp_path)
 
     monkeypatch.setattr(cd.subprocess, "run",
                         lambda cmd, *a, **k: (seen.update(cmd=cmd), _Done())[1])
-    assert cd._spawn("vivy", "1050", "a task") == "run-abc123"
+    assert cd._spawn("widget", "1050", "a task") == "run-abc123"
     assert "--agents-dir" not in seen["cmd"]
 
 
 def test_the_first_existing_donor_wins(cd, monkeypatch, tmp_path):
-    second = tmp_path / "Convivy" / "constance" / ".claude" / "agents"
+    monkeypatch.setattr(cd, "_EXPLAINER_DONORS", ("finch", "harbor"))
+    second = tmp_path / "Convivy" / "harbor" / ".claude" / "agents"
     second.mkdir(parents=True)
     (second / "explainer.md").write_text("---\nname: explainer\n---\nbody")
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     # Checkouts resolve from builder_root.root(), which never reads Path.home().
     monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    # vivy (first in the list) has no checkout here, so constance is chosen.
+    # finch (first in the list) has no checkout here, so harbor is chosen.
     assert cd._agents_dir() == second
 
 
@@ -310,8 +334,8 @@ def _agent_shape(path):
 @pytest.mark.needs_kb
 def test_no_donor_has_drifted_from_the_indexed_explainer(cd):
     """The donors govern what every changelog explainer runs across the whole
-    fleet, so a PR touching vivy's explainer.md is a fleet-wide policy change
-    reviewed only against vivy's bar — the cross-repo effect is invisible from
+    fleet, so a PR touching widget's explainer.md is a fleet-wide policy change
+    reviewed only against widget's bar — the cross-repo effect is invisible from
     inside that repo (security review, #252). This converts that implicit social
     contract into a failing test.
 
@@ -360,12 +384,15 @@ def test_the_task_forbids_the_scribe_tools_the_shared_definition_carries(cd):
     assert "read-and-summarize only" in task
 
 
-def test_the_spawn_never_passes_pr(cd, monkeypatch):
+def test_the_spawn_never_passes_pr(cd, monkeypatch, tmp_path):
     """`agentctl spawn --pr N` pins a worktree to the PR head and REFUSES a
     closed or merged one. Every PR this command touches is merged by definition,
     so passing it fails 100% of the time — which is exactly what happened on the
     first live run (exit 2, "refusing to dispatch against a closed/merged PR").
     The explainer reads the merge from main instead."""
+    # Keep `_agents_dir()`'s `BR.root()` lookup off the real machine's donor
+    # checkouts (see `test_the_pass_continues_past_a_stuck_explainer`).
+    monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
     seen = {}
 
     class _Done:
@@ -376,9 +403,9 @@ def test_the_spawn_never_passes_pr(cd, monkeypatch):
         return _Done()
 
     monkeypatch.setattr(cd.subprocess, "run", fake_run)
-    assert cd._spawn("vivy", "1050", "a task") == "run-abc123"
+    assert cd._spawn("widget", "1050", "a task") == "run-abc123"
     assert "--pr" not in seen["cmd"]
-    assert "--on" in seen["cmd"] and "vivy" in seen["cmd"]
+    assert "--on" in seen["cmd"] and "widget" in seen["cmd"]
     assert "--foreground" in seen["cmd"]
 
 
@@ -429,7 +456,7 @@ def test_a_run_that_returns_nothing_posts_nothing(cd, monkeypatch, tmp_path):
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     # Checkouts resolve from builder_root.root(), which never reads Path.home().
     monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    (tmp_path / "Convivy" / "vivy" / ".git").mkdir(parents=True)
+    (tmp_path / "Convivy" / "widget" / ".git").mkdir(parents=True)
     _stub_reads(monkeypatch, cd, [_merge(5)], [])
     monkeypatch.setattr(cd, "_spawn", lambda repo, pr, task: "run-deadbee")
     monkeypatch.setattr(cd, "_final_output", lambda run_id: None)
@@ -445,7 +472,7 @@ def test_a_dry_run_spawns_nothing(cd, monkeypatch, tmp_path):
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     # Checkouts resolve from builder_root.root(), which never reads Path.home().
     monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    (tmp_path / "Convivy" / "vivy" / ".git").mkdir(parents=True)
+    (tmp_path / "Convivy" / "widget" / ".git").mkdir(parents=True)
     _stub_reads(monkeypatch, cd, [_merge(5)], [])
 
     def boom(*a, **k):
@@ -461,7 +488,7 @@ def test_max_dispatch_bounds_one_pass(cd, monkeypatch, tmp_path):
     monkeypatch.setattr(cd.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     # Checkouts resolve from builder_root.root(), which never reads Path.home().
     monkeypatch.setattr(cd.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    (tmp_path / "Convivy" / "vivy" / ".git").mkdir(parents=True)
+    (tmp_path / "Convivy" / "widget" / ".git").mkdir(parents=True)
     _stub_reads(monkeypatch, cd, [_merge(i) for i in range(1, 11)], [])
     spawned = []
     monkeypatch.setattr(cd, "_spawn",

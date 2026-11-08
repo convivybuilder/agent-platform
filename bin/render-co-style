@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""render-co-style — write the generated iTerm DynamicProfiles and Deck theme
+seed `co_style_render` renders from the registry (CQ-590 / E36 slice 5).
+
+Called from install.sh phase 5, on the crew machine. Writes into a directory
+outside any repository — default `~/.local/state/agent-platform/co-style` —
+that tools/install-crew-ssh-config.sh reads instead of the now-deleted
+`iterm/co-*.json` and the per-crew keys `deck/theme.json` used to carry.
+
+Each run fully regenerates both: a unit dropped from the registry, or one that
+loses its `co_accent`, must not leave a stale profile or theme entry behind.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import co_style_render  # noqa: E402
+import projects  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_OUT_DIR = Path.home() / ".local" / "state" / "agent-platform" / "co-style"
+
+# The same shape `projects.validate_registry` requires of these fields.
+# Neither path `projects.load()` can take — a `PROJECTS_JSON` file or a fetch
+# from the Library — runs `validate_registry` on what it returns, so a
+# malformed value reaches here unchecked: left unvalidated, a colour field
+# would raise inside `co_style_render.render_profile`'s hex parse and abort
+# the render for every unit (security-reviewer, PR #1066 round 1); a style id
+# (`co_style_id`, or the slug when absent — `co_style_render.style_id_for`)
+# or a `co_iterm_guid` containing `/` or `..` would write outside the
+# generated iTerm directory, or collide with another profile's Guid
+# (security-reviewer, PR #1066 round 2); a `crew` or `tmux_session` field
+# that is a list or dict raises `TypeError: unhashable type` where `co_style_
+# render.deck_key_for` uses whichever of the two it picks as a dict key for
+# Deck's `sessions`/`railNames` maps, and one that is an int alongside other
+# units' string keys raises later, sorting the Deck theme's keys to write
+# (both reviewers, PR #1066 round 4; `tmux_session` checked the same way,
+# CQ-603). `_NAME_OK` and `valid_crew` are imported from projects.py rather
+# than copied, so the rules can't drift apart.
+_HEX_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_COLOR_FIELDS = ("co_accent", "co_bg", "co_fg", "co_term_fg", "co_selection")
+_NAME_OK = projects._NAME_OK
+_valid_crew = projects.valid_crew
+
+
+def _invalid_fields(slug: str, unit: dict) -> list[str]:
+    """Names of `unit`'s rendered fields that fail `projects.validate_registry`'s
+    shape: each colour field not a six-hex-digit string, the unit's style id
+    (`co_style_id` when set, the registry slug otherwise) not a `_NAME_OK`-safe
+    string, `co_iterm_guid` not a `_NAME_OK`-safe string, or `crew`/
+    `tmux_session` not `valid_crew` (`None` or a string) — both reach
+    `co_style_render.deck_key_for` as a dict key, so both get the same
+    check. `projects.load()` never runs
+    `validate_registry` on a `PROJECTS_JSON` file or a Library fetch, so a
+    field here can be null, an int or a list rather than the string
+    `.match()` requires; checked with a bare `.match()` that raises
+    `TypeError` on those, this aborts the render for every unit (PR #1066
+    round 3) instead of skipping the one unit."""
+    bad = [f for f in _COLOR_FIELDS
+           if f in unit and not (isinstance(unit[f], str) and _HEX_COLOR_RE.match(unit[f]))]
+    style_id = co_style_render.style_id_for(slug, unit)
+    if not (isinstance(style_id, str) and _NAME_OK.match(style_id)):
+        bad.append("co_style_id" if "co_style_id" in unit else "style id (from the slug)")
+    if "co_iterm_guid" in unit and not (
+            isinstance(unit["co_iterm_guid"], str) and _NAME_OK.match(unit["co_iterm_guid"])):
+        bad.append("co_iterm_guid")
+    if "crew" in unit and not _valid_crew(unit["crew"]):
+        bad.append("crew")
+    if "tmux_session" in unit and not _valid_crew(unit["tmux_session"]):
+        bad.append("tmux_session")
+    return bad
+
+
+def _skip_invalid_units(registry: dict) -> dict:
+    """`registry` with every unit whose colour fields, style id,
+    `co_iterm_guid` or `crew` fail validation dropped, each printed as a
+    warning naming the unit and the bad field(s). The rest of the registry
+    renders unaffected — the one place that decides whether a unit renders,
+    for both the iTerm profiles and the Deck theme (`render()` passes this
+    function's result to both)."""
+    safe = {}
+    for slug, unit in registry.items():
+        bad = _invalid_fields(slug, unit) if isinstance(unit, dict) else []
+        if bad:
+            print(f"render-co-style: skipping {slug}: malformed {', '.join(bad)}",
+                  file=sys.stderr)
+            continue
+        safe[slug] = unit
+    return safe
+
+
+def _write_target_ok(path: Path, directory: Path) -> bool:
+    """Whether `path` resolves to somewhere directly inside `directory`.
+    `_skip_invalid_units` already refuses a style id that would produce a
+    `path` outside `directory`; this is a second, independent check at the
+    write site, so a style id that somehow reaches here malformed still
+    cannot write outside the generated iTerm directory."""
+    return path.resolve().parent == directory.resolve()
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` to `path` via a temp file in the same directory, then
+    `rename(2)` — so a reader (the laptop installer, over the SMB mount) never
+    sees a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp"
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def render(registry: dict, committed_theme: dict, out_dir: Path) -> tuple[int, Path]:
+    """Write every rendered profile and the Deck theme seed under `out_dir`.
+    Returns (profile count, out_dir). Both outputs render from the same
+    `_skip_invalid_units`-filtered registry, so the one function that
+    decides whether a unit renders governs both — the iTerm side alone had
+    the filter through round 3, leaving the Deck side to render a unit
+    `_skip_invalid_units` had already judged unsafe (both reviewers, PR
+    #1066 round 4)."""
+    safe_registry = _skip_invalid_units(registry)
+    profiles = co_style_render.render_profiles(safe_registry)
+    theme = co_style_render.render_deck_theme(safe_registry, committed_theme)
+
+    iterm_dir = out_dir / "iterm"
+    iterm_dir.mkdir(parents=True, exist_ok=True)
+    for stale in iterm_dir.glob("co-*.json"):
+        if stale.stem[3:] not in profiles:
+            stale.unlink()
+    for style_id, profile in profiles.items():
+        target = iterm_dir / f"co-{style_id}.json"
+        if not _write_target_ok(target, iterm_dir):
+            print(f"render-co-style: refusing to write outside {iterm_dir}: "
+                  f"style id {style_id!r}", file=sys.stderr)
+            continue
+        _atomic_write(target, json.dumps(profile, indent=2) + "\n")
+
+    _atomic_write(out_dir / "deck" / "theme.json",
+                  json.dumps(theme, indent=2, sort_keys=True) + "\n")
+    return len(profiles), out_dir
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
+                    help="the generated directory (default: %(default)s)")
+    p.add_argument("--theme-committed", type=Path, default=REPO / "deck" / "theme.json",
+                    help="the committed deck/theme.json, read for its non-per-crew keys")
+    args = p.parse_args(argv)
+
+    registry = projects.load()
+    committed_theme = json.loads(args.theme_committed.read_text())
+    count, out_dir = render(registry, committed_theme, args.out_dir)
+    print(f"Rendered {count} iTerm profile(s) and the Deck theme seed -> {out_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -35,6 +35,7 @@ cat > "$CONVIVY_OPERATOR_CONFIG" <<'JSON'
                       "private-e", "private-f", "private-g"],
   "operator_marker": "operator",
   "roster_crew": "operator-crew",
+  "apps_crew": "operator-crew-apps",
   "github_login": "operator-login",
   "tailnet_host": "tailnet.example"
 }
@@ -92,17 +93,27 @@ export PATH
 # that fakes HOME for co's crews must also point the root there, explicitly, the
 # one way root() can be moved.
 #
-# The optional second argument also writes PROJECTS_REGISTRY=<that path> — the
-# seam bin/co reads at every site that resolves config/projects.json, so a test
-# needing a private or sonnet-tier crew the operator's own checked-in registry
-# does not (and must not) name can hand it a fixture instead
-# (write_private_registry below writes one). Omitted, co falls back to its own
-# config/projects.json exactly as it did before this seam existed.
+# The second argument also writes PROJECTS_REGISTRY=<that path> — the seam
+# bin/co reads at every site that resolves the crew registry, so a test
+# needing a private or sonnet-tier crew can hand it a fixture instead
+# (write_private_registry below writes one, or a test builds its own JSON).
+# OMITTED, this writes an empty-but-valid `{}` registry of its own under
+# <fake-home> instead of leaving PROJECTS_REGISTRY unset: co has no file to
+# fall back to any more (CQ-565 — the operator's own config/projects.json is
+# gone), and an unset PROJECTS_JSON reaches the Library, which a test run has
+# neither the network nor the credential for. `{}` names no crew at all,
+# matching the registry-independent "nothing is registered" behaviour most
+# callers of this helper already rely on.
 co_root_config() {
     mkdir -p "$1/Convivy"
+    local registry=${2:-}
+    if [ -z "$registry" ]; then
+        registry="$1/empty-projects-registry.json"
+        printf '{}' > "$registry"
+    fi
     {
         printf 'CREWS_ROOT=%s\n' "$1/Convivy"
-        [ -n "${2:-}" ] && printf 'PROJECTS_REGISTRY=%s\n' "$2"
+        printf 'PROJECTS_REGISTRY=%s\n' "$registry"
     } > "$1/session-agent.env"
     printf '%s\n' "$1/session-agent.env"
 }
@@ -120,6 +131,31 @@ write_private_registry() { # <path> <slug> <display>
     "home_dir": "<root>/$2", "dirs": [], "crew": "$2",
     "lifecycle": "active", "products": [], "repos": ["$2"],
     "aliases": [], "kb": "local", "private": true
+  }
+}
+JSON
+}
+
+# write_walled_off_registry <path> <slug> <display> [<style_id> <accent> <label>]:
+# a registry naming exactly one active, `walled_off: true` crew
+# (platform/decisions/0100), for a test that exercises bin/co's walled-off gate
+# without touching the operator's own live registry or crew. Paired with
+# co_root_config's PROJECTS_REGISTRY argument, the same seam write_private_registry
+# above uses. <style_id> defaults to <slug>; <accent> defaults to the periwinkle
+# "#7b61ff" every unstyled call of the ask-era branch used to hardcode; <label>
+# defaults to absent, so `_apply_co_style` falls back to <style_id> itself.
+write_walled_off_registry() { # <path> <slug> <display> [<style_id> <accent> <label>]
+    local style_id=${4:-$2} accent=${5:-#7b61ff}
+    local label_line=""
+    [ -n "${6:-}" ] && label_line="\"co_label\": \"$6\","
+    cat > "$1" <<JSON
+{
+  "$2": {
+    "class": "project", "display": "$3", "owner": "convivy",
+    "home_dir": "<root>/$2", "dirs": [], "crew": "$2",
+    "lifecycle": "active", "products": [], "repos": ["$2"],
+    "aliases": [], "kb": "local", "walled_off": true,
+    "co_style_id": "$style_id", $label_line "co_accent": "$accent"
   }
 }
 JSON

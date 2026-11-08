@@ -6,8 +6,9 @@ state and copying over it would discard every theme picked in the app. The
 reasoning is right; the granularity was wrong. Deck writes that same file on any
 preference change, so a single Cmd-minus creates it — after which the installer
 sees a file, leaves it alone, and the user never receives Convivy's session
-mapping at all. Observed: the operator's Hollis rendered blue in Deck where iTerm renders
-pink, because his file existed and carried no `sessions` block.
+mapping at all. Observed: one of the operator's crew sessions rendered blue in
+Deck where iTerm renders pink, because his file existed and carried no
+`sessions` block.
 
 So the unit of "already present" is a KEY, not a FILE. A key the user has is
 theirs and is never touched. A key they lack is filled from the seed.
@@ -17,7 +18,7 @@ declared once, in the ssh aliases the operator's own ssh-alias installer writes
 (`tmux new -s <name> -c <workdir>`). Parsing them there means this repo holds one
 copy of that list rather than two, so there is no second list to forget to
 update. Display names are data rather than derivation, because no transformation
-turns `svc` into `Convivy Kit`.
+turns a bare session key into the human label a crew is known by on the rail.
 
 **That guarantee is about the repo, not about an installed config.** Once a user
 has a `rail` key it is theirs and is never touched, so a session added to the
@@ -143,16 +144,17 @@ def seed_document(theme_json: str, ssh_config: str) -> dict:
     A RAIL NAME IS NOT A PROJECT DISPLAY, and nothing binds the two. ARCH-426 draws
     the line explicitly: the Keel owns what projects exist, the operator owns which
     are pinned to the rail and what they are called there. So `railNames` carries
-    keys that are no project at all (`ask`, the `*-commercial` sites, and `steward`
+    keys that are no project at all (the walled-off crew, the `*-commercial` sites,
+    and `steward`
     — whose crew was retired on 2026-08-06 and whose rail key is the operator's to
     keep or drop, not this module's), omits registered projects with no co session
     of their own, and may legitimately disagree on
-    a label — `svc` is "Convivy Kit" here and "App Kit" in the registry. Do not
-    "fix" that by making one mirror the other; a drift test between them would
-    assert a coupling this architecture rejects.
+    a label — a crew's rail name here can differ from its `display` in the
+    registry. Do not "fix" that by making one mirror the other; a drift test
+    between them would assert a coupling this architecture rejects.
 
     What DOES have to track the registry is a rail name that has gone plain wrong,
-    which is how the NYH split reached this file: three properties were renamed and
+    which is how the Acme split reached this file: three properties were renamed and
     two rail labels kept the old names (reviewer, PR #339).
     """
     doc = json.loads(theme_json)

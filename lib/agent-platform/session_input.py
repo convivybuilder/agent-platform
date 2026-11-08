@@ -232,7 +232,7 @@ KEYS = {
 # WHY C-u AND NOT C-c, WHICH IS WHAT THIS USED TO BE. `C-c` empties the box in
 # one keystroke, and it also INTERRUPTS — which killed background subagents
 # whenever a message was sent to a session whose main agent read `waiting` while
-# a subagent was still working. The operator lost two selector build runs to this on
+# a subagent was still working. The operator lost two product-crew build runs to this on
 # 2026-07-24; an earlier round had already stopped it firing at `working`
 # sessions, but `waiting` is exactly the state a session sits in while its
 # background work continues.
@@ -999,7 +999,7 @@ def send_message(session_name: str, text: str, settle: float = PASTE_SETTLE_SECO
     # `waiting` is exactly what a main agent reads while a background subagent
     # works on behind it. So every message sent to a session with background work
     # killed that work, intermittently, with nothing to show the caller had done
-    # it. The operator lost two selector build runs this way on 2026-07-24.
+    # it. The operator lost two product-crew build runs this way on 2026-07-24.
     #
     # `C-u` kills the input line without interrupting anything — measured, see
     # CLEAR_KEYSTROKES. The state gate stays because it still describes WHEN a

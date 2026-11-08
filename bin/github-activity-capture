@@ -5,8 +5,8 @@ issue_01M4ZB5C5ZX0MV206064MTRAE0), so Orient can retire its own GitHub
 capture (convivy-orient's github_capture.py, which rides the operator's
 personal `gh` login).
 
-AUTHENTICATES AS THE `convivy-bosun` GITHUB APP (app id 4666673), never `gh`,
-mirroring `bin/pr-state-capture` and `bin/ci-result-capture`. UNLIKE either
+AUTHENTICATES AS THE INSTALL'S OWN GITHUB APP (`github_app.installed_app()`), never
+`gh`, mirroring `bin/pr-state-capture` and `bin/ci-result-capture`. UNLIKE either
 sibling, this job's tokens carry NO `issues` permission at all (operator's
 ruling, 2026-10-15, relayed by the steward): work items live in the
 Library's corrections queue, GitHub issues are not a Convivy surface, and
@@ -16,7 +16,7 @@ read/post pass (`capture_repository`); this script is the launchd entry
 point that walks every installation's repositories and calls it.
 
 ONE INSTALLATION PER OWNER, READ FROM THE APP'S OWN INSTALLATION LIST, NOT
-FROM `config/projects.json`. `pr-state-capture.repos_to_capture()` derives
+FROM THE PROJECT REGISTRY. `pr-state-capture.repos_to_capture()` derives
 its repo list from the registry because Deck's PR-ladder panel needs every
 registered repo covered even ones the App reaches only through a "selected
 repositories" installation; this job instead asks each installation
@@ -46,10 +46,27 @@ a repo's cursor exactly where it was whenever any post in that pass fails —
 so every later pass would re-read and re-fail the same repository's full
 window forever, never advancing past it.
 
+A FOURTH EXCLUSION, ADDED IN SECURITY REVIEW ROUND 1 (CQ·605):
+`GACT.is_safe_basename()` refuses a repository whose bare basename is not a
+safe path/CLI segment (reuses `worktrees._is_safe_segment`, the guard
+`is_dispatch_target` already applies to the identical pattern). The
+installation listing, not the registry, names these repositories, so a
+basename of `.` or `..` is reachable here; refusing it before
+`capture_repository` ever runs keeps that value out of every signal's
+`product`/`stream`, which `bin/changelog-drain` later reads as a path
+segment and an `agentctl spawn --on` argument. `_capturable_repos()` is the
+ONE place that applies this exclusion (and the archived/sandbox/
+private-project ones above it): round 1 added the basename skip only to
+`main()`'s loop, so `--audit-window` still read a refused repository's real
+events, found no row for them (`main()` never posted one) and reported
+every one a miss (review round 2 finding) — factored into this one helper
+so `main()`'s posting loop and `run_audit()`'s read-only loop can no longer
+drift apart on which repositories they skip.
+
 REPO NAMES ARE NEVER ESCAPED BEFORE BUILDING A GITHUB URL. Every `repo`
 string this script and `github_activity.py` interpolate into a GitHub API
 URL comes from GitHub's own installation-repository listing (`full_name`)
-— never from `config/projects.json`, user input or any other source — and
+— never from the project registry, user input or any other source — and
 GitHub itself restricts a repository name to letters, digits, `.`, `-` and
 `_`. No other path in this change builds a URL from a repo name reaching it
 any other way, so no escaping or validation is added.
@@ -75,15 +92,18 @@ scheduled fire skipped rather than overlapping it (launchd.plist(5)), so
 150s leaves headroom before the next firing instead of racing it.
 
 A TRANSPORT ERROR (A RAW `OSError`: `urllib.error.URLError`, a socket
-timeout, a connection reset) IS CAUGHT AT EVERY GITHUB CALL `main()` MAKES,
-NOT ONLY INSIDE `capture_repository`. `github_app.request` only catches
-`urllib.error.HTTPError`; a connection-level failure propagates uncaught
-through every other call built on it, which is exactly how
-`pr-state-capture` crashed on this machine: its own `main` called
-`list_pulls` called `github_app.request`, a `ConnectionResetError` reached
-nothing that caught it, and that pass ended with every owner after the
-failing one never read (review round on #916). This job makes the same
-four kinds of call and catches each at the cost it can afford:
+timeout, a connection reset, OR A TRUNCATED RESPONSE BODY — GitHub cutting
+a page off mid-read, which `github_app.request` raises as a `ConnectionError`
+chained from the underlying `http.client.IncompleteRead`) IS CAUGHT AT EVERY
+GITHUB CALL `main()` MAKES, NOT ONLY INSIDE `capture_repository`.
+`github_app.request` only catches `urllib.error.HTTPError`; any other
+failure propagates as an `OSError` through every other call built on it,
+which is exactly how `pr-state-capture` crashed on this machine: its own
+`main` called `list_pulls` called `github_app.request`, a
+`ConnectionResetError` reached nothing that caught it, and that pass ended
+with every owner after the failing one never read (review round on #916).
+This job makes the same four kinds of call and catches each at the cost it
+can afford:
 
 - `GA.installations`, before the per-owner loop, has no narrower scope to
   fall back to: the error is logged and `main()` returns 1.
@@ -100,32 +120,43 @@ four kinds of call and catches each at the cost it can afford:
 
 Usage:
     github-activity-capture
+    github-activity-capture --audit-window START END
+
+`--audit-window START END` (both ISO-8601 UTC, e.g. 2026-10-20T00:00:00Z) is a
+READ-ONLY check (CQ·494, E25 PR 4) that every review verdict, merge, review
+comment and conversation comment GitHub reports in [START, END] has landed in
+the Library under THIS job's own posting credential — the proof the overlap
+window needs before Orient's own GitHub capture can retire. It never posts
+and never moves the cursor; it refuses on the same missing credential as an
+ordinary pass. Exits 0 when every event matched, 1 when any did not (printing
+one line per miss: kind, repo, the GitHub object's URL and why — no row, a
+row ingested by another identity, or skipped by the same empty-body rule the
+job itself applies) or the window itself is invalid (END not after START, or
+longer than 7 days — this audit is for one overlap window, not a backfill).
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import sys
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 
-import builder_root as BR  # noqa: E402
 import github_activity as GACT  # noqa: E402
 import github_app as GA  # noqa: E402
 import projects  # noqa: E402
 import signal_client as SC  # noqa: E402
+import vault_plane as VP  # noqa: E402
 
-# The convivy-bosun GitHub App (issue_01M2KV16ZRG3N49GRER8Q7545H, app id
-# 4666673), the same App `bin/pr-state-capture` and `bin/ci-result-capture`
-# already authenticate as. Re-derived per run, never stored.
-APP_ID = "4666673"
-
-# Read from the passwd home, never $HOME — see builder_root.real_account_home.
-KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
+# The install's own GitHub App (issue_01M2KV16ZRG3N49GRER8Q7545H), the same App
+# `bin/pr-state-capture` and `bin/ci-result-capture` already authenticate as —
+# resolved fresh per run through `GA.installed_app()`, never a literal, never stored.
 
 # The token this script mints can only ever read pull requests (and their
 # reviews/comments, which live under the same `pull_requests` scope) and the
@@ -141,14 +172,14 @@ _READ_ONLY_PERMISSIONS = {"pull_requests": "read", "metadata": "read"}
 SIGNAL_TOKEN_ENV = "GITHUB_ACTIVITY_CAPTURE_TOKEN"
 SIGNAL_TOKEN_FILE = Path.home() / ".orient-control" / "github-activity-capture-token"
 
-# Named directly, not derived from the registry — the same two repositories
-# Orient's own capture (convivy-orient's github_capture.py) excludes, per the
-# epic's specification (issue_01M4ZB5C5ZX0MV206064MTRAE0). Both are under
-# `convivy`, this job's primary owner.
-SANDBOX_REPOS = {
-    "convivy/vivy-ownerrez-sandbox-tools",
-    "convivy/constance-sevenshifts-sandbox-tools",
-}
+# The same repositories Orient's own capture (convivy-orient's
+# github_capture.py) excludes, per the epic's specification
+# (issue_01M4ZB5C5ZX0MV206064MTRAE0) — named directly there rather than
+# derived, and read here from each unit's own `activity_capture_excluded_repos`
+# (projects.activity_capture_excluded_repos) rather than a second hardcoded
+# copy. All under `convivy`, this job's primary owner.
+SANDBOX_REPOS = {projects.repo_github_slug(r)
+                 for r in projects.activity_capture_excluded_repos()}
 
 # One deadline for the whole pass' signal posting, not per signal — see the
 # module docstring's "ONE POSTING DEADLINE FOR THE WHOLE PASS" section.
@@ -207,35 +238,386 @@ def list_installation_repos(token: str, *, opener=urllib.request.urlopen) -> lis
                         f"repositories; refusing to treat an unread page as absence")
 
 
+def _capturable_repos(repos: list[dict], excluded: set[str]) -> list[str]:
+    """Every `repo_obj["full_name"]` in `repos`, sorted, after the one filter
+    `main()`'s posting loop and `run_audit()`'s read-only loop must both
+    apply: missing name, archived, excluded (sandbox/private-project,
+    case-insensitive) or an unsafe basename (`GACT.is_safe_basename`, round 1,
+    CQ·605) — one definition so the two loops cannot drift the way they did
+    in round 1: `run_audit()` had no basename skip, so a repository `main()`
+    refused and never posted a signal for still had its real events read
+    back and reported as misses (round 2 finding, CQ·605). Prints the same
+    refusal line for an unsafe basename either loop would have printed on
+    its own."""
+    out: list[str] = []
+    for repo_obj in sorted(repos, key=lambda r: (r.get("full_name") or "").lower()):
+        full_name = repo_obj.get("full_name") or ""
+        if not full_name or repo_obj.get("archived") or full_name.lower() in excluded:
+            continue
+        if not GACT.is_safe_basename(full_name):
+            # The installation listing, not the reviewed project registry
+            # (see the module docstring's "ONE INSTALLATION PER OWNER"
+            # section) — refused here, before any signal or audit read ever
+            # carries this basename as product/stream, so nothing
+            # downstream (bin/changelog-drain's path check and
+            # `agentctl spawn --on`) ever sees it (security review round 1,
+            # CQ·605).
+            print(f"github-activity-capture: refusing repository with an "
+                 f"unsafe basename: {full_name!r}", file=sys.stderr)
+            continue
+        out.append(full_name)
+    return out
+
+
+def _require_signal_token() -> str | None:
+    """This job's own posting credential, or `None` after printing the
+    refusal `main()` and `run_audit()` both act on — see the module
+    docstring's "POSTING CREDENTIAL HAS NO SHARED-TOKEN FALLBACK" section.
+    One definition so the audit refuses on exactly the same missing
+    credential, with the same message, as an ordinary pass."""
+    tok = signal_token()
+    if not tok:
+        print(f"github-activity-capture: no {SIGNAL_TOKEN_FILE} and no "
+             f"${SIGNAL_TOKEN_ENV}; refusing to read GitHub without this "
+             f"job's own posting credential (no fallback to the shared "
+             f"agent-platform token: it lacks the signal.create_review "
+             f"capability this job's kinds need)", file=sys.stderr)
+        return None
+    return tok
+
+
+def _app_auth() -> str | None:
+    """A fresh App JWT, or `None` after printing why it could not be
+    minted. Shared by `main()` and `run_audit()` so both refuse on the
+    same key problem with the same message."""
+    try:
+        app = GA.installed_app()
+    except GA.Unreadable as e:
+        print(f"github-activity-capture: {e}", file=sys.stderr)
+        return None
+    problem = GA.key_problem(app.key_path, label="the install's GitHub App")
+    if problem:
+        print(f"github-activity-capture: {problem}", file=sys.stderr)
+        return None
+    try:
+        return GA.app_jwt(app.key_path, app.app_id)
+    except GA.Unreadable as e:
+        print(f"github-activity-capture: {e}", file=sys.stderr)
+        return None
+
+
+# --- audit: a read-only check that every window event landed under this
+#     job's own credential (CQ·494, E25 PR 4) ---------------------------------
+#
+# Why this exists and what it must never do: see the module docstring's
+# `--audit-window` section. It never calls `SC.post_signal` (or anything
+# that does) and never touches `GACT.load_cursor`/`save_cursor`.
+
+# One overlap window, not a backfill — the epic's own 24-hour pause is the
+# case this is sized for; a caller asking for more is almost certainly
+# naming the wrong window rather than meaning it.
+_AUDIT_WINDOW_MAX = dt.timedelta(days=7)
+
+# The four kinds `github_activity.py`'s transforms produce — see that
+# module's docstring. `issue_comment` is deliberately not one of them (the
+# operator's ruling the module docstring records), so it is never audited.
+_AUDIT_KINDS = ("review_verdict", "changelog", "review_comment", "pr_comment")
+
+# `GET /signals`' own page cap (library-protocol §3), mirrored here the same
+# way `bin/mcp-ops-server`'s `SIGNAL_LIST_MAX` is.
+_SIGNAL_PAGE_LIMIT = 200
+# Bounds a single (repo, kind) read-back the same way `_MAX_PAGES` bounds an
+# installation's repository listing: a loud refusal past this many pages,
+# never a silent partial read treated as the whole answer.
+_MAX_SIGNAL_PAGES = 50
+
+
+class AuditError(RuntimeError):
+    """A window, credential or Library-identity problem the audit cannot
+    recover from — distinct from a per-event miss, which is printed and
+    counted rather than raised."""
+
+
+def _parse_audit_bound(raw: str, name: str) -> dt.datetime:
+    """`raw` as a UTC-zoned `datetime`, or raises `AuditError` naming `name`
+    (`"START"`/`"END"`) when it is not ISO-8601 or carries no zone — the
+    same "Z" shape GitHub's own timestamps use (`github_activity._parse_ts`),
+    required explicitly here because an unzoned string parsed as local time
+    would silently shift the window by the host's offset."""
+    try:
+        value = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise AuditError(f"{name} {raw!r} is not an ISO-8601 timestamp") from None
+    if value.tzinfo is None:
+        raise AuditError(f"{name} {raw!r} carries no UTC zone (e.g. "
+                         f"2026-10-20T00:00:00Z)")
+    return value.astimezone(dt.timezone.utc)
+
+
+def whoami(token: str, *, opener=urllib.request.urlopen) -> str:
+    """This credential's own `actor`, exactly as the Library's `GET /whoami`
+    resolves it (library-protocol §2: "`GET /whoami` returns the calling
+    identity as the Library resolved it ... so a client can assert on what
+    it holds instead of assuming it"). This is the identity a `GET /signals`
+    row's `ingested_by` carries when THIS credential is the one that posted
+    it — the one way the audit can tell its own rows apart from Orient's or
+    anyone else's without posting anything itself. `GET /whoami` has no
+    Orient counterpart, so this reaches the Library's own address
+    (`vault_plane.library_url`) rather than the translated, plane-aware one
+    `SC.post_signal` uses. Raises `AuditError` on any transport failure, non-
+    200 or missing `actor`: the audit cannot tell a miss from a mismatch
+    without first knowing its own identity, so a degraded "unknown" identity
+    here must never read as a clean pass."""
+    req = urllib.request.Request(VP.library_url("/whoami"),
+                                 headers=VP.library_headers(token=token))
+    try:
+        with opener(req, timeout=SC._DELIVERY_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        raise AuditError(f"GET /whoami failed: {type(e).__name__}: {e}") from e
+    actor = payload.get("actor") if isinstance(payload, dict) else None
+    if not actor:
+        raise AuditError(f"GET /whoami returned no actor: {payload!r:.200}")
+    return actor
+
+
+def _read_ingested_urls(repo: str, kind: str, since_iso: str, token: str, *,
+                        opener=urllib.request.urlopen) -> dict[str, str | None]:
+    """Every `refs.url` -> `ingested_by` the Library holds for `kind` and
+    `product=` `repo`'s bare basename (CQ·605 — every signal writer's
+    `product` is the bare repo name, never `owner/repo`), with
+    `produced_at` on or after `since_iso` (library-protocol §3.2's `GET
+    /signals` filters) — paged to the end via `offset`/`truncated` the way
+    `issue_client.list_ledger_entries` pages. `dedup_key` is never served
+    (library-protocol §3.1), which is why the audit matches on `refs.url`
+    instead: see the module docstring. A row with no `refs.url` is skipped
+    — nothing `github_activity.py`'s own transforms ever produce lacks one,
+    so a row without one did not come from this job's own posting path
+    either. Raises `AuditError` on any transport failure, non-200 or
+    missing `signals` list."""
+    product = GACT._repo_basename(repo)
+    out: dict[str, str | None] = {}
+    offset = 0
+    for _ in range(_MAX_SIGNAL_PAGES):
+        qs = urllib.parse.urlencode({"kind": kind, "product": product, "since": since_iso,
+                                     "limit": _SIGNAL_PAGE_LIMIT, "offset": offset})
+        req = urllib.request.Request(VP.url(f"/api/signals?{qs}"),
+                                     headers=VP.headers(token=token))
+        try:
+            with opener(req, timeout=SC._DELIVERY_TIMEOUT) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            raise AuditError(f"GET /signals (kind={kind}, product={product}) failed: "
+                             f"{type(e).__name__}: {e}") from e
+        rows = payload.get("signals") if isinstance(payload, dict) else None
+        if not isinstance(rows, list):
+            raise AuditError(f"GET /signals (kind={kind}, product={product}) returned "
+                             f"no signals list: {payload!r:.200}")
+        for row in rows:
+            url = (row.get("refs") or {}).get("url") if isinstance(row, dict) else None
+            if url:
+                out[url] = row.get("ingested_by")
+        if not payload.get("truncated") or not rows:
+            return out
+        offset += len(rows)
+    raise AuditError(f"GET /signals (kind={kind}, product={product}) still truncated "
+                     f"after {_MAX_SIGNAL_PAGES} pages; refusing to keep paging")
+
+
+def _collect_window_events(repo: str, start: dt.datetime, end: dt.datetime, token: str, *,
+                           opener=urllib.request.urlopen,
+                           sleep=time.sleep) -> list[tuple[str, str, dict | None]]:
+    """Every GitHub event of the four kinds in `[start, end]`, as `(kind,
+    github_url, signal_or_none)` — `github_url` is the raw object's own
+    `html_url`, always present even when the transform returns `None`
+    (the empty-body skip), because a miss line needs a URL regardless of
+    which of the three reasons it carries. Reviews are matched by
+    `submitted_at`, merges by `merged_at`, both kinds of comment by
+    `created_at`, per the plan this audit was built from. Reuses PR 2's own
+    fetchers and transforms (`github_activity.py`) — no second copy of
+    either."""
+    since_iso = GACT._format_ts(start)
+    events: list[tuple[str, str, dict | None]] = []
+
+    for rc in GACT.fetch_review_comments(repo, since_iso, token, opener=opener, sleep=sleep):
+        created = rc.get("created_at")
+        if created and start <= GACT._parse_ts(created) <= end:
+            events.append(("review_comment", rc.get("html_url") or "",
+                          GACT.signal_from_review_comment(repo, rc)))
+
+    for ic in GACT.fetch_conversation_comments(repo, since_iso, token, opener=opener,
+                                               sleep=sleep):
+        created = ic.get("created_at")
+        if created and start <= GACT._parse_ts(created) <= end:
+            events.append(("pr_comment", ic.get("html_url") or "",
+                          GACT.signal_from_issue_comment(repo, ic)))
+
+    prs = GACT.fetch_updated_pull_requests(repo, since_iso, token, opener=opener, sleep=sleep)
+    for pr in prs:
+        merged_at = pr.get("merged_at")
+        if merged_at and start <= GACT._parse_ts(merged_at) <= end:
+            events.append(("changelog", pr.get("html_url") or "",
+                          GACT.signal_from_merge(repo, pr)))
+        number = pr.get("number")
+        for review in GACT.fetch_reviews(repo, number, token, opener=opener, sleep=sleep):
+            submitted = review.get("submitted_at")
+            if submitted and start <= GACT._parse_ts(submitted) <= end:
+                events.append(("review_verdict", review.get("html_url") or "",
+                              GACT.signal_from_review(repo, number, review)))
+    return events
+
+
+def _classify_window_events(repo: str, events: list[tuple[str, str, dict | None]],
+                            start: dt.datetime, signal_tok: str, identity: str, *,
+                            opener=urllib.request.urlopen) -> list[dict]:
+    """Every event in `events`, matched (or not) against the Library's own
+    rows — one `_read_ingested_urls` read per kind actually seen, not per
+    event. Returns one dict per event: `{"repo", "kind", "url", "status",
+    "reason"}`, `status` either `"matched"` or `"miss"`. The three miss
+    reasons are the plan's own: no row at all, a row ingested by a
+    different identity (Orient's, most likely, during the overlap window),
+    or the same empty-body rule `github_activity.py`'s transforms apply —
+    `events` already carries that decision as a `None` signal, classified
+    here rather than re-derived."""
+    since_iso = GACT._format_ts(start)
+    ingested_by_kind: dict[str, dict[str, str | None]] = {}
+    results: list[dict] = []
+    for kind, url, sig in events:
+        if sig is None:
+            results.append({"repo": repo, "kind": kind, "url": url, "status": "miss",
+                           "reason": "skipped by the empty-body rule"})
+            continue
+        match_url = sig["refs"]["url"]
+        if kind not in ingested_by_kind:
+            ingested_by_kind[kind] = _read_ingested_urls(repo, kind, since_iso, signal_tok,
+                                                          opener=opener)
+        if match_url not in ingested_by_kind[kind]:
+            results.append({"repo": repo, "kind": kind, "url": match_url, "status": "miss",
+                           "reason": "no row"})
+            continue
+        ingested_by = ingested_by_kind[kind][match_url]
+        if ingested_by != identity:
+            results.append({
+                "repo": repo, "kind": kind, "url": match_url, "status": "miss",
+                "reason": f"row ingested by {ingested_by!r}, not this job's own "
+                         f"credential ({identity!r})"})
+            continue
+        results.append({"repo": repo, "kind": kind, "url": match_url, "status": "matched"})
+    return results
+
+
+def run_audit(start_raw: str, end_raw: str, *, opener=urllib.request.urlopen) -> int:
+    """`--audit-window START END` — see the module docstring. Read-only:
+    never posts, never moves the cursor. Returns 0 when every window event
+    matched, 1 on any miss (printed as it is found) or an invalid window,
+    credential or Library-identity problem (printed, then refused)."""
+    sig_tok = _require_signal_token()
+    if not sig_tok:
+        return 1
+
+    try:
+        start = _parse_audit_bound(start_raw, "START")
+        end = _parse_audit_bound(end_raw, "END")
+    except AuditError as e:
+        print(f"github-activity-capture: {e}", file=sys.stderr)
+        return 1
+    if end <= start:
+        print(f"github-activity-capture: END ({end_raw!r}) must be after "
+             f"START ({start_raw!r})", file=sys.stderr)
+        return 1
+    if end - start > _AUDIT_WINDOW_MAX:
+        print(f"github-activity-capture: the window ({end - start}) exceeds "
+             f"{_AUDIT_WINDOW_MAX}; this audit is for one overlap window, not "
+             f"a backfill", file=sys.stderr)
+        return 1
+
+    jwt = _app_auth()
+    if not jwt:
+        return 1
+
+    try:
+        identity = whoami(sig_tok, opener=opener)
+    except AuditError as e:
+        print(f"github-activity-capture: {e}", file=sys.stderr)
+        return 1
+
+    try:
+        installations = GA.installations(jwt, opener=opener)
+    except (GA.Unreadable, OSError) as e:
+        print(f"github-activity-capture: {e}", file=sys.stderr)
+        return 1
+
+    excluded = private_repo_slugs() | SANDBOX_REPOS
+    tallies = {kind: {"matched": 0, "missed": 0} for kind in _AUDIT_KINDS}
+    exit_code = 0
+
+    for inst in sorted(installations,
+                       key=lambda i: ((i.get("account") or {}).get("login") or "")):
+        owner = ((inst.get("account") or {}).get("login")) or "?"
+        inst_id = str(inst.get("id") or "")
+        try:
+            if not inst_id:
+                raise GA.Unreadable("the installation carries no id")
+            token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS,
+                                          opener=opener)
+            repos = list_installation_repos(token, opener=opener)
+        except (GA.Unreadable, OSError) as e:
+            print(f"github-activity-capture: {owner}: {e}", file=sys.stderr)
+            exit_code = 1
+            continue
+
+        for full_name in _capturable_repos(repos, excluded):
+            try:
+                events = _collect_window_events(full_name, start, end, token, opener=opener)
+                results = _classify_window_events(full_name, events, start, sig_tok, identity,
+                                                   opener=opener)
+            except (GACT.FetchError, AuditError, OSError) as e:
+                print(f"github-activity-capture: {full_name}: {e}", file=sys.stderr)
+                exit_code = 1
+                continue
+            for r in results:
+                if r["status"] == "matched":
+                    tallies[r["kind"]]["matched"] += 1
+                else:
+                    tallies[r["kind"]]["missed"] += 1
+                    exit_code = 1
+                    print(f"github-activity-capture: miss kind={r['kind']} "
+                         f"repo={r['repo']} url={r['url']!r} reason={r['reason']}")
+
+    for kind in _AUDIT_KINDS:
+        t = tallies[kind]
+        print(f"github-activity-capture: audit {kind} matched={t['matched']} "
+             f"missed={t['missed']}")
+    return exit_code
+
+
 def main() -> int:
-    argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         description="Capture GitHub review verdicts, review comments, "
                     "conversation comments and the merged-PR changelog as "
-                    "signals, authenticating as the convivy-bosun GitHub App."
-    ).parse_args()
+                    "signals, authenticating as the install's own GitHub App.")
+    parser.add_argument(
+        "--audit-window", nargs=2, metavar=("START", "END"), default=None,
+        help="read-only: audit that every GitHub event of the four kinds in "
+            "[START, END] (ISO-8601 UTC) has a Library row ingested by this "
+            "job's own credential — never posts, never moves the cursor; "
+            "see the module docstring.")
+    args = parser.parse_args()
+
+    if args.audit_window is not None:
+        return run_audit(*args.audit_window)
 
     pass_start_monotonic = time.monotonic()
     pass_start_wall = dt.datetime.now(dt.timezone.utc)
 
     # Checked BEFORE any GitHub read — see the module docstring's "POSTING
     # CREDENTIAL HAS NO SHARED-TOKEN FALLBACK" section.
-    sig_tok = signal_token()
+    sig_tok = _require_signal_token()
     if not sig_tok:
-        print(f"github-activity-capture: no {SIGNAL_TOKEN_FILE} and no "
-             f"${SIGNAL_TOKEN_ENV}; refusing to read GitHub without this "
-             f"job's own posting credential (no fallback to the shared "
-             f"agent-platform token: it lacks the signal.create_review "
-             f"capability this job's kinds need)", file=sys.stderr)
         return 1
 
-    problem = GA.key_problem(KEY_PATH, label="the convivy-bosun App")
-    if problem:
-        print(f"github-activity-capture: {problem}", file=sys.stderr)
-        return 1
-    try:
-        jwt = GA.app_jwt(KEY_PATH, APP_ID)
-    except GA.Unreadable as e:
-        print(f"github-activity-capture: {e}", file=sys.stderr)
+    jwt = _app_auth()
+    if not jwt:
         return 1
 
     # Counts every GitHub request this pass makes, across every installation
@@ -320,10 +702,7 @@ def main() -> int:
                 print(f"github-activity-capture: {owner}: rate limit could not be "
                      f"read ({rate_code})", file=sys.stderr)
 
-        for repo_obj in sorted(repos, key=lambda r: (r.get("full_name") or "").lower()):
-            full_name = repo_obj.get("full_name") or ""
-            if not full_name or repo_obj.get("archived") or full_name.lower() in excluded:
-                continue
+        for full_name in _capturable_repos(repos, excluded):
             try:
                 result = GACT.capture_repository(
                     full_name, cursor.get(full_name), token, poster, pass_start_wall,

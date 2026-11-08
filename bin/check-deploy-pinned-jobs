@@ -1,6 +1,7 @@
 #!/usr/bin/env python3.11
 r"""Is every LOADED launchd job's full argv pointing somewhere real, and
-somewhere that is not the agent-platform working checkout? (platform/decisions/0059)
+somewhere that is not the agent-platform working checkout? And is every
+deploy-pinned area's installed commit still what main ships? (platform/decisions/0059)
 
 WHY THIS EXISTS, SPECIFICALLY. #469's own completion measurement for the
 deploy-area migration read only `ProgramArguments[0]` — the interpreter — and
@@ -65,6 +66,50 @@ nothing after that day's first signal, unless its key differs: the key carries t
 label and argv pairs, so a return with a different set logs again. It never creates a work item (platform/decisions/0073). A `launchctl print` that fails for one label is skipped
 with a note, not a crash. Exits non-zero when any breach was found.
 
+A SECOND, INDEPENDENT CHECK: is a deploy-pinned AREA itself behind what it is
+pinned to. `run-register-api` was found on 2026-09-12 serving a deploy
+installed 2026-08-31, nine days after six merged commits to `bin/run-register-api`
+— four of them fail-closed privacy fixes — went live nowhere, because that
+area has its own installer and nothing refreshes it (`agent-platform-autopull`
+only refreshes the shared deploy area). The argv check above cannot see this:
+a dangling-or-checkout-reaching walk only asks whether a LOADED job's argv
+resolves, and a job reading a real, existing file in a deploy area that is
+simply stale passes it clean.
+
+For every directory directly under the deploy root (default
+`~/.local/deploy`, `--deploy-root` to override) holding a `DEPLOYED_COMMIT`
+file, `classify_deploy_area` reads that file's `commit:` and
+`installed_from:` lines, and in the repository named by `installed_from`
+counts the commits on `origin/main` after `commit:` that touch a path the
+area ships. The area's shipped paths are everything on disk under the area,
+relative to the area's own root (no per-area list to go stale), excluding
+`venv/` at the area's root and any `__pycache__` directory anywhere under
+it — what the installer built, never something main ships, and excluding
+it is not free of cost: measured on this machine, agent-platform-shared
+carries 3,616 files on disk and only 196 outside those two, bosun-server
+3,392 and 7, run-register-api 1,489 and 21, so every one of the rest would
+otherwise be a dead pathspec entry on every `git rev-list` call this check
+makes. A path that exists in the deploy area but not in the repository
+still just never matches any commit, costing only a pathspec entry. One
+match is enough to report the area STALE, naming the deployed commit and
+how many commits it lags. An area whose lag cannot be computed —
+`installed_from` missing from `DEPLOYED_COMMIT`, the named repository
+absent or not a git checkout, the deployed commit unknown there,
+`origin/main` unresolvable there, a directory under the area that could not
+be listed, or an area with no shipped paths at all (every real installer
+ships at least `bin/`, so an empty result only means something went
+wrong) — is reported UNCHECKABLE, never silently treated as current: an
+unreadable state must never read as a clean one, same rule
+`check-primary-checkouts` follows for an unreadable project registry. Both
+STALE and UNCHECKABLE areas go through the same per-breach-class signal,
+day-scoped dedup key, and non-zero exit as the argv breaches above.
+
+This check reads only local git refs (`rev-parse`, `cat-file`, `rev-list`)
+against whatever `origin/main` the named repository already has — it never
+runs `git fetch` and makes no network call, so a repository whose remote
+tracking ref is itself stale reports against that stale ref rather than
+reaching out to update it.
+
 RE-RUN THIS BY HAND. The shell equivalent of the argv-walk:
 
     for label in $(launchctl list | awk -F'\t' 'NR>1 && $3!=""{print $3}'); do
@@ -88,8 +133,10 @@ the prefix lets it through, a known gap not acted on. A job that encodes a
 credential in a path component still should not do that, because sanitise
 catches only the prefixes it knows.
 
-SAFETY. Read-only. Runs `launchctl list` / `launchctl print` and nothing
-else; never loads, unloads, or kickstarts anything.
+SAFETY. Read-only. Runs `launchctl list` / `launchctl print` and, for the
+deploy-area lag check, local `git` read commands (`rev-parse`, `cat-file`,
+`rev-list`) against repositories already on disk; never loads, unloads, or
+kickstarts anything, and never fetches, clones, or writes to a repository.
 """
 from __future__ import annotations
 
@@ -107,6 +154,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / 
 import builder_root as BR  # noqa: E402
 
 CHECKOUT_ROOT = str(BR.root() / "agent-platform")
+
+# Every deploy-pinned area (install-run-register-api, install-agent-platform-shared,
+# ...) writes its DEPLOYED_COMMIT one level under here. `pathlib.Path.home()`,
+# not BR.root(): this is the account's own home, same convention
+# check-primary-checkouts' LAUNCH_AGENTS uses, and is unrelated to the
+# platform's configured CREWS_ROOT.
+DEPLOY_ROOT = pathlib.Path.home() / ".local" / "deploy"
 
 # Every plist this platform owns is com.convivy.* (`ls launchd/*.plist`) —
 # see module docstring's SCOPE section for why everything else (macOS's own
@@ -278,6 +332,152 @@ def classify(label: str, argv: list[str], *,
     return breaches
 
 
+def _parse_deployed_commit(text: str) -> dict[str, str]:
+    """A DEPLOYED_COMMIT file's `key: value` lines -> a dict.
+
+    A line with no colon, or a blank line, is skipped rather than raising —
+    a hand-edited or partially-written file must read as a missing field,
+    never crash the check that exists to notice it.
+    """
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip()
+    return fields
+
+
+def _deploy_areas(deploy_root: pathlib.Path) -> list[pathlib.Path]:
+    """Every directory directly under `deploy_root` holding a DEPLOYED_COMMIT
+    file, sorted by name for a stable run order. A missing deploy root reads
+    as "nothing to check", same as a missing LAUNCH_AGENTS dir elsewhere."""
+    try:
+        candidates = sorted(deploy_root.iterdir())
+    except OSError:
+        return []
+    return [d for d in candidates if d.is_dir() and (d / "DEPLOYED_COMMIT").is_file()]
+
+
+class _ShippedPathsUnreadable(Exception):
+    """`_shipped_paths` could not list every directory under the area."""
+
+
+def _shipped_paths(area: pathlib.Path) -> list[str]:
+    """Every file under `area`, relative to `area` itself, as POSIX strings —
+    derived from what the area actually holds on disk rather than a
+    per-area list that would go stale the moment an installer's file set
+    changes. DEPLOYED_COMMIT itself is excluded: it is this check's own
+    marker, never a file main ships. `venv/` directly under `area` and any
+    `__pycache__` directory at any depth are excluded too: what the
+    installer built, never something main ships — see the module docstring
+    for the per-area file counts that exclusion is worth.
+
+    Raises `_ShippedPathsUnreadable` if any directory under `area` could not
+    be listed, rather than silently returning whatever the walk reached
+    before the failure: a short, incomplete result must never be mistaken
+    for a complete one.
+    """
+    errors: list[OSError] = []
+    paths: list[str] = []
+    for root, dirs, files in os.walk(area, onerror=errors.append):
+        root_path = pathlib.Path(root)
+        if root_path == area and "venv" in dirs:
+            dirs.remove("venv")
+        if "__pycache__" in dirs:
+            dirs.remove("__pycache__")
+        for name in files:
+            rel = (root_path / name).relative_to(area)
+            if rel == pathlib.Path("DEPLOYED_COMMIT"):
+                continue
+            paths.append(rel.as_posix())
+    if errors:
+        raise _ShippedPathsUnreadable(
+            f"could not list {len(errors)} director{'y' if len(errors) == 1 else 'ies'} "
+            f"under {area}: {errors[0]}")
+    return sorted(paths)
+
+
+def _run_git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess | None:
+    """One read-only git call against `repo`, or None if it could not even
+    run (missing repo dir, no git on PATH, a timeout) — never raises."""
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def classify_deploy_area(area: pathlib.Path) -> dict[str, Any]:
+    """One deploy area -> its status dict: `area` (name) and `status`
+    (`"current"`, `"stale"`, or `"uncheckable"`), plus the fields that status
+    carries (`deployed_commit`/`lag` for stale, `reason` for uncheckable).
+
+    Every early return below is "uncheckable", never "current" — an
+    unreadable `DEPLOYED_COMMIT`, a missing `installed_from`, a repository
+    that is gone or is not a git checkout, a deployed commit unknown there,
+    an unresolvable `origin/main`, a directory under the area that could
+    not be listed, or an area with no shipped paths at all (every real
+    installer ships at least `bin/`, so an empty result only means
+    something went wrong) must never read as "nothing to report" (the same
+    rule `check-primary-checkouts` follows for an unreadable project
+    registry).
+    """
+    name = area.name
+    try:
+        fields = _parse_deployed_commit((area / "DEPLOYED_COMMIT").read_text(encoding="utf-8"))
+    except OSError as exc:
+        return {"area": name, "status": "uncheckable",
+                "reason": f"could not read DEPLOYED_COMMIT: {exc}"}
+
+    commit = fields.get("commit")
+    if not commit:
+        return {"area": name, "status": "uncheckable",
+                "reason": "DEPLOYED_COMMIT has no commit: line"}
+
+    installed_from = fields.get("installed_from")
+    if not installed_from:
+        return {"area": name, "status": "uncheckable", "deployed_commit": commit,
+                "reason": "DEPLOYED_COMMIT has no installed_from: line"}
+
+    repo = pathlib.Path(installed_from)
+    proc = _run_git(repo, "rev-parse", "--git-dir")
+    if proc is None or proc.returncode != 0:
+        return {"area": name, "status": "uncheckable", "deployed_commit": commit,
+                "reason": f"installed_from {installed_from} is not a git repository"}
+
+    proc = _run_git(repo, "cat-file", "-e", f"{commit}^{{commit}}")
+    if proc is None or proc.returncode != 0:
+        return {"area": name, "status": "uncheckable", "deployed_commit": commit,
+                "reason": f"commit {commit} is unknown in {installed_from}"}
+
+    proc = _run_git(repo, "rev-parse", "--verify", "origin/main")
+    if proc is None or proc.returncode != 0:
+        return {"area": name, "status": "uncheckable", "deployed_commit": commit,
+                "reason": f"origin/main does not resolve in {installed_from}"}
+
+    try:
+        shipped = _shipped_paths(area)
+    except _ShippedPathsUnreadable as exc:
+        return {"area": name, "status": "uncheckable", "deployed_commit": commit,
+                "reason": str(exc)}
+    if not shipped:
+        return {"area": name, "status": "uncheckable", "deployed_commit": commit,
+                "reason": f"{area} has no shipped paths to check"}
+
+    proc = _run_git(repo, "rev-list", "--count", f"{commit}..origin/main", "--", *shipped)
+    if proc is None or proc.returncode != 0:
+        return {"area": name, "status": "uncheckable", "deployed_commit": commit,
+                "reason": f"git rev-list could not count commits in {installed_from}"}
+
+    lag = int(proc.stdout.strip() or "0")
+    if lag == 0:
+        return {"area": name, "status": "current", "deployed_commit": commit, "lag": 0}
+    return {"area": name, "status": "stale", "deployed_commit": commit, "lag": lag,
+            "installed_from": installed_from}
+
+
 def _launchctl_list() -> str:
     proc = subprocess.run(["launchctl", "list"], capture_output=True,
                           text=True, timeout=30)
@@ -326,6 +526,35 @@ def _body(lead: str, breaches: list[dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
+_STALE_DEPLOY_LEAD = (
+    "A deploy-pinned area's DEPLOYED_COMMIT is behind commits already merged "
+    "to main that touch a file the area ships, so a merged, reviewed change "
+    "is not live there until someone reinstalls it."
+)
+
+_UNCHECKABLE_DEPLOY_LEAD = (
+    "A deploy-pinned area's lag behind main could not be computed, so "
+    "whether a merged change has reached it is unknown rather than "
+    "confirmed current."
+)
+
+
+def _stale_deploy_body(breaches: list[dict[str, Any]]) -> str:
+    lines = [_STALE_DEPLOY_LEAD, ""]
+    for b in sorted(breaches, key=lambda b: b["area"]):
+        plural = "" if b["lag"] == 1 else "s"
+        lines.append(f"- `{b['area']}`: deployed `{b['deployed_commit']}`, "
+                      f"{b['lag']} commit{plural} behind origin/main")
+    return "\n".join(lines)
+
+
+def _uncheckable_deploy_body(breaches: list[dict[str, Any]]) -> str:
+    lines = [_UNCHECKABLE_DEPLOY_LEAD, ""]
+    for b in sorted(breaches, key=lambda b: b["area"]):
+        lines.append(f"- `{b['area']}`: {b['reason']}")
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="check-deploy-pinned-jobs",
                                      description=__doc__)
@@ -333,6 +562,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="uid launchctl's gui/<uid>/<label> domain uses (for testing)")
     parser.add_argument("--checkout-root", default=CHECKOUT_ROOT,
                         help="override the agent-platform checkout root (for testing)")
+    parser.add_argument("--deploy-root", default=str(DEPLOY_ROOT),
+                        help="override the deploy areas root (for testing)")
     parser.add_argument("--no-report", action="store_true",
                         help="detect breaches but do not log signals (dry run)")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -365,10 +596,27 @@ def main(argv: list[str] | None = None) -> int:
         if opts.verbose and not job_argv:
             print(f"[OK] {label}: no argv parsed", file=sys.stderr)
 
-    if not dangling and not checkout_reaching:
+    stale_deploy: list[dict[str, Any]] = []
+    uncheckable_deploy: list[dict[str, Any]] = []
+    for area in _deploy_areas(pathlib.Path(opts.deploy_root)):
+        result = classify_deploy_area(area)
+        if result["status"] == "stale":
+            print(f"[BREACH] stale-deploy {result['area']}: deployed "
+                  f"{result['deployed_commit']} is {result['lag']} commit(s) "
+                  "behind origin/main", file=sys.stderr)
+            stale_deploy.append(result)
+        elif result["status"] == "uncheckable":
+            print(f"[BREACH] uncheckable-deploy {result['area']}: {result['reason']}",
+                  file=sys.stderr)
+            uncheckable_deploy.append(result)
+        elif opts.verbose:
+            print(f"[OK] {result['area']}: at origin/main", file=sys.stderr)
+
+    if not dangling and not checkout_reaching and not stale_deploy and not uncheckable_deploy:
         if opts.verbose:
             print("[OK] every loaded job's argv resolves and stays out of "
-                  "the checkout", file=sys.stderr)
+                  "the checkout, and every deploy area is at origin/main",
+                  file=sys.stderr)
         return 0
 
     day = _utc_today()
@@ -389,6 +637,26 @@ def main(argv: list[str] | None = None) -> int:
                         dry_run=opts.no_report)
         print(f"[CHECKOUT-REACHING] {len(checkout_reaching)} → {res.get('status', '?')}",
               file=sys.stderr)
+
+    if stale_deploy:
+        ids = sorted(f"{b['area']}:{b['deployed_commit']}" for b in stale_deploy)
+        n = len(stale_deploy)
+        title = f"[deploy-pinned-jobs] {n} deploy area{'' if n == 1 else 's'} behind main"
+        res = _post_signal("agent-platform", title, _stale_deploy_body(stale_deploy),
+                           dedup_key=f"deploy-pinned-jobs:stale-deploy:{_names_digest(ids)}:{day}",
+                        dry_run=opts.no_report)
+        print(f"[STALE-DEPLOY] {n} → {res.get('status', '?')}", file=sys.stderr)
+
+    if uncheckable_deploy:
+        ids = sorted(f"{b['area']}:{b['reason']}" for b in uncheckable_deploy)
+        n = len(uncheckable_deploy)
+        title = (f"[deploy-pinned-jobs] {n} deploy area{'' if n == 1 else 's'} "
+                f"could not be checked for lag")
+        res = _post_signal(
+            "agent-platform", title, _uncheckable_deploy_body(uncheckable_deploy),
+            dedup_key=f"deploy-pinned-jobs:uncheckable-deploy:{_names_digest(ids)}:{day}",
+            dry_run=opts.no_report)
+        print(f"[UNCHECKABLE-DEPLOY] {n} → {res.get('status', '?')}", file=sys.stderr)
 
     if _report_failures > 0:
         print(f"[REPORT-FAIL] {_report_failures} report(s) failed — "

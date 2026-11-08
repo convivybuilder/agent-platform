@@ -3,9 +3,10 @@
 
 A project with a home directory and associated directories has one inbox per
 directory and one reader. The co watches the home directory's inbox, so a note an
-agent drops while standing in an associated directory is never read. `svc` is the
-live case: agents working in `convivy-services` write to that repo's inbox and the
-svc co, watching `convivy-app-kit/inbox`, sees nothing.
+agent drops while standing in an associated directory is never read. A project
+spanning two repos is the live case: agents working in its second repo write to
+that repo's inbox and the project's co, watching only its home repo's inbox,
+sees nothing.
 
 This points every associated directory's `inbox/` at the home directory's, so the
 project having one inbox is true at the filesystem level rather than true only for
@@ -23,7 +24,7 @@ the link itself commits nothing.
 
 Usage:
     link-project-inboxes                 # apply to every registered project
-    link-project-inboxes --project svc   # just one
+    link-project-inboxes --project acme  # just one
     link-project-inboxes --check         # report drift, change nothing, exit 1 if any
 
 Exit status: 0 when everything is linked, 1 when something needs attention — a

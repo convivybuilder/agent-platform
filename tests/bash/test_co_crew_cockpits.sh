@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tests for bin/co's crew-cockpit branch: ~/Convivy/{library,agent-platform,
-# convivy-orient}, the three directories the 2026-08-17 crew split created.
+# northwind-orient}, the three directories the 2026-08-17 crew split created.
 # They launch bare Claude Code with NO --agent, the way substrate and the other
 # named cockpits do, because a crew co holds the dispatch role itself rather
 # than handing it to a planning-orchestrator none of them individuates.
@@ -12,7 +12,7 @@
 #
 #   1. Matching on BASENAME instead of full path. The first implementation did,
 #      following its siblings. `library` is a generic directory name — unlike
-#      `hollis` or `convivy-app-kit` — so a scratch clone or a
+#      `galley` or `foundry-kit` — so a scratch clone or a
 #      `git worktree add ../library` anywhere on disk would have taken the
 #      branch and launched bypassPermissions in unvetted content
 #      (security-reviewer, PR #404). The gate is now three absolute paths.
@@ -43,7 +43,7 @@ setup() { # -> echoes fake HOME
     home=$(mktemp -d)
     mkdir -p "$home/stubbin"
 
-    for d in Convivy/library Convivy/agent-platform Convivy/convivy-orient \
+    for d in Convivy/library Convivy/agent-platform Convivy/northwind-orient \
              Convivy/library2 Convivy/worktrees/agent-platform.reviewer \
              Convivy/nested/library elsewhere/library; do
         mkdir -p "$home/$d/.claude/agents"
@@ -70,7 +70,7 @@ run_co_in() {
     stderr_log=$(mktemp)
     ( cd "$home/$rel" && \
       HOME="$home" PATH="$home/stubbin:$PATH" CLAUDE_CALL_LOG="$call_log" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "$@" >/dev/null 2>"$stderr_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" "$@" >/dev/null 2>"$stderr_log" )
     RC=$?
     CLAUDE_ARGS=$(cat "$call_log")
     STDERR=$(cat "$stderr_log")
@@ -78,7 +78,7 @@ run_co_in() {
 }
 
 echo "== the three crew cockpits launch bare claude, with no agent =="
-for crew in library agent-platform convivy-orient; do
+for crew in library agent-platform northwind-orient; do
     H=$(setup)
     run_co_in "$H" "Convivy/$crew"
     assert_eq "1" "$(echo "$CLAUDE_ARGS" | grep -q -- '--permission-mode' && echo 1 || echo 0)" \
@@ -103,7 +103,7 @@ echo "== the gate resolves the WHOLE path, not just \$HOME =="
 H=$(setup)
 mv "$H/Convivy" "$H/Convivy.real"
 ln -s "$H/Convivy.real" "$H/Convivy"
-for crew in library agent-platform convivy-orient; do
+for crew in library agent-platform northwind-orient; do
     run_co_in "$H" "Convivy/$crew"
     assert_eq "1" "$(echo "$CLAUDE_ARGS" | grep -q -- '--permission-mode' && echo 1 || echo 0)" \
         "$crew: still matches when ~/Convivy is itself a symlink"

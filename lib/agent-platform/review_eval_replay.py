@@ -26,13 +26,19 @@ and the model's remaining pairs are recorded `not_run`, never as failures.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import re
 import subprocess
+import sys
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+import registry
 
 REASON = "review-replay eval harness (agent-platform#807)"
 
@@ -102,6 +108,26 @@ def plan_replays(entries: list[dict], arms: list[ModelArm],
     return out
 
 
+def _interleave_by_entry(queue: list[tuple[dict, ModelArm]]) -> list[tuple[dict, ModelArm]]:
+    """`plan_replays` returns its queue entry-major (every arm of one entry
+    before the next entry's). Submitted to the pool in that order, the first
+    `concurrency` pairs pulled would often be several arms of the SAME
+    entry — exactly the pairs `run_batch`'s per-entry guard serializes — so
+    most of the pool would sit blocked on that guard instead of making
+    progress on a different entry. Regrouping round-robin by entry (one pair
+    per entry, cycling through arms) keeps consecutive submissions on
+    different entries whenever more than one is queued, so the guard below
+    stops two arms of the SAME entry from overlapping without stopping the
+    batch from running `concurrency` DIFFERENT entries at once."""
+    by_entry: dict[str, list[tuple[dict, ModelArm]]] = {}
+    for entry, arm in queue:
+        by_entry.setdefault(entry["entry_id"], []).append((entry, arm))
+    out: list[tuple[dict, ModelArm]] = []
+    for row in itertools.zip_longest(*by_entry.values()):
+        out.extend(pair for pair in row if pair is not None)
+    return out
+
+
 def _parse_run_id(spawn_stdout: str, spawn_stderr: str) -> str | None:
     m = _RUN_ID_RE.search(spawn_stdout) or _RUN_ID_RE.search(spawn_stderr)
     return m.group(1) if m else None
@@ -147,13 +173,107 @@ def collect_run_result(run_dir: Path) -> dict:
     }
 
 
+def _live_eval_run_ids(runs_root: Path) -> list[str]:
+    """Every run id `registry.list_runs()` reports alive — that is ALSO an
+    eval-mode dispatch: `meta.json` carries `eval_mode: true`, written by
+    `agentctl spawn --eval-mode` (`build_spawn_argv`, above). The registry is
+    shared across EVERY `agentctl` process on the machine, not just this
+    one's in-memory `entry_locks` — which is the point: this is how
+    `run_batch` sees a run left alive by an earlier, interrupted call, not
+    only ones it dispatched itself.
+
+    `list_runs()`'s liveness check is NOT the same ground truth `agentctl
+    status` reads. It reaps dead entries with the registry's own
+    `_is_alive` (`registry.py`'s `_reap_in_place`) — a bare `os.kill(pid, 0)`
+    signal-0 probe, with no defense against a recycled pid — not
+    `_run_process_gone` (`bin/agentctl:12606`), which additionally
+    cross-checks the registry's own recorded start time before trusting a
+    pid match, specifically because a signal-0 probe alone cannot tell a
+    recycled pid from the original. This is fail-safe, not fail-open: a
+    recycled pid can only make a run that is actually long dead read as
+    "alive" here, which makes `run_batch` refuse to start when it could
+    safely have started — never the reverse, since a pid that is truly gone
+    reports `ProcessLookupError` unambiguously either way. A false "alive"
+    can therefore delay a batch; it cannot let two arms of the same entry
+    overlap, which is the gap this function exists to close."""
+    out = []
+    for r in registry.list_runs():
+        run_id = r.get("run_id")
+        if not run_id:
+            continue
+        run_dir = find_run_dir(runs_root, run_id)
+        if run_dir is None:
+            continue
+        meta = _read_json(run_dir / "meta.json")
+        if meta and meta.get("eval_mode"):
+            out.append(run_id)
+    return out
+
+
+class LiveEvalRunsError(RuntimeError):
+    """Raised by `run_batch` before dispatching anything, when `_live_eval_run_ids`
+    finds an eval-mode run still alive. Carries the ids so a caller doesn't have
+    to re-parse the message."""
+
+    def __init__(self, run_ids: list[str]):
+        self.run_ids = list(run_ids)
+        ids = " ".join(self.run_ids)
+        super().__init__(
+            f"refusing to start: {len(self.run_ids)} eval-mode run(s) already "
+            f"live: {ids}. Wait for them (agentctl wait {ids}) or kill them "
+            f"(agentctl kill <run-id> --final) before starting a new replay batch.")
+
+
+_KILL_CONFIRM_INITIAL_BACKOFF_S = 1.0
+_KILL_CONFIRM_MAX_BACKOFF_S = 30.0
+
+
 def run_one(entry: dict, arm: ModelArm, *, runs_root: Path,
            run_subprocess: Callable = subprocess.run,
-           wait_timeout: float = 1800.0) -> dict:
+           wait_timeout: float = 1800.0,
+           sleep: Callable[[float], None] = time.sleep) -> dict:
     """Dispatch one (entry, arm) replay, wait for it, and return its result
     dict — never raises: a spawn/wait failure is recorded as an errored
     result (cost still read from whatever run dir exists), so one bad replay
-    does not take the batch down."""
+    does not take the batch down.
+
+    `agentctl wait`'s own exit codes (`bin/agentctl:11815-11826`, its
+    `_wait_for_runs`): 0 the run finished and succeeded. 1 the run id never
+    resolved to a run dir (`_wait_for_runs`'s own lookup, `bin/agentctl:12217-
+    12220`) — nothing this wait could see was dispatched under that id, so
+    there is nothing to kill. 2 the `--timeout` elapsed with the run STILL
+    ALIVE. 3 is `EXIT_WAITER_KILLED` (`bin/agentctl:11818`) — the WAITER
+    process was killed (usually the harness's task-lifetime cap), not the
+    run: its own handler prints that "the run(s) below are NOT affected"
+    before exiting 3 (`bin/agentctl:11983-11985,12004`), so after a 3 the
+    dispatched run's liveness is exactly as unknown as before the wait
+    started. 4 is `EXIT_RUN_FAILED` (`bin/agentctl:11826`) — the run ended,
+    in a status `WAIT_FAILURE_STATUSES` names (errored, killed,
+    budget_refused, ...).
+
+    Only 2 and 3 can mean the run is still alive, so both get the
+    kill-then-reconfirm below; 0, 1 and 4 already mean the run has ended or
+    never existed and need no kill. This function must not return with the
+    run possibly still alive, since `run_batch`'s per-entry lock is held for
+    exactly the duration of this call (agent-platform#940 round 2 revise,
+    reviewer + security-reviewer) — returning early would release that lock
+    onto a same-entry sibling while this arm's scratch directory, and the
+    stale permission set it rendered before any sibling existed, are still
+    live. `--final` keeps the ARCH-131 deepseek fail-over from respawning the
+    run under a new pid right after this kills it.
+
+    The confirmation `agentctl wait ... --timeout 0` never itself times out
+    (`0` disables the deadline — `cmd_wait`'s own `timeout if timeout else
+    None`), so it can only come back 0, 1, 3 or 4: 0/4 mean the run has now
+    ended and break the loop; 1/3 mean the confirmation itself didn't settle
+    the question (the id stopped resolving, or THIS wait's own waiter was
+    killed in turn) and retry the kill+confirm pair. The lock is held for
+    the whole retry loop — releasing it early would be the exact bug this
+    loop exists to close — so each retry prints which run id and which exit
+    code forced it (round 3 revise, security-reviewer: a caller watching the
+    batch otherwise sees nothing while it waits) and backs off before
+    retrying: 1s, doubling to a 30s ceiling, uncapped in count, since giving
+    up would mean guessing the run is gone rather than confirming it."""
     base = {"entry_id": entry["entry_id"], "model_key": arm.key,
            "repo": entry["repo"], "pr": entry["pr"], "kind": entry["kind"]}
     argv = build_spawn_argv(entry, arm)
@@ -167,6 +287,23 @@ def run_one(entry: dict, arm: ModelArm, *, runs_root: Path,
                "not_run": False}
     wait = run_subprocess(["agentctl", "wait", run_id, "--timeout", str(wait_timeout)],
                           capture_output=True, text=True)
+    original_exit = wait.returncode
+    run_may_be_alive = original_exit in (2, 3)
+    if run_may_be_alive:
+        backoff = _KILL_CONFIRM_INITIAL_BACKOFF_S
+        while True:
+            run_subprocess(["agentctl", "kill", run_id, "--final"],
+                           capture_output=True, text=True)
+            confirm = run_subprocess(["agentctl", "wait", run_id, "--timeout", "0"],
+                                     capture_output=True, text=True)
+            if confirm.returncode in (0, 4):
+                wait = confirm
+                break
+            print(f"run_one: {run_id} kill+confirm retry after confirmation "
+                 f"wait exit {confirm.returncode}; retrying in {backoff}s",
+                 file=sys.stderr)
+            sleep(backoff)
+            backoff = min(backoff * 2, _KILL_CONFIRM_MAX_BACKOFF_S)
     run_dir = find_run_dir(runs_root, run_id)
     collected = collect_run_result(run_dir) if run_dir else {
         "verdict": None, "body": None, "tokens_in": 0, "tokens_out": 0,
@@ -174,7 +311,11 @@ def run_one(entry: dict, arm: ModelArm, *, runs_root: Path,
     }
     result = {**base, "run_id": run_id, "wait_exit": wait.returncode, **collected,
               "not_run": False}
-    if wait.returncode not in (0,):
+    if run_may_be_alive:
+        why = (f"timeout after {wait_timeout}s" if original_exit == 2
+              else "the waiter was killed; run status unknown")
+        result["error"] = f"wait exit {original_exit} ({why}) — killed and confirmed ended"
+    elif wait.returncode not in (0,):
         result["error"] = f"wait exit {wait.returncode}"
     return result
 
@@ -187,12 +328,60 @@ def run_batch(entries: list[dict], arms: list[ModelArm], *, results_dir: Path,
     pair as it finishes (so a crash mid-batch loses nothing already done),
     and return the full list of results for this call (both freshly run and
     skip-resumed are NOT included here — callers that want the full picture
-    read `load_existing_results` again after this returns)."""
+    read `load_existing_results` again after this returns).
+
+    Never runs two arms of the SAME corpus entry concurrently WITHIN one call
+    to this function (agent-platform#940 round 1 revise, reviewer +
+    security-reviewer): each dispatched run's `permissions.deny` can only deny
+    the sibling scratch directories that already exist when its own settings
+    render (`run_sandbox.py`'s `_existing_eval_sibling_dirs` — permission
+    globs have no negation, so a wildcard broad enough to cover a future
+    sibling also covers this dispatch's own directory and breaks its
+    `Write`), so an arm whose settings render before a same-entry sibling's
+    directory exists could read that sibling's draft `verdict.json`. That
+    only matters between two arms replaying the SAME entry — one could copy
+    the other's answer and corrupt the comparison; arms on different entries
+    are reviewing different PRs, so another entry's verdict gives nothing to
+    copy. A per-entry lock, held for the whole `run_one` call, makes that
+    overlap impossible; `_interleave_by_entry` reorders the queue so the lock
+    serializes same-entry arms only, never the batch as a whole.
+
+    THE LOCK ALONE IS NOT ENOUGH, and two more mechanisms close what it
+    leaves (agent-platform#940 round 2 revise, reviewer + security-reviewer).
+    First: the lock is held only until `run_one` RETURNS, and `run_one` used
+    to return as soon as `agentctl wait` returned — including on a timeout,
+    which leaves the dispatched run genuinely alive. `run_one` now kills a
+    timed-out run and confirms it has ended (its own docstring) before
+    returning, so the lock is never released onto a run that may still be
+    running. Second: the lock is this ONE call's in-memory state — nothing
+    about it survives a crash or an operator-interrupted `replay run` that
+    gets resumed, which this module's own top docstring advertises as
+    supported, and a run from the interrupted call can still be alive when
+    the new call starts. This function therefore refuses to start AT ALL —
+    dispatching nothing — when `_live_eval_run_ids` finds any eval-mode run
+    still alive, rather than trying to match a live run back to the corpus
+    entry it belongs to.
+
+    WHAT THIS REFUSAL DOES NOT CATCH (round 3 revise, security-reviewer):
+    the registry read happens once, before this call dispatches anything.
+    An earlier replay's still-registered, still-running arms are refused
+    against. Two `run_batch` calls started close enough together can each
+    read the registry before the other has dispatched anything, each see no
+    live eval run, and both proceed — the same same-entry overlap this
+    refusal exists to close, promoted from within-process to between-process.
+    No lock closes that here: no occurrence of two concurrent `replay run`
+    invocations has been named, and the harness is run by one operator at a
+    time."""
+    live = _live_eval_run_ids(runs_root)
+    if live:
+        raise LiveEvalRunsError(live)
     results_dir.mkdir(parents=True, exist_ok=True)
     existing = load_existing_results(results_dir)
-    queue = plan_replays(entries, arms, existing)
+    queue = _interleave_by_entry(plan_replays(entries, arms, existing))
     if not queue:
         return []
+
+    entry_locks: dict[str, threading.Lock] = {e["entry_id"]: threading.Lock() for e, _ in queue}
 
     def _worker(entry, arm):
         # Checked AT DISPATCH TIME, not once before the pool starts: a long
@@ -225,8 +414,16 @@ def run_batch(entries: list[dict], arms: list[ModelArm], *, results_dir: Path,
                       "tokens_in": 0, "tokens_out": 0, "not_run": True,
                       "reason": f"{arm.key} reached its spend cap"}
         else:
-            result = run_one(entry, arm, runs_root=runs_root,
-                             run_subprocess=run_subprocess, wait_timeout=wait_timeout)
+            # Held for the whole dispatch+wait, not just the spawn: `run_one`
+            # now blocks until the run has genuinely ended (killing it itself
+            # on a wait-timeout rather than returning early — see its own
+            # docstring), so releasing the lock only after it returns is what
+            # keeps a same-entry sibling's directory from ever existing while
+            # this arm's settings could still be rendered — see this
+            # function's own docstring.
+            with entry_locks[entry["entry_id"]]:
+                result = run_one(entry, arm, runs_root=runs_root,
+                                 run_subprocess=run_subprocess, wait_timeout=wait_timeout)
             if cap_tracker is not None and arm.is_gateway:
                 cap_tracker.reconcile(arm.key, estimated, result.get("usd") or 0.0)
         result_path(results_dir, entry["entry_id"], arm.key).write_text(

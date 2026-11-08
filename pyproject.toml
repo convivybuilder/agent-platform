@@ -6,6 +6,14 @@
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-q"
+# CI's python job hung three times on PR #955 (CQ·523) at the same point in
+# collection, with no output past the progress dots and no log until the job
+# ends. pytest's built-in faulthandler dumps every thread's traceback to
+# stderr if a single test runs past this many seconds, without failing the
+# test, so a hung test names itself and the line it's stuck on in the CI log
+# while the job is still running. The slowest legitimate test observed in CI
+# runs 60s, far under this.
+faulthandler_timeout = 600
 
 [tool.coverage.run]
 # Measure the importable platform lib — the bin/ CLIs are exercised too but load

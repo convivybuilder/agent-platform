@@ -2,7 +2,7 @@
 # A plain `co` launch (no `-r`) notices a stale render and refreshes it on
 # its own (issue_01M4GJRCDNKCV4QREH68KSRS3W).
 #
-# THE OCCURRENCE: on 2026-10-09 vivy-commercial (and four other crews) were
+# THE OCCURRENCE: on 2026-10-09 finch-commercial (and four other crews) were
 # still running instruction blocks a KB change had replaced days earlier,
 # because only `co -r` ever re-renders and nobody remembered to pass it.
 # `_co_refresh_if_stale` runs `knowledge-ctx check` on every plain launch of
@@ -20,7 +20,7 @@ CO="$REPO_ROOT/bin/co"
 
 # A fake HOME with a knowledge repo that has a REAL, reachable origin (same
 # shape as test_co_crew_refresh.sh), plus one crew-cockpit directory
-# (shipwright) and one `*-commercial` directory (vivy-commercial — the exact
+# (outfitter) and one `*-commercial` directory (finch-commercial — the exact
 # branch the occurrence happened on) each already individuated:
 # `.claude/.active-profile` present, so `_co_refresh_if_stale`'s guard does
 # not short-circuit on "never rendered here".
@@ -44,24 +44,27 @@ setup() { # -> echoes fake HOME
         git push -q -u origin main
     ) >/dev/null 2>&1
 
-    mkdir -p "$home/Convivy/shipwright/.claude/agents"
-    : > "$home/Convivy/shipwright/.claude/agents/planning-orchestrator.md"
-    printf 'platform/daytime\n' > "$home/Convivy/shipwright/.claude/.active-profile"
-    ( cd "$home/Convivy/shipwright" && git init -q . )
+    mkdir -p "$home/Convivy/outfitter/.claude/agents"
+    : > "$home/Convivy/outfitter/.claude/agents/planning-orchestrator.md"
+    printf 'platform/daytime\n' > "$home/Convivy/outfitter/.claude/.active-profile"
+    ( cd "$home/Convivy/outfitter" && git init -q . )
 
-    mkdir -p "$home/Convivy/vivy-commercial/.claude/agents"
-    : > "$home/Convivy/vivy-commercial/.claude/agents/product-manager.md"
-    printf 'vivy/commercial\n' > "$home/Convivy/vivy-commercial/.claude/.active-profile"
-    ( cd "$home/Convivy/vivy-commercial" && git init -q . )
+    mkdir -p "$home/Convivy/finch-commercial/.claude/agents"
+    : > "$home/Convivy/finch-commercial/.claude/agents/product-manager.md"
+    printf 'finch/commercial\n' > "$home/Convivy/finch-commercial/.claude/.active-profile"
+    ( cd "$home/Convivy/finch-commercial" && git init -q . )
 
     # A crew-cockpit directory never individuated at all — no
     # `.claude/.active-profile` — so `_co_refresh_if_stale` must behave
     # exactly as before this existed: never calls `knowledge-ctx check`.
-    mkdir -p "$home/Convivy/placard/.claude/agents"
-    : > "$home/Convivy/placard/.claude/agents/planning-orchestrator.md"
-    ( cd "$home/Convivy/placard" && git init -q . )
+    # `signpost` filled this role until it retired (the operator, 2026-10-21,
+    # relayed by the steward) and left `_co_crew_dirs`; `telemetry` is another
+    # cockpit entry this file does not otherwise use.
+    mkdir -p "$home/Convivy/telemetry/.claude/agents"
+    : > "$home/Convivy/telemetry/.claude/agents/planning-orchestrator.md"
+    ( cd "$home/Convivy/telemetry" && git init -q . )
 
-    # ROUND 1 BLOCKING FINDING: substrate/selector/deck gate `-r`'s own
+    # ROUND 1 BLOCKING FINDING: substrate/beacon/deck gate `-r`'s own
     # `knowledge-ctx use --force` on the FULL canonical path, not the
     # basename match that selects the branch, because `--force` rmtrees
     # `.claude/agents` and `.claude/skills` — an off-path clone sharing the
@@ -75,15 +78,15 @@ setup() { # -> echoes fake HOME
     printf 'platform/daytime\n' > "$home/Convivy/elsewhere/substrate/.claude/.active-profile"
     ( cd "$home/Convivy/elsewhere/substrate" && git init -q . )
 
-    mkdir -p "$home/Convivy/elsewhere/selector/.claude/agents"
-    : > "$home/Convivy/elsewhere/selector/.claude/agents/planning-orchestrator.md"
-    printf 'selector/daytime\n' > "$home/Convivy/elsewhere/selector/.claude/.active-profile"
-    ( cd "$home/Convivy/elsewhere/selector" && git init -q . )
+    mkdir -p "$home/Convivy/elsewhere/beacon/.claude/agents"
+    : > "$home/Convivy/elsewhere/beacon/.claude/agents/planning-orchestrator.md"
+    printf 'beacon/daytime\n' > "$home/Convivy/elsewhere/beacon/.claude/.active-profile"
+    ( cd "$home/Convivy/elsewhere/beacon" && git init -q . )
 
-    mkdir -p "$home/Convivy/elsewhere/convivy-deck/.claude/agents"
-    : > "$home/Convivy/elsewhere/convivy-deck/.claude/agents/planning-orchestrator.md"
-    printf 'deck/daytime\n' > "$home/Convivy/elsewhere/convivy-deck/.claude/.active-profile"
-    ( cd "$home/Convivy/elsewhere/convivy-deck" && git init -q . )
+    mkdir -p "$home/Convivy/elsewhere/northwind-deck/.claude/agents"
+    : > "$home/Convivy/elsewhere/northwind-deck/.claude/agents/planning-orchestrator.md"
+    printf 'deck/daytime\n' > "$home/Convivy/elsewhere/northwind-deck/.claude/.active-profile"
+    ( cd "$home/Convivy/elsewhere/northwind-deck" && git init -q . )
 
     # The profiled-dirs branch's own extra gate is different: the FULL path
     # matches (this IS the canonical `$_co_crews_root/www`), but git does
@@ -150,7 +153,7 @@ run_co_in() { # <home> <rel> [extra env assignments...] -- <co args...>
     ( cd "$home/$rel" && HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$call_log" KX_CALL_LOG="$kx_log" \
       env -u TMUX -u TMUX_PANE "${envs[@]}" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "${coargs[@]}" \
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" "${coargs[@]}" \
       >/dev/null 2>"$err_log" )
     RC=$?
     CLAUDE_ARGS=$(cat "$call_log")
@@ -164,32 +167,32 @@ kx_calls_for() { printf '%s\n' "$KX_ARGS" | grep -c "^$1"; } # <subcommand>
 H=$(setup)
 
 echo "== an individuated crew-cockpit workspace: check runs on a plain launch =="
-run_co_in "$H" "Convivy/shipwright" KX_CHECK_RC=0 --
-assert_rc 0 "$RC" "shipwright: plain co still exits 0"
-assert_eq 1 "$(kx_calls_for check)" "shipwright: knowledge-ctx check is called once"
-assert_contains "$CLAUDE_ARGS" "--model" "shipwright: launch is reached"
+run_co_in "$H" "Convivy/outfitter" KX_CHECK_RC=0 --
+assert_rc 0 "$RC" "outfitter: plain co still exits 0"
+assert_eq 1 "$(kx_calls_for check)" "outfitter: knowledge-ctx check is called once"
+assert_contains "$CLAUDE_ARGS" "--model" "outfitter: launch is reached"
 
 echo "== check reports current (exit 0): no refresh, no use call =="
-run_co_in "$H" "Convivy/shipwright" KX_CHECK_RC=0 --
+run_co_in "$H" "Convivy/outfitter" KX_CHECK_RC=0 --
 assert_eq 0 "$(kx_calls_for use)" "current: knowledge-ctx use is never called"
 assert_contains "$CLAUDE_ARGS" "--model" "current: launch is still reached"
 
 echo "== check reports behind (exit 1): refresh runs, then launch =="
-run_co_in "$H" "Convivy/shipwright" KX_CHECK_RC=1 --
+run_co_in "$H" "Convivy/outfitter" KX_CHECK_RC=1 --
 assert_rc 0 "$RC" "behind: plain co still exits 0"
 assert_eq 1 "$(kx_calls_for use)" "behind: knowledge-ctx use is called once"
 assert_contains "$ERR" "behind" "behind: co says the render is behind"
 assert_contains "$CLAUDE_ARGS" "--model" "behind: launch is reached after the refresh"
 
 echo "== check cannot tell (exit 3): refresh runs, then launch =="
-run_co_in "$H" "Convivy/shipwright" KX_CHECK_RC=3 --
+run_co_in "$H" "Convivy/outfitter" KX_CHECK_RC=3 --
 assert_rc 0 "$RC" "cannot tell: plain co still exits 0"
 assert_eq 1 "$(kx_calls_for use)" "cannot tell: knowledge-ctx use is called once"
 assert_contains "$ERR" "cannot tell" "cannot tell: co says it could not tell"
 assert_contains "$CLAUDE_ARGS" "--model" "cannot tell: launch is reached after the refresh"
 
 echo "== a refused refresh still launches, on the existing render =="
-run_co_in "$H" "Convivy/shipwright" KX_CHECK_RC=1 KX_REFUSE_USE=1 --
+run_co_in "$H" "Convivy/outfitter" KX_CHECK_RC=1 KX_REFUSE_USE=1 --
 assert_rc 0 "$RC" "refused refresh: plain co still exits 0 rather than aborting"
 assert_contains "$ERR" "refresh failed or was refused" \
     "refused refresh: co says the refresh did not complete"
@@ -205,15 +208,15 @@ assert_eq 1 "$(kx_calls_for check)" "substrate off-path: knowledge-ctx check is 
 assert_eq 0 "$(kx_calls_for use)" "substrate off-path: knowledge-ctx use is never called"
 assert_contains "$CLAUDE_ARGS" "--model" "substrate off-path: launch is reached anyway"
 
-echo "== selector: an off-path clone sharing the basename never calls knowledge-ctx use =="
-run_co_in "$H" "Convivy/elsewhere/selector" KX_CHECK_RC=1 --
-assert_rc 0 "$RC" "selector off-path: plain co still exits 0"
-assert_eq 1 "$(kx_calls_for check)" "selector off-path: knowledge-ctx check is called once"
-assert_eq 0 "$(kx_calls_for use)" "selector off-path: knowledge-ctx use is never called"
-assert_contains "$CLAUDE_ARGS" "--model" "selector off-path: launch is reached anyway"
+echo "== beacon: an off-path clone sharing the basename never calls knowledge-ctx use =="
+run_co_in "$H" "Convivy/elsewhere/beacon" KX_CHECK_RC=1 --
+assert_rc 0 "$RC" "beacon off-path: plain co still exits 0"
+assert_eq 1 "$(kx_calls_for check)" "beacon off-path: knowledge-ctx check is called once"
+assert_eq 0 "$(kx_calls_for use)" "beacon off-path: knowledge-ctx use is never called"
+assert_contains "$CLAUDE_ARGS" "--model" "beacon off-path: launch is reached anyway"
 
 echo "== deck: an off-path clone sharing the basename never calls knowledge-ctx use =="
-run_co_in "$H" "Convivy/elsewhere/convivy-deck" KX_CHECK_RC=1 --
+run_co_in "$H" "Convivy/elsewhere/northwind-deck" KX_CHECK_RC=1 --
 assert_rc 0 "$RC" "deck off-path: plain co still exits 0"
 assert_eq 1 "$(kx_calls_for check)" "deck off-path: knowledge-ctx check is called once"
 assert_eq 0 "$(kx_calls_for use)" "deck off-path: knowledge-ctx use is never called"
@@ -228,8 +231,8 @@ assert_contains "$ERR" "git does not ignore .claude/" "www: co explains why it s
 assert_contains "$CLAUDE_ARGS" "--model" "www: launch is reached anyway"
 
 echo "== a subcrew child's plain launch, stale render: the cheap skip fires, not a real refresh =="
-run_co_in "$H" "Convivy/shipwright" KX_CHECK_RC=1 \
-    TMUX=test-session TMUX_PANE=%0 TMUX_STUB_SESSION=shipwright--child --
+run_co_in "$H" "Convivy/outfitter" KX_CHECK_RC=1 \
+    TMUX=test-session TMUX_PANE=%0 TMUX_STUB_SESSION=outfitter--child --
 assert_rc 0 "$RC" "subcrew: plain co still exits 0"
 assert_eq 1 "$(kx_calls_for check)" "subcrew: knowledge-ctx check is called once"
 assert_eq 0 "$(kx_calls_for use)" "subcrew: knowledge-ctx use is never called"
@@ -240,24 +243,24 @@ assert_eq 0 "$(printf '%s' "$ERR" | grep -c aborting)" \
 assert_contains "$CLAUDE_ARGS" "--model" "subcrew: launch is reached"
 
 echo "== a never-individuated workspace behaves exactly as before =="
-run_co_in "$H" "Convivy/placard" --
-assert_rc 0 "$RC" "placard: plain co still exits 0"
-assert_eq 0 "$(kx_calls_for check)" "placard: knowledge-ctx check is never called"
-assert_eq 0 "$(kx_calls_for use)" "placard: knowledge-ctx use is never called"
-assert_contains "$CLAUDE_ARGS" "--model" "placard: launch is reached"
+run_co_in "$H" "Convivy/telemetry" --
+assert_rc 0 "$RC" "telemetry: plain co still exits 0"
+assert_eq 0 "$(kx_calls_for check)" "telemetry: knowledge-ctx check is never called"
+assert_eq 0 "$(kx_calls_for use)" "telemetry: knowledge-ctx use is never called"
+assert_contains "$CLAUDE_ARGS" "--model" "telemetry: launch is reached"
 
 echo "== an explicit co -r never calls check — it already refreshed =="
-run_co_in "$H" "Convivy/shipwright" KX_CHECK_RC=1 -- -r
-assert_rc 0 "$RC" "shipwright -r: still exits 0"
-assert_eq 0 "$(kx_calls_for check)" "shipwright -r: knowledge-ctx check is never called"
-assert_eq 1 "$(kx_calls_for use)" "shipwright -r: knowledge-ctx use is called once, by -r itself"
+run_co_in "$H" "Convivy/outfitter" KX_CHECK_RC=1 -- -r
+assert_rc 0 "$RC" "outfitter -r: still exits 0"
+assert_eq 0 "$(kx_calls_for check)" "outfitter -r: knowledge-ctx check is never called"
+assert_eq 1 "$(kx_calls_for use)" "outfitter -r: knowledge-ctx use is called once, by -r itself"
 
-echo "== the vivy-commercial occurrence itself: a plain launch there refreshes too =="
-run_co_in "$H" "Convivy/vivy-commercial" KX_CHECK_RC=1 --
-assert_rc 0 "$RC" "vivy-commercial: plain co still exits 0"
-assert_eq 1 "$(kx_calls_for check)" "vivy-commercial: knowledge-ctx check is called once"
-assert_eq 1 "$(kx_calls_for use)" "vivy-commercial: knowledge-ctx use is called once"
-assert_contains "$CLAUDE_ARGS" "--model" "vivy-commercial: launch is reached after the refresh"
+echo "== the finch-commercial occurrence itself: a plain launch there refreshes too =="
+run_co_in "$H" "Convivy/finch-commercial" KX_CHECK_RC=1 --
+assert_rc 0 "$RC" "finch-commercial: plain co still exits 0"
+assert_eq 1 "$(kx_calls_for check)" "finch-commercial: knowledge-ctx check is called once"
+assert_eq 1 "$(kx_calls_for use)" "finch-commercial: knowledge-ctx use is called once"
+assert_contains "$CLAUDE_ARGS" "--model" "finch-commercial: launch is reached after the refresh"
 
 rm -rf "$H"
 finish

@@ -106,35 +106,37 @@ public struct BosunRegistrationClient: RegistrationTransport {
         account: String, callerKind: String, ceiling: String, protocolVersion: String
     ) throws -> RegistrationOutcome {
         let (host, port) = try Self.parseAddress(config.bosunAddress)
-        let rootPEM = try String(contentsOfFile: config.rootCAPath, encoding: .utf8)
-        let rootCert = try NIOSSLCertificate(bytes: Array(try derFromPEM(rootPEM)), format: .der)
 
-        let clientCertDER = try derFromPEM(clientCertificatePEM)
-        let clientCert = try NIOSSLCertificate(bytes: Array(clientCertDER), format: .der)
-        let privateKey = NIOSSLPrivateKey(customPrivateKey: MachineKeyNIOPrivateKey(key: machineKey))
-
-        var tlsConfig = TLSConfiguration.makeClientConfiguration()
-        tlsConfig.minimumTLSVersion = .tlsv13
-        tlsConfig.maximumTLSVersion = .tlsv13
-        tlsConfig.certificateChain = [.certificate(clientCert)]
-        tlsConfig.privateKey = .privateKey(privateKey)
-        // Hostname verification is replaced, never turned off outright
-        // (0092 Handoff): `.noHostnameVerification` disables only the
-        // SNI/CN-matching step BoringSSL would otherwise do; chain
-        // validation to `trustRoots` below still runs, and the custom
-        // verification callback below runs IN ADDITION, doing the
-        // serverAuth/URI checks `BosunServerVerification` implements.
-        tlsConfig.certificateVerification = .noHostnameVerification
-        tlsConfig.trustRoots = .certificates([rootCert])
-
-        let sslContext = try NIOSSLContext(configuration: tlsConfig)
-        let bosunURIName = config.bosunURIName
+        var capturedRefusal: BosunServerRefusal?
+        let setup = try BosunMutualTLS.makeSetup(
+            config: config, machineKey: machineKey, clientCertificatePEM: clientCertificatePEM,
+            onServerCertificateRefusal: { capturedRefusal = $0 })
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         defer { try? group.syncShutdownGracefully() }
 
         let responsePromise = group.next().makePromise(of: ByteBuffer.self)
-        var capturedRefusal: BosunServerRefusal?
+        // Guarantees `responsePromise` is completed before `group`'s own
+        // shutdown `defer` above runs: NIO's leak check raises a fatal
+        // error ("leaking promise created at...") if an `EventLoopPromise`
+        // is still unfulfilled when its event loop group shuts down, and
+        // either throwing `.wait()` below (`connect`, `writeAndFlush`) can
+        // leave this promise unfulfilled — a connect refused before any
+        // handler ever sees the failure, or a write failure the pipeline
+        // never reports to `_ResponseCollector`. `PromiseCompletionClaim`
+        // is the single gate every path that can complete the promise
+        // (`_ResponseCollector`, the timeout task below, and this `defer`)
+        // goes through, so whichever gets there first wins and nothing
+        // double-completes the promise — itself a separate fatal error.
+        // Declared, and its `defer` ordered, after `group`'s own `defer`
+        // above so Swift runs this one first (defers run in reverse
+        // declaration order).
+        let promiseCompletion = PromiseCompletionClaim()
+        defer {
+            if promiseCompletion.claim() {
+                responsePromise.fail(BosunRegistrationAbandoned())
+            }
+        }
         // Set by `_ResponseCollector.errorCaught` the moment NIO reports
         // ANY error on this channel — not only a server-certificate
         // refusal — before `responsePromise` itself is failed with it.
@@ -154,29 +156,14 @@ public struct BosunRegistrationClient: RegistrationTransport {
         let bootstrap = ClientBootstrap(group: group)
             .connectTimeout(.seconds(connectTimeoutSeconds))
             .channelInitializer { channel in
-                let verify: NIOSSLCustomVerificationCallback = { certs, promise in
-                    guard let leaf = certs.first else {
-                        promise.succeed(.failed)
-                        return
-                    }
-                    do {
-                        try BosunServerVerification.verify(
-                            leafCertificateDER: Data(leaf.toDERBytes()), rootPEM: rootPEM,
-                            expectedBosunURIName: bosunURIName)
-                        promise.succeed(.certificateVerified)
-                    } catch let refusal as BosunServerRefusal {
-                        capturedRefusal = refusal
-                        promise.succeed(.failed)
-                    } catch {
-                        promise.succeed(.failed)
-                    }
-                }
                 do {
                     let sslHandler = try NIOSSLClientHandler(
-                        context: sslContext, serverHostname: nil, customVerificationCallback: verify)
+                        context: setup.sslContext, serverHostname: nil, customVerificationCallback: setup.verify)
                     try channel.pipeline.syncOperations.addHandler(sslHandler)
                     try channel.pipeline.syncOperations.addHandler(
-                        _ResponseCollector(promise: responsePromise, onError: { capturedTransportError = $0 }))
+                        _ResponseCollector(
+                            promise: responsePromise, completion: promiseCompletion,
+                            onError: { capturedTransportError = $0 }))
                     return channel.eventLoop.makeSucceededVoidFuture()
                 } catch {
                     return channel.eventLoop.makeFailedFuture(error)
@@ -206,6 +193,7 @@ public struct BosunRegistrationClient: RegistrationTransport {
         // forced close itself produces (`preferRealCause`, below).
         let timeout = BosunRegistrationTimeout(timeoutSeconds: responseTimeoutSeconds)
         let timeoutTask = channel.eventLoop.scheduleTask(in: .seconds(responseTimeoutSeconds)) {
+            guard promiseCompletion.claim() else { return }
             capturedTransportError = capturedTransportError ?? timeout
             responsePromise.fail(timeout)
             channel.close(promise: nil)
@@ -339,6 +327,44 @@ struct BosunRegistrationTimeout: Error, CustomStringConvertible {
     }
 }
 
+/// What `performRegistration`'s own closing `defer` fails `responsePromise`
+/// with, on the one path that reaches it without `_ResponseCollector` or the
+/// timeout task ever having completed the promise themselves (a `connect` or
+/// `writeAndFlush` failure neither reports). Never read by any caller of
+/// `register`: by the time this fires, `performRegistration` is already
+/// throwing a DIFFERENT error, which is the one `register`'s `catch` maps to
+/// `.serverCertificateRefused`/`.transportError`; this only keeps NIO's leak
+/// check from treating the promise as abandoned.
+private struct BosunRegistrationAbandoned: Error, CustomStringConvertible {
+    var description: String {
+        "performRegistration exited without completing its response promise"
+    }
+}
+
+/// The single gate every path that can complete one `performRegistration`
+/// call's `responsePromise` goes through — `_ResponseCollector`, the timeout
+/// task, and `performRegistration`'s own closing `defer` — so whichever
+/// claims it first is the one that actually calls `succeed`/`fail`, and NIO
+/// never sees the same promise completed twice (itself a fatal error, same
+/// family as the leaked-promise check this exists to satisfy). Duplicated
+/// from `BosunAuthorizationClient.swift`'s own copy rather than shared, for
+/// the same reason its `_ResponseCollector` is duplicated: each file's own
+/// `private` keeps the two from colliding.
+private final class PromiseCompletionClaim {
+    private let lock = NSLock()
+    private var claimed = false
+
+    /// Returns `true` the first time this is called, `false` every time
+    /// after.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if claimed { return false }
+        claimed = true
+        return true
+    }
+}
+
 /// Collects every byte received on the connection into one buffer, and
 /// succeeds its promise once the Bosun closes the connection —
 /// `_RegistrationHandler.do_POST` always sets `close_connection = True`
@@ -349,11 +375,12 @@ private final class _ResponseCollector: ChannelInboundHandler {
 
     private var buffer: ByteBuffer?
     private let promise: EventLoopPromise<ByteBuffer>
+    private let completion: PromiseCompletionClaim
     private let onError: (Error) -> Void
-    private var finished = false
 
-    init(promise: EventLoopPromise<ByteBuffer>, onError: @escaping (Error) -> Void) {
+    init(promise: EventLoopPromise<ByteBuffer>, completion: PromiseCompletionClaim, onError: @escaping (Error) -> Void) {
         self.promise = promise
+        self.completion = completion
         self.onError = onError
     }
 
@@ -366,14 +393,12 @@ private final class _ResponseCollector: ChannelInboundHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        guard !finished else { return }
-        finished = true
+        guard completion.claim() else { return }
         promise.succeed(buffer ?? context.channel.allocator.buffer(capacity: 0))
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        guard !finished else { return }
-        finished = true
+        guard completion.claim() else { return }
         onError(error)
         promise.fail(error)
     }

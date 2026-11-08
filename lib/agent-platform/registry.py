@@ -22,7 +22,7 @@ is top-level, `parent_run=None`). So:
     once (ARCH-422). This is the fairness cap, and it is the one that was missing.
 
 Why the third cap exists, and why raising `max_concurrent` was the wrong answer.
-On 2026-07-29 the constance in-box drain opened PR #555 and then could not review
+On 2026-07-29 a product crew's in-box drain opened PR #555 and then could not review
 it: nine `agentctl spawn` attempts over ~55 minutes were refused with
 `global concurrency ceiling (16/16)`. Nine of the sixteen slots held
 `planning-orchestrator` runs, one per product, each holding its slot for the whole
@@ -58,6 +58,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -134,7 +135,7 @@ def limits():
 # about. Two definitions of one concept is how that happens (the ARCH-340 lesson).
 #
 # The substring test on "orchestrator" is intentional and covers every current and
-# future `*-orchestrator`, including app-prefixed ones (`hollis-…`, `sel-…`) with no
+# future `*-orchestrator`, including app-prefixed ones (`acme-…`, `globex-…`) with no
 # suffix gymnastics. It is more permissive than an exact set, and that is the safe
 # direction: a false positive caps one extra run, a false negative silently
 # re-opens the starvation for that role.
@@ -254,6 +255,74 @@ def _is_alive(pid: int | None) -> bool:
     return True
 
 
+def _pid_start_time(pid) -> str | None:
+    """The OS's record of when `pid` started, or None if it can't be read.
+
+    Same `ps -p <pid> -o lstart=` probe bin/agentctl's own `_pid_start_time`
+    uses to corroborate a pid against what the registry recorded at spawn
+    (`_run_process_gone`, `_died_without_finalizing`) — this module can't
+    import that one back (bin/agentctl is a script, not a package, and lib
+    doesn't depend on bin), so this is the registry's own copy of the same
+    probe, kept to the same contract: None covers every failure (missing
+    `ps`, the pid already gone, a non-numeric pid) so a caller treats "can't
+    tell" as absence of evidence rather than as a mismatch.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    try:
+        cp = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                            capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if cp.returncode != 0:
+        return None
+    return cp.stdout.strip() or None
+
+
+def _dispatcher_still_finalizing(r: dict) -> bool:
+    """True when `r`'s child pid is gone but its registered dispatcher is
+    still alive and corroborated against `dispatcher_pid_started_at` — the
+    same start-time corroboration `_died_without_finalizing` (bin/agentctl)
+    uses for these same two fields, applied here so the entry survives long
+    enough for that check to ever run (CQ·523).
+
+    `_finalize_run` runs INSIDE the dispatcher process, writing outcome.json
+    well after the claude child it dispatched has already exited. Before this
+    fix, `_reap_in_place` kept an entry alive only while the child's `pid` was
+    alive, so any registry write by another process during that finalize
+    window (`add_run`, `can_spawn`, `list_runs`, `reap_stale`) dropped the
+    entry — and with it gone, `_died_without_finalizing` found no registry
+    entry and fell back to its pre-fix, child-pid-only verdict, reporting a
+    run dead that was still finalizing (at least 20 runs in one day,
+    issue_01M5CVYP72M2W5N7K2Q2S4Z5X3). The fix is here, not there: the entry
+    must not disappear while the dispatcher is still provably running.
+
+    An entry with no `dispatcher_pid` (a pre-fix or already-reaped run; see
+    `_died_without_finalizing`'s own docstring) has no second pid to check and
+    returns False, leaving `_reap_in_place`'s child-only rule as the whole
+    answer for that entry — unchanged from today.
+
+    Unknown is NOT dead, the same posture `_pid_alive`/`_run_process_gone`
+    already carry: a dispatcher pid alive with no recorded start time to
+    corroborate against, or a current start time `ps` can't read, survives
+    rather than being reaped on a check this function cannot actually perform.
+    """
+    dispatcher_pid = r.get("dispatcher_pid")
+    if dispatcher_pid is None:
+        return False
+    if not _is_alive(dispatcher_pid):
+        return False
+    recorded = r.get("dispatcher_pid_started_at")
+    if not recorded:
+        return True
+    current = _pid_start_time(dispatcher_pid)
+    if current is None:
+        return True
+    return current == recorded
+
+
 def _log_stale(entries: list[dict]) -> None:
     if not entries:
         return
@@ -270,18 +339,39 @@ def _reap_in_place(reg: dict) -> list[dict]:
     Reserved entries (reserve_slot called, attach_pid not yet called) have no
     real pid. Keep them alive while they are recent; reap them after
     RESERVATION_TIMEOUT_SECONDS so a process that crashes between the two calls
-    does not leak a slot permanently."""
+    does not leak a slot permanently.
+
+    Aged by `reserved_at` (when the slot was reserved), not `started_at` (when
+    the run was first dispatched, before CQ·518): `started_at` predates a
+    usage hold that can run for hours, so a reservation taken right after a
+    multi-hour hold was already past the timeout the moment it was written —
+    the next registry write by any other process reaped it out from under the
+    run that just reserved it, which then started `claude` with no registry
+    entry at all (CQ·518, 2026-10-19: six runs reaped this way in one wave). A
+    reservation with no `reserved_at` (written by an older agentctl) falls
+    back to `started_at`, so it still ages out rather than leaking forever.
+
+    A non-reserved entry whose child `pid` is dead is not reaped outright any
+    more either: it survives one further test, `_dispatcher_still_finalizing`,
+    while its registered `dispatcher_pid` is alive and start-time-corroborated
+    against `dispatcher_pid_started_at` — the claude child the entry's `pid`
+    names exits well before `_finalize_run`, running inside the DISPATCHER,
+    gets around to writing outcome.json, and a reap during that window used to
+    drop the entry out from under a run that was still finalizing (CQ·523).
+    An entry with no `dispatcher_pid` has nothing to check there and keeps
+    today's child-only rule; `_dispatcher_still_finalizing` returns False for
+    it, same as if the dispatcher had already been confirmed gone."""
     alive, stale = [], []
     now = datetime.now(timezone.utc)
     for r in reg.get("runs", []):
         if r.get("reserved"):
             try:
-                ts = r["started_at"].replace("Z", "+00:00")
+                ts = (r.get("reserved_at") or r["started_at"]).replace("Z", "+00:00")
                 age = (now - datetime.fromisoformat(ts)).total_seconds()
             except (KeyError, ValueError):
                 age = RESERVATION_TIMEOUT_SECONDS + 1  # malformed — treat as expired
             (alive if age < RESERVATION_TIMEOUT_SECONDS else stale).append(r)
-        elif _is_alive(r.get("pid")):
+        elif _is_alive(r.get("pid")) or _dispatcher_still_finalizing(r):
             alive.append(r)
         else:
             stale.append(r)
@@ -463,6 +553,12 @@ def reserve_slot(entry: dict) -> None:
 
     Raises ConcurrencyError if either cap would be breached. Reaps stale entries
     first, including expired reservations, so dead runs don't block admission.
+
+    Records `reserved_at` as NOW, distinct from the caller's `started_at` (the
+    run's original spawn time, which can be hours before this call when a
+    usage hold sat in between) — `_reap_in_place` ages the reservation by
+    `reserved_at` so a hold that outlasts RESERVATION_TIMEOUT_SECONDS does not
+    hand the reaper an already-expired slot the moment it is taken (CQ·518).
     """
     missing = [k for k in REQUIRED_RESERVATION_FIELDS if k not in entry]
     if missing:
@@ -494,6 +590,7 @@ def reserve_slot(entry: dict) -> None:
             "dispatcher_pid_started_at": entry.get("dispatcher_pid_started_at"),
             "parent_run": entry.get("parent_run"),
             "reserved": True,
+            "reserved_at": _now_iso(),
         })
         _write(reg)
 

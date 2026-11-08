@@ -13,10 +13,10 @@
 #
 # Cases, each a crew shape restore can meet:
 #   1. no agent, an unrecognised directory          -> the generic tail
-#   2. no agent, selector-backend (a profiled dir)  -> the profiled branch, which
+#   2. no agent, beacon-backend (a profiled dir)  -> the profiled branch, which
 #      takes only a bare `co` or a leading `/` prompt as its own
 #   3. coder, an unrecognised directory             -> the agent path
-#   4. coder, selector-backend                      -> the profiled branch must NOT take it
+#   4. coder, beacon-backend                      -> the profiled branch must NOT take it
 #   5. no agent, an individuated directory          -> the agent path with the default agent
 #
 # claude, knowledge-ctx and session-agent are stubs. Nothing reaches a live tmux
@@ -48,7 +48,7 @@ print(shlex.join(CR.co_command(t)[1:]))
 # records its argv one per line, and a stub knowledge-ctx that answers $MOCK_KC_EXIT.
 setup() {
     local home=$1
-    mkdir -p "$home/stubbin" "$home/Convivy/brandnew" "$home/Convivy/selector-backend"
+    mkdir -p "$home/stubbin" "$home/Convivy/brandnew" "$home/Convivy/beacon-backend"
     ln -s "$CO" "$home/stubbin/co"
     cat > "$home/stubbin/claude" <<'EOF'
 #!/bin/bash
@@ -60,8 +60,8 @@ EOF
 exit "${MOCK_KC_EXIT:-42}"
 EOF
     chmod +x "$home/stubbin/claude" "$home/stubbin/knowledge-ctx"
-    # selector-backend is a git checkout: bin/co's profiled branch matches the git toplevel.
-    git init -q "$home/Convivy/selector-backend"
+    # beacon-backend is a git checkout: bin/co's profiled branch matches the git toplevel.
+    git init -q "$home/Convivy/beacon-backend"
 }
 
 # run_restore <home> <cwd-name> <agent-or-empty>: types the restore line into zsh.
@@ -75,7 +75,7 @@ run_restore() {
     ( cd "$home/Convivy/$cwd" && env -u TMUX -u TMUX_PANE \
         HOME="$home" PATH="$home/stubbin:$PATH" CLAUDE_CALL_LOG="$call_log" \
         MOCK_KC_EXIT="${MOCK_KC_EXIT:-42}" \
-        /bin/zsh -c "co --root-config '$(co_root_config "$home")' $args" \
+        /bin/zsh -c "co --root-config '$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")' $args" \
         >/dev/null 2>"$err_log" )
     RC=$?
     ARGV=$(cat "$call_log" 2>/dev/null || true)
@@ -99,12 +99,12 @@ assert_eq "$SID" "$(value_after --resume)" "no agent, unrecognised directory: cl
 assert_eq "no" "$(has_arg --agent)" "no agent, unrecognised directory: claude gets no --agent"
 rm -rf "$H"
 
-# --- 2. no agent, selector-backend: the profiled branch -------------------------
+# --- 2. no agent, beacon-backend: the profiled branch -------------------------
 H=$(mktemp -d); setup "$H"
-MOCK_KC_EXIT=0 run_restore "$H" selector-backend ""
-assert_rc 0 "$RC" "no agent, selector-backend: co exits 0 ($(echo "$STDERR" | head -1))"
-assert_eq "$SID" "$(value_after --resume)" "no agent, selector-backend: claude gets --resume <session id>"
-assert_eq "no" "$(has_arg --agent)" "no agent, selector-backend: claude gets no --agent"
+MOCK_KC_EXIT=0 run_restore "$H" beacon-backend ""
+assert_rc 0 "$RC" "no agent, beacon-backend: co exits 0 ($(echo "$STDERR" | head -1))"
+assert_eq "$SID" "$(value_after --resume)" "no agent, beacon-backend: claude gets --resume <session id>"
+assert_eq "no" "$(has_arg --agent)" "no agent, beacon-backend: claude gets no --agent"
 rm -rf "$H"
 
 # --- 3. coder, unrecognised directory: the agent path ----------------------------
@@ -117,14 +117,14 @@ assert_eq "coder" "$(value_after --agent)" "coder, unrecognised directory: claud
 assert_eq "$SID" "$(value_after --resume)" "coder, unrecognised directory: claude gets --resume <session id>"
 rm -rf "$H"
 
-# --- 4. coder, selector-backend: the profiled branch does not take an agent crew --
+# --- 4. coder, beacon-backend: the profiled branch does not take an agent crew --
 H=$(mktemp -d); setup "$H"
-mkdir -p "$H/Convivy/selector-backend/.claude/agents"
-: > "$H/Convivy/selector-backend/.claude/agents/coder.md"
-MOCK_KC_EXIT=0 run_restore "$H" selector-backend coder
-assert_rc 0 "$RC" "coder, selector-backend: co exits 0 ($(echo "$STDERR" | head -1))"
-assert_eq "coder" "$(value_after --agent)" "coder, selector-backend: claude gets --agent coder"
-assert_eq "$SID" "$(value_after --resume)" "coder, selector-backend: claude gets --resume <session id>"
+mkdir -p "$H/Convivy/beacon-backend/.claude/agents"
+: > "$H/Convivy/beacon-backend/.claude/agents/coder.md"
+MOCK_KC_EXIT=0 run_restore "$H" beacon-backend coder
+assert_rc 0 "$RC" "coder, beacon-backend: co exits 0 ($(echo "$STDERR" | head -1))"
+assert_eq "coder" "$(value_after --agent)" "coder, beacon-backend: claude gets --agent coder"
+assert_eq "$SID" "$(value_after --resume)" "coder, beacon-backend: claude gets --resume <session id>"
 rm -rf "$H"
 
 # --- 5. no agent, an individuated directory: the default agent, as a bare prompt --

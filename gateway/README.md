@@ -48,8 +48,9 @@ inputs.
    prefix with `brew --prefix postgresql@15`).
 2. **Install the prisma client package into the gateway venv.** `gateway/requirements.txt`
    pins `prisma==0.11.0`. install.sh does not create the venv or install into it, so run
-   `pip install -r gateway/requirements.txt` in the venv that holds litellm. Provisioning
-   generates the client from that package, so install it before `install.sh` runs.
+   `pip install --require-hashes --only-binary :all: -r gateway/requirements.lock.txt` in the venv that holds
+   litellm. Provisioning generates the client from that package, so install it before
+   `install.sh` runs.
 3. **Name the role and database, and write the URL without a password.**
    `LLM_GATEWAY_DB_ROLE` and `LLM_GATEWAY_DB_NAME` default to `litellm`. Each must be a
    lowercase identifier, because provisioning writes them into SQL. Set the host, port and
@@ -108,9 +109,11 @@ The schema therefore comes from `--provision-db` alone.
 The start check looks for the `LiteLLM_VerificationToken` table only, so it does not notice a
 schema that lacks a later LiteLLM migration.
 
-**Upgrading LiteLLM:** after `pip install` changes the litellm version in the gateway venv,
-run `$HOME/.local/lib/llm-gateway/llm-gateway-run.sh --provision-db` before the gateway restarts. install.sh does not change
-the venv, but its own run calls `--provision-db` too, so a reinstall also covers the upgrade.
+**Upgrading LiteLLM:** after `pip install --require-hashes --only-binary :all: -r gateway/requirements.lock.txt`
+changes the litellm version in the gateway venv, run
+`$HOME/.local/lib/llm-gateway/llm-gateway-run.sh --provision-db` before the gateway restarts.
+install.sh does not change the venv, but its own run calls `--provision-db` too, so a
+reinstall also covers the upgrade.
 
 ## Consumers and the mint
 

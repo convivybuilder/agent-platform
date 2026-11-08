@@ -1,0 +1,374 @@
+{
+  "_meta": {
+    "doc": "Rich fixture registry for tests marked `rich_registry` (CQ-565, renamed from `real_registry`: this repo's own config/projects.json is gone, the crew registry now lives in the Library, and this fixture — not a committed copy of any install's real data — is what those tests read). Shaped like a production registry (private crews, repo_owners overrides, split/local/central KB postures, products, scopes, aliases) but every project, product, repo, crew and person name here is made up, naming nothing a real Convivy crew answers to."
+  },
+  "_products": {
+    "finch": {"display": "Finch", "owner": "convivy"},
+    "harbor": {"display": "Harbor", "owner": "convivy"},
+    "galley": {"display": "Galley", "owner": "convivy"},
+    "atlas": {"display": "Atlas", "owner": "convivy"},
+    "beacon": {"display": "Beacon", "owner": "convivy"},
+    "oak-studio": {"display": "Acme Studio", "owner": "acme"},
+    "cartographer": {"display": "Cartographer", "owner": "convivy"},
+    "northwind-concierge": {"display": "Northwind Concierge", "owner": "convivy"}
+  },
+  "_kb_legacy": ["knowledge", "www", "foundry-kit", "foundry-services", "finch-landing", "harbor-landing", "outfitter"],
+  "_release_names": ["EXAMPLE"],
+  "_business_umbrella_dir": "acme",
+  "_scopes": {
+    "company": {"display": "Company"},
+    "platform": {"display": "Platform"},
+    "commercial": {"display": "Commercial"},
+    "engineering-practice": {"display": "Engineering Practice"},
+    "keel": {"display": "Keel"}
+  },
+  "library": {
+    "class": "project", "display": "Library", "owner": "tbd",
+    "created_by": "person_01FAKE00000000000000000001",
+    "home_dir": "<root>/library", "dirs": [], "repos": ["library", "knowledge"],
+    "aliases": [], "crew": "library",
+    "lifecycle": "active", "products": [], "crew_cockpit": true,
+    "co_accent": "#5c8a99", "co_label": "Library",
+    "kb": "central", "kb_project": "library",
+    "kb_project_by_repo": {
+      "library": {"kb_project": "library", "reason": "library's own repo resolves to its own kb_project."}
+    },
+    "kb_scope_exceptions": {
+      "knowledge": {"kb_project": "knowledge", "reason": "library/daytime narrows the knowledge repo's own profile."}
+    },
+    "live_checkout_readers": {
+      "knowledge": {
+        "reads": "com.convivy.knowledge-watcher indexes this checkout live",
+        "adr": "ARCH-395",
+        "jobs": ["com.convivy.knowledge-watcher"]
+      },
+      "library": {
+        "reads": "com.convivy.library runs the Library API straight out of this checkout",
+        "adr": "platform/decisions/0022",
+        "jobs": ["com.convivy.library"]
+      }
+    }
+  },
+  "bosun": {
+    "class": "project", "display": "Bosun", "owner": "convivy",
+    "home_dir": "<root>/agent-platform", "dirs": [], "repos": ["agent-platform"],
+    "aliases": ["keel"], "cost_fold_aliases": ["keel"], "crew": "bosun", "agent_prefix": "platform-",
+    "lifecycle": "active", "products": [], "crew_cockpit": true,
+    "co_accent": "#6f8140", "co_label": "Bosun",
+    "kb": "central", "kb_project": "agent-platform",
+    "kb_project_by_repo": {
+      "agent-platform": {"kb_project": "agent-platform", "reason": "agent-platform is the substrate platform repo itself."}
+    },
+    "live_checkout_readers": {
+      "agent-platform": {
+        "reads": "~/.local/bin and ~/.local/lib symlink into this working tree, so every cron job and the overnight run whatever branch it sits on",
+        "adr": "ARCH-396",
+        "jobs": []
+      }
+    }
+  },
+  "steward": {
+    "class": "project", "display": "Steward", "owner": "convivy",
+    "home_dir": "<root>/substrate", "dirs": [], "repos": ["substrate"],
+    "aliases": [], "crew": "steward", "lifecycle": "active", "products": [],
+    "crew_cockpit": true, "kb": "central", "kb_project": "platform",
+    "kb_project_by_repo": {
+      "substrate": {"kb_project": "platform", "reason": "substrate inherited the retired shared scope's catch-all role."},
+      "dev-setup": {"kb_project": "platform", "reason": "dev-setup is the frozen build workshop, filed under platform."}
+    }
+  },
+  "ledger": {
+    "class": "project", "display": "Ledger", "owner": "convivy",
+    "home_dir": "<root>/LEDGER", "dirs": [], "repos": ["LEDGER"], "aliases": [],
+    "crew": "ledger", "lifecycle": "active", "products": [], "kb": "local",
+    "task_text_public": false, "private": true, "local_agents": true,
+    "live_checkout_readers": {
+      "LEDGER": {
+        "reads": "com.convivy.ledger-review reads this checkout",
+        "adr": "platform/decisions/0043",
+        "jobs": ["com.convivy.ledger-review"]
+      }
+    }
+  },
+  "satchel": {
+    "class": "project", "display": "Satchel", "owner": "convivy",
+    "home_dir": "<root>/SATCHEL", "dirs": [], "repos": ["SATCHEL"], "aliases": [],
+    "crew": "satchel", "lifecycle": "active", "products": [], "kb": "local",
+    "task_text_public": false, "private": true, "local_agents": true,
+    "co_accent": "#7a4fae", "co_fg": "#f2e9ff",
+    "kb_profile_allowlist": ["satchel-daytime"],
+    "note": "The slug, crew, display and repo here are invented, naming nothing a real Convivy crew answers to; knowledge-ctx's `allowed_profiles` (bin/knowledge-ctx, via projects.profile_allowlist()) keys this row's kb_profile_allowlist on the directory name, and several tests exercise that real, non-sensitive guard through this row.",
+    "kb_project_by_repo": {
+      "SATCHEL": {"kb_project": "platform", "reason": "SATCHEL resolves to platform and is restricted by knowledge-ctx's allowlist to satchel-daytime alone."}
+    }
+  },
+  "relay": {
+    "class": "project", "display": "Harness Kit", "owner": "convivy",
+    "home_dir": "<root>/foundry-kit", "dirs": ["<root>/foundry-services"],
+    "repos": ["foundry-kit", "foundry-services"],
+    "aliases": [], "crew": "relay", "agent_prefix": "relay-", "lifecycle": "active",
+    "products": [], "co_self_contained": true, "kb": "central", "kb_project": "relay",
+    "task_text_public": true,
+    "sandbox_repos": ["foundry-services"],
+    "channel_prefixes": ["relay"], "signal_product": "foundry-kit",
+    "kb_scope_exceptions": {
+      "foundry-kit": {"kb_project": "foundry-kit", "reason": "projects/relay/ does not exist in the knowledge repo."},
+      "foundry-services": {"kb_project": "foundry-services", "reason": "projects/relay/ does not exist in the knowledge repo."}
+    },
+    "live_checkout_readers": {
+      "foundry-services": {
+        "reads": "a persistent service runs this package from an editable install in this checkout's venv, so every request runs whatever branch this checkout sits on",
+        "adr": "ARCH-249",
+        "jobs": ["com.convivy.think-gateway"]
+      },
+      "foundry-kit": {
+        "reads": "a deploy job runs against this checkout and the package is an editable install in its venv, so the source tree is what a deploy ships",
+        "adr": "ARCH-249",
+        "jobs": ["com.convivy.rails.update", "com.convivy.appkit.autoupdate"]
+      }
+    },
+    "calls_shared_tools": {"foundry-kit": ["post-changelog"]}
+  },
+  "cartographer": {
+    "class": "product", "display": "Cartographer", "owner": "convivy",
+    "home_dir": "<root>/cartographer", "dirs": [], "repos": ["cartographer"], "aliases": [],
+    "crew": "cartographer", "agent_prefix": "cart-", "lifecycle": "active",
+    "products": ["cartographer"], "kb": "central", "kb_project": "cartographer",
+    "kb_project_by_repo": {
+      "cartographer": {"kb_project": "cartographer", "reason": "cartographer's own project."}
+    }
+  },
+  "styleguide": {
+    "class": "project", "display": "Write Better", "owner": "convivy",
+    "home_dir": "<root>/styleguide", "dirs": [], "repos": ["styleguide"], "aliases": [],
+    "crew": "styleguide", "agent_prefix": "sg-", "model_tier": "sonnet",
+    "lifecycle": "active", "products": [], "kb": "local", "task_text_public": true,
+    "co_writing_guide": true
+  },
+  "northwind-commercial": {
+    "class": "project", "display": "General", "owner": "convivy",
+    "home_dir": "<root>/northwind-commercial", "dirs": [], "repos": ["northwind-commercial"],
+    "aliases": [], "crew": "northwind-commercial", "lifecycle": "active", "products": [],
+    "company_workspace": true, "co_accent": "#e6ce00", "co_label": "General", "co_fg": "#26240a",
+    "kb": "central", "kb_project": "company", "task_text_public": true,
+    "kb_project_by_repo": {
+      "northwind-commercial": {"kb_project": "company", "reason": "northwind-commercial is the company-level commercial workspace."}
+    },
+    "default_profile": {"northwind-commercial": "commercial"}
+  },
+  "northwind-deck": {
+    "class": "project", "display": "Deck", "owner": "convivy",
+    "home_dir": "<root>/northwind-deck", "dirs": [], "repos": ["northwind-deck"],
+    "aliases": [], "crew": "deck", "agent_prefix": "deck-", "lifecycle": "active",
+    "products": [], "crew_cockpit": true, "co_cockpit_gate": "basename",
+    "co_style_id": "deck", "co_accent": "#d4af37", "co_label": "Deck", "co_fg": "#4a341d",
+    "kb": "central", "kb_project": "deck",
+    "typecheck": {"northwind-deck": {"dir": ".", "argv": ["swift", "build", "--disable-automatic-resolution"]}},
+    "kb_project_by_repo": {
+      "northwind-deck": {"kb_project": "deck", "reason": "Deck has its own knowledge/projects/deck/ directory."}
+    }
+  },
+  "northwind-orient": {
+    "class": "project", "display": "Orient", "owner": "convivy",
+    "home_dir": "<root>/northwind-orient", "dirs": [], "repos": ["northwind-orient", "www"],
+    "aliases": [], "crew": "northwind-orient", "agent_prefix": "orient-", "lifecycle": "active",
+    "products": [], "crew_cockpit": true, "co_accent": "#ff9e5c", "co_label": "Orient",
+    "profiled_dirs": ["<root>/www"],
+    "kb": "central", "kb_project": "northwind-orient",
+    "kb_project_by_repo": {
+      "northwind-orient": {"kb_project": "northwind-orient", "reason": "orient's own KB project and daytime profile."}
+    },
+    "kb_scope_exceptions": {
+      "www": {"kb_project": "www", "reason": "the public www repo must not inherit the whole company/commercial reference set."}
+    }
+  },
+  "signpost": {
+    "class": "project", "display": "Signpost", "owner": "convivy",
+    "home_dir": "<root>/signpost", "dirs": [], "repos": ["signpost"], "aliases": [],
+    "crew": "signpost", "lifecycle": "archived", "products": [], "kb": "central",
+    "kb_project": "signpost",
+    "kb_project_by_repo": {
+      "signpost": {"kb_project": "signpost", "reason": "signpost's own project."}
+    }
+  },
+  "outfitter": {
+    "class": "project", "display": "Outfitter", "owner": "convivy",
+    "home_dir": "<root>/outfitter", "dirs": [], "repos": ["outfitter", "brewcask-tap"],
+    "aliases": [], "crew": "outfitter", "lifecycle": "active", "products": [],
+    "crew_cockpit": true, "co_accent": "#4a6d8c", "co_label": "Outfitter",
+    "kb": "central", "kb_project": "company", "repo_owners": {"brewcask-tap": "caskforge"},
+    "repo_display": {"brewcask-tap": "Brewcask Tap"},
+    "kb_scope_exceptions": {
+      "outfitter": {"kb_project": "outfitter", "reason": "outfitter's output ships publicly."},
+      "brewcask-tap": {"kb_project": "outfitter", "reason": "caskforge/brewcask-tap is a public GitHub repo."}
+    }
+  },
+  "telemetry": {
+    "class": "project", "display": "Telemetry", "owner": "convivy",
+    "home_dir": "<root>/telemetry", "dirs": [], "repos": ["telemetry"], "aliases": [],
+    "crew": "telemetry", "agent_prefix": "sig-", "lifecycle": "active", "products": [],
+    "crew_cockpit": true, "co_accent": "#0e9aa7", "co_label": "Telemetry",
+    "kb": "central", "kb_project": "telemetry", "activation_lanes": ["lane-one", "lane-two"],
+    "kb_project_by_repo": {
+      "telemetry": {"kb_project": "telemetry", "reason": "telemetry's own project; the row is what makes knowledge-ctx use daytime resolve from <root>/telemetry."}
+    }
+  },
+  "owner-dot-com": {
+    "class": "project", "display": "owner-site.com", "owner": "convivy",
+    "github_owner": "ownerlogin", "home_dir": "<root>/owner-site-dot-com", "dirs": [],
+    "repos": ["owner-site-dot-com", "owner-site-com"], "aliases": [], "crew": "owner-dot-com",
+    "lifecycle": "active", "products": [], "kb": "local",
+    "repo_owners": {"owner-site-com": "owner-at-northwind"}, "private": true,
+    "note": "a fifth crew split out of this row references owner-dot-com by name."
+  },
+  "owner-personal": {
+    "class": "project", "display": "Owner Personal", "owner": "convivy",
+    "home_dir": "<root>/ownerlogin", "dirs": [], "repos": ["ownerlogin"], "aliases": [],
+    "crew": "owner-personal", "lifecycle": "active", "products": [], "kb": "local",
+    "private": true,
+    "note": "split from the owner-dot-com row."
+  },
+  "finch": {
+    "class": "product", "display": "Finch", "owner": "convivy",
+    "home_dir": "<root>/finch", "dirs": [],
+    "repos": ["finch", "finch-ownerrez-sandbox-tools", "finch-commercial", "finch-landing"],
+    "aliases": [], "crew": "finch", "products": ["finch"], "co_generic_refresh": true,
+    "co_accent": "#2f6f4f", "co_label": "Finch",
+    "lifecycle": "active", "kb": "central", "kb_project": "finch", "task_text_public": true,
+    "typecheck": {"finch": {"dir": "frontend", "argv": ["npm", "run", "typecheck"]}},
+    "kb_project_by_repo": {
+      "finch": {"kb_project": "finch", "reason": "Finch's own repo resolves to its own kb_project."},
+      "finch-ownerrez-sandbox-tools": {"kb_project": "finch", "reason": "shares Finch's own kb_project and profile."},
+      "finch-commercial": {"kb_project": "finch", "reason": "Finch's own commercial workspace, same KB slice."}
+    },
+    "kb_scope_exceptions": {
+      "finch-landing": {"kb_project": "finch-landing", "reason": "finch-landing's output is public marketing copy."}
+    },
+    "activity_capture_excluded_repos": ["finch-ownerrez-sandbox-tools"],
+    "channel_prefixes": ["finch"],
+    "calls_shared_tools": {"finch": ["post-changelog", "post-release-note"]}
+  },
+  "harbor": {
+    "class": "product", "display": "Harbor", "owner": "convivy",
+    "home_dir": "<root>/harbor", "dirs": [],
+    "repos": ["harbor", "harbor-landing", "harbor-commercial", "harbor-updates"],
+    "aliases": [], "crew": "harbor", "products": ["harbor"], "co_generic_refresh": true,
+    "co_accent": "#5B2A86", "co_label": "Harbor",
+    "profiled_dirs": ["<root>/harbor-landing", "<root>/harbor-updates"],
+    "lifecycle": "active", "kb": "central", "kb_project": "harbor", "task_text_public": true,
+    "adr_kb_projects": ["harbor"],
+    "typecheck": {"harbor": {"dir": ".", "argv": ["mypy"]}},
+    "kb_project_by_repo": {
+      "harbor": {"kb_project": "harbor", "reason": "Harbor's own repo resolves to its own kb_project."},
+      "harbor-commercial": {"kb_project": "harbor", "reason": "Harbor's own commercial workspace, same KB slice."}
+    },
+    "kb_scope_exceptions": {
+      "harbor-landing": {"kb_project": "harbor-landing", "reason": "harbor-landing's output is public marketing copy."},
+      "harbor-updates": {"kb_project": "harbor-landing", "reason": "harbor-updates is an outward-facing surface."}
+    },
+    "activity_capture_excluded_repos": ["harbor-sevenshifts-sandbox-tools"],
+    "channel_prefixes": ["harbor"],
+    "calls_shared_tools": {"harbor": ["post-changelog"]}
+  },
+  "galley": {
+    "class": "product", "display": "Galley", "owner": "convivy",
+    "home_dir": "<root>/galley", "dirs": [], "repos": ["galley"], "aliases": [],
+    "crew": "galley", "products": ["galley"], "co_generic_refresh": true,
+    "co_accent": "#8a3b2e", "co_label": "Galley",
+    "lifecycle": "active", "kb": "central", "kb_project": "galley", "task_text_public": true,
+    "kb_project_by_repo": {
+      "galley": {"kb_project": "galley", "reason": "Galley's own repo resolves to its own kb_project."}
+    },
+    "channel_prefixes": ["galley"]
+  },
+  "atlas": {
+    "class": "product", "display": "Atlas", "owner": "convivy",
+    "home_dir": "<root>/atlas", "dirs": [], "repos": ["atlas"],
+    "aliases": ["demo-assistant", "aide"],
+    "cost_fold_aliases": ["atlas", "demo-assistant", "aide"], "crew": "atlas",
+    "agent_prefix": ["atlas-", "aide-"], "products": ["atlas"], "co_self_contained": true,
+    "lifecycle": "active", "kb": "central", "kb_project": "atlas",
+    "task_text_public": false, "data_local": true, "adr_kb_projects": ["atlas"],
+    "kb_project_by_repo": {
+      "atlas": {"kb_project": "atlas", "reason": "Atlas's own repo resolves to its own kb_project."}
+    },
+    "channel_prefixes": ["atlas"]
+  },
+  "beacon": {
+    "class": "product", "display": "Beacon", "owner": "convivy",
+    "home_dir": "<root>/beacon", "dirs": [], "repos": ["beacon", "beacon-backend"],
+    "aliases": [], "crew": "beacon", "agent_prefix": "sel-", "crew_cockpit": true,
+    "co_cockpit_gate": "basename", "profiled_dirs": ["<root>/beacon-backend"],
+    "products": ["beacon"], "lifecycle": "active", "kb": "central", "kb_project": "beacon",
+    "task_text_public": false, "data_local": true,
+    "kb_project_by_repo": {
+      "beacon": {"kb_project": "beacon", "reason": "Beacon's own repo resolves to its own kb_project."},
+      "beacon-backend": {"kb_project": "beacon", "reason": "Beacon's own backend service, same KB slice."}
+    },
+    "channel_prefixes": ["beacon"],
+    "live_checkout_readers": {
+      "beacon": {
+        "reads": "the com.beacon.* jobs all run from this checkout, and the package is an editable install in its venv, so the source tree is what they execute",
+        "adr": "ARCH-247",
+        "jobs": []
+      },
+      "beacon-backend": {
+        "reads": "com.beacon-backend.api serves the backend API from this checkout",
+        "adr": "ARCH-247",
+        "jobs": ["com.beacon-backend.api"]
+      }
+    },
+    "calls_shared_tools": {"beacon": ["post-changelog"], "beacon-backend": ["post-changelog"]}
+  },
+  "oak-arch-tools": {
+    "class": "project", "owner": "acme", "github_owner": "owner-at-northwind",
+    "github_owner_private": true,
+    "display": "Acme Arch Tools", "home_dir": "<root>/acme/oak-arch-tools", "dirs": [],
+    "repos": ["oak-arch-tools"], "aliases": ["oak-architecture"],
+    "cost_fold_aliases": ["oak-arch-tools", "oak-architecture"], "crew": "oak-arch-tools",
+    "model_tier": "sonnet", "products": ["oak-studio"], "lifecycle": "active",
+    "kb": "split", "kb_project": "oak-studio", "data_local": true, "task_text_public": false,
+    "adr_kb_projects": ["oak-studio"]
+  },
+  "oak-etc": {
+    "class": "project", "owner": "acme", "github_owner": "owner-at-northwind",
+    "display": "Cedar Ridge Circle", "home_dir": "<root>/acme/oak-etc", "dirs": [],
+    "repos": ["oak-etc"], "aliases": [], "crew": "oak-etc", "model_tier": "sonnet",
+    "products": ["oak-studio"], "lifecycle": "active", "kb": "split", "kb_project": "oak-studio",
+    "data_local": true, "task_text_public": false
+  },
+  "oak-park-villa": {
+    "class": "project", "owner": "acme", "github_owner": "owner-at-northwind",
+    "display": "Orchard Lane", "home_dir": "<root>/acme/oak-park-villa", "dirs": [],
+    "repos": ["oak-park-villa"], "aliases": [], "crew": "oak-park-villa", "model_tier": "sonnet",
+    "co_accent": "#6F4E37", "co_label": "Orchard Lane",
+    "products": ["oak-studio"], "lifecycle": "active", "kb": "split", "kb_project": "oak-studio",
+    "data_local": true, "task_text_public": false
+  },
+  "oak-guest": {
+    "class": "project", "owner": "acme", "github_owner": "ownerlogin",
+    "display": "Zephyr Guest", "home_dir": "<root>/acme/oak-guest", "dirs": [],
+    "repos": ["oak-guest"], "aliases": [], "crew": "oak-guest", "model_tier": "sonnet",
+    "products": [], "lifecycle": "active", "kb": "split", "kb_project": "oak-guest"
+  },
+  "oak-marketing": {
+    "class": "project", "owner": "acme", "github_owner": "ownerlogin",
+    "display": "Zephyr Marketing", "home_dir": "<root>/acme/oak-marketing", "dirs": [],
+    "repos": ["oak-marketing"], "aliases": [], "crew": "oak-marketing", "model_tier": "sonnet",
+    "products": [], "lifecycle": "active", "kb": "split", "kb_project": "oak-marketing"
+  },
+  "oak-properties": {
+    "class": "project", "owner": "acme", "github_owner": "ownerlogin",
+    "display": "Zephyr Properties", "home_dir": "<root>/acme/oak-properties", "dirs": [],
+    "repos": ["oak-properties"], "aliases": [], "crew": "oak-properties", "model_tier": "sonnet",
+    "products": [], "lifecycle": "active", "kb": "split", "kb_project": "oak-properties"
+  },
+  "northwind-concierge": {
+    "class": "product", "display": "Northwind Concierge", "owner": "convivy",
+    "home_dir": "<root>/northwind-concierge", "dirs": [], "repos": ["northwind-concierge"],
+    "aliases": [], "crew": "northwind-concierge", "agent_prefix": "conc-",
+    "model_tier": "sonnet", "products": ["northwind-concierge"], "crew_cockpit": true,
+    "lifecycle": "active", "kb": "central", "kb_project": "northwind-concierge",
+    "task_text_public": false, "data_local": true
+  }
+}

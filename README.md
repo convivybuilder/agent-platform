@@ -12,15 +12,15 @@ index to Claude Code, the daytime `co` wrapper — survives the loss of the mach
 runs on and can be restored on a fresh machine in minutes rather than rebuilt from
 session history.
 
-It is **not** where agents do their daily work. Product code lives in
-`Convivy/{constance,vivy,vivy-ownerrez-sandbox-tools}`; knowledge docs live in
-`Convivy/knowledge`; this repo holds the *runtime infrastructure* that operates
-on those other three.
+It is **not** where agents do their daily work. Product code lives in the
+product repos, each a sibling of this one under `Convivy/`; knowledge docs
+live in `Convivy/knowledge`; this repo holds the *runtime infrastructure*
+that operates on both.
 
 ## What's in here
 
 ```
-bin/                       11 platform binaries (Python + bash)
+bin/                       10 platform binaries (Python + bash)
   agentctl                  Spawn / list / status / kill / budget / logs agent runs
   agent-summary             Daily 7am cron — Slack summary of yesterday's runs
   co                        Daytime wrapper: `claude` with the planning-orchestrator system prompt
@@ -28,7 +28,6 @@ bin/                       11 platform binaries (Python + bash)
   knowledge-ctx             Individuate per-profile agents + skills into a repo's .claude/
   knowledge-watcher         Live-indexes ~/Convivy/knowledge → ~/.knowledge-index/index.db
   mcp-kb-server             MCP stdio server exposing kb_search / kb_get / kb_list_topics
-  notion-migrate            [retired 2026-05-28 — Notion sunset] one-shot Notion → KB migration tool; binary preserved as historical artifact
   worktrees-cleanup         Reap stale agent worktrees with `git worktree remove`
   worktrees-status          Table of every primary + extra worktree across all repos
 
@@ -97,20 +96,23 @@ claude mcp add kb -- ~/.local/bin/mcp-kb-server
 ## Operator config
 
 A handful of modules (`memory_archive.py`, `knowledge.py`, `kb_audit.py`,
-`velocity-report`, `session-view`, `notion-migrate`) read this machine's operator
+`velocity-report`, `session-view`) read this machine's operator
 identity from one JSON file outside the repo, never from a hardcoded literal:
 `$HOME/.config/convivy/operator.json` by default, or the path named by
 `$CONVIVY_OPERATOR_CONFIG` (tests point this at a tmp file). See
 `config/operator.example.json` for the template; copy it, rename it, and fill in
-real values — never commit the real file. Every key is required; a missing or
+real values — never commit the real file. Most keys are required; a missing or
 malformed file makes each caller fail closed (refuse to archive, refuse to
-validate, report "unconfigured") rather than fall back to a default.
+validate, report "unconfigured") rather than fall back to a default. `apps_crew`
+is the exception: it names a crew only some installs have, so a missing key
+means this install has none, and `knowledge.py` imports fine without it.
 
 | Key | Used by |
 | --- | --- |
 | `excluded_crews` | `memory_archive.py`'s exclusion list — crews whose memories are never archived |
-| `operator_marker` | `knowledge.py`'s audience/author marker; `notion-migrate`'s default author |
+| `operator_marker` | `knowledge.py`'s audience/author marker |
 | `roster_crew` | `knowledge.py`'s roster crew slug (`ALLOWED_CREWS`) |
+| `apps_crew` (optional) | `knowledge.py`'s other operator-named crew slug (`ALLOWED_CREWS`), when this install has one |
 | `github_login` | `kb_audit.py`'s `EXPECTED_COLLABORATORS` login; `velocity-report`'s `GH_OWNER` mapping |
 | `tailnet_host` | `session-view`'s SSH hint |
 
@@ -118,8 +120,7 @@ validate, report "unconfigured") rather than fall back to a default.
 
 ## What's out of scope for this repo
 
-- **Product repos** (constance, vivy, vivy-ownerrez-sandbox-tools, knowledge). They have
-  their own remotes.
+- **Product repos and the knowledge repo.** They have their own remotes.
 - **Per-machine state** (run directories, SQLite index, Keychain entries, MCP registrations).
 - **Documentation that lives in `convivy/knowledge`** — runbooks (`agent-slack-webhook-setup`,
   `daytime-workflow`, `using-the-knowledge-base`), agent prompts, ADRs (`ARCH-026` etc.). When

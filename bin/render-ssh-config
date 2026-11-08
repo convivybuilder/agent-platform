@@ -1,0 +1,200 @@
+#!/usr/bin/env python3
+"""render-ssh-config — write the generated ssh host blocks and mosh launcher
+table `ssh_config_render` renders from the registry (CQ-603 / E36 slice 6).
+
+Called from install.sh phase 5, on the crew machine, beside render-co-style.
+Writes into the same generated directory outside any repository — default
+`~/.local/state/agent-platform/co-style` — under `ssh/`, which
+tools/install-crew-ssh-config.sh reads over the mounted volume and installs
+on the laptop.
+
+Each run fully regenerates every file written below: a unit dropped from the
+registry, or one that loses its `crew` field, must not leave a stale block
+behind.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import co_style_render  # noqa: E402
+import operator_config  # noqa: E402
+import projects  # noqa: E402
+import ssh_config_render  # noqa: E402
+
+DEFAULT_OUT_DIR = Path.home() / ".local" / "state" / "agent-platform" / "co-style"
+
+# The same shape `co_style_id` is already held to in bin/render-co-style,
+# imported from projects.py rather than copied, so the rules can't drift
+# apart — see that script's own comment for why a copy would be a problem
+# (security-reviewer, PR #1066 rounds 1-3): `projects.load()` runs neither
+# load path through `projects.validate_registry`, so a malformed `crew`,
+# `home_dir` or style id reaches here unchecked.
+_NAME_OK = projects._NAME_OK
+
+
+def _safe_relative_dir(rel: str) -> bool:
+    """Whether every path segment of `rel` is `_NAME_OK`-safe: blocks a `..`
+    segment, a leading `/` (an empty segment), and anything else unsafe to
+    splice directly into a remote shell command — `rel` reaches a `tmux new
+    -s ... -c @MINI_ROOT@/<rel>` the laptop's RemoteCommand runs verbatim."""
+    parts = rel.split("/")
+    return bool(parts) and all(_NAME_OK.match(p) for p in parts)
+
+
+def _valid_entries(registry: dict) -> list[dict[str, str]]:
+    """[{"crew": ..., "dir": ..., "style_id": ..., "session": ...}] for every
+    unit `ssh_config_render.sessions` yields whose `crew`, `home_dir`, style
+    id and (when present) `tmux_session` all pass a name/path shape check —
+    each failure is printed and the unit skipped, never guessed. `session`
+    is the unit's own `tmux_session` when it has one, else its `crew`
+    (ssh_config_render module docstring). Sorted by session name for a
+    stable, diffable render; a second unit sharing a SESSION NAME with one
+    already kept is skipped and named too, since two blocks can't attach the
+    same tmux session — two units CAN share a `crew`, as long as each names
+    its own `tmux_session`, for a crew that runs more than one session."""
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for slug, unit in ssh_config_render.sessions(registry):
+        crew = unit.get("crew")
+        if not (isinstance(crew, str) and _NAME_OK.match(crew)):
+            print(f"render-ssh-config: skipping {slug}: malformed crew {crew!r}",
+                  file=sys.stderr)
+            continue
+        rel = ssh_config_render.relative_home_dir(unit)
+        if rel is None or not _safe_relative_dir(rel):
+            print(f"render-ssh-config: skipping {slug}: malformed home_dir "
+                  f"{unit.get('home_dir')!r}", file=sys.stderr)
+            continue
+        style_id = co_style_render.style_id_for(slug, unit)
+        if not (isinstance(style_id, str) and _NAME_OK.match(style_id)):
+            print(f"render-ssh-config: skipping {slug}: malformed style id {style_id!r}",
+                  file=sys.stderr)
+            continue
+        tmux_session = unit.get("tmux_session")
+        if tmux_session is not None and not (
+                isinstance(tmux_session, str) and _NAME_OK.match(tmux_session)):
+            print(f"render-ssh-config: skipping {slug}: malformed tmux_session "
+                  f"{tmux_session!r}", file=sys.stderr)
+            continue
+        session = tmux_session or crew
+        if session in seen:
+            print(f"render-ssh-config: skipping {slug}: another unit already "
+                  f"claims session {session!r}", file=sys.stderr)
+            continue
+        seen.add(session)
+        out.append({"crew": crew, "dir": rel, "style_id": style_id, "session": session})
+    out.sort(key=lambda e: e["session"])
+    return out
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` to `path` via a temp file in the same directory, then
+    `rename(2)` — so a reader (the laptop installer, over the SMB mount)
+    never sees a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp"
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def _standby_entries(entries: list[dict[str, str]], standby_sessions: list | None) -> list[dict[str, str]]:
+    """The subset of `entries` named by `standby_sessions` (a list of session
+    names — each entry's own `tmux_session` when it has one, else its
+    `crew`, matching `_valid_entries`'s own key — in that order) — each name
+    absent from `entries` (not a rendered unit's session, or one skipped by
+    `_valid_entries` as malformed) is named on stderr and dropped, never
+    guessed into a block of its own."""
+    if not standby_sessions:
+        return []
+    by_session = {e["session"]: e for e in entries}
+    out = []
+    for name in standby_sessions:
+        entry = by_session.get(name) if isinstance(name, str) else None
+        if entry is None:
+            print(f"render-ssh-config: skipping standby session {name!r}: no such "
+                  f"session among the rendered units", file=sys.stderr)
+            continue
+        out.append(entry)
+    return out
+
+
+def render(registry: dict, crew_host: str | None, ssh_user: str | None,
+           standby_host: str | None, out_dir: Path, *,
+           standby_alias: str | None = None, standby_sessions: list | None = None) -> Path:
+    """Writes `out_dir/ssh/hosts.conf`, `out_dir/ssh/mosh-sessions.conf`,
+    `out_dir/ssh/standby-sessions.conf` and `out_dir/ssh/standby-host`.
+    `hosts.conf` and `mosh-sessions.conf` are written EMPTY — never with a
+    guessed host or user — when `crew_host` or `ssh_user` is missing, each
+    named on stderr, with every crew block still rendered when both are
+    known. `standby-sessions.conf` and `standby-host` stay empty unless
+    `standby_alias` AND `standby_host` are BOTH given — the name and the
+    destination for a standby block are only ever read from the operator
+    config, never guessed (ssh_config_render.render_host_blocks) — in which
+    case `standby-host` carries the raw `standby_host` string for the laptop
+    installer to read its root from, written only when there is at least
+    one standby session block that needs it. Returns the `ssh/` directory
+    written into."""
+    entries = _valid_entries(registry)
+    ssh_dir = out_dir / "ssh"
+
+    if not crew_host:
+        print("render-ssh-config: no crew host configured (operator config key "
+              "'tailnet_host') — skipping the ssh/mosh render entirely", file=sys.stderr)
+        host_text = mosh_text = standby_sessions_text = standby_host_text = ""
+    elif not ssh_user:
+        print("render-ssh-config: no ssh user configured (operator config key "
+              "'ssh_user') — skipping the ssh/mosh render entirely", file=sys.stderr)
+        host_text = mosh_text = standby_sessions_text = standby_host_text = ""
+    else:
+        matched_standby_entries = _standby_entries(entries, standby_sessions)
+        if not standby_host:
+            print("render-ssh-config: no standby host configured (operator config "
+                  "key 'standby_tailnet_host') — skipping the standby block",
+                  file=sys.stderr)
+            effective_alias = None
+        elif not standby_alias:
+            print("render-ssh-config: no standby alias configured (operator config "
+                  "key 'standby_alias') — skipping the standby block", file=sys.stderr)
+            effective_alias = None
+        else:
+            effective_alias = standby_alias
+
+        host_text = ssh_config_render.render_host_blocks(
+            entries, crew_host=crew_host, ssh_user=ssh_user, standby_host=standby_host,
+            standby_alias=effective_alias, standby_entries=matched_standby_entries)
+        mosh_text = ssh_config_render.render_mosh_sessions(entries)
+        standby_sessions_text = ssh_config_render.render_standby_session_blocks(
+            effective_alias, matched_standby_entries, standby_host)
+        standby_host_text = f"{standby_host}\n" if standby_sessions_text else ""
+
+    _atomic_write(ssh_dir / "hosts.conf", host_text)
+    _atomic_write(ssh_dir / "mosh-sessions.conf", mosh_text)
+    _atomic_write(ssh_dir / "standby-sessions.conf", standby_sessions_text)
+    _atomic_write(ssh_dir / "standby-host", standby_host_text)
+    return ssh_dir
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--out-dir", type=Path, default=DEFAULT_OUT_DIR,
+                    help="the generated directory (default: %(default)s)")
+    args = p.parse_args(argv)
+
+    registry = projects.load()
+    crew_host = operator_config.get_optional("tailnet_host")
+    ssh_user = operator_config.get_optional("ssh_user")
+    standby_host = operator_config.get_optional("standby_tailnet_host")
+    standby_alias = operator_config.get_optional("standby_alias")
+    standby_sessions = operator_config.get_optional("standby_sessions")
+    ssh_dir = render(registry, crew_host, ssh_user, standby_host, args.out_dir,
+                      standby_alias=standby_alias, standby_sessions=standby_sessions)
+    print(f"Rendered ssh host blocks + mosh launcher table -> {ssh_dir}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

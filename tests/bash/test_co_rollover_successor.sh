@@ -4,7 +4,7 @@
 # THE BUG. `co_rollover.spawn_successor` launches the successor as
 # `co -r "/handoff-pickup <path>"`, one argv word. Three branches of bin/co
 # parse their first positional argument with `case "${1:-}" in ... *) agent=$1
-# ;; esac` — the `*-commercial` branch, the company-level `convivy-commercial`
+# ;; esac` — the `*-commercial` branch, the company-level `northwind-commercial`
 # branch, and the generic product-branch tail. All three read that whole
 # prompt string as an AGENT NAME, so `.claude/agents/<the-whole-prompt>.md`
 # never exists and the launch fails "not individuated" instead of rolling
@@ -22,8 +22,8 @@
 # THE MARKER-LEAK CLASS (round 3, PR #574). Round 2 scoped the marker to the
 # `co` command itself (not the fallback shell) and had `_co_reindividuate`
 # unset it — but only about half of bin/co's launch branches ever call that
-# helper. Every self-contained branch (hollis, selector, convivy-app-kit,
-# convivy-deck, write-better, nyh-architecture, Cookbook/cookbook-app, and the
+# helper. Every self-contained branch (galley, beacon, foundry-kit,
+# convivy-deck, write-better, oak, Cookbook/cookbook-app, and the
 # brand-new-project generic tail below) `exec`s claude directly and never
 # reached the unset, so the marker rode into the successor's whole `claude`
 # process tree on any of those. The fix moved the unset to the very top of
@@ -44,9 +44,14 @@ PROMPT="/handoff-pickup /x/handoff.md"
 # `-r` path pulls it before individuating, so a fake would abort first and
 # every assertion below would pass for the wrong reason), plus the three
 # fixtures the parse fix and the rollover marker both need to reach:
-# constance-commercial (`*-commercial`), convivy-commercial (its own branch),
-# and vivy (the generic product-branch tail, which requires cwd's basename be
-# in its own `-r` allowlist).
+# harbor-commercial (`*-commercial`), northwind-commercial (its own branch),
+# and finch (the generic product-branch tail, which requires cwd's basename be
+# in its own `-r` allowlist). The pickup-recording cases further down need a
+# SECOND generic-tail fixture distinct from that one's shared directory;
+# crew-test is a synthetic product named only in its own fixture registry
+# (registry-crew-test.json, below), never in the operator's own
+# config/projects.json, so those cases don't add a registered product's name
+# to this file.
 setup() { # -> echoes fake HOME
     local home
     home=$(mktemp -d)
@@ -67,24 +72,46 @@ setup() { # -> echoes fake HOME
         git push -q -u origin main
     ) >/dev/null 2>&1
 
-    mkdir -p "$home/Convivy/constance-commercial/.claude/agents"
+    mkdir -p "$home/Convivy/harbor-commercial/.claude/agents"
     for a in product-manager product-analyst some-other-agent; do
-        : > "$home/Convivy/constance-commercial/.claude/agents/$a.md"
+        : > "$home/Convivy/harbor-commercial/.claude/agents/$a.md"
     done
-    ( cd "$home/Convivy/constance-commercial" && git init -q . )
+    ( cd "$home/Convivy/harbor-commercial" && git init -q . )
 
-    mkdir -p "$home/Convivy/convivy-commercial/.claude/agents"
-    : > "$home/Convivy/convivy-commercial/.claude/agents/positioning-strategist.md"
-    ( cd "$home/Convivy/convivy-commercial" && git init -q . )
+    mkdir -p "$home/Convivy/northwind-commercial/.claude/agents"
+    : > "$home/Convivy/northwind-commercial/.claude/agents/positioning-strategist.md"
+    ( cd "$home/Convivy/northwind-commercial" && git init -q . )
 
-    mkdir -p "$home/Convivy/vivy/.claude/agents"
-    : > "$home/Convivy/vivy/.claude/agents/planning-orchestrator.md"
+    mkdir -p "$home/Convivy/finch/.claude/agents"
+    : > "$home/Convivy/finch/.claude/agents/planning-orchestrator.md"
     # The predecessor's individuation, as knowledge-ctx writes it
     # (`<project>/<profile>\n`). _co_reindividuate's skips only apply when
     # this is present and names the launched profile; the tests near the end
     # rewrite or remove it.
-    echo "vivy/daytime" > "$home/Convivy/vivy/.claude/.active-profile"
-    ( cd "$home/Convivy/vivy" && git init -q . )
+    echo "finch/daytime" > "$home/Convivy/finch/.claude/.active-profile"
+    ( cd "$home/Convivy/finch" && git init -q . )
+
+    # The pickup-recording cases' own generic-tail fixture (see the comment
+    # above setup()): a synthetic product, not the one just above, so
+    # `run_co` can be called a second time on the ordinary (unmarked) launch
+    # path without reusing — and thereby growing the count of — a
+    # registered product name. `co_generic_refresh: true` is what the Phase
+    # 3 generic tail's validator (`_co_generic_refresh_allowed`) requires;
+    # the registry row lives only in registry-crew-test.json, read via
+    # run_co's REGISTRY_OVERRIDE.
+    mkdir -p "$home/Convivy/crew-test/.claude/agents"
+    : > "$home/Convivy/crew-test/.claude/agents/planning-orchestrator.md"
+    ( cd "$home/Convivy/crew-test" && git init -q . )
+    cat > "$home/registry-crew-test.json" <<JSON
+{
+  "crew-test": {
+    "class": "product", "display": "Crew Test", "owner": "convivy",
+    "home_dir": "<root>/crew-test", "dirs": [], "crew": "crew-test",
+    "lifecycle": "active", "products": ["crew-test"], "repos": ["crew-test"],
+    "aliases": [], "kb": "local", "co_generic_refresh": true
+  }
+}
+JSON
 
     # A brand-new, unrecognized directory — no .claude/agents/*.md, matches no
     # named-product branch — to reach the generic tail (bin/co's Deck
@@ -134,16 +161,35 @@ exit 0
 EOF
     chmod +x "$home/stubbin/knowledge-ctx"
 
+    # Stubs the detached pickup watch bin/co starts for a rollover successor
+    # (`_co_exec_claude`, `$+commands[co-rollover-pickup-watch]`) — a real
+    # one would actually wait up to 120s and then shell out to the real
+    # `co-rollover`, which this bash-level test must never do (the suite's
+    # own safety rule: no real tmux, co, co-rollover, or claude). Logs its
+    # argv as one line per call and exits 0 immediately, with no sleep.
+    cat > "$home/stubbin/co-rollover-pickup-watch" <<'EOF'
+#!/bin/bash
+printf '%s\n' "$@" > "$WATCH_CALL_LOG"
+exit 0
+EOF
+    chmod +x "$home/stubbin/co-rollover-pickup-watch"
+
     echo "$home"
 }
 
-# run_co <home> <dir-under-home> [co args...] -> sets RC, CLAUDE_ARGS, CLAUDE_ENV, KX_CALLS, ERR
-# Honours CO_ROLLOVER_SUCCESSOR, CO_ROLLOVER_EXEMPT_PID, and KX_REFUSE from
-# the caller's environment if set.
+# run_co <home> <dir-under-home> [co args...] -> sets RC, CLAUDE_ARGS, CLAUDE_ENV, KX_CALLS,
+# WATCH_ARGS, ERR
+# Honours CO_ROLLOVER_SUCCESSOR, CO_ROLLOVER_EXEMPT_PID, KX_REFUSE, and
+# REGISTRY_OVERRIDE from the caller's environment if set. REGISTRY_OVERRIDE,
+# unlike the other three, is not handed into co's environment — it is read
+# here, in this script, and plumbed to `co_root_config`'s own
+# PROJECTS_REGISTRY seam, so a case naming the crew-test fixture reaches co
+# with crew-test's fixture registry rather than the operator's own
+# config/projects.json.
 run_co() {
     local home=$1 rel=$2; shift 2
-    local call_log kx_log env_log err_log
-    call_log=$(mktemp); kx_log=$(mktemp); env_log=$(mktemp); err_log=$(mktemp)
+    local call_log kx_log env_log watch_log err_log
+    call_log=$(mktemp); kx_log=$(mktemp); env_log=$(mktemp); watch_log=$(mktemp); err_log=$(mktemp)
     # A literal `VAR=value` token before the command is what bash recognizes as
     # a prefix assignment — one produced by expanding another parameter (the
     # `${X:+VAR=val}` shape) is parsed as a plain word instead and bash tries
@@ -152,16 +198,28 @@ run_co() {
     # as unset).
     ( cd "$home/$rel" && HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$call_log" KX_CALL_LOG="$kx_log" CLAUDE_ENV_LOG="$env_log" \
+      WATCH_CALL_LOG="$watch_log" \
       CO_ROLLOVER_SUCCESSOR="${CO_ROLLOVER_SUCCESSOR:-}" \
       CO_ROLLOVER_EXEMPT_PID="${CO_ROLLOVER_EXEMPT_PID:-}" \
       KX_REFUSE="${KX_REFUSE:-}" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "$@" >/dev/null 2>"$err_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "${REGISTRY_OVERRIDE:-$REPO_ROOT/tests/fixtures/rich_registry.json}")" "$@" >/dev/null 2>"$err_log" )
     RC=$?
+    # The pickup watch is started detached and disowned (bin/co's own point:
+    # it must outlive the `exec claude` above, which is this subshell's own
+    # exit), so its argv can still be unwritten the instant this subshell
+    # returns. The real stub exits almost immediately once started; this
+    # bounds the wait at 1s total rather than racing it.
+    local waited=0
+    while [[ ! -s $watch_log && $waited -lt 20 ]]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
     CLAUDE_ARGS=$(cat "$call_log")
     CLAUDE_ENV=$(cat "$env_log")
     KX_CALLS=$(cat "$kx_log")
+    WATCH_ARGS=$(cat "$watch_log")
     ERR=$(cat "$err_log")
-    rm -f "$call_log" "$kx_log" "$env_log" "$err_log"
+    rm -f "$call_log" "$kx_log" "$env_log" "$watch_log" "$err_log"
 }
 
 # The stub records one argv element per line, so this pulls the value
@@ -176,25 +234,32 @@ _has_prompt_line() { # <argv-log-text>
     printf '%s\n' "$1" | grep -Fxq "$PROMPT"
 }
 
+# Same pulls-the-adjacent-value trick as _agent_value, for the pickup watch's
+# own argv (one element per line) and for claude's --session-id.
+_session_id_value() { printf '%s\n' "$1" | awk '$0=="--session-id"{getline; print; exit}'; }
+_watch_handoff_path() { printf '%s\n' "$1" | awk '$0=="--handoff-path"{getline; print; exit}'; }
+_watch_session_id() { printf '%s\n' "$1" | awk '$0=="--session-id"{getline; print; exit}'; }
+_watch_claude_pid() { printf '%s\n' "$1" | awk '$0=="--claude-pid"{getline; print; exit}'; }
+
 H=$(setup)
 
 echo "== rollover's /handoff-pickup prompt is no longer read as an agent name =="
 
-run_co "$H" Convivy/constance-commercial -r "$PROMPT"
+run_co "$H" Convivy/harbor-commercial -r "$PROMPT"
 assert_rc 0 "$RC" "*-commercial: co -r with the rollover prompt exits 0"
 assert_eq "product-manager" "$(_agent_value "$CLAUDE_ARGS")" \
     "*-commercial: rollover prompt takes the branch's default agent (product-manager)"
 assert_eq "1" "$(_has_prompt_line "$CLAUDE_ARGS" && echo 1 || echo 0)" \
     "*-commercial: the prompt reaches claude as its own argv element"
 
-run_co "$H" Convivy/convivy-commercial -r "$PROMPT"
-assert_rc 0 "$RC" "convivy-commercial: co -r with the rollover prompt exits 0"
+run_co "$H" Convivy/northwind-commercial -r "$PROMPT"
+assert_rc 0 "$RC" "northwind-commercial: co -r with the rollover prompt exits 0"
 assert_eq "positioning-strategist" "$(_agent_value "$CLAUDE_ARGS")" \
-    "convivy-commercial: rollover prompt takes the branch's default agent (positioning-strategist)"
+    "northwind-commercial: rollover prompt takes the branch's default agent (positioning-strategist)"
 assert_eq "1" "$(_has_prompt_line "$CLAUDE_ARGS" && echo 1 || echo 0)" \
-    "convivy-commercial: the prompt reaches claude as its own argv element"
+    "northwind-commercial: the prompt reaches claude as its own argv element"
 
-run_co "$H" Convivy/vivy -r "$PROMPT"
+run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "product branch: co -r with the rollover prompt exits 0"
 assert_eq "planning-orchestrator" "$(_agent_value "$CLAUDE_ARGS")" \
     "product branch: rollover prompt takes the branch's default agent (planning-orchestrator)"
@@ -203,18 +268,18 @@ assert_eq "1" "$(_has_prompt_line "$CLAUDE_ARGS" && echo 1 || echo 0)" \
 
 echo "== regression pins: ordinary agent selection in the commercial fixture is unaffected =="
 
-run_co "$H" Convivy/constance-commercial pa
+run_co "$H" Convivy/harbor-commercial pa
 assert_rc 0 "$RC" "co pa: exits 0"
 assert_eq "product-analyst" "$(_agent_value "$CLAUDE_ARGS")" "co pa: still selects product-analyst"
 
-run_co "$H" Convivy/constance-commercial some-other-agent
+run_co "$H" Convivy/harbor-commercial some-other-agent
 assert_rc 0 "$RC" "co <explicit-agent>: exits 0"
 assert_eq "some-other-agent" "$(_agent_value "$CLAUDE_ARGS")" \
     "co <explicit-agent>: the passthrough arm still selects an unlisted agent name"
 
 echo "== CO_ROLLOVER_SUCCESSOR skips the forced re-individuate, the pull still runs =="
 
-CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked rollover successor: co -r still exits 0"
 assert_eq "planning-orchestrator" "$(_agent_value "$CLAUDE_ARGS")" \
     "marked rollover successor: still launches the branch's default agent"
@@ -233,13 +298,50 @@ assert_contains "$ERR" "pulling $H/Convivy/knowledge" \
 assert_eq "" "$CLAUDE_ENV" \
     "marked rollover successor: CO_ROLLOVER_SUCCESSOR does not reach claude's environment"
 
+echo "== a marked rollover successor's pickup is recorded by co itself, not by its model =="
+
+# issue: a successor's MODEL has to choose to run `/handoff-pickup`'s own
+# `co-rollover --picked-up`, and twice it did not. bin/co now starts a
+# detached watch itself, handing claude a generated --session-id and the
+# watch that same id, so the watch can record the pickup under it.
+RID=$(_session_id_value "$CLAUDE_ARGS")
+assert_eq "1" "$([[ -n $RID ]] && echo 1 || echo 0)" \
+    "marked rollover successor: claude receives a --session-id"
+assert_eq "$RID" "$(_watch_session_id "$WATCH_ARGS")" \
+    "marked rollover successor: the pickup watch receives the SAME session id claude did"
+assert_eq "/x/handoff.md" "$(_watch_handoff_path "$WATCH_ARGS")" \
+    "marked rollover successor: the pickup watch receives the handoff path out of the prompt"
+assert_eq "1" "$([[ -n $(_watch_claude_pid "$WATCH_ARGS") ]] && echo 1 || echo 0)" \
+    "marked rollover successor: the pickup watch receives co's own pid"
+
+echo "== an ordinary launch gets no --session-id and starts no pickup watch =="
+
+# crew-test's own generic-tail fixture (a dedicated one — see the comment
+# on its setup() above), same -r, but no CO_ROLLOVER_SUCCESSOR marker and no
+# /handoff-pickup prompt — the ordinary case must be completely unchanged.
+REGISTRY_OVERRIDE="$H/registry-crew-test.json" run_co "$H" Convivy/crew-test -r
+assert_rc 0 "$RC" "ordinary co -r (no marker, no prompt): exits 0"
+assert_eq "" "$(_session_id_value "$CLAUDE_ARGS")" \
+    "ordinary co -r: claude receives no --session-id"
+assert_eq "" "$WATCH_ARGS" \
+    "ordinary co -r: no pickup watch is started"
+
+# The prompt alone, with no CO_ROLLOVER_SUCCESSOR marker, must not trigger
+# the watch either — only a MARKED successor qualifies.
+REGISTRY_OVERRIDE="$H/registry-crew-test.json" run_co "$H" Convivy/crew-test -r "$PROMPT"
+assert_rc 0 "$RC" "unmarked co -r with the rollover prompt: exits 0"
+assert_eq "" "$(_session_id_value "$CLAUDE_ARGS")" \
+    "unmarked co -r with the rollover prompt: claude receives no --session-id"
+assert_eq "" "$WATCH_ARGS" \
+    "unmarked co -r with the rollover prompt: no pickup watch is started"
+
 echo "== CO_ROLLOVER_EXEMPT_PID: a marked successor with a valid pid re-individuates, exempted =="
 
 # issue_01M2FDBJS8GMA16DX4XNBVH2K6: with a predecessor pid to exempt, the
 # successor no longer skips outright — it re-individuates with
 # --exempt-pid so a real knowledge-repo change since the predecessor's own
 # last activation still lands.
-CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + valid exempt pid: co -r still exits 0"
 assert_contains "$KX_CALLS" "use daytime --force --exempt-pid 12345" \
     "marked successor + valid exempt pid: knowledge-ctx use --force --exempt-pid 12345 is called"
@@ -250,7 +352,7 @@ assert_eq "" "$CLAUDE_ENV" \
 
 echo "== CO_ROLLOVER_EXEMPT_PID: a non-digit or empty value keeps today's skip =="
 
-CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID="not-a-pid" run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID="not-a-pid" run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + non-digit exempt pid: co -r still exits 0"
 assert_eq "" "$(echo "$KX_CALLS" | grep -x 'use daytime --force')" \
     "marked successor + non-digit exempt pid: knowledge-ctx use --force is never called"
@@ -261,7 +363,7 @@ assert_contains "$ERR" "rollover successor: skipping knowledge-ctx use --force" 
 assert_eq "" "$CLAUDE_ENV" \
     "marked successor + non-digit exempt pid: neither marker reaches claude's environment"
 
-CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID="" run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID="" run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + empty exempt pid: co -r still exits 0"
 assert_contains "$ERR" "rollover successor: skipping knowledge-ctx use --force" \
     "marked successor + empty exempt pid: the skip is announced"
@@ -271,7 +373,7 @@ assert_eq "" "$CLAUDE_ENV" \
 # A malformed list — one bad element anywhere in it — is treated as fully
 # absent, not partially applied: bin/co validates the WHOLE comma list before
 # accepting any of it.
-CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID="111,abc" run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID="111,abc" run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + malformed pid list: co -r still exits 0"
 assert_eq "" "$(echo "$KX_CALLS" | grep -F -- '--exempt-pid')" \
     "marked successor + malformed pid list: --exempt-pid is never passed"
@@ -286,7 +388,7 @@ echo "== CO_ROLLOVER_EXEMPT_PID: a comma-separated list adds one --exempt-pid pe
 # pane (tmux_transcript.claude_pids_under's documented computer-use-fork
 # shape), so co_rollover.spawn_successor passes every one of them through as
 # a comma-separated list, and bin/co must plumb one --exempt-pid per pid.
-CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=111,222 run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=111,222 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + multiple exempt pids: co -r still exits 0"
 assert_contains "$KX_CALLS" "use daytime --force --exempt-pid 111 --exempt-pid 222" \
     "marked successor + multiple exempt pids: one --exempt-pid per pid is passed"
@@ -299,7 +401,7 @@ echo "== CO_ROLLOVER_EXEMPT_PID without CO_ROLLOVER_SUCCESSOR adds no --exempt-p
 # re-individuate — an exempt-pid list with no CO_ROLLOVER_SUCCESSOR must not
 # reach knowledge-ctx at all, and the ordinary (non-rollover) --force call
 # still runs.
-CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "unmarked launch + exempt pid: co -r still exits 0"
 assert_contains "$KX_CALLS" "use daytime --force" \
     "unmarked launch + exempt pid: the ordinary --force call still runs"
@@ -316,7 +418,7 @@ echo "== a refused re-individuate falls back to the skip instead of exit 1 =="
 # operator in the `|| exec zsh` fallback: co falls back to the same skip an
 # unresolved pid takes, and claude still launches on the predecessor's
 # already-individuated profile.
-KX_REFUSE=1 CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/vivy -r "$PROMPT"
+KX_REFUSE=1 CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + refused re-individuate: co -r still exits 0"
 assert_eq "1" "$(_has_prompt_line "$CLAUDE_ARGS" && echo 1 || echo 0)" \
     "marked successor + refused re-individuate: claude still launches"
@@ -346,7 +448,7 @@ assert_eq "" "$CLAUDE_ENV" \
 
 echo "== an ordinary co -r (no marker) still individuates =="
 
-run_co "$H" Convivy/vivy -r
+run_co "$H" Convivy/finch -r
 assert_rc 0 "$RC" "ordinary co -r: exits 0"
 assert_contains "$KX_CALLS" "use daytime --force" \
     "ordinary co -r: knowledge-ctx use --force is still called"
@@ -357,10 +459,10 @@ echo "== the skips require the predecessor's .active-profile to name the launche
 # because .claude held no .active-profile: both skips assumed an individuation
 # that was never there. Site 1 is the no-pid skip; site 2 is the refusal
 # fallback. Each now runs / fails unless the marker is present and matches.
-MARKER="$H/Convivy/vivy/.claude/.active-profile"
+MARKER="$H/Convivy/finch/.claude/.active-profile"
 
-echo "vivy/daytime" > "$MARKER"
-CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/vivy -r "$PROMPT"
+echo "finch/daytime" > "$MARKER"
+CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "site 1, matching .active-profile: exits 0"
 assert_eq "" "$(echo "$KX_CALLS" | grep -x 'use daytime --force')" \
     "site 1, matching .active-profile: knowledge-ctx use --force is not called"
@@ -368,7 +470,7 @@ assert_contains "$ERR" "verified .claude/.active-profile names daytime" \
     "site 1, matching .active-profile: the skip says it verified the marker"
 
 rm -f "$MARKER"
-CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "site 1, no .active-profile: exits 0"
 assert_contains "$KX_CALLS" "use daytime --force" \
     "site 1, no .active-profile: knowledge-ctx use --force runs"
@@ -377,16 +479,16 @@ assert_eq "" "$(echo "$KX_CALLS" | grep -F -- '--exempt-pid')" \
 assert_eq "" "$(echo "$ERR" | grep -F 'skipping knowledge-ctx use --force')" \
     "site 1, no .active-profile: the skip is not announced"
 
-echo "vivy/commercial" > "$MARKER"
-CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/vivy -r "$PROMPT"
+echo "finch/commercial" > "$MARKER"
+CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "site 1, .active-profile names a different profile: exits 0"
 assert_contains "$KX_CALLS" "use daytime --force" \
     "site 1, .active-profile names a different profile: knowledge-ctx use --force runs"
 assert_eq "" "$(echo "$ERR" | grep -F 'skipping knowledge-ctx use --force')" \
     "site 1, .active-profile names a different profile: the skip is not announced"
 
-echo "vivy/daytime" > "$MARKER"
-KX_REFUSE=1 CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/vivy -r "$PROMPT"
+echo "finch/daytime" > "$MARKER"
+KX_REFUSE=1 CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "site 2, matching .active-profile: falls back, exits 0"
 assert_contains "$ERR" "names daytime)" \
     "site 2, matching .active-profile: the fallback says it verified the marker"
@@ -394,7 +496,7 @@ assert_eq "1" "$(_has_prompt_line "$CLAUDE_ARGS" && echo 1 || echo 0)" \
     "site 2, matching .active-profile: claude still launches"
 
 rm -f "$MARKER"
-KX_REFUSE=1 CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/vivy -r "$PROMPT"
+KX_REFUSE=1 CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_EXEMPT_PID=12345 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 1 "$RC" "site 2, no .active-profile: the launch fails with exit 1"
 assert_contains "$ERR" "daytime was never individuated in this" \
     "site 2, no .active-profile: the message says it was never individuated"

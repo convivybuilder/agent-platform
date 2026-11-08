@@ -7,6 +7,7 @@ git layer would assume away exactly the race this exists to close.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+import issue_client
 import kb_writes as kw
 
 DOC = """---
@@ -48,18 +50,51 @@ SEEDED = "projects/platform/reference/seeded.md"
 ROSTER = "projects/agent-platform/agents/reviewer.md"
 
 
-@pytest.fixture
-def cage(tmp_path, monkeypatch, agentctl, library_identity):
-    """An origin, a shared checkout, and a cage worktree path — the real topology."""
-    origin = tmp_path / "origin"
+def _admit_body(**extra):
+    """A `POST /reference/admission` 200 body that admits the write
+    (library-protocol.md §4.1). Carries `clauses_waived` (library#306's served
+    signal, knowledge#974) as `[]`, since nothing is waived on an ordinary
+    admitted write."""
+    body = {"may_land": True, "errors": [], "clauses_checked": ["frontmatter", "checkout"],
+            "clauses_refused": [], "clauses_waived": []}
+    body.update(extra)
+    return body
+
+
+def _default_library_post(path, name, body):
+    """`cage`'s default stub for `agentctl._library_post`: admits every
+    `/reference/admission` ask, so every test in this module that is not ABOUT
+    the admission gate (CQ·531) keeps testing exactly what it tested before
+    that gate existed, with no network call and no real credential read. The
+    admission tests below override this per-test with their own stub."""
+    assert path == "/reference/admission", f"unexpected Library POST in a kb apply test: {path}"
+    return 200, _admit_body()
+
+
+@pytest.fixture(scope="session")
+def _cage_template(tmp_path_factory):
+    """The `cage` fixture's origin/seed/checkout topology (11 git subprocess
+    calls — init, config, add, commit, remote, push, clone, config), built
+    once rather than by every one of the 170+ tests that request `cage`.
+    `cage` copies these three directories rather than re-deriving them, and
+    re-points each copy's `origin` remote at ITS OWN copy of the bare repo,
+    since `git clone`/`remote add` bakes the template's own absolute path
+    into `.git/config`."""
+    root = tmp_path_factory.mktemp("cage-template")
+    origin = root / "origin"
     origin.mkdir()
     _git(origin, "init", "--quiet", "--bare", "--initial-branch=main")
 
-    seed = tmp_path / "seed"
+    seed = root / "seed"
     seed.mkdir()
     _git(seed, "init", "--quiet", "--initial-branch=main")
     _git(seed, "config", "user.email", "t@example.com")
     _git(seed, "config", "user.name", "T")
+    # Git's detached auto-maintenance after a commit briefly holds
+    # objects/maintenance.lock, which races the `cage` fixture's copytree of
+    # this template.
+    _git(seed, "config", "maintenance.auto", "false")
+    _git(seed, "config", "gc.auto", "0")
     _write_doc(seed, SEEDED, slug="seeded", body="Original body.")
     _write_doc(seed, ROSTER, slug="reviewer", body="Roster doc.")
     _git(seed, "add", "-A")
@@ -67,16 +102,40 @@ def cage(tmp_path, monkeypatch, agentctl, library_identity):
     _git(seed, "remote", "add", "origin", str(origin))
     _git(seed, "push", "--quiet", "-u", "origin", "main")
 
-    checkout = tmp_path / "knowledge"
+    checkout = root / "knowledge"
     subprocess.run(["git", "clone", "--quiet", str(origin), str(checkout)],
                    capture_output=True, text=True, check=True)
     _git(checkout, "config", "user.email", "t@example.com")
     _git(checkout, "config", "user.name", "T")
+    return root
+
+
+@pytest.fixture
+def cage(tmp_path, monkeypatch, agentctl, library_identity, _cage_template):
+    """An origin, a shared checkout, and a cage worktree path — the real topology."""
+    origin = tmp_path / "origin"
+    seed = tmp_path / "seed"
+    checkout = tmp_path / "knowledge"
+    shutil.copytree(_cage_template / "origin", origin)
+    shutil.copytree(_cage_template / "seed", seed)
+    shutil.copytree(_cage_template / "knowledge", checkout)
+    # The template's own absolute path, baked into `seed`'s and `checkout`'s
+    # `.git/config` by `remote add`/`clone` above, re-pointed at THIS test's copy.
+    _git(seed, "remote", "set-url", "origin", str(origin))
+    _git(checkout, "remote", "set-url", "origin", str(origin))
 
     monkeypatch.setattr(agentctl, "KNOWLEDGE_ROOT", checkout)
     monkeypatch.setattr(agentctl, "SCRIBE_WORKTREE", tmp_path / "cage-wt")
+    # `_kb_resolve_ref` looks up any `args.doc` that does not end in
+    # `.md`/`.yaml`/`.yml` (a `.txt` argument, as the non-md refusal test
+    # passes) against `agentctl.KB_INDEX` — the real machine's
+    # `~/.knowledge-index/index.db` unless repointed here. This cage has no
+    # such index of its own, so this must resolve to "missing" rather than
+    # reach the real one.
+    monkeypatch.setattr(agentctl, "KB_INDEX", tmp_path / "no-knowledge-index.db")
     monkeypatch.setattr(kw, "DB", tmp_path / "kb-writes.db")
     monkeypatch.setattr(agentctl, "_kb_writes", lambda: kw)
+    monkeypatch.setattr(agentctl, "_library_post", _default_library_post)
     kw.ensure_db()
     return Namespace(origin=origin, seed=seed, checkout=checkout, tmp=tmp_path)
 
@@ -178,6 +237,26 @@ def test_a_document_the_indexer_would_drop_is_refused_and_nothing_reaches_main(
     err = capsys.readouterr().err
     assert rc == 6, err
     assert "indexer would drop" in err and "not-a-roster-agent" in err, err
+    assert _git(cage.origin, "rev-parse", "main").stdout.strip() == main_before, \
+        "nothing reached origin/main"
+    assert not (cage.tmp / "cage-wt" / rel).exists(), "the cage is restored"
+
+
+def test_a_write_under_a_project_the_registry_does_not_name_is_refused(
+        cage, agentctl, capsys):
+    """platform/decisions/0097: `kb_create`/`kb_update` commit through this
+    command with no pull request, so this precheck was the only gate `kb apply`
+    had on a directory the registry does not admit — and on origin/main it let
+    one through, creating the directory outright. `projects/brand-new/` does
+    not exist in `cage`'s checkout, so this is the `pending`-name path."""
+    rel = "projects/brand-new/reference/first.md"
+    body = DOC.format(slug="first", title="First", body="New project.").replace(
+        "project: platform", "project: brand-new")
+    main_before = _git(cage.origin, "rev-parse", "main").stdout.strip()
+    rc = agentctl.cmd_kb_apply(_args(rel, kw.content_sha(""), content=body))
+    err = capsys.readouterr().err
+    assert rc == 6, err
+    assert "indexer would drop" in err and "not a project the registry names" in err, err
     assert _git(cage.origin, "rev-parse", "main").stdout.strip() == main_before, \
         "nothing reached origin/main"
     assert not (cage.tmp / "cage-wt" / rel).exists(), "the cage is restored"
@@ -1429,3 +1508,394 @@ def test_kb_apply_bootstraps_before_reading_stdin_for_person_provenance(
     assert rc == 0
     assert "Signed by Deck." in _origin_content(cage, SEEDED)
     assert ("person", "ok", "person", DECK_PERSON) in _author_rows()
+
+
+# --- admission: `POST /reference/admission` before every commit (CQ·96 step
+# 2(c); CQ·531) --------------------------------------------------------------
+#
+# Each case below is a PAIR identical except for the stub's answer (CQ·96
+# comment 1202): only the delta between admitting and refusing proves the
+# answer is read, and the two refusal cases below isolate one clause each
+# (CQ·96 comments 1203/1204), so a refusal that names both at once cannot
+# pass against an implementation checking only one.
+
+
+def _refuse_body(clauses: list[str], errors: list[str]) -> dict:
+    """A 200 content refusal still carries `clauses_waived` (library#306's
+    served signal, knowledge#974): the key is present on every 200 the
+    admission handler returns, whatever `may_land` says."""
+    return {"may_land": False, "errors": errors,
+            "clauses_checked": ["frontmatter", "checkout"], "clauses_refused": clauses,
+            "clauses_waived": []}
+
+
+def _stub_admission(agentctl, monkeypatch, answer):
+    """Replace `agentctl._library_post` with a stub that answers exactly one
+    `/reference/admission` call with `answer` — a `(status, body)` pair, or an
+    exception instance to raise — and records every call's body in `.calls`.
+    Any other path reaching `_library_post` is a different bug in this test
+    module, not something this stub should silently swallow."""
+    calls = []
+
+    def fake(path, name, body):
+        assert path == "/reference/admission", f"unexpected Library POST: {path}"
+        calls.append(body)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(agentctl, "_library_post", fake)
+    return calls
+
+
+def _apply_with_edit(agentctl, doc, sha, new_text, **kw_):
+    return agentctl.cmd_kb_apply(_args(
+        doc, sha, edits=f'[{{"old": "Original body.", "new": "{new_text}"}}]', **kw_))
+
+
+def _assert_nothing_committed(cage, label: str) -> None:
+    """The admission gate runs after `_scribe_worktree()` has already opened
+    the cage worktree, so a refused write can still leave that worktree
+    EXISTING — `_history` then grows a `cage` key it did not have before the
+    call, even with no new commit in it. The fact that proves nothing landed
+    is that the cage's log holds no commit `origin` lacks, not that
+    `_history` is identical before and after (the same shape as
+    `_assert_no_stray_cage_commit` above, for the Deck-signature refusals)."""
+    hist = _history(cage)
+    stray = set(hist.get("cage", [])) - set(hist["origin"])
+    assert not stray, f"{label} left a commit behind: {stray}"
+
+
+def test_an_admitted_write_commits(cage, agentctl, monkeypatch):
+    calls = _stub_admission(agentctl, monkeypatch, (200, _admit_body()))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Admitted.")
+    assert rc == 0
+    assert "Admitted." in _origin_content(cage, SEEDED)
+    assert len(calls) == 1
+
+
+def test_a_frontmatter_only_refusal_names_frontmatter_and_writes_nothing(
+        cage, agentctl, monkeypatch, capsys):
+    _stub_admission(agentctl, monkeypatch,
+                    (200, _refuse_body(["frontmatter"],
+                                       ["audience value not in roster: nobody"])))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Refused on frontmatter.")
+    assert rc == 9
+    _assert_nothing_committed(cage, "a frontmatter refusal")
+    assert "Original body." in _origin_content(cage, SEEDED)
+    err = capsys.readouterr().err
+    assert "frontmatter" in err
+    assert "checkout" not in err
+    assert ("in-session", "refused-admission") in [(r[0], r[1]) for r in _rows()]
+
+
+def test_a_checkout_only_refusal_names_checkout_and_writes_nothing(
+        cage, agentctl, monkeypatch, capsys):
+    _stub_admission(agentctl, monkeypatch,
+                    (200, _refuse_body(["checkout"],
+                                       ["no live checkout is held on platform/reference/"
+                                        "seeded; take one before writing"])))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Refused on checkout.")
+    assert rc == 9
+    _assert_nothing_committed(cage, "a checkout refusal")
+    assert "Original body." in _origin_content(cage, SEEDED)
+    err = capsys.readouterr().err
+    assert "checkout" in err
+    assert "frontmatter" not in err
+
+
+def test_an_unreachable_library_refuses_and_writes_nothing(
+        cage, agentctl, monkeypatch, capsys):
+    _stub_admission(agentctl, monkeypatch, agentctl._LibraryUnreachable(
+        "dispatch refused: the Library is unreachable (ConnectionRefusedError); "
+        "cannot ask whether this write may land"))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Unreachable.")
+    assert rc == 9
+    _assert_nothing_committed(cage, "an unreachable-Library refusal")
+    assert "Original body." in _origin_content(cage, SEEDED)
+    err = capsys.readouterr().err
+    assert "could not be reached" in err
+
+
+def test_an_admission_call_that_errors_another_way_refuses_and_writes_nothing(
+        cage, agentctl, monkeypatch, capsys):
+    """Distinct from the unreachable case (CQ·96 comment 1202: the two must
+    not share a message) — a malformed answer, not a network failure."""
+    _stub_admission(agentctl, monkeypatch, SystemExit(
+        "dispatch refused: the Library answered /reference/admission with "
+        "malformed JSON (ValueError); cannot ask whether this write may land"))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Errored.")
+    assert rc == 9
+    _assert_nothing_committed(cage, "an admission error")
+    assert "Original body." in _origin_content(cage, SEEDED)
+    err = capsys.readouterr().err
+    assert "errored" in err
+    assert "could not be reached" not in err
+
+
+def test_the_admission_request_carries_owner_equal_to_the_normalized_holder(
+        cage, agentctl, monkeypatch):
+    calls = _stub_admission(agentctl, monkeypatch, (200, _admit_body()))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Owner check.",
+                          holder="  run-test  ")
+    assert rc == 0
+    [body] = calls
+    assert body["owner"] == "run-test"
+
+
+def test_the_admission_request_for_an_update_carries_the_canonical_path(
+        cage, agentctl, monkeypatch):
+    """`path` (library#306) is the index's `source_ref` for the document being
+    written, so the Library's checkout clause binds to the document actually
+    at that path rather than to whatever id the write's frontmatter claims.
+    `create` is `False` here: a write over a document already on main must
+    not waive the checkout clause the way a fresh document can (library#306
+    round 2)."""
+    calls = _stub_admission(agentctl, monkeypatch, (200, _admit_body()))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Path check.")
+    assert rc == 0
+    [body] = calls
+    assert body["path"] == SEEDED
+    assert body["create"] is False
+
+
+def test_the_admission_request_for_a_new_doc_carries_its_unindexed_path(
+        cage, agentctl, monkeypatch):
+    """Same field, a `kb apply` that creates a document at a path nothing has
+    indexed yet (the empty-sha case `test_apply_creates_a_new_doc_from_the_
+    empty_sha` above exercises without an admission assertion). `create` is
+    `True` here, so the Library may waive the checkout clause for a document
+    the index has not caught up to yet (library#306 round 2)."""
+    calls = _stub_admission(agentctl, monkeypatch, (200, _admit_body()))
+    rel = "projects/platform/reference/fresh.md"
+    body_doc = DOC.format(slug="fresh", title="Fresh", body="Brand new.")
+    rc = agentctl.cmd_kb_apply(_args(rel, kw.content_sha(""), content=body_doc))
+    assert rc == 0
+    [body] = calls
+    assert body["path"] == rel
+    assert body["create"] is True
+
+
+def test_the_admission_request_for_a_symlinked_write_carries_the_real_target(
+        cage, agentctl, monkeypatch):
+    """The two tests above both use a requested path that already equals its
+    canonical form, so they would pass just as well if the admission call were
+    handed `source_ref` (the caller's string) in place of `canonical_ref` (what
+    git actually stages) — the exact library#306 bypass this PR closes. Here
+    the requested path is a symlink to a different, policy-allowed, indexable
+    document, the same setup
+    `test_a_symlink_to_a_roster_path_is_caught_by_the_canonical_check` above
+    uses to force the canonical-policy check to run on the resolved path
+    rather than the string. Swapping `canonical_ref` for `source_ref` in the
+    `_kb_admission_check` call inside `cmd_kb_apply` makes this assertion fail
+    (verified by hand for this PR; not a swap this test performs itself).
+
+    The write never reaches a successful commit here: `git add` on a symlink
+    path whose own bytes did not change (only the file it points at did)
+    stages nothing, so the commit attempted after admission fails — a
+    pre-existing limitation of writing through a symlinked alias, unrelated
+    to this PR. The admission call happens before that commit attempt, so
+    `calls` already holds what this test is checking regardless of the run's
+    final exit code."""
+    link = cage.seed / "projects/platform/reference/aka.md"
+    link.symlink_to("seeded.md")
+    _git(cage.seed, "add", "-A")
+    _git(cage.seed, "commit", "--quiet", "-m", "add a symlink to the seeded doc")
+    _git(cage.seed, "push", "--quiet", "origin", "main")
+
+    calls = _stub_admission(agentctl, monkeypatch, (200, _admit_body()))
+    sha = _sha_on_origin(cage, SEEDED)
+    agentctl.cmd_kb_apply(_args(
+        "projects/platform/reference/aka.md", sha, provenance="in-session",
+        edits='[{"old": "Original body.", "new": "Through the symlink."}]'))
+    [body] = calls
+    assert body["path"] == SEEDED
+
+
+# --- admission: the served signal (library#306, knowledge#974 round 3) ------
+#
+# A Library that predates library#306 ignores `path`/`create` and answers 200
+# on the frontmatter id alone, with no `clauses_waived` key. The wire ruling
+# (the steward, 2026-10-22) reads that key's absence on a 200 as the amendment
+# not being served — whatever `may_land` says — and refuses rather than trust
+# an answer that never ran the check this PR exists to force. `clauses_waived`
+# present, even `[]`, is the only shape that is trusted.
+
+
+def test_a_200_missing_clauses_waived_refuses_as_not_served_even_when_admitted(
+        cage, agentctl, monkeypatch, capsys):
+    body = _admit_body()
+    del body["clauses_waived"]
+    _stub_admission(agentctl, monkeypatch, (200, body))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Blind admit.")
+    assert rc == 9
+    _assert_nothing_committed(cage, "a served-signal-missing admit")
+    assert "Original body." in _origin_content(cage, SEEDED)
+    err = capsys.readouterr().err
+    assert "does not serve path/create admission" in err
+    assert "library#306" in err
+
+
+def test_a_200_missing_clauses_waived_refuses_as_not_served_even_when_refused(
+        cage, agentctl, monkeypatch, capsys):
+    """The same not-served refusal, now with `may_land: false` — proving the
+    check runs BEFORE `may_land` is read, rather than only on the admitted
+    branch. Without the fix this would refuse too, but for the wrong reason
+    (the ordinary clause-refusal message), which is why this test's own
+    one-line removal below (not committed) also checks the message, not only
+    the exit code."""
+    body = _refuse_body(["checkout"], ["no live checkout is held"])
+    del body["clauses_waived"]
+    _stub_admission(agentctl, monkeypatch, (200, body))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Blind refuse.")
+    assert rc == 9
+    _assert_nothing_committed(cage, "a served-signal-missing refusal")
+    assert "Original body." in _origin_content(cage, SEEDED)
+    err = capsys.readouterr().err
+    assert "does not serve path/create admission" in err
+    assert "library#306" in err
+
+
+def test_a_200_with_clauses_waived_empty_and_may_land_true_proceeds(
+        cage, agentctl, monkeypatch):
+    """The served signal present, even as `[]`, and `may_land: true`: the one
+    shape library#306's handler sends today for an ordinary admitted write,
+    and the one this PR's check must still let through."""
+    _stub_admission(agentctl, monkeypatch, (200, _admit_body(clauses_waived=[])))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Served and admitted.")
+    assert rc == 0
+    assert "Served and admitted." in _origin_content(cage, SEEDED)
+
+
+def test_a_200_with_a_non_list_clauses_waived_refuses_as_not_served(
+        cage, agentctl, monkeypatch, capsys):
+    """A `clauses_waived` that is present but not a list is not the shape the
+    served signal names, so it is refused the same way as an absent key."""
+    _stub_admission(agentctl, monkeypatch, (200, _admit_body(clauses_waived="none")))
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Malshaped waiver.")
+    assert rc == 9
+    _assert_nothing_committed(cage, "a non-list clauses_waived")
+    assert "Original body." in _origin_content(cage, SEEDED)
+    err = capsys.readouterr().err
+    assert "does not serve path/create admission" in err
+
+
+# --- admission: the real JSON encoding (CQ·531, the Bosun's live check) -----
+#
+# Every case above stubs `agentctl._library_post` itself, so the real
+# `json.dumps` call inside it — the one that crashed on an unquoted
+# `last_reviewed` date before any request was sent — never ran. These cases
+# restore the real `_library_post` and stub one layer further down, the
+# opener `issue_client.pinned_opener()` returns, so the actual encoding runs
+# and a test can read the bytes that would have gone out over the wire.
+
+
+class _AdmissionOpener:
+    """Stands in for `issue_client.pinned_opener()` for exactly the
+    `POST /reference/admission` call `_library_post` makes. `status`/`answer`
+    is what the Library answers; `.requests` keeps every `urllib.request.
+    Request` actually built, so a test can read `.data` — the bytes
+    `json.dumps` produced — rather than the pre-serialization dict a stub of
+    `_library_post` itself would have seen."""
+
+    def __init__(self, status=200, answer=None):
+        self.status = status
+        self.answer = _admit_body() if answer is None else answer
+        self.requests: list = []
+
+    def open(self, req, timeout=None):
+        self.requests.append(req)
+        if self.status == 200:
+            return _Served(json.dumps(self.answer).encode())
+        import urllib.error
+        raise urllib.error.HTTPError(
+            req.full_url, self.status, "answered", None,
+            io.BytesIO(json.dumps(self.answer).encode()))
+
+
+class _Served(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+
+@pytest.fixture(scope="session")
+def _real_library_post(agentctl):
+    """`agentctl._library_post` as the module defines it, read once per
+    session the first time any test asks for it — before which every prior
+    test's `monkeypatch.setattr` on it has already been undone, since none of
+    them replace it any other way. The unstubbed implementation `real_
+    admission` restores underneath `cage`'s own default stub."""
+    return agentctl._library_post
+
+
+@pytest.fixture
+def real_admission(agentctl, monkeypatch, tmp_path, _real_library_post):
+    """Un-stubs `agentctl._library_post` back to the real implementation —
+    overriding `cage`'s own default stub, so this fixture must be requested
+    AFTER `cage` in a test's parameter list — and points its transport at a
+    fresh `_AdmissionOpener` instead of a live Library. A test configures the
+    opener's `.status`/`.answer` and reads `.requests` from the object this
+    returns."""
+    token = tmp_path / "agent-platform-token"
+    token.write_text("test-token\n")
+    monkeypatch.setattr(agentctl.SC, "TOKEN_FILE", token)
+    monkeypatch.setattr(agentctl, "_library_post", _real_library_post)
+    opener = _AdmissionOpener()
+    monkeypatch.setattr(issue_client, "pinned_opener", lambda: opener)
+    return opener
+
+
+def test_an_admitted_write_sends_last_reviewed_as_the_iso_string_the_validator_reads(
+        cage, agentctl, real_admission):
+    """`SEEDED`'s frontmatter carries an unquoted `last_reviewed: 2026-07-25`,
+    which `yaml.safe_load` parses to a `datetime.date` — the exact shape
+    `reference_admission.validate_frontmatter` on the Library side does NOT
+    accept (it reads `last_reviewed` as a string only). Against the unfixed
+    code this never gets far enough to assert anything: `_library_post`'s own
+    `json.dumps(body)` raises `TypeError` building the request, so
+    `real_admission.requests` would be empty and `rc` would be a crash, not 0."""
+    sha = _sha_on_origin(cage, SEEDED)
+    rc = _apply_with_edit(agentctl, SEEDED, sha, "Encoded.")
+    assert rc == 0
+    assert "Encoded." in _origin_content(cage, SEEDED)
+    [req] = real_admission.requests
+    sent = json.loads(req.data.decode("utf-8"))  # fails on the unfixed code: no request is sent
+    assert sent["frontmatter"]["last_reviewed"] == "2026-07-25"  # unfixed: a `date`, not reached
+    assert isinstance(sent["frontmatter"]["last_reviewed"], str)  # unfixed: not reached
+    assert sent["owner"] == "run-test"
+
+
+def test_an_encoding_failure_refuses_as_errored_and_writes_nothing(
+        cage, agentctl, real_admission, capsys):
+    """A frontmatter value this fix does not know how to coerce — unlike
+    `last_reviewed`, which it does — must still refuse through the "errored"
+    message and leave nothing committed, rather than escape
+    `_kb_admission_check` as an unhandled `TypeError` the way the unfixed
+    code's uncoerced `last_reviewed` date did (CQ·531). `!!binary` is YAML's
+    own tag for bytes, which is neither a date nor anything else this fix
+    coerces, so it reaches `_library_post` unencodable."""
+    rel = "projects/platform/reference/binary-field.md"
+    body = DOC.format(slug="binary-field", title="Binary field", body="New.").replace(
+        "authors: [operator]\n", "authors: [operator]\ncustom_note: !!binary |\n  aGVsbG8=\n")
+    rc = agentctl.cmd_kb_apply(_args(rel, kw.content_sha(""), content=body))
+    assert rc == 9  # unfixed: the process exits non-zero on an uncaught traceback, not 9
+    _assert_nothing_committed(cage, "an encoding failure")
+    err = capsys.readouterr().err
+    assert "errored" in err  # unfixed: a traceback on stderr, never this word
+    assert "TypeError" in err  # unfixed: the traceback says this, but `cmd_kb_apply` never catches it
+    assert real_admission.requests == []  # unfixed: also empty, but for the same reason the above fail

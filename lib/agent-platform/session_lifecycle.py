@@ -263,16 +263,24 @@ def session_exists(name: str) -> bool:
     return TT.run(["tmux", "has-session", "-t", f"={name}"]) is not None
 
 
-# THE DEFAULT TMUX SERVER SHOULD BE FORKED FROM THE GUI SESSION. Every tmux session
-# inherits the security context of the SERVER that forked it, not of the client
-# that attached. A server forked from an SSH login cannot read the login
-# Keychain, so every crew under it got exit 36 from `security
+# THE DEFAULT TMUX SERVER SHOULD BE FORKED FROM THE GUI SESSION, ON MACOS. Every
+# tmux session inherits the security context of the SERVER that forked it, not
+# of the client that attached. A server forked from an SSH login cannot read the
+# login Keychain, so every crew under it got exit 36 from `security
 # find-generic-password` and HTTP 401 from gh, which crews read as a revoked
 # token. That lasted from a restart over SSH at 08:42 to a restart from the GUI
 # session at 08:50 on 2026-10-05. The keeper job runs in the Aqua session and
 # forks the server there. ensure_default_server() starts that job only when no
 # server answers; a server that is already up passes, whatever forked it. So the
-# GUI origin is guaranteed only for a server this helper started.
+# GUI origin is guaranteed only for a server this helper started, and only on
+# macOS.
+#
+# OFF MACOS THERE IS NO KEEPER JOB, AND NONE SHOULD BE ADDED. Claude Code off
+# macOS keeps its login in a file rather than the GUI session's Keychain, so
+# there is no SSH-origin problem here for a keeper job to exist to work around
+# (Shipwright's jobs/tmux-keeper.toml declares `platforms = ["macos"]` on
+# purpose). ensure_default_server() forks the server itself there instead,
+# directly, under this same KEEPER_SESSION name.
 KEEPER_LABEL = "com.convivy.tmux-keeper"
 KEEPER_SESSION = "keeper"
 # Bounds the wait for the keeper session. Short polls, so a keeper that is up is
@@ -307,35 +315,30 @@ def _probe_default_server() -> tuple[list[str] | None, str]:
     return done.stdout.splitlines(), ""
 
 
+def _host_platform() -> str:
+    """`sys.platform`, read through one named function rather than inline, so a
+    test can patch this single seam (`monkeypatch.setattr(SL, "_host_platform",
+    ...)`) instead of `sys.platform` itself — the same convention
+    `run_sandbox._dispatch_host_platform` already uses for the same reason."""
+    return sys.platform
+
+
 def _keeper_refusal(detail: str) -> TmuxServerError:
+    """The macOS refusal: names the one `launchctl` command that can still fix
+    it, run from the GUI session. Never used off macOS — there is nothing for a
+    Linux user to run there, and this text must not tell them to."""
     return TmuxServerError(
         f"{detail}. The tmux server must be started from the GUI session: run "
         f"`launchctl kickstart gui/{os.getuid()}/{KEEPER_LABEL}` there.")
 
 
-def ensure_default_server(wait: float = KEEPER_WAIT_SECONDS,
-                          poll: float = KEEPER_POLL_SECONDS) -> None:
-    """Make sure the default tmux server is running.
+def _kickstart_keeper() -> None:
+    """Ask the GUI-session keeper job to fork the server, on macOS.
 
-    Returns at once when any session exists on the default server, whichever
-    process forked it, so a server forked over SSH passes unchecked. Otherwise it
-    kickstarts the keeper job without `-k`, because a keeper that is already
-    running must not be killed, and waits up to `wait` seconds for the keeper
-    session to appear. The keeper job forks that server from the GUI session. It
-    raises TmuxServerError when the kickstart fails or the keeper session does
-    not appear in time; the timeout message carries the last tmux fault.
-
-    Checks the default socket only. A caller with TMUX_TMPDIR set checks the
-    socket that variable names instead. No current caller sets it, so no guard
-    is added for it.
-
-    Never runs `tmux new-session` or `start-server` itself. A caller's shell is
-    the wrong place to fork the server, because the server inherits that shell's
-    security context.
+    Without `-k`: a keeper that is already running must not be killed by this
+    call, only brought up if it is not. Raises the macOS refusal when
+    `launchctl` cannot run or refuses.
     """
-    names, _ = _probe_default_server()
-    if names:
-        return
     try:
         kick = subprocess.run(
             ["launchctl", "kickstart", f"gui/{os.getuid()}/{KEEPER_LABEL}"],
@@ -345,6 +348,65 @@ def ensure_default_server(wait: float = KEEPER_WAIT_SECONDS,
     if kick.returncode != 0:
         raise _keeper_refusal(
             f"launchctl kickstart exited {kick.returncode}: {kick.stderr.strip()}")
+
+
+def _fork_keeper_directly() -> None:
+    """Start the default tmux server itself, off macOS.
+
+    There is no keeper job to kickstart there — see the comment above
+    KEEPER_LABEL — so this runs the keeper job's own command directly:
+    `tmux new-session -d -s keeper -c <home>`. Raises TmuxServerError carrying
+    tmux's own message when tmux cannot run or refuses; never the macOS
+    refusal, which names a `launchctl` command that would not run here.
+    """
+    try:
+        started = subprocess.run(
+            ["tmux", "new-session", "-d", "-s", KEEPER_SESSION,
+             "-c", str(_real_account_home())],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TmuxServerError(str(exc)) from exc
+    if started.returncode != 0:
+        raise TmuxServerError(
+            started.stderr.strip() or f"tmux new-session exited {started.returncode}")
+
+
+def ensure_default_server(wait: float = KEEPER_WAIT_SECONDS,
+                          poll: float = KEEPER_POLL_SECONDS) -> None:
+    """Make sure the default tmux server is running.
+
+    Returns at once when any session exists on the default server, whichever
+    process forked it, so a server forked over SSH passes unchecked. Otherwise,
+    ON MACOS it kickstarts the keeper job (see the comment above KEEPER_LABEL for
+    why the server must be forked from the GUI session there) and waits up to
+    `wait` seconds for the keeper session to appear. OFF MACOS there is no
+    keeper job to kickstart, so it forks the server itself with
+    `tmux new-session -d -s keeper -c <home>` — the keeper job's own command —
+    and runs the same wait.
+
+    Raises TmuxServerError when the server could not be started this way, or the
+    keeper session does not appear in time; the timeout message carries the
+    last tmux fault. On macOS the message also names the `launchctl` command to
+    run from the GUI session; off macOS it never does, since there is nothing
+    for a Linux caller to run there.
+
+    Checks the default socket only. A caller with TMUX_TMPDIR set checks the
+    socket that variable names instead. No current caller sets it, so no guard
+    is added for it.
+
+    NEVER RUNS `tmux new-session` ON MACOS. A caller's shell there is the wrong
+    place to fork the server, because the server inherits that shell's security
+    context — see the comment above KEEPER_LABEL. Off macOS there is no GUI
+    origin to protect, so this forks the server itself.
+    """
+    names, _ = _probe_default_server()
+    if names:
+        return
+    on_macos = _host_platform() == "darwin"
+    if on_macos:
+        _kickstart_keeper()
+    else:
+        _fork_keeper_directly()
     deadline = time.monotonic() + wait
     # Exact match on the list. `has-session -t keeper` prefix-matches, so a
     # session named `keepers` would otherwise pass for the keeper.
@@ -355,9 +417,9 @@ def ensure_default_server(wait: float = KEEPER_WAIT_SECONDS,
                 last = fault or "tmux exited without a message"
             else:
                 last = f"the server lists {', '.join(names) or 'no sessions'}"
-            raise _keeper_refusal(
-                f"the keeper session did not appear within {wait:g} seconds; "
-                f"last tmux check: {last}")
+            detail = (f"the keeper session did not appear within {wait:g} seconds; "
+                      f"last tmux check: {last}")
+            raise _keeper_refusal(detail) if on_macos else TmuxServerError(detail)
         time.sleep(poll)
         names, fault = _probe_default_server()
 
@@ -439,7 +501,7 @@ def start(name: str, directory: str | None = None,
     `--kill`) greys on Deck's rail, which is correct — it has no agent — and its
     Start button then failed forever with "already exists". Deck swallows that
     message as an expected race, so the click reported nothing at all. Observed
-    on the `ask` session, 2026-07-24.
+    on the walled-off crew's own session, 2026-07-24.
 
     So the refusal is now on the agent, not on the session: an existing session
     with a live agent is refused, and one sitting at a bare shell has the command

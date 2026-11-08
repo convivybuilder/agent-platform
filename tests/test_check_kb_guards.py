@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import pathlib
 import subprocess
 import sys
 import textwrap
 
 import pytest
+
+import projects
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CHECK = REPO / "bin" / "check-kb-guards"
@@ -327,8 +330,24 @@ def test_the_failing_list_is_bounded(kb_guards):
 
 def _kb_keys(kb_guards, tmp_path, monkeypatch, *, day, breach):
     """Run main() with every repo's guard failing (breach) or passing; return the
-    dedup_keys it logged. The guard run itself is stubbed; _post_signal too."""
-    (tmp_path / "knowledge" / "projects").mkdir(parents=True, exist_ok=True)
+    dedup_keys it logged. The guard run itself is stubbed; _post_signal too.
+
+    The knowledge checkout is a real git repo with a committed, readable
+    `projects/` tree at `origin/main` — not a bare `mkdir` — so the directory
+    check (platform/decisions/0097 point 6) finds nothing to flag and this
+    test isolates the per-repo guard's own day scoping, which is what it
+    pins. Some callers reuse one `tmp_path` across several runs, so the repo
+    is only built once."""
+    repo = tmp_path / "knowledge"
+    if not (repo / ".git").is_dir():
+        _init_knowledge_repo(repo)
+        (repo / "projects").mkdir(parents=True, exist_ok=True)
+        (repo / "projects" / ".gitkeep").write_text("", encoding="utf-8")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "init")
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                             check=True, capture_output=True, text=True).stdout.strip()
+        _set_origin_main(repo, sha)
     monkeypatch.setattr(kb_guards, "_utc_today", lambda: day, raising=False)
     monkeypatch.setattr(kb_guards, "run_repo",
                         lambda repo, *a, **k: (not breach, "guard failed", "out", []))
@@ -361,3 +380,172 @@ def test_kb_guards_present_absent_present_logs_again_on_the_later_day(
     back = _kb_keys(kb_guards, tmp_path, monkeypatch, day="2030-01-03", breach=True)
     assert absent == []
     assert back and not set(back) & set(present)
+
+
+# --- the directory check: every projects/<name>/ names a registered project --
+# (platform/decisions/0097 point 6). Fixtures use synthetic project names only
+# (`alpha`, `beta`, `unregistered-zeta`) — never a registered crew or product.
+
+
+def _git(repo: pathlib.Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+
+
+def _init_knowledge_repo(repo: pathlib.Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "Test")
+
+
+def _commit_dirs(repo: pathlib.Path, names: list[str], message: str) -> str:
+    """Adds a placeholder file under `projects/<name>/` for each of `names`,
+    commits, and returns the new commit's full sha."""
+    for name in names:
+        d = repo / "projects" / name
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "doc.md").write_text("placeholder", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+    out = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                         check=True, capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def _set_origin_main(repo: pathlib.Path, sha: str) -> None:
+    _git(repo, "update-ref", "refs/remotes/origin/main", sha)
+
+
+def _registry_with_legal_projects(tmp_path: pathlib.Path, names: set[str]) -> pathlib.Path:
+    """A minimal registry whose `legal_kb_projects()` is exactly `names`: every
+    name goes in `_kb_legacy`, which `_legal_kb_projects_from_raw` unions in
+    directly, with no unit and no scope to also account for."""
+    raw = {"_kb_legacy": sorted(names), "_products": {}, "_scopes": {}}
+    path = tmp_path / "projects.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    return path
+
+
+def _use_registry(monkeypatch, path: pathlib.Path) -> None:
+    monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+    projects._load_raw.cache_clear()
+
+
+def test_an_unregistered_directory_logs_one_signal_naming_it_and_its_commit(
+        kb_guards, tmp_path, monkeypatch):
+    repo = tmp_path / "knowledge"
+    _init_knowledge_repo(repo)
+    _commit_dirs(repo, ["alpha", "beta"], "add alpha and beta")
+    zeta_sha = _commit_dirs(repo, ["unregistered-zeta"], "add unregistered-zeta")
+    _set_origin_main(repo, zeta_sha)
+    _use_registry(monkeypatch, _registry_with_legal_projects(tmp_path, {"alpha", "beta"}))
+
+    calls = []
+    monkeypatch.setattr(kb_guards, "_post_signal",
+                        lambda *a, **k: calls.append((a, k)) or {"status": "stub"})
+    result = kb_guards.check_project_directories(repo, "2030-01-01")
+
+    assert result == 1
+    assert len(calls) == 1
+    (_product, title, body, *_rest), kwargs = calls[0]
+    assert "unregistered-zeta" in title
+    assert zeta_sha in body
+    assert kwargs["dedup_key"] == "kb-guards:dir:unregistered-zeta:2030-01-01"
+
+
+def test_a_fully_registered_tree_logs_no_signal(kb_guards, tmp_path, monkeypatch):
+    repo = tmp_path / "knowledge"
+    _init_knowledge_repo(repo)
+    sha = _commit_dirs(repo, ["alpha", "beta"], "add alpha and beta")
+    _set_origin_main(repo, sha)
+    _use_registry(monkeypatch, _registry_with_legal_projects(tmp_path, {"alpha", "beta"}))
+
+    calls = []
+    monkeypatch.setattr(kb_guards, "_post_signal", lambda *a, **k: calls.append(1) or {"status": "stub"})
+    result = kb_guards.check_project_directories(repo, "2030-01-01")
+
+    assert result == 0
+    assert calls == []
+
+
+def test_a_directory_only_in_the_working_tree_logs_no_signal(kb_guards, tmp_path, monkeypatch):
+    """The check reads `origin/main`, not the working tree: a directory present
+    only on disk and never committed must not be flagged."""
+    repo = tmp_path / "knowledge"
+    _init_knowledge_repo(repo)
+    sha = _commit_dirs(repo, ["alpha"], "add alpha")
+    _set_origin_main(repo, sha)
+    (repo / "projects" / "unregistered-zeta").mkdir(parents=True)
+    _use_registry(monkeypatch, _registry_with_legal_projects(tmp_path, {"alpha"}))
+
+    calls = []
+    monkeypatch.setattr(kb_guards, "_post_signal", lambda *a, **k: calls.append(1) or {"status": "stub"})
+    result = kb_guards.check_project_directories(repo, "2030-01-01")
+
+    assert result == 0
+    assert calls == []
+
+
+def test_dir_added_commit_names_the_newest_add_not_a_superseded_one(kb_guards, tmp_path):
+    """A directory added, deleted, and re-added later must be blamed on the
+    re-adding commit — the add that produced what is on `origin/main` now —
+    not the superseded first add, which would send the steward to revert the
+    wrong commit."""
+    repo = tmp_path / "knowledge"
+    _init_knowledge_repo(repo)
+    _commit_dirs(repo, ["unregistered-zeta"], "add unregistered-zeta")
+    _git(repo, "rm", "-r", "-q", "projects/unregistered-zeta")
+    _git(repo, "commit", "-q", "-m", "remove unregistered-zeta")
+    readd_sha = _commit_dirs(repo, ["unregistered-zeta"], "re-add unregistered-zeta")
+    _set_origin_main(repo, readd_sha)
+
+    assert kb_guards.dir_added_commit(repo, "unregistered-zeta") == readd_sha
+
+
+def test_an_unreadable_registry_logs_one_breach_and_no_per_directory_signal(
+        kb_guards, tmp_path, monkeypatch):
+    repo = tmp_path / "knowledge"
+    _init_knowledge_repo(repo)
+    sha = _commit_dirs(repo, ["unregistered-zeta"], "add unregistered-zeta")
+    _set_origin_main(repo, sha)
+    _use_registry(monkeypatch, tmp_path / "no-such-registry.json")
+
+    calls = []
+    monkeypatch.setattr(kb_guards, "_post_signal", lambda *a, **k: calls.append(1) or {"status": "stub"})
+    result = kb_guards.check_project_directories(repo, "2030-01-01")
+
+    assert result == 1
+    assert len(calls) == 1
+
+
+def test_an_unreadable_origin_main_logs_one_breach_and_no_per_directory_signal(
+        kb_guards, tmp_path, monkeypatch):
+    """`git ls-tree` failing (no `origin/main` ref at all) must log one breach
+    naming the failure, never read as a knowledge tree with nothing
+    unregistered — the same shape `run_repo` gives an unwritten pytest report."""
+    repo = tmp_path / "knowledge"
+    _init_knowledge_repo(repo)  # no commits, so no origin/main ref exists
+    _use_registry(monkeypatch, _registry_with_legal_projects(tmp_path, {"alpha"}))
+
+    calls = []
+    monkeypatch.setattr(kb_guards, "_post_signal", lambda *a, **k: calls.append(1) or {"status": "stub"})
+    result = kb_guards.check_project_directories(repo, "2030-01-01")
+
+    assert result == 1
+    assert len(calls) == 1
+
+
+def test_cli_no_report_suppresses_the_directory_signal(kb_guards, tmp_path, monkeypatch):
+    repo = tmp_path / "knowledge"
+    _init_knowledge_repo(repo)
+    sha = _commit_dirs(repo, ["unregistered-zeta"], "add unregistered-zeta")
+    _set_origin_main(repo, sha)
+    _use_registry(monkeypatch, _registry_with_legal_projects(tmp_path, set()))
+
+    import signal_client
+    monkeypatch.setattr(
+        signal_client, "post_alert",
+        lambda *a, **k: pytest.fail("signal posted despite --no-report"))
+
+    rc = kb_guards.main(["--convivy-root", str(tmp_path), "--no-report"])
+    assert rc == 2  # the breach is still detected and counted; nothing is reported

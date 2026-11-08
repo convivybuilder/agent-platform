@@ -21,6 +21,7 @@ import pytest
 
 import agent_policy as AP
 import builder_root as BR
+import issue_client as IC
 import kb_merge as KM
 import review_protocol as RP
 
@@ -57,6 +58,17 @@ def _origin_is_github(agentctl, monkeypatch):
     monkeypatch.setattr(agentctl, "_kb_origin_is_github", lambda root: True)
 
 
+@pytest.fixture(autouse=True)
+def _legal_kb_projects(monkeypatch):
+    """Every other test in this file builds `Change`s and `krepo` files under
+    ad-hoc project names (`x`, `unrelated`) that name no row in the real
+    config/projects.json. Pinning a permissive set here keeps every one of
+    those paths admissible; the tests for the project-registry check itself
+    (below) narrow this set with their own
+    `monkeypatch.setattr(KM.projects, "legal_kb_projects", ...)`."""
+    monkeypatch.setattr(KM.projects, "legal_kb_projects", lambda: {"x", "unrelated", "platform"})
+
+
 def _policy_text(knowledge=True, instructions=True, rounds=5, code=None):
     """A policy file in the exact form `agent_policy.load` reads. `code` adds the
     `review_rounds_code` line; without it the file has none, and the code cap is 11."""
@@ -89,6 +101,14 @@ def _stamp(agent, run_id, commit=HEAD, verdict="APPROVE", pinned=None):
 
 def _commit(sha, message):
     return {"sha": sha, "commit": {"message": message}}
+
+
+def _admitted(head_sha):
+    """The Library's `POST /merge/admission` answer admitting a merge at
+    `head_sha` outright — `library-protocol` §6.7's shape, with nothing
+    `missing` and enforcement on."""
+    return {"approved": True, "reason": "", "head_sha": head_sha, "enforced": True,
+           "missing": []}
 
 
 def _facts(**over):
@@ -205,6 +225,42 @@ def test_a_pr_with_an_unread_policy_or_unread_files_refuses():
     assert why == ["the knowledge checkout could not be read: could not fetch (offline)"]
 
 
+# --- the project registry (platform/decisions/0097) ----------------------------
+
+
+def test_an_added_file_under_an_unregistered_project_directory_refuses(monkeypatch):
+    monkeypatch.setattr(KM.projects, "legal_kb_projects", lambda: {"x"})
+    why = KM.refusals(_facts(changes=[_change("projects/nope/new.md")]))
+    assert len(why) == 1
+    assert "projects/nope/new.md" in why[0]
+    assert "projects/nope/" in why[0] and "not a registered project" in why[0], why
+
+
+def test_an_added_file_under_a_registered_project_directory_is_not_refused(monkeypatch):
+    monkeypatch.setattr(KM.projects, "legal_kb_projects", lambda: {"x"})
+    assert KM.refusals(_facts(changes=[_change("projects/x/new.md")])) == []
+
+
+def test_an_unreadable_project_registry_refuses_naming_it(monkeypatch):
+    def boom():
+        raise FileNotFoundError("/no/such/config/projects.json")
+    monkeypatch.setattr(KM.projects, "legal_kb_projects", boom)
+    why = KM.refusals(_facts())
+    assert len(why) == 1
+    assert "the project registry could not be read" in why[0]
+    assert "/no/such/config/projects.json" in why[0], why
+
+
+def test_a_renames_destination_under_an_unregistered_directory_refuses_even_from_a_registered_source(
+        krepo, monkeypatch):
+    monkeypatch.setattr(KM.projects, "legal_kb_projects", lambda: {"x"})
+    why = KM.refusals(krepo.facts({"projects/x/moving.md": None,
+                                   "projects/nope/moving.md": krepo.BASE["projects/x/moving.md"]}))
+    assert any("projects/x/moving.md -> projects/nope/moving.md" in w
+               and "projects/nope/" in w and "not a registered project" in w
+               for w in why), why
+
+
 def test_a_branch_behind_main_refuses_naming_both_shas():
     """knowledge#699 (issue_01M3XNHABVJ4RZJPQAQ13A46DW): a PASS recorded against a
     stale main must not admit a branch that main has since moved past."""
@@ -243,11 +299,11 @@ def test_a_stamp_with_no_run_id_makes_the_round_count_unreadable():
 
 
 def test_an_internal_app_reviewer_counts_toward_its_role():
-    """The gate counts `platform-reviewer` as the reviewer role
+    """The gate counts `synthcrew-reviewer` as the reviewer role
     (review_protocol._review_base), so the round cap must too. Otherwise a PR
     reviewed under a prefixed name passes review-status with its rounds read as
     zero, and the cap never fires."""
-    six = [_stamp("platform-reviewer", f"run-0000000{i}") for i in range(1, 7)]
+    six = [_stamp("synthcrew-reviewer", f"run-0000000{i}") for i in range(1, 7)]
     why = KM.refusals(_facts(stamps=six + [_stamp("security-reviewer", "run-000000aa")]))
     assert len(why) == 1 and "reviewer ran 6 rounds" in why[0], why
 
@@ -278,7 +334,7 @@ def test_merge_after_lines_are_parsed_exactly():
 
 
 def test_every_failing_condition_is_reported_not_just_the_first():
-    why = KM.refusals(_facts(repo="convivy/vivy", head_ref="main", review_ok=False))
+    why = KM.refusals(_facts(repo="convivy/widget", head_ref="main", review_ok=False))
     assert len(why) == 3
 
 
@@ -1135,7 +1191,8 @@ def kb(krepo, agentctl, monkeypatch, library_identity):
 
 
 def _wire(agentctl, monkeypatch, kb, *, head, gate_head=None, gate_ok=True, gate_reasons=(),
-          stamps=None, messages=(f"docs: x\n\n{TRAILER}\n",), dry_run=True, author=BOT):
+          stamps=None, messages=(f"docs: x\n\n{TRAILER}\n",), dry_run=True, author=BOT,
+          admission=None, check_wait=1800.0):
     """Drive `cmd_kb_merge` against canned GitHub reads and the real git of `kb`.
     `head` is what this command's OWN first read of the PR returns for
     headRefOid (used for the author/commits/companions reads); `gate_head`
@@ -1146,7 +1203,13 @@ def _wire(agentctl, monkeypatch, kb, *, head, gate_head=None, gate_ok=True, gate
     is stubbed directly rather than its own GitHub reads, since CI/draft/
     mergeability are not this command's concern and every real caller of it
     is exercised by review-status's own test file. Returns the exit code and
-    the ordered calls to the review decision: `(pr, repo, required)` each."""
+    the ordered calls to the review decision: `(pr, repo, required)` each.
+
+    `admission`, when given, replaces the default auto-approving stub for
+    `issue_client.check_merge_admission`. On `dry_run` (the default) nothing
+    may call it at all — a merge is never attempted, so asking the Library
+    for admission to make one would be reaching for a merge this run never
+    makes."""
     import argparse
     gate_head = head if gate_head is None else gate_head
     if stamps is None:
@@ -1181,12 +1244,20 @@ def _wire(agentctl, monkeypatch, kb, *, head, gate_head=None, gate_ok=True, gate
     def never_merge(*a, **k):
         raise AssertionError("merge_pr reached")
 
+    def never_admit(*a, **k):
+        raise AssertionError("check_merge_admission reached")
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        return _admitted(head_sha_)
+
     monkeypatch.setattr(agentctl, "_gh_pr_json", fake_pr_json)
     monkeypatch.setattr(agentctl.subprocess, "run", fake_run)
     monkeypatch.setattr(agentctl, "_review_status_decision", fake_review)
+    monkeypatch.setattr(IC, "check_merge_admission",
+                        never_admit if dry_run else (admission or fake_admission))
     if dry_run:
         monkeypatch.setattr(KM, "merge_pr", never_merge)
-    args = argparse.Namespace(pr=7, repo=None, dry_run=dry_run, check_wait=1800.0)
+    args = argparse.Namespace(pr=7, repo=None, dry_run=dry_run, check_wait=check_wait)
     return agentctl.cmd_kb_merge(args), calls
 
 
@@ -1259,6 +1330,457 @@ def test_the_command_mints_its_token_for_the_installation_it_derived(
     assert rc == 0, capsys.readouterr()
     assert calls == [("derive", "jwt.x.y"), ("mint", "jwt.x.y", "161212648"),
                      ("merge", 7, kb.head, "ghs_scoped")]
+
+
+# --- the Library's own merge/admission gate (CQ·534, library-protocol §6.7) -------
+#
+# `agentctl kb merge` asks `POST /merge/admission` once its own gate has
+# passed, and obeys the answer — these pin that the ask carries the exact
+# commit about to be merged, that a refusal or an unreachable Library
+# refuses the merge rather than falling back to this command's own gate
+# alone, and that the ask never happens before this command's own gate has
+# already passed.
+
+
+def _stub_merge_token(monkeypatch):
+    """The merge-token mint `_wire`'s own tests reach once they merge for real
+    (`test_the_command_mints_its_token_for_the_installation_it_derived`'s own
+    stubs) — pulled out so each admission test that merges does not have to
+    repeat it."""
+    monkeypatch.setattr(KM, "key_problem", lambda *a, **k: None)
+    monkeypatch.setattr(KM, "app_jwt", lambda *a, **k: "jwt.x.y")
+    monkeypatch.setattr(KM, "knowledge_installation", lambda jwt, **k: "161212648")
+    monkeypatch.setattr(KM, "installation_token", lambda jwt, inst, **k: "ghs_scoped")
+
+
+def test_the_command_sends_the_pinned_head_repo_pr_and_requester_to_admission(
+        agentctl, monkeypatch, capsys, kb):
+    seen = {}
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        seen.update(repo=repo_, pr=pr_, head_sha=head_sha_, requester=requester_)
+        return _admitted(head_sha_)
+
+    _stub_merge_token(monkeypatch)
+    monkeypatch.setattr(KM, "merge_pr", lambda n, sha, tok, **k: (True, "merged as abc"))
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    assert rc == 0, capsys.readouterr()
+    assert seen == {"repo": "convivy/knowledge", "pr": 7, "head_sha": kb.head,
+                    "requester": "agentctl kb merge"}
+
+
+def test_an_admission_refusal_refuses_without_merging_and_names_reason_and_missing(
+        agentctl, monkeypatch, capsys, kb):
+    """A round cap exceeded never resolves itself by waiting, so `retryable:
+    false` here — unlike knowledge#1132's `check_pending` entries, covered
+    separately below."""
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        return {"approved": False, "reason": "security-reviewer round cap exceeded",
+               "head_sha": head_sha_, "enforced": True,
+               "missing": [{"kind": "stamp", "role": "security-reviewer", "workflow": None,
+                           "detail": "no APPROVE at this head", "retryable": False}]}
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "security-reviewer round cap exceeded" in err
+    assert "stamp" in err and "security-reviewer" in err and "no APPROVE at this head" in err
+
+
+def test_a_retryable_admission_refusal_polls_the_same_head_until_approved(
+        agentctl, monkeypatch, capsys, kb):
+    """knowledge#1132: the Library refused with a `check_pending`,
+    `retryable: true` entry for about two minutes because the rebuilt head
+    hadn't reported yet. A single `kb merge` must ride that out — re-asking
+    at the SAME head — rather than fail the run."""
+    attempt = {"n": 0}
+    heads_seen = []
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        attempt["n"] += 1
+        heads_seen.append(head_sha_)
+        if attempt["n"] == 1:
+            return {"approved": False, "reason": "checks still pending",
+                    "head_sha": head_sha_, "enforced": True,
+                    "missing": [{"kind": "check_pending", "role": None,
+                                "workflow": "validate", "detail": "no conclusion yet",
+                                "retryable": True}]}
+        return _admitted(head_sha_)
+
+    sleeps = []
+    monkeypatch.setattr(agentctl, "_kb_merge_admission_poll_sleep",
+                        lambda s: sleeps.append(s))
+    _stub_merge_token(monkeypatch)
+    monkeypatch.setattr(KM, "merge_pr", lambda n, sha, tok, **k: (True, "merged as abc"))
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    assert rc == 0, capsys.readouterr()
+    assert heads_seen == [kb.head, kb.head]
+    assert sleeps == [agentctl.KB_MERGE_ADMISSION_POLL_SECS]
+
+
+def test_an_unrebuilt_merge_mints_once(
+        agentctl, monkeypatch, capsys, kb):
+    """A merge with no rebuild never minted a token for a rebuild's push, so
+    the one mint made for the merge itself is the only one — whatever the
+    admission ask did or did not wait for."""
+    _stub_merge_token(monkeypatch)
+    mints = []
+    monkeypatch.setattr(KM, "installation_token",
+                        lambda jwt, inst, **k: mints.append((jwt, inst)) or "ghs_scoped")
+    merges = []
+    monkeypatch.setattr(KM, "merge_pr",
+                        lambda n, sha, tok, **k: merges.append((n, sha, tok))
+                        or (True, "merged as abc"))
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False)
+    assert rc == 0, capsys.readouterr()
+    assert len(mints) == 1
+    assert merges == [(7, kb.head, "ghs_scoped")]
+
+
+def test_a_mixed_missing_list_with_one_non_retryable_entry_refuses_immediately(
+        agentctl, monkeypatch, capsys, kb):
+    """One non-retryable entry alongside a retryable one must refuse on the
+    FIRST answer — the retryable entry never earns a retry it would need
+    every entry's agreement for."""
+    calls = []
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        calls.append(head_sha_)
+        return {"approved": False, "reason": "mixed refusal", "head_sha": head_sha_,
+                "enforced": True,
+                "missing": [
+                    {"kind": "check_pending", "role": None, "workflow": "validate",
+                     "detail": "no conclusion yet", "retryable": True},
+                    {"kind": "stamp", "role": "security-reviewer", "workflow": None,
+                     "detail": "no APPROVE at this head", "retryable": False},
+                ]}
+
+    sleeps = []
+    monkeypatch.setattr(agentctl, "_kb_merge_admission_poll_sleep",
+                        lambda s: sleeps.append(s))
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert len(calls) == 1
+    assert sleeps == []
+    assert "mixed refusal" in err
+
+
+def test_a_missing_entry_with_retryable_absent_refuses_immediately(
+        agentctl, monkeypatch, capsys, kb):
+    """A `missing` entry with no `retryable` key at all must read as
+    non-retryable — only `retryable: true` exactly earns a retry."""
+    calls = []
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        calls.append(head_sha_)
+        return {"approved": False, "reason": "unclear", "head_sha": head_sha_,
+                "enforced": True,
+                "missing": [{"kind": "check_pending", "role": None, "workflow": "validate",
+                            "detail": "no conclusion yet"}]}
+
+    sleeps = []
+    monkeypatch.setattr(agentctl, "_kb_merge_admission_poll_sleep",
+                        lambda s: sleeps.append(s))
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert len(calls) == 1
+    assert sleeps == []
+    assert "unclear" in err
+
+
+def test_a_retryable_refusal_past_check_wait_refuses_and_never_merges(
+        agentctl, monkeypatch, capsys, kb):
+    """A retryable refusal that never clears before `--check-wait` elapses
+    must still refuse — naming the last answer's reason and entries, plus a
+    note that a re-run may succeed once the head finishes reporting."""
+    calls = []
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        calls.append(head_sha_)
+        return {"approved": False, "reason": "checks still pending",
+                "head_sha": head_sha_, "enforced": True,
+                "missing": [{"kind": "check_pending", "role": None, "workflow": "validate",
+                            "detail": "no conclusion yet", "retryable": True}]}
+
+    times = iter([0.0, 10.0])
+    monkeypatch.setattr(agentctl.time, "monotonic", lambda: next(times))
+    sleeps = []
+    monkeypatch.setattr(agentctl, "_kb_merge_admission_poll_sleep",
+                        lambda s: sleeps.append(s))
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission, check_wait=5.0)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert len(calls) == 1
+    assert sleeps == []
+    assert "checks still pending" in err and "no conclusion yet" in err
+    assert "may still finish reporting" in err and "re-run kb merge" in err
+
+
+def test_an_error_on_a_later_retry_ask_exits_2_and_never_merges(
+        agentctl, monkeypatch, capsys, kb):
+    """A transport failure that surfaces only on the SECOND ask (after a
+    retryable first refusal) must still refuse with exit 2 — a retry loop
+    must never swallow `MergeAdmissionError` into another retry."""
+    attempt = {"n": 0}
+    calls = []
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        attempt["n"] += 1
+        calls.append(head_sha_)
+        if attempt["n"] == 1:
+            return {"approved": False, "reason": "checks still pending",
+                    "head_sha": head_sha_, "enforced": True,
+                    "missing": [{"kind": "check_pending", "role": None,
+                                "workflow": "validate", "detail": "no conclusion yet",
+                                "retryable": True}]}
+        raise IC.MergeAdmissionError("transport:TimeoutError", "timed out")
+
+    sleeps = []
+    monkeypatch.setattr(agentctl, "_kb_merge_admission_poll_sleep",
+                        lambda s: sleeps.append(s))
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert len(calls) == 2
+    assert calls[0] == calls[1] == kb.head
+    assert "timed out" in err
+    assert sleeps == [agentctl.KB_MERGE_ADMISSION_POLL_SECS]
+
+
+def test_a_truthy_non_boolean_approved_is_never_read_as_approval(
+        agentctl, monkeypatch, capsys, kb):
+    """`approved` must be exactly `True` to admit. The string `"false"` is
+    truthy in Python, so a prior `if not admission.get("approved")` reading
+    read it as approval; only an `is not True` check refuses it."""
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        return {"approved": "false", "reason": "malformed answer", "head_sha": head_sha_,
+               "enforced": True, "missing": []}
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "malformed answer" in err
+
+
+def test_the_library_being_unreachable_refuses_without_merging(
+        agentctl, monkeypatch, capsys, kb):
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        raise IC.MergeAdmissionError("transport:TimeoutError", "timed out")
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "could not ask the Library" in err and "timed out" in err
+
+
+def test_admission_is_never_asked_when_the_commands_own_gate_already_refused(
+        agentctl, monkeypatch, capsys, kb):
+    """A PR the existing gate refuses must never even reach the Library."""
+    def never_admit(*a, **k):
+        raise AssertionError("check_merge_admission reached")
+
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False, gate_ok=False,
+                 gate_reasons=["required CI is not green"], admission=never_admit)
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "required CI is not green" in out
+
+
+def test_enforcement_off_is_reported_but_approval_still_governs(
+        agentctl, monkeypatch, capsys, kb):
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        a = _admitted(head_sha_)
+        a["enforced"] = False
+        return a
+
+    _stub_merge_token(monkeypatch)
+    monkeypatch.setattr(KM, "merge_pr", lambda n, sha, tok, **k: (True, "merged as abc"))
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "enforcement off" in out
+
+
+def test_enforcement_off_still_refuses_an_unapproved_merge(
+        agentctl, monkeypatch, capsys, kb):
+    """`enforced: false` names what the Library is doing; it is never read as
+    permission to merge anyway when `approved` is false."""
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        return {"approved": False, "reason": "not admitted", "head_sha": head_sha_,
+               "enforced": False, "missing": []}
+
+    def never_merge(*a, **k):
+        raise AssertionError("merge_pr reached")
+
+    monkeypatch.setattr(KM, "merge_pr", never_merge)
+    rc, _ = _wire(agentctl, monkeypatch, kb, head=kb.head, dry_run=False,
+                 admission=fake_admission)
+    out, err = capsys.readouterr()
+    assert rc == 1
+    assert "enforcement off" in out
+    assert "not admitted" in err
+
+
+def test_after_a_rebuild_admission_is_asked_about_the_rebuilt_head_not_the_old_one(
+        agentctl, monkeypatch, capsys, kb):
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    seen = {}
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        return heads["current"], None
+
+    def fake_settle(repo_, pr_, sha_, **kw):
+        return None
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        seen["head_sha"] = head_sha_
+        return _admitted(head_sha_)
+
+    def fake_merge(n, sha, tok, **kw):
+        return True, f"merged as {sha[:12]}"
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=fake_settle, merge=fake_merge, admission=fake_admission)
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert seen["head_sha"] == heads["current"]
+    assert seen["head_sha"] != s
+
+
+def test_a_rebuilt_merge_whose_admission_approves_at_once_mints_twice(
+        agentctl, monkeypatch, capsys, kb):
+    """The rebuild mints its own token for its push (`_kb_merge_write_token`,
+    shared with the merge that follows). That token is spent on the push, so
+    the merge mints again unconditionally — even when admission approves on
+    the first ask and the admission loop never waits at all (round 3,
+    issue_01M6A3WEKKTJYX0KB2RP4HZ91M: round 2's fix re-minted only when the
+    admission wait outlasted the rebuild's token, missing that the rebuild's
+    OWN waits — head-catchup, required-checks — can outlast it just as well).
+    `merge_pr` must receive the second, not the rebuild's first."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    merged = []
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        return heads["current"], None
+
+    def fake_settle(repo_, pr_, sha_, **kw):
+        return None
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        return _admitted(head_sha_)
+
+    def fake_merge(n, sha, tok, **kw):
+        merged.append((n, sha, tok))
+        return True, f"merged as {sha[:12]}"
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=fake_settle, merge=fake_merge, admission=fake_admission)
+    mints = []
+    monkeypatch.setattr(KM, "installation_token",
+                        lambda jwt, inst, **k: mints.append((jwt, inst)) or f"ghs_{len(mints)}")
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert len(mints) == 2
+    assert merged == [(7, heads["current"], "ghs_2")]
+
+
+def test_a_rebuilt_merge_whose_admission_polls_also_mints_twice(
+        agentctl, monkeypatch, capsys, kb):
+    """The same as the no-wait case just above, but with a retryable
+    admission refusal (knowledge#1132) polled once first: the mint count is
+    unchanged at two, because the second mint is unconditional rather than
+    triggered by the wait."""
+    s = kb.head
+    kb.publish_main({"projects/unrelated/y.md": "a different document\n"})
+    heads = {"current": s}
+    merged = []
+
+    def fake_rebuild(repo_, pr_, facts_, config_, token_):
+        heads["current"] = _rebase_pr_onto_main(kb, facts_.head_sha)
+        return heads["current"], None
+
+    def fake_settle(repo_, pr_, sha_, **kw):
+        return None
+
+    attempt = {"n": 0}
+
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        attempt["n"] += 1
+        if attempt["n"] == 1:
+            return {"approved": False, "reason": "checks still pending",
+                    "head_sha": head_sha_, "enforced": True,
+                    "missing": [{"kind": "check_pending", "role": None,
+                                "workflow": "validate", "detail": "no conclusion yet",
+                                "retryable": True}]}
+        return _admitted(head_sha_)
+
+    def fake_merge(n, sha, tok, **kw):
+        merged.append((n, sha, tok))
+        return True, f"merged as {sha[:12]}"
+
+    args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
+                      settle=fake_settle, merge=fake_merge, admission=fake_admission)
+    monkeypatch.setattr(agentctl, "_kb_merge_admission_poll_sleep", lambda s: None)
+    mints = []
+    monkeypatch.setattr(KM, "installation_token",
+                        lambda jwt, inst, **k: mints.append((jwt, inst)) or f"ghs_{len(mints)}")
+    rc = agentctl.cmd_kb_merge(args)
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    assert len(mints) == 2
+    assert merged == [(7, heads["current"], "ghs_2")]
 
 
 def test_the_command_refuses_a_pr_another_account_opened(agentctl, monkeypatch, capsys, kb):
@@ -1852,13 +2374,15 @@ def test_kb_merge_await_head_catchup_refuses_at_once_on_a_genuine_third_sha(
 
 
 def _wire_full(agentctl, monkeypatch, kb, *, heads, dry_run=False, check_wait=1800.0,
-               head_wait=60.0, rebuild=None, settle=None, merge=None):
+               head_wait=60.0, rebuild=None, settle=None, merge=None, admission=None):
     """Wire `cmd_kb_merge` against LIVE reads of `kb`'s own PR head
     (`heads["current"]`) rather than `_wire`'s fixed canned ones: a rebuild
     genuinely moves the branch partway through the command, and the SECOND
     read must see where it landed. `rebuild`/`settle`/`merge` each default to
     a stub that fails the test if reached — a scenario that expects one of
-    them never to run says so by never overriding it."""
+    them never to run says so by never overriding it. `admission` defaults
+    to auto-approving `issue_client.check_merge_admission`, read against
+    `heads["current"]` at call time, so a rebuild that moves it is seen."""
     import argparse
 
     def fake_pr_json(pr, fields, repo=None):
@@ -1889,9 +2413,13 @@ def _wire_full(agentctl, monkeypatch, kb, *, heads, dry_run=False, check_wait=18
             raise AssertionError(f"{name} reached, but this scenario expects it not to be")
         return boom
 
+    def fake_admission(repo_, pr_, head_sha_, requester_, **kw):
+        return _admitted(head_sha_)
+
     monkeypatch.setattr(agentctl, "_gh_pr_json", fake_pr_json)
     monkeypatch.setattr(agentctl.subprocess, "run", fake_run)
     monkeypatch.setattr(agentctl, "_review_status_decision", fake_review)
+    monkeypatch.setattr(IC, "check_merge_admission", admission or fake_admission)
     monkeypatch.setattr(agentctl, "_kb_merge_rebuild",
                         rebuild or _unreached("_kb_merge_rebuild"))
     monkeypatch.setattr(agentctl, "_kb_merge_await_required_checks",
@@ -2147,8 +2675,15 @@ def test_the_command_asks_for_a_rerun_when_the_rebuilt_heads_checks_time_out(
             message=(f"kb-write-trailer still shows no recorded conclusion on "
                      f"{sha_[:12]} after {kw['timeout']:.0f}s"),
             retryable=True)
+    # `fake_rebuild` never moves `heads["current"]` to the rebuilt sha, so the
+    # REAL `_kb_merge_await_head_catchup` this drives through never sees it
+    # catch up either — it genuinely polls (real `time.sleep`) until
+    # `head_wait` runs out, which is the retryable branch this test actually
+    # exercises (`fake_settle` above is never reached). Both bounds are
+    # shrunk so that still happens in milliseconds, not 60s.
+    monkeypatch.setattr(agentctl, "KB_MERGE_HEAD_CATCHUP_POLL_SECS", 0.01)
     args = _wire_full(agentctl, monkeypatch, kb, heads=heads, rebuild=fake_rebuild,
-                      settle=fake_settle)
+                      settle=fake_settle, head_wait=0.05)
     rc = agentctl.cmd_kb_merge(args)
     err = capsys.readouterr().err
     assert rc == 1
@@ -2563,7 +3098,7 @@ def test_a_copied_approve_with_a_flipped_verdict_is_not_counted_and_the_command_
     out = capsys.readouterr().out
     assert "verdict" in out  # _authenticated_stamps named why the copy was dropped
 
-    def fake_pr_json(pr, fields, repo=None):
+    def fake_pr_json(pr, fields, repo=None, env=None):
         return view
 
     def fake_run(cmd, **kw):

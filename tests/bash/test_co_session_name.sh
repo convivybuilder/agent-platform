@@ -24,13 +24,13 @@ setup() { # -> echoes fake HOME
     local home d
     home=$(mktemp -d)
     mkdir -p "$home/stubbin"
-    for d in Convivy/library Convivy/agent-platform Convivy/convivy-orient \
-             Convivy/CFO; do
+    for d in Convivy/library Convivy/agent-platform Convivy/northwind-orient \
+             Convivy/LEDGER; do
         mkdir -p "$home/$d/.claude/agents"
         : > "$home/$d/.claude/agents/scout.md"
         ( cd "$home/$d" && git init -q . )
     done
-    mkdir -p "$home/Convivy/ask"          # deliberately not a repo
+    mkdir -p "$home/Convivy/parlor"       # deliberately not a repo
     cat > "$home/stubbin/claude" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$@" > "$CLAUDE_CALL_LOG"
@@ -46,15 +46,21 @@ EOF
 exit ${KX_STATUS:-0}
 EOF
     chmod +x "$home/stubbin/knowledge-ctx"
+    # A registry naming one synthetic walled-off crew (platform/decisions/0100),
+    # for the sections below exercising the session-name prefix the crew's own
+    # /newchat skill exports — unused by every other section, which reads the
+    # rich fixture via REGISTRY_OVERRIDE's own default.
+    write_walled_off_registry "$home/walled-registry.json" parlor Parlor parlor "#7b61ff" Parlor
     echo "$home"
 }
 
 # run_co_in <home> <dir> [env assignments...] -> sets CLAUDE_ARGS
 run_co_in() {
     local home=$1 rel=$2; shift 2
-    local call_log; call_log=$(mktemp)
+    local call_log registry; call_log=$(mktemp)
+    registry=${REGISTRY_OVERRIDE:-$REPO_ROOT/tests/fixtures/rich_registry.json}
     ( cd "$home/$rel" && HOME="$home" PATH="$home/stubbin:$PATH" \
-      CLAUDE_CALL_LOG="$call_log" "$@" /bin/zsh "$CO" --root-config "$(co_root_config "$home")" ${CO_EXTRA_ARGS:-} >/dev/null 2>&1 )
+      CLAUDE_CALL_LOG="$call_log" "$@" /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$registry")" ${CO_EXTRA_ARGS:-} >/dev/null 2>&1 )
     CLAUDE_ARGS=$(cat "$call_log")
     rm -f "$call_log"
 }
@@ -73,35 +79,65 @@ assert_name() { # <expected> <dir> <home>
 
 H=$(setup)
 
-assert_name "Bosun"   "Convivy/agent-platform" "$H"
-assert_name "Library" "Convivy/library"        "$H"
-assert_name "Orient"  "Convivy/convivy-orient" "$H"
-assert_name "CFO"     "Convivy/CFO"            "$H"
+assert_name "Bosun"   "Convivy/agent-platform"   "$H"
+assert_name "Library" "Convivy/library"          "$H"
+assert_name "Orient"  "Convivy/northwind-orient" "$H"
+assert_name "Ledger"  "Convivy/LEDGER"           "$H"
 
-# Ask with no topic: the bare crew name is all there is.
-assert_name "ask" "Convivy/ask" "$H"
+# The walled-off crew with no topic: its own co_label is all there is.
+REGISTRY_OVERRIDE="$H/walled-registry.json"
+assert_name "Parlor" "Convivy/parlor" "$H"
 
-# ASK IS THE ONE CASE A CREW NAME DOES NOT IDENTIFY. The eight crews get one row
-# each; ask gets one per topic, so four rows reading "ask" reproduces the very
-# problem this change fixes, one level down. /newchat already carries the topic
-# in the prefix it exports.
-run_co_in "$H" "Convivy/ask" env CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=ask-new-session-audio-setup
+# THE WALLED-OFF CREW IS THE ONE CASE A CREW NAME DOES NOT IDENTIFY A SESSION.
+# Every other crew gets one row each; this one gets one per topic, so four rows
+# reading the same bare name reproduces the very problem this change fixes, one
+# level down. Its own /newchat skill already carries the topic in the prefix it
+# exports.
+run_co_in "$H" "Convivy/parlor" env CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=parlor-new-session-audio-setup
 got=$(printf '%s\n' "$CLAUDE_ARGS" | grep -A1 -x -- '--name' | tail -1)
-assert_eq "Ask · audio setup" "$got" "an ask topic reaches the picker row"
+assert_eq "Parlor · audio setup" "$got" "a walled-off crew's own topic reaches the picker row"
 
 # A HOSTILE TOPIC IS DROPPED, NOT RENDERED. The label reaches tmux's status-left,
 # which is a FORMAT STRING — `#(cmd)` in one runs through /bin/sh whenever the
 # status line redraws with a client attached (verified against the live exploit;
 # a detached session never renders, so it is easy to "test" this and see
 # nothing). /newchat's instruction to slugify the topic is prose addressed to an
-# assistant, not a guard, and the ask surface reads Gmail, Drive and Slack into
-# the session that runs it — so the value can be shaped by someone else's content.
-run_co_in "$H" "Convivy/ask" env \
-    "CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=ask-new-session-x #(touch /tmp/co-injection-marker)"
+# assistant, not a guard, and this crew reads Gmail, Drive and Slack into the
+# session that runs it — so the value can be shaped by someone else's content.
+run_co_in "$H" "Convivy/parlor" env \
+    "CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=parlor-new-session-x #(touch /tmp/co-injection-marker)"
 got=$(printf '%s\n' "$CLAUDE_ARGS" | grep -A1 -x -- '--name' | tail -1)
-assert_eq "ask" "$got" "a topic that is not a plain slug is dropped entirely"
+assert_eq "Parlor" "$got" "a topic that is not a plain slug is dropped entirely"
 assert_eq "0" "$(printf '%s' "$CLAUDE_ARGS" | grep -c '#(' || true)" \
     "no tmux format sequence survives into the session name"
+unset REGISTRY_OVERRIDE
+
+# THE PREFIX ITSELF MUST PRODUCE TODAY'S EXACT VALUE for a unit whose co_style_id
+# is "ask" — the literal every launch of the walled-off crew exported before this
+# generalization, read back here from claude's own inherited environment (the co
+# shell exports it and never unsets it before the exec). Pinned independent of
+# the session-name assertions above, which exercise a differently-styled
+# synthetic unit, so the two concerns do not collide in one fixture.
+H2=$(setup)
+write_walled_off_registry "$H2/legacy-style-id-registry.json" parlor Parlor ask
+cat > "$H2/stubbin/claude" <<'EOF'
+#!/bin/bash
+printf '%s\n' "${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX-unset}" > "$CLAUDE_ENV_LOG"
+exit 0
+EOF
+chmod +x "$H2/stubbin/claude"
+env_log=$(mktemp)
+# Unset first: this variable is "set only when unset" (bin/co), so an ambient
+# value this very shell inherited (a remote-control session already running
+# one) would otherwise win over co's own export and silently pass this test
+# for the wrong reason.
+( cd "$H2/Convivy/parlor" && unset CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX && \
+  HOME="$H2" PATH="$H2/stubbin:$PATH" CLAUDE_ENV_LOG="$env_log" \
+  /bin/zsh "$CO" --root-config "$(co_root_config "$H2" "$H2/legacy-style-id-registry.json")" >/dev/null 2>&1 )
+assert_eq "ask-new-session" "$(cat "$env_log")" \
+    "a unit whose co_style_id is ask exports today's exact session-name prefix"
+rm -f "$env_log"
+rm -rf "$H2"
 
 # THE TWO PATHS THAT WERE ACTUALLY BROKEN, exercised end to end rather than
 # inferred from the source. Cookbook and the generic new-project tail call no
@@ -147,7 +183,7 @@ unset CO_EXTRA_ARGS
 # where repo_root is empty and so is the basename taken from it.
 call_log=$(mktemp)
 ( cd "$H" && HOME="$H" PATH="$H/stubbin:$PATH" \
-  CLAUDE_CALL_LOG="$call_log" KX_STATUS=42 /bin/zsh "$CO" --root-config "$(co_root_config "$H")" >/dev/null 2>&1 )
+  CLAUDE_CALL_LOG="$call_log" KX_STATUS=42 /bin/zsh "$CO" --root-config "$(co_root_config "$H" "$REPO_ROOT/tests/fixtures/rich_registry.json")" >/dev/null 2>&1 )
 argv=$(cat "$call_log")
 assert_eq "0" "$(printf '%s\n' "$argv" | grep -c -x -- '--name' || true)" \
     "no --name flag at all when the label would be empty"

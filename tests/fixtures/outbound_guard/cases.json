@@ -34,7 +34,7 @@
  {"expect": "ALLOW", "bash": "grep -rn 'application \"Messages\"' /srv/convivy"},
  {"expect": "ALLOW", "bash": "grep -n sendmail /etc/postfix/main.cf"},
  {"expect": "ALLOW", "bash": "notmuch search 'from:mailer-daemon'"},
- {"expect": "ALLOW", "bash": "osascript -e 'display notification \"done\" with title \"EA\"'"},
+ {"expect": "ALLOW", "bash": "osascript -e 'display notification \"done\" with title \"SATCHEL\"'"},
  {"expect": "ALLOW", "bash": "osascript -e 'tell application \"Calendar\" to get name of calendars'"},
  {"expect": "ALLOW", "bash": "osascript -e 'tell application \"Messages\" to get name of every chat'"},
  {"expect": "ALLOW", "bash": "curl -s 'https://gmail.googleapis.com/gmail/v1/users/me/messages?q=rodent'"},
@@ -46,7 +46,7 @@
  {"expect": "ALLOW", "bash": "cat {GUARD}"},
  {"expect": "ALLOW", "bash": "python3 {GUARD} < {FIX}/payload.json"},
  {"expect": "ALLOW", "bash": "mail"},
- {"expect": "ALLOW", "bash": "python3 /srv/convivy/EA/bin/sync-messages.py --help"},
+ {"expect": "ALLOW", "bash": "python3 /srv/convivy/SATCHEL/bin/sync-messages.py --help"},
  {"expect": "ALLOW", "bash": "ls 2>&1 | grep x > /tmp/out.txt"},
 
  {"expect": "BLOCK", "tool": "mcp__claude_ai_Google_Calendar__create_event", "input": {"summary": "x", "attendeeEmails": ["mike@example.com"]}},

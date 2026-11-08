@@ -4,10 +4,12 @@ Locks in: token resolution (env > file > None), the tee kill-switch, channel→
 product mapping, text extraction from Slack payloads, and the best-effort POST
 (never raises; skip without a token).
 """
+import hashlib
 import json
 
 import pytest
 
+import projects
 import signal_client as sc
 
 
@@ -28,14 +30,98 @@ def test_token_absent_is_none(tmp_path, monkeypatch):
 
 
 
-def test_product_for_channel():
-    assert sc.product_for_channel("vivy-explanations") == "vivy"
-    assert sc.product_for_channel("sous-chef-bugs") == "sous-chef"
-    assert sc.product_for_channel("selector-features") == "selector"
-    assert sc.product_for_channel("svc-changelog") == "convivy-app-kit"
+@pytest.fixture
+def temp_registry(tmp_path, monkeypatch):
+    """Point `projects` at a registry this test writes, so `product_for_channel`
+    is pinned against the general mechanism rather than today's real product
+    names (made-up units only — the real registry is config/projects.json's own
+    job to cover)."""
+    def _write(units: dict):
+        path = tmp_path / "projects.json"
+        path.write_text(json.dumps(units))
+        monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+        projects._load_raw.cache_clear()
+        return path
+    yield _write
+    projects._load_raw.cache_clear()
+
+
+def test_product_for_channel_reads_channel_prefixes_from_the_registry(temp_registry):
+    """No hardcoded prefix list of its own — `product_for_channel` matches each
+    registered unit's own `channel_prefixes`, and returns that unit's slug."""
+    temp_registry({
+        "acme": {"channel_prefixes": ["acme"]},
+        "globex": {"channel_prefixes": ["globex-suite"]},
+    })
+    assert sc.product_for_channel("acme-explanations") == "acme"
+    assert sc.product_for_channel("globex-suite-bugs") == "globex"
     assert sc.product_for_channel("cost") == "platform"
     assert sc.product_for_channel("alerts-code-health") == "platform"
     assert sc.product_for_channel("") == "platform"
+
+
+def test_product_for_channel_falls_through_on_an_absent_channel_prefixes_field(temp_registry):
+    """The conservative default: a unit with no `channel_prefixes` at all claims
+    no channel, same as `platform` for anything unmatched — adding a unit never
+    costs an existing channel its classification."""
+    temp_registry({"acme": {}})
+    assert sc.product_for_channel("acme-explanations") == "platform"
+
+
+# --- signal_product: the override that keeps a unit's product string stable ----
+#
+# A unit whose channel-matching slug would otherwise differ from a product
+# string a signal reader already stores sets this optional registry field
+# (`projects.signal_product`) to keep that history from splitting.
+
+
+def test_product_for_channel_returns_a_unit_s_signal_product_override(temp_registry):
+    """A unit that sets `signal_product` gets that string back, not its own
+    slug — the override this field exists for."""
+    temp_registry({
+        "acme": {"channel_prefixes": ["acme"], "signal_product": "acme-suite"},
+    })
+    assert sc.product_for_channel("acme-explanations") == "acme-suite"
+
+
+def test_product_for_channel_falls_back_to_the_slug_with_no_signal_product(temp_registry):
+    """A unit with `channel_prefixes` but no `signal_product` keeps the plain
+    slug it always returned."""
+    temp_registry({"acme": {"channel_prefixes": ["acme"]}})
+    assert sc.product_for_channel("acme-explanations") == "acme"
+
+
+def test_product_for_channel_refuses_a_non_string_signal_product(temp_registry):
+    """A malformed override is a registry bug to surface — `projects.
+    signal_product` raises, and `product_for_channel` does not catch it."""
+    temp_registry({"acme": {"channel_prefixes": ["acme"], "signal_product": 123}})
+    with pytest.raises(ValueError):
+        sc.product_for_channel("acme-explanations")
+
+
+@pytest.mark.rich_registry
+def test_product_for_channel_matches_every_registered_prefix_in_the_rich_registry():
+    """Over the rich test registry's own fixed set of `channel_prefixes`
+    rows — every unit that defines one resolves a `<prefix>example` channel
+    to its own `signal_product` override when it sets one, else its own
+    slug, so a fixture edit that drops or renames either is caught here
+    rather than only by a drift in the signal store downstream."""
+    resolved = set()
+    for slug, unit in projects.load().items():
+        prefixes = unit.get("channel_prefixes")
+        if not prefixes:
+            continue
+        expected = unit.get("signal_product") or slug
+        for prefix in prefixes:
+            assert sc.product_for_channel(f"{prefix}example") == expected
+        resolved.add(expected)
+    # Pins this install's resolved product SET — a count and a hash of the
+    # sorted values, not the values themselves — so this assertion cannot
+    # name a crew directly while still catching any registry edit that
+    # changes which products channel labels resolve to.
+    digest = hashlib.sha256("\n".join(sorted(resolved)).encode()).hexdigest()
+    assert (len(resolved), digest) == (
+        6, "c037437f42a866460146b4d7968ea393e11b04ccb487e692ee5c0c48b075b19d")
 
 
 def test_extract_text_top_level():
@@ -459,7 +545,7 @@ def test_a_429_then_success_logs_the_alert(monkeypatch, tmp_path):
     monkeypatch.setenv(sc.TOKEN_ENV, "env-secret")
     monkeypatch.setattr(sc, "TOKEN_FILE", tmp_path / "missing")
     calls = _sequence(monkeypatch, [("error:429", "1"), "created"])
-    result = sc.post_alert("primary-mutation", "body", product="vivy", dedup_key="k",
+    result = sc.post_alert("primary-mutation", "body", product="acme", dedup_key="k",
                            sleep=lambda s: None)
     assert result == "created"
     assert len(calls) == 2
@@ -475,7 +561,7 @@ def test_an_alert_makes_three_attempts_and_waits_at_most_four_and_a_half_seconds
     monkeypatch.setattr(sc.random, "uniform", lambda a, b: b)
     calls = _sequence(monkeypatch, ["error:TimeoutError"] * 3)
     slept = []
-    result = sc.post_alert("primary-mutation", "body", product="vivy", dedup_key="k",
+    result = sc.post_alert("primary-mutation", "body", product="acme", dedup_key="k",
                            timeout=5, sleep=slept.append)
     assert result == "error:TimeoutError"
     assert len(calls) == 3

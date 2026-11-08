@@ -262,7 +262,14 @@ def _stub_exec(calls):
     return lambda py, argv: calls.append((py, argv))
 
 
-def test_a_second_ensure_with_the_marker_set_exits_1_without_exec(tmp_path, monkeypatch):
+def test_a_second_ensure_with_the_marker_set_exits_1_without_exec(tmp_path, monkeypatch, home):
+    # The exit path below builds `lacking` from EVERY candidate, not just the
+    # first that serves — including the real user's venv (`_passwd_home`/
+    # `HOME`) unless repointed here, the same leak
+    # `test_a_child_after_a_satisfied_bootstrap_does_not_see_the_marker` guards
+    # against for the re-exec path.
+    monkeypatch.setattr(VB, "_passwd_home", lambda: None)
+    monkeypatch.setenv("HOME", str(home))
     v = _make_venv(tmp_path / "deploy" / "venv")
     script = _script(tmp_path / "deploy" / "bin" / "cmd")
     (tmp_path / "deploy" / "DEPLOYED_COMMIT").write_text("commit: x\n")
@@ -427,7 +434,12 @@ def test_optional_execs_into_the_first_serving_venv(tmp_path, monkeypatch):
     monkeypatch.delenv(VB.MARKER)
 
 
-def test_optional_returns_quietly_when_no_venv_serves(tmp_path, monkeypatch):
+def test_optional_returns_quietly_when_no_venv_serves(tmp_path, monkeypatch, home):
+    # No venv exists under `tmp_path`, so `find_venv` falls through every
+    # candidate — including the real user's venv (`_passwd_home`/`HOME`)
+    # unless repointed here (same leak as the test above).
+    monkeypatch.setattr(VB, "_passwd_home", lambda: None)
+    monkeypatch.setenv("HOME", str(home))
     script = _script(tmp_path / "worktree" / "bin" / "cmd")
     monkeypatch.delenv(VB.MARKER, raising=False)
     calls = []

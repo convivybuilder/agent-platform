@@ -31,6 +31,10 @@ import operator_config
 # default. See `config/operator.example.json` for the key's shape.
 OPERATOR_MARKER = operator_config.get("operator_marker")
 ROSTER_CREW = operator_config.get("roster_crew")
+# Unlike ROSTER_CREW, not every install has an apps crew — a missing key
+# means this install has none, never a reason to fail the import. `None`
+# here is why ALLOWED_CREWS below only adds this when it's a non-empty string.
+APPS_CREW = operator_config.get_optional("apps_crew")
 
 ALLOWED_KINDS = {
     "agent",
@@ -82,141 +86,70 @@ ALLOWED_KINDS = {
     # with knowledge scripts/validate.py.
     "build-plan",
 }
-# `shared`, `convivy`, `utility` and `engineering` are GONE (ARCH-438), and their
-# absence is the end of Phase 0 step 5. Step 5 re-filed every document out of them;
-# PR G could not delete them because two still held a live dispatch profile; H1
-# relocated those and H2 re-pointed the workspace mappings. The paired knowledge PR
-# deletes the directories, so nothing can be filed there.
+
+
+def _legal_projects() -> frozenset[str]:
+    """Every KB project slug a validator must admit (platform/decisions/0097):
+    `projects.legal_kb_projects()` — `kb_slugs()` (every central/split unit's
+    own `kb_project`) union `scopes()` (the non-project scopes: `company`,
+    `platform`, `commercial`, `engineering-practice`) union `_kb_legacy`
+    (the project registry) — slugs that still carry documents but name no
+    unit's own `kb_project`.
+
+    `projects` is imported here, not at module top, for the same reason
+    `private_crew_names()` imports it lazily: importing this module must never
+    fail for want of it. An empty frozenset comes back when the registry
+    cannot be read, so every project name is then refused by `_name_refusal`
+    with the "could not be read" reason — a closed catalogue, the same failure
+    mode `private_crew_names` documents."""
+    try:
+        import projects  # noqa: PLC0415
+        return frozenset(projects.legal_kb_projects())
+    except Exception:
+        return frozenset()
+
+
+def _current_allowed_projects() -> frozenset[str]:
+    """The legal project set as read RIGHT NOW, not the set this module saw at
+    import. `_name_refusal` and `project_catalogue` call this rather than
+    `ALLOWED_PROJECTS` so a crew `agentctl crew register`/`crew create`
+    registers in THIS process — `crew create` runs the doctor's KB-slug check
+    straight after registering, in the same process — is admitted without a
+    restart, and so a long-running reader (`bin/knowledge-watcher`,
+    `bin/mcp-kb-server`) picks up a newly registered project on its next call
+    rather than needing one.
+
+    Reads through `projects.legal_kb_projects_live()`, which sees a change to
+    the project registry on the very next call with nothing to clear —
+    never `legal_kb_projects()`'s cached path, which the two daemons above
+    never clear, and never `ALLOWED_PROJECTS`, the set captured at import. An
+    empty frozenset on a failed read is returned AS
+    IS, never patched up with `ALLOWED_PROJECTS`: platform/decisions/0097,
+    point 2, refuses a name outside the registry's set whether or not the
+    registry is readable, and an unreadable registry at import already gives
+    an empty set that refuses every name the same way (reviewer +
+    security-reviewer, PR #978 round 1 — the import-time fallback this
+    replaced admitted an already-known name through an outage that this
+    module's own import-time behaviour would have refused)."""
+    try:
+        import projects  # noqa: PLC0415
+        return frozenset(projects.legal_kb_projects_live())
+    except Exception:
+        return frozenset()
+
+
+# THE IMPORT-TIME BASELINE. Nothing in this module treats it as current:
+# `_name_refusal` and `project_catalogue` call `_current_allowed_projects()`,
+# not this name, so a project the registry names AFTER this module's own
+# import — in the same process or in a long-running one — is admitted on the
+# next call rather than the next restart (platform/decisions/0097, point 2;
+# the gap this closes is recorded there as the crew-create doctor misreading
+# its own crew).
 #
-# `engineering-practice` is a DIFFERENT scope and stays. It is cross-PRODUCT
-# engineering idiom; `engineering` was a bucket whose 13 documents all moved out.
-# The two were never spelled the same for exactly this moment.
-ALLOWED_PROJECTS = {"constance",
-                    # the constance.team landing page's own project (2026-08-25).
-                    # Separate from `constance` so its narrow dispatch profile is
-                    # the DEFAULT for that repo rather than an opt-in — an agent
-                    # writing public marketing copy must not carry Constance's
-                    # company/commercial reference material. Registered here in
-                    # the same breath as the KB validator: a project the
-                    # validator accepts and the indexer rejects produces
-                    # documents that merge green and never index.
-                    "constance-landing",
-                    "vivy", "sous-chef", "agent-platform",
-                    # the personal-apps suite + its platform (KB unification, ARCH-355):
-                    "hollis", "selector", "convivy-app-kit", "convivy-services",
-                    # non-product project with a team-plane KB slice (ARCH-358):
-                    "nyh-studio",
-                    # placard (2026-09-05): property instruction pages reached by a
-                    # QR code posted at the property. Registered here in the same
-                    # breath as knowledge/scripts/validate.py, for the reason the
-                    # constance-landing note above gives — the bead merged green
-                    # against the validator and then never indexed, because this
-                    # copy still rejected it.
-                    "placard",
-                    # shipwright (2026-09-06, the operator; knowledge#356): the crew that
-                    # works Convivy Builder. A slug of its own, for its runbooks
-                    # and its dispatch profile — distinct from which product's
-                    # BEAD it writes, which is the Builder's. Mirrored here the
-                    # same evening the validator gained it, so the profile and
-                    # the first runbook index instead of repeating placard's gap.
-                    "shipwright",
-                    # signals (2026-09-16): the Signals crew, an open internal
-                    # product writing derived signal to the Archives. Registered
-                    # with the knowledge validator and its daytime profile.
-                    "signals",
-                    # www (2026-09-12): convivy/www, the public site, Orient's
-                    # repo with a narrow project of its own, for the reason the
-                    # constance-landing note above gives: a worker writing public
-                    # site copy must not carry company or commercial reference
-                    # material (security-reviewer, agent-platform#552).
-                    # Registered here with the validator, so its profile indexes.
-                    "www",
-                    # vivy-landing (2026-10-02, orchestrator ruling): the OwnerRez
-                    # partner-page repo's narrow project, for the reason the
-                    # constance-landing note above gives. Registered here with the
-                    # validator, so its profile indexes.
-                    "vivy-landing",
-                    # the laptop GUI client for the fleet (ARCH-374):
-                    "deck",
-                    # the public writing guide (ARCH-440). Minted when write-better
-                    # split off `platform/daytime` and needed a directory to hold its
-                    # own profile. It owns no KB document yet — registered now so the
-                    # first one authored is INDEXED rather than silently rejected,
-                    # which is this set's failure mode when it lags.
-                    "write-better",
-                    # the Keel's own projects (ARCH-426). The Keel is FOUR projects —
-                    # these three plus `agent-platform`, already listed above because it
-                    # was a project before ARCH-426. They carry the platform documents
-                    # filed under `shared` today, which re-file onto them in step 5.
-                    #
-                    # Naming one destination, because a guard now depends on it: the 29
-                    # AGENT PROFILES go to `agent-platform`, whose agentctl dispatches
-                    # them and whose name the Library's roster must carry.
-                    # `kb_writes.PR_ONLY_SEGMENTS` guards that path, so a reader who
-                    # concluded from here that the profiles were headed for `substrate`
-                    # would be reading a contradiction (reviewer, PR #341).
-                    #
-                    # The "~85" figure this comment used to carry was wrong and is
-                    # dropped: about 15 of the `shared` skills are cross-PRODUCT
-                    # engineering practice bound for `engineering-practice`, and the
-                    # overview, brand and legal documents are company-altitude.
-                    "substrate", "knowledge", "convivy-orient",
-                    # `keel` is the project those first two folded INTO on 2026-08-06,
-                    # when the steward was retired. It owns no KB document yet and is
-                    # registered ahead of one for the reason `write-better` was: the
-                    # first document authored under it — the Keel's bead — must INDEX
-                    # rather than be silently rejected.
-                    #
-                    # `substrate` and `knowledge` STAY, deliberately, though neither is
-                    # a registry project any more. The KB document migration is a
-                    # separate epic, so documents still sit under both slugs; dropping
-                    # them here would un-index those documents rather than move them.
-                    # `test_kb_slugs_are_registered_projects` asserts
-                    # `kb_slugs() - ALLOWED_PROJECTS` is empty — a subset check in one
-                    # direction — so a slug with no registry entry is legal here and an
-                    # unregistered PROJECT is what it actually catches.
-                    "keel",
-                    # The Library's own KB slice, from the 2026-08-17 crew split
-                    # (the operator). The Keel's two halves each took a crew, and the Library
-                    # writes its documents under its own slug from that point. `keel`
-                    # STAYS above for the same reason `substrate` and `knowledge` do:
-                    # documents already filed there keep validating, and moving them
-                    # is a re-filing pass rather than a side effect of a rename.
-                    # `bosun` needs no entry — it keeps `agent-platform` as its slice,
-                    # so its documents never move. `steward` writes to `platform`,
-                    # already legal below as a scope.
-                    "library",
-                    # one project over the app kit + the backend commercial server
-                    # (ARCH-426 amendment); `convivy-app-kit` and `convivy-services`
-                    # stay legal until those docs re-file onto `svc`.
-                    "svc",
-                    # archy (2026-10-02, the operator via the steward): the small-business
-                    # agentic ops product, installed by a specialist. Client data
-                    # never enters it, per its bead. Registered here in the same
-                    # breath as config/projects.json, for the reason the
-                    # constance-landing note above gives.
-                    "archy",
-                    # The NON-PROJECT scopes (ARCH-426 amendments). The Library's scope
-                    # set is Project union these, ONE VOCABULARY VALID IN ALL THREE
-                    # VAULTS — a Reference Room document may legitimately be scoped
-                    # `platform`, the way an Archives signal may be scoped `company`.
-                    # `company` supersedes `convivy`, which stays legal until the
-                    # step-5 re-filing pass moves its 17 documents.
-                    # `engineering-practice` is cross-PRODUCT engineering idiom that
-                    # binds every product and belongs to no project (operator 2026-07-31);
-                    # it is NOT spelled `engineering`, a live slug whose documents all
-                    # move out under the same pass.
-                    "company", "platform", "commercial", "engineering-practice"}
-# This literal is the BASELINE, not the whole set. `project_catalogue` adds every
-# `projects/<name>/` directory the knowledge repo being validated actually holds,
-# so a project Convivy has never heard of (an adopter's) validates and indexes
-# without a row here. The baseline stays for two reasons: every project below keeps
-# validating when its directory is absent from a tree, and
-# `check-registration.py` (the new-crew skill) reads this literal.
-#
-# The knowledge repo's scripts/validate.py still carries its own closed copy and
-# gates PRs with it, so a new project's first PR fails THERE until the Library
-# changes that script. The indexer no longer needs the matching edit.
+# `bin/agentctl`'s readiness probe (`hasattr(K, "ALLOWED_PROJECTS")`) and the
+# tests that compare against a known baseline are the remaining readers of the
+# name itself.
+ALLOWED_PROJECTS = _legal_projects()
 ALLOWED_STATUSES = {"draft", "current", "deprecated", "archived"}
 # Per-doc publish surface (ARCH-289). Absent = internal (fail-closed): a doc reaches
 # the public Convivy Lab projection only with an explicit `visibility: public`.
@@ -225,162 +158,36 @@ ALLOWED_VISIBILITY = {"public", "team", "internal"}
 # The audience roster is the Library's, served at GET /roster. Admission reads it
 # through audience_roster() below, never from this literal.
 #
-# This literal is the loader's input and nothing else. `library/load_crew_registry.py`
-# reads it with ast.literal_eval to seed `roster_agents` when that table is empty
-# (`--reseed` overwrites a populated one). Keep it in step with the Library's roster
-# so a fresh seed produces the same names. Agent roster per ARCH-012/017
-# (+ ARCH-049 product-manager) + the operator marker (human in the loop per ARCH-020).
+# This literal is the FRESH-INSTALL SEED for the Library's roster and nothing else:
+# `library/load_crew_registry.py roster <path>` reads it with ast.literal_eval to
+# populate `roster_agents` once, when that table is empty, and Shipwright's
+# jobs/library.toml runs that loader on a fresh install. A crew's own agents reach
+# the live roster afterward through PUT /roster/{name}, never by editing this file.
 ALLOWED_AUDIENCE = {
-    # Retired from dispatch (issue_01M2GDVPR81Z0X991Z7XD3VR0M, the operator's 2026-09-14
-    # ruling): the overnight drain, knowledge-scribe and kb-sync-verifier (step
-    # 5), and — per the same epic's comment 2661, also 2026-09-14 — the three
-    # overnight stage agents overnight-triage / overnight-fix-drain /
-    # overnight-verify. Every dispatcher is deleted: `bin/agentctl`'s
-    # `scribe`/`full-monty` command families for the first four,
-    # `bin/launch-overnight` (agent-platform#578, merged as adff106) for the
-    # stage agents. The names stay here anyway: 100 documents on knowledge/main
-    # under `projects/` (74 of them decision records) name one of the first
-    # four in `audience`, and 7 more name one of the stage agents, recording
-    # history that predates each removal, and the Library will not rewrite
-    # that frontmatter. Revoking a name in the Library's roster fails validation
-    # for every document still carrying it, within ROSTER_TTL_S of the change.
-    # Same rule this file already applies to `telemetry.py`'s VALID_ORIGINS:
-    # remove producers of new data, keep readers of the old.
-    "overnight-orchestrator",
-    "hollis-overnight-orchestrator",
-    "knowledge-scribe",
-    "kb-sync-verifier",
-    "overnight-triage",
-    "overnight-fix-drain",
-    "overnight-verify",
+    # Builder's four starter agents, shipped at
+    # payload/knowledge-seed/projects/platform/agents in convivy/shipwright, and
+    # named in payload/knowledge-seed/projects/platform/profiles/default.yaml's
+    # `audience_contains` list.
     "planning-orchestrator",
-    "planner",
-    "architect",
     "coder",
-    "refactorer",
     "reviewer",
-    "test-writer",
-    "bug-investigator",
-    "bug-fixer",
-    "design-critic",
-    "product-analyst",
-    "explainer",
-    "curator",
-    "observability-scribe",
     "security-reviewer",
-    "security-auditor",
-    "product-manager",
-    # company commercial team (ARCH-124) — company-level positioning + presentation
-    "positioning-strategist",
-    "commercial-writer",
-    # platform build crew (substrate ARCH-099) — tuned for agent-platform code
-    "platform-architect",
-    "platform-planner",
-    "platform-coder",
-    # THE PRODUCT CREWS. Every name below is dispatched against a self-contained
-    # product repo, and they are listed together because the reason they were
-    # separated is expiring: the content move (issue_01M092R482KSQHKKVG4XJ8X257)
-    # puts each crew's definitions in the Reference Room, on the operator's directive that
-    # all materials for all agents live there. Once a crew's documents are
-    # indexed, this roster is what lets the indexer accept them.
-    #
-    # Registering a name in the Library's roster does NOT index anything. It permits
-    # an `audience` value; the document still has to exist and land by PR. So
-    # rostering the whole set ahead of the migration is safe, and it is the order that avoids
-    # the failure described under `orient-coder` below — a document merging with
-    # green CI and never indexing, because the gate lives in this file and the
-    # copy a knowledge-repo reviewer can see only warns.
-    #
-    # deck (ARCH-382 [J6]) was the first product-prefixed crew registered here.
-    # `deck-coder` was missing while its two siblings were present, which is the
-    # same half-registration shape, caught before it mattered because the crew is
-    # not indexed yet.
-    "deck-coder",
-    "deck-reviewer",
-    "deck-security-reviewer",
-    # hollis (ARCH-243/177).
-    "hollis-architect",
-    "hollis-coder",
-    "hollis-planner",
-    "hollis-reviewer",
-    "hollis-security-reviewer",
-    # selector (ARCH-243/177). Carries a design critic its siblings do not.
-    "sel-architect",
-    "sel-coder",
-    "sel-design-critic",
-    "sel-planner",
-    "sel-reviewer",
-    "sel-security-reviewer",
-    # THE `svc-*` NAMES ARE SHARED BY TWO REPOS AND THE DEFINITIONS ARE NOT THE
-    # SAME. convivy-app-kit and convivy-services each carry all five, and the
-    # files differ substantively — the kit's non-dependency fence against the
-    # services' two-plane cost fence and no-persist rules, not a substituted repo
-    # name. They stay distinct through `project:`, since a document id is
-    # `<project>/agents/<name>` and a profile include can filter on project. This
-    # roster is a permit list of NAMES, so one entry per name is correct here and
-    # is not a merge of the two crews.
-    "svc-architect",
-    "svc-coder",
-    "svc-planner",
-    "svc-reviewer",
-    "svc-security-reviewer",
-    # substrate's read-only search lane (project: platform).
+    # shadow-reviewer is a literal in bin/agentctl's own dispatch logic
+    # (`_SHADOW_REVIEW_AGENTS`, `_is_review_agent`), not only a crew's roster
+    # entry, so the engine recognizes it on a fresh install before any crew
+    # defines it.
+    "shadow-reviewer",
+    # scout is a literal in lib/agent-platform/tool_policy.py's
+    # `ENFORCEABLE_AGENTS`, the same engine-level recognition shadow-reviewer
+    # gets above: the tool-policy enforcement an agent named "scout" receives
+    # does not wait on a crew's roster entry.
     "scout",
-    # write-better's prose crew (project: write-better). All FOUR have no KB
-    # source and are untracked AND gitignored in their repo, so the Reference Room
-    # is about to become their first durable home rather than a second copy.
-    #
-    # `wb-reviewer` is prefixed and the other three are not, because only it
-    # collides. The repo calls it `reviewer`, and it is NOT the shared `reviewer`:
-    # it checks the writing guide's internal consistency and carries only
-    # Read/Grep/Glob, where the shared one reviews code diffs and posts review
-    # stamps. They share a filename and nothing else, which is exactly why the
-    # first pass at this migration skipped it as already-sourced. Ten-plus
-    # profiles select `kind: agent` with `audience_contains: [reviewer]` and no
-    # project filter, so a second document answering to `reviewer` would match all
-    # of them and render to the same `reviewer.md` — whichever won would be
-    # arbitrary and silent.
-    "editor",
-    "instructional-designer",
-    "rhetorician",
-    "wb-reviewer",
-    # convivy-orient's crew. Registered here rather than self-contained, because
-    # unlike deck/hollis/selector this crew's agents live in the SHARED index
-    # (`project: convivy-orient`), so the indexer must accept the audience value
-    # or the document never lands and the agent cannot be dispatched at all.
-    #
-    # THE ROSTER IS READ FROM THE LIBRARY PER DECISION, NOT FROM THIS SET. A roster
-    # change reaches the next decision within ROSTER_TTL_S seconds, with nothing
-    # restarted (see audience_roster). Before this, the long-running watcher gated
-    # on a copy taken at import: an addition dropped documents until a restart, and
-    # a revocation kept admitting them. While the Library cannot be read, a document
-    # whose only undecided check is its audience or its binds_agents is deferred, not
-    # refused: its row is kept as it was, and the first scan or event that reaches
-    # the Library decides it. A document with any other refusal is refused as before.
-    #
-    # THIS ROSTER IS THE GATE, and it failed closed and silent on 2026-08-18.
-    # `orient-coder` merged to knowledge/main, knowledge CI passed, and the
-    # document never indexed — because the knowledge repo's own validator makes
-    # this a WARNING (`scripts/validate.py`, warnings exit 0) while the check at
-    # `validate_frontmatter` below makes it an ERROR. The lenient copy is the one
-    # visible from inside the knowledge repo, so a reviewer working there is
-    # structurally unable to see the strict one. Two reviewers saw the missing
-    # roster entry and both under-rated it, in opposite directions.
-    # The durable fix — making the two copies agree, or provable — is
-    # `issue_01M09MSRMKQX7FEGRHBZW74XC7`.
-    "orient-coder",
-    # outside-view strategy consultant on the agentic operating model (ARCH-158)
+    # consultant is a dispatchable agent (agent-platform/agents/consultant, the
+    # outside strategy consultant), valid in both audience and binds_agents. team
+    # and contractor are the groups NON_AGENT_AUDIENCE (below) needs: the
+    # team-wide marker and the contractor-tier marker.
     "consultant",
-    # "team" is a special human-audience marker (like the operator marker), NOT an agent role: it
-    # tags a doc for the team.convivy.com orientation site. convivy-orient/build.py
-    # filters the site to team-tagged docs (substrate ARCH-089).
     "team",
-    # "contractor" is the contractor-tier human-audience marker (substrate ARCH-228
-    # Phase 5). A doc tagged [team, contractor] shows on both the
-    # full team site and the contractor view; team-only docs are hidden from
-    # contractors. convivy-orient/build.py gates the contractor render on this marker
-    # (contractor_ok = "contractor" in audience) — default-deny, replacing the old
-    # CONTRACTOR_HIDDEN_* blocklist.
     "contractor",
 }
 # OPERATOR_MARKER is a runtime value (read from operator config, not a string
@@ -398,11 +205,11 @@ ALLOWED_AUDIENCE = ALLOWED_AUDIENCE | {OPERATOR_MARKER}
 # document can reach this checkout without passing that CI: the knowledge ruleset
 # exempts org admins. Keep the two in sync.
 
-# The four roster values naming a PERSON or a group rather than a dispatchable
-# agent. `audience` says who may read a document and `binds_agents` says who must
-# obey a block; the operator reads every document and obeys none, so these are valid
-# audiences and never valid in `binds_agents`.
-NON_AGENT_AUDIENCE = {"consultant", "team", "contractor"}
+# The roster values naming a group rather than a dispatchable agent. `audience`
+# says who may read a document and `binds_agents` says who must obey a block; the
+# operator reads every document and obeys none, so these are valid audiences and
+# never valid in `binds_agents`.
+NON_AGENT_AUDIENCE = {"team", "contractor"}
 # Written as a literal plus a union to match ALLOWED_AUDIENCE above, for
 # consistency: no reader outside this repo parses NON_AGENT_AUDIENCE.
 NON_AGENT_AUDIENCE = NON_AGENT_AUDIENCE | {OPERATOR_MARKER}
@@ -425,18 +232,81 @@ ALLOWED_ROLES = {
     "refactorer", "reviewer", "rhetorician", "scout", "security-auditor",
     "security-reviewer", "test-writer", "writing-reviewer",
 }
-# `binds_crews` values: EXACTLY the `crew` fields in config/projects.json, which is
-# what a session's crew is. Not project slugs (`bosun` works `agent-platform`) and
-# not the name a crew goes by in prose (`orient` is `convivy-orient`). The first
-# knowledge-side copy was written from memory and was wrong on eleven names, four
-# of which validated and bound no session. `test_allowed_crews_is_the_registrys_
-# crew_set` in tests/test_projects.py holds this equal to the registry both ways.
-ALLOWED_CREWS = {
-    "archy", "bosun", "cfo", "constance", "convivy-commercial", "convivy-orient",
-    "deck", "ea", "hollis", ROSTER_CREW, "library", "nyh-arch-tools", "nyh-etc",
-    "nyh-park-villa", "placard", "selector", "shipwright", "signals", "sous-chef",
-    "steward", "svc", "vivy", "write-better",
-}
+# `binds_crews` values: EXACTLY the `crew` fields of the project registry, which
+# is what a session's crew is. Not project slugs (`widget` works `widget-ops`) and
+# not the name a crew goes by in prose (`northwind` is `acme-northwind`).
+#
+# CQ·586: DERIVED from the registry (`projects.legal_crews()`) rather than a
+# hand-kept literal. The first knowledge-side copy was written from memory and
+# was wrong on eleven names, four of which validated and bound no session — a
+# derived set cannot drift from the registry it is drawn from the way a
+# hand-kept copy could.
+
+
+def _legal_crews() -> frozenset[str]:
+    """Every unit's own `crew` field in the project registry, as of this
+    module's own import.
+
+    `projects` is imported here, not at module top, for the same reason
+    `_legal_projects()` imports it lazily: importing this module must never
+    fail for want of it. An empty frozenset comes back when the registry
+    cannot be read, so every crew name is then refused by
+    `instruction_block_errors` — a closed catalogue, never "every crew
+    allowed" (the same failure mode `_legal_projects()` documents for
+    projects)."""
+    try:
+        import projects  # noqa: PLC0415
+        return frozenset(projects.legal_crews())
+    except Exception:
+        return frozenset()
+
+
+def _current_allowed_crews() -> frozenset[str]:
+    """The legal crew set as read RIGHT NOW, not the set this module saw at
+    import. `instruction_block_errors` calls this rather than
+    `ALLOWED_CREWS` so a crew the registry gains or loses after this
+    module's import is seen on the very next call rather than needing a
+    restart — a long-running reader (`bin/knowledge-watcher`,
+    `bin/mcp-kb-server`) that started while the registry was unreadable
+    would otherwise refuse every registered crew's `binds_crews` documents
+    for its whole run (reviewer + security-reviewer, PR #1065 round 1).
+
+    Reads through `projects.legal_crews_live()`, which sees a change to the
+    project registry on the very next call with nothing to clear — never
+    `legal_crews()`'s cached path, which the two daemons above never clear,
+    and never `ALLOWED_CREWS`, the set captured at import. An unreadable
+    registry at call time yields an empty registry-derived set, exactly as
+    `_current_allowed_projects()` does on its own failed read (returned AS
+    IS, never patched up with a baseline): platform/decisions/0097, point 2,
+    refuses a name outside the live set whether or not the registry is
+    readable. `ROSTER_CREW` and `APPS_CREW` are not registry-derived — they
+    come from this install's own operator config — so they are added after,
+    unconditionally, exactly as `ALLOWED_CREWS` adds them below."""
+    try:
+        import projects  # noqa: PLC0415
+        crews = frozenset(projects.legal_crews_live())
+    except Exception:
+        crews = frozenset()
+    crews = crews | {ROSTER_CREW}
+    if isinstance(APPS_CREW, str) and APPS_CREW:
+        crews = crews | {APPS_CREW}
+    return crews
+
+
+# THE IMPORT-TIME BASELINE. Nothing in this module treats it as current:
+# `instruction_block_errors` calls `_current_allowed_crews()`, not this name,
+# so a crew the registry gains or loses AFTER this module's own import — in
+# the same process or in a long-running one — is seen on the next call
+# rather than the next restart (platform/decisions/0097, point 2, applied
+# here the way it already is for `ALLOWED_PROJECTS`/`_current_allowed_projects()`).
+#
+# `bin/agentctl`'s readiness probe and the tests that compare against a
+# known baseline are the remaining readers of the name itself.
+ALLOWED_CREWS = _legal_crews() | {ROSTER_CREW}
+# APPS_CREW is None on an install with no apps crew (see above) — added only
+# when it names one, so the set itself never holds None.
+if isinstance(APPS_CREW, str) and APPS_CREW:
+    ALLOWED_CREWS = ALLOWED_CREWS | {APPS_CREW}
 
 REQUIRED = ("id", "kind", "project", "title", "status")
 LIST_FIELDS = ("topics", "audience", "applies_to", "depends_on", "authors", "tools",
@@ -483,16 +353,38 @@ INSTRUCTION_BLOCK_BODY_BUDGET_BYTES = 4096
 # a trailing newline, so `.match` let `foo\n` past every name refusal below, and
 # the patterns are handed to callers that use `.match` (crew_doctor).
 _PROJECT_SLUG = re.compile(r"^[a-z][a-z-]*\Z")
-# The scopes ARCH-438 retired (comment above ALLOWED_PROJECTS). A directory with
-# one of these names is refused even though it matches the slug syntax.
+# `shared`, `convivy`, `utility` and `engineering` are GONE (ARCH-438), and their
+# absence is the end of Phase 0 step 5. Step 5 re-filed every document out of them;
+# PR G could not delete them because two still held a live dispatch profile; H1
+# relocated those and H2 re-pointed the workspace mappings. The paired knowledge PR
+# deletes the directories, so nothing can be filed there. A directory with one of
+# these names is refused even though it matches the slug syntax above.
+#
+# `engineering-practice` is a DIFFERENT scope and stays. It is cross-PRODUCT
+# engineering idiom; `engineering` was a bucket whose 13 documents all moved out.
+# The two were never spelled the same for exactly this moment.
 RETIRED_PROJECTS = frozenset({"shared", "convivy", "utility", "engineering"})
 
 
 def id_pattern_for(projects) -> re.Pattern:
-    """The id pattern whose project alternatives are exactly `projects`. Every
-    member must already satisfy `_PROJECT_SLUG`, so nothing is escaped."""
+    """The id pattern whose project alternatives are the members of `projects`
+    that satisfy `_PROJECT_SLUG`, each `re.escape`d.
+
+    `projects` is registry-controlled (a unit's own `kb_project`, among other
+    sources — see `_legal_projects()`), and `crew_registration.build_row`
+    validated `slug` but not `kb_project` until PR #978 round 2, so a value
+    that is not valid regex syntax (an unbalanced paren, say) could reach
+    here. Escaping closes the `re.compile()` crash that value caused at this
+    module's own import, which took down agentctl, the watcher, the KB
+    server, and kb apply and kb sync (security-reviewer, PR #978 round 2). A
+    member that fails `_PROJECT_SLUG` is left out of the alternation
+    entirely, rather than escaped in: it is refused by `_name_refusal`'s own
+    slug check regardless, so admitting it here would only widen the pattern
+    for no gain."""
+    valid = [p for p in projects if _PROJECT_SLUG.fullmatch(p)]
     return re.compile(
-        r"^(" + "|".join(sorted(projects)) + r")/[a-z][a-z-]*/[a-z0-9][a-z0-9-]*\Z")
+        r"^(" + "|".join(re.escape(p) for p in sorted(valid)) + r")/"
+        r"[a-z][a-z-]*/[a-z0-9][a-z0-9-]*\Z")
 
 
 # Module-level, for readers with no tree in hand: the baseline set's pattern.
@@ -500,9 +392,12 @@ ID_PATTERN = id_pattern_for(ALLOWED_PROJECTS)
 
 
 class ProjectCatalogue(NamedTuple):
-    """The projects one knowledge tree admits. `allowed` is the baseline plus the
-    tree's valid `projects/` directories; `id_pattern` is built from `allowed`;
-    `refused` maps each directory entry that was NOT admitted to why."""
+    """The projects one knowledge tree admits: always exactly the CURRENT legal
+    set, `_current_allowed_projects()` as of this call (platform/decisions/0097
+    closes the set to what the registry names, so no tree ever adds to it).
+    `id_pattern` is built from `allowed`; `refused` maps each directory entry —
+    and the `pending` name of a write — the registry does not name, or whose
+    own entry fails a filesystem check, to why."""
     allowed: frozenset
     id_pattern: re.Pattern
     refused: dict
@@ -534,10 +429,11 @@ def _name_refusal(name: str) -> str | None:
     if name in RETIRED_PROJECTS:
         return (f"'{name}' is a retired scope (ARCH-438); nothing may be filed "
                 f"under it")
-    # Before the slug rule, so `EA` names the privacy wall and not the casing.
+    # Before the slug rule, so a private crew's own-case slug names the privacy wall and not the casing.
     private = private_crew_names()
+    allowed = _current_allowed_projects()
     if private is None:
-        if name not in ALLOWED_PROJECTS:
+        if name not in allowed:
             return (f"'{name}' cannot be admitted: the project registry could not "
                     f"be read, so private crews cannot be told apart "
                     f"(platform/decisions/0043)")
@@ -547,6 +443,9 @@ def _name_refusal(name: str) -> str | None:
     if not _PROJECT_SLUG.fullmatch(name):
         return (f"'{name}' is not a plain lowercase directory name "
                 f"(expected [a-z][a-z-]*, the id syntax's project segment)")
+    if name not in allowed:
+        return (f"'{name}' is not a project the registry names "
+                f"(platform/decisions/0097)")
     return None
 
 
@@ -567,10 +466,14 @@ def project_dir_refusal(root: Path, name: str) -> str | None:
 
 
 def project_catalogue(root: Path, pending: str | None = None) -> ProjectCatalogue:
-    """Read the projects the knowledge repo at `root` holds. A missing or unreadable
-    `projects/` admits only the baseline. `pending` names a directory a write is
-    about to create; when it is not on disk it is admitted on its name alone."""
-    allowed = set(ALLOWED_PROJECTS)
+    """`allowed` is always the CURRENT legal set (`_current_allowed_projects()`,
+    a live read): `root`'s own `projects/` directories name nothing this
+    registry does not already admit (platform/decisions/0097). What `root`
+    decides is `refused` — the reason recorded against each directory actually
+    on disk, and against `pending` (a write's not-yet-created directory name),
+    that the registry excludes or whose own on-disk entry fails a filesystem
+    check — for a caller reporting why a document under it was dropped."""
+    allowed = set(_current_allowed_projects())
     refused: dict[str, str] = {}
     try:
         names = sorted(p.name for p in (Path(root) / "projects").iterdir())
@@ -757,8 +660,8 @@ def validate_frontmatter(fm: Any, catalogue: ProjectCatalogue | None = None,
     allowed = catalogue.allowed if catalogue else ALLOWED_PROJECTS
     id_pattern = catalogue.id_pattern if catalogue else ID_PATTERN
     if "project" in fm and not _is_one_of(fm["project"], allowed):
-        # `_name_refusal` as well, so `project: EA` gets the privacy reason though
-        # only the casefolded name is in `refused`.
+        # `_name_refusal` as well, so a private crew's own-case slug gets the
+        # privacy reason though only the casefolded name is in `refused`.
         why = (catalogue.refused.get(fm["project"]) or _name_refusal(fm["project"])
                if catalogue and isinstance(fm["project"], str) else None)
         errs.append(f"invalid project: {fm['project']}" + (f" ({why})" if why else ""))
@@ -829,8 +732,9 @@ def instruction_block_errors(fm: Any, body: str,
     roles = fm.get("binds_roles") or []
 
     if isinstance(crews, list):
+        allowed_crews = _current_allowed_crews()
         for val in crews:
-            if not _is_one_of(val, ALLOWED_CREWS):
+            if not _is_one_of(val, allowed_crews):
                 errs.append(f"binds_crews names an unknown crew: {val}")
     # Names only the roster can decide. A person is refused here, and a non-string
     # is refused here, so neither needs the roster.

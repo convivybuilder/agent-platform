@@ -9,6 +9,27 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 CLA="$REPO_ROOT/bin/create-lab-app"
 
+# create-lab-app reads the shared app-kit library's name and clone URL from
+# the registry (the `kit_repo` field on the one unit that owns it, CQ-602)
+# rather than naming it literally. An invented unit and repo name, so this
+# file names no real Convivy crew or repository; exported so every
+# invocation below sees it without repeating it per call.
+KIT_REPO="beacon-kit"
+KIT_REGISTRY=$(mktemp -d)/kit-registry.json
+cat > "$KIT_REGISTRY" <<JSON
+{
+  "beacon-kit-unit": {
+    "class": "project", "display": "Beacon Kit Unit", "owner": "test-owner",
+    "home_dir": "<root>/$KIT_REPO", "dirs": [],
+    "repos": ["$KIT_REPO"], "aliases": [],
+    "crew": "beacon-kit-unit", "lifecycle": "active", "products": [],
+    "kb": "local",
+    "kit_repo": "$KIT_REPO"
+  }
+}
+JSON
+export PROJECTS_JSON="$KIT_REGISTRY"
+
 # --- dry-run lists both handoff skills (no fs writes) ----------------------
 out=$(/bin/bash "$CLA" testapp --prefix tt --dry-run 2>&1)
 echo "$out" | grep -q '.claude/skills/handoff-leave/SKILL.md'
@@ -67,6 +88,19 @@ assert_rc 0 "$?" "handoff-pickup preserves literal \$(git rev-parse ...)"
 grep -q 'ARCH-043' "$LEAVE"
 assert_rc 0 "$?" "handoff-leave carries the ARCH-043 path convention"
 
+# The scaffolded charter names the kit repo the registry's `kit_repo` field
+# named, not a literal (CQ-602), and no copy of the scaffold names no real
+# repository either.
+grep -q "$KIT_REPO" "$FAKE_HOME/Convivy/testapp/CLAUDE.md"
+assert_rc 0 "$?" "CLAUDE.md names the registry's kit_repo for the think() seam"
+grep -q "$KIT_REPO" "$FAKE_HOME/Convivy/testapp/.claude/agents/tt-architect.md"
+assert_rc 0 "$?" "the architect agent file names the registry's kit_repo for the think() seam"
+grep -q "$KIT_REPO" "$FAKE_HOME/Convivy/testapp/.claude/agents/tt-coder.md"
+assert_rc 0 "$?" "the coder agent file names the registry's kit_repo for the think() seam"
+checklist_kit=$(/bin/bash "$CLA" kitapp --prefix ka --dry-run 2>&1)
+echo "$checklist_kit" | grep -qF "github.com/convivy/$KIT_REPO@vN"
+assert_rc 0 "$?" "the checklist's pip install line uses the registry's kit repo and github slug"
+
 # The scaffolded README, CLAUDE.md and post-creation checklist must not tell a
 # new app to rely on REPO_LOCAL_DOCS, or on 'scribe' refusing writes against it:
 # #578 (b23cf33e, 2026-09-14) deleted both the tuple and the `scribe verify`/
@@ -78,10 +112,9 @@ assert_rc 0 "$?" "handoff-leave carries the ARCH-043 path convention"
 # look — unlike a checklist line an operator reads before acting.
 README="$FAKE_HOME/Convivy/testapp/README.md"
 CLAUDEMD="$FAKE_HOME/Convivy/testapp/CLAUDE.md"
-ORCH="$FAKE_HOME/Convivy/testapp/.claude/agents/tt-overnight-orchestrator.md"
 ADR="$FAKE_HOME/Convivy/testapp/docs/decisions/0001-testapp-creation.md"
 
-for f in "$README" "$CLAUDEMD" "$ORCH" "$ADR"; do
+for f in "$README" "$CLAUDEMD" "$ADR"; do
     [ -f "$f" ]; assert_rc 0 "$?" "scaffold wrote $(basename "$f")"
     grep -q 'REPO_LOCAL_DOCS' "$f"
     assert_rc 1 "$?" "$(basename "$f") no longer names the removed REPO_LOCAL_DOCS"
@@ -117,29 +150,36 @@ echo "$checklist" | grep -q 'BOTH tuples'
 assert_rc 1 "$?" "dry-run checklist no longer tells the operator to add the app to two tuples"
 echo "$checklist" | grep -q 'to LOCAL_AGENT_REPOS'
 assert_rc 1 "$?" "dry-run checklist no longer tells the operator to add the app to LOCAL_AGENT_REPOS"
-echo "$checklist" | grep -q '_INTERNAL_APP_PREFIXES'
-assert_rc 0 "$?" "dry-run checklist tells the operator to register the crew prefix in _INTERNAL_APP_PREFIXES"
+echo "$checklist" | grep -q "agent_prefix' field in"
+assert_rc 0 "$?" "dry-run checklist tells the operator to give the crew's unit an agent_prefix field"
+echo "$checklist" | grep -qE '_INTERNAL_APP_PREFIXES|INTERNAL_APP_PREFIXES'
+assert_rc 1 "$?" "dry-run checklist no longer tells the operator to edit the deleted prefix constants"
 
-# The scaffolded CLAUDE.md review cycle step and the overnight-orchestrator's
-# auto-cycle step must both name the current posting command (`agentctl
-# review-post`), not `gh pr comment`, and must name the review-round caps
-# without baking a number into a file this tool writes once at creation and
-# never touches again — a written-in number drifts the moment the policy's
-# `review_rounds_per_role` or `review_rounds_code` next changes (the document cap
-# has changed twice: platform/decisions/0083 raised it 3 -> 5, and the operator raised it
-# again 5 -> 7 on 2026-10-01, sig_01M3W9600TWE8SVKQNXX6G282A; the code cap is new,
-# 2026-10-05). Every app scaffolded after this PR would otherwise ship stale
-# onboarding text, unnoticed the same way the CLAUDE.md hit was on the first round.
-ORCH="$FAKE_HOME/Convivy/testapp/.claude/agents/tt-overnight-orchestrator.md"
-[ -f "$ORCH" ]; assert_rc 0 "$?" "overnight-orchestrator agent file written"
+# The scaffolded CLAUDE.md review cycle step must name the current posting
+# command (`agentctl review-post`), not `gh pr comment`, and must name the
+# review-round caps without baking a number into a file this tool writes once
+# at creation and never touches again — a written-in number drifts the moment
+# the policy's `review_rounds_per_role` or `review_rounds_code` next changes
+# (the document cap has changed twice: platform/decisions/0083 raised it 3 -> 5,
+# and the operator raised it again 5 -> 7 on 2026-10-01,
+# sig_01M3W9600TWE8SVKQNXX6G282A; the code cap is new, 2026-10-05). Every app
+# scaffolded after this PR would otherwise ship stale onboarding text,
+# unnoticed the same way the CLAUDE.md hit was on the first round.
 
-# The cap wording is hand-copied into this file's two generated steps and into
+# platform/decisions/0102 retires scheduled autonomous crews permanently: a
+# newly scaffolded product must not get one.
+shopt -s nullglob
+orch_files=("$FAKE_HOME"/Convivy/testapp/.claude/agents/*-overnight-orchestrator.md)
+shopt -u nullglob
+[ "${#orch_files[@]}" -eq 0 ]; assert_rc 0 "$?" "no *-overnight-orchestrator.md agent file is scaffolded"
+
+# The cap wording is hand-copied into this file's generated step and into
 # docs/lab-product-template.md, so each copy is pinned to the same literal text. A key-name
-# grep passed while the wording drifted. Both strings are the prose the three copies carry.
+# grep passed while the wording drifted. Both strings are the prose the two copies carry.
 CAP_DEFAULT='(for a pull request that changes code or any file an agent is instructed to act on, the cap is `review_rounds_code` in the platform'\''s agent policy file, or eleven rounds when that file has no `review_rounds_code` line; for one that changes only documents, the cap is `review_rounds_per_role` in that file)'
 CAP_PROGRESS='A pull request that changes code or any file an agent is instructed to act on runs rounds past the document cap only while no finding in the latest round repeats one an earlier round raised'
 
-for f in "$CLAUDEMD" "$ORCH"; do
+for f in "$CLAUDEMD"; do
     grep -q 'review-round cap' "$f"
     assert_rc 0 "$?" "$(basename "$f") names the review-round cap"
     grep -q 'review_rounds_per_role' "$f" && grep -q 'review_rounds_code' "$f" && grep -q 'changes only documents' "$f"
@@ -204,6 +244,21 @@ grep -q 'platform/skills/write-bead' "$WB"
 assert_rc 1 "$?" "write-bead stub names no deprecated kb_get target"
 grep -q 'payload/skills/write-bead/SKILL.md' "$WB"
 assert_rc 0 "$?" "write-bead stub names the Shipwright payload source"
+
+# --- no unit declares kit_repo: refuses before writing anything -------------
+# The scaffold has named the kit's think() seam as a hard dependency since
+# ARCH-249, so a registry with no kit_repo answer is treated the same as an
+# unreadable one (bin/bug-sweep's own "cannot read ... from the registry"
+# convention) rather than silently generating a charter with nothing wired.
+EMPTY_KIT_REGISTRY=$(mktemp -d)/empty-kit-registry.json
+printf '{}' > "$EMPTY_KIT_REGISTRY"
+NOKIT_HOME=$(mktemp -d)
+out=$(HOME="$NOKIT_HOME" PROJECTS_JSON="$EMPTY_KIT_REGISTRY" /bin/bash "$CLA" nokitapp --prefix nk \
+    --root-config "$(co_root_config "$NOKIT_HOME")" 2>&1)
+assert_rc 1 "$?" "no unit declaring kit_repo exits 1"
+assert_contains "$out" "cannot read the kit repository from the registry" "and says why"
+[ ! -e "$NOKIT_HOME/Convivy/nokitapp" ]; assert_rc 0 "$?" "and nothing was written"
+rm -rf "$NOKIT_HOME" "$EMPTY_KIT_REGISTRY"
 
 rm -rf "$FAKE_HOME"
 finish

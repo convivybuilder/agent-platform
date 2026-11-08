@@ -23,6 +23,7 @@ import importlib.machinery
 import importlib.util
 import os
 import pathlib
+import subprocess
 import sys
 from unittest import mock
 
@@ -43,6 +44,18 @@ def _load():
 @pytest.fixture()
 def cdpj():
     return _load()
+
+
+@pytest.fixture(autouse=True)
+def _empty_deploy_root(cdpj, tmp_path_factory, monkeypatch):
+    """Every test in this file defaults to an EMPTY deploy root. Without this,
+    `main()`'s `--deploy-root` default is this machine's real `~/.local/deploy`,
+    so a test that never mentions deploy areas at all would pick up whatever is
+    actually installed there and depend on host state. A test that wants a
+    deploy-area fixture passes its own `--deploy-root` explicitly, which wins
+    over this default the same way `--checkout-root` already does.
+    """
+    monkeypatch.setattr(cdpj, "DEPLOY_ROOT", tmp_path_factory.mktemp("empty-deploy-root"))
 
 
 # --- parse_labels ------------------------------------------------------------
@@ -255,10 +268,10 @@ def test_a_clean_deploy_pinned_job_is_not_a_breach(cdpj, tmp_path):
 
 
 def test_non_absolute_argv_entries_are_not_paths(cdpj, tmp_path):
-    """Flags and bare values (`--days`, `14`, `hollis`) are not file paths and
-    must never be realpath-resolved against the cwd and reported as breaches."""
-    argv = ["--repo-scorecard", "hollis", "--days", "14"]
-    assert cdpj.classify("com.convivy.model-scorecard-hollis", argv,
+    """Flags and bare values (`--days`, `14`) are not file paths and must
+    never be realpath-resolved against the cwd and reported as breaches."""
+    argv = ["--days", "14"]
+    assert cdpj.classify("com.convivy.model-scorecard", argv,
                          checkout_root=str(tmp_path / "agent-platform")) == []
 
 
@@ -748,3 +761,309 @@ def test_deploy_pinned_present_absent_present_logs_again_on_the_later_day(
     back = _deploy_keys(cdpj, tmp_path, monkeypatch, day="2030-01-03", breach=True)
     assert absent == []
     assert len(back) == 1 and back[0] not in present
+
+
+# --- classify_deploy_area: a deploy area falling behind main (E24·3) --------
+#
+# `widget-area`, `widget-tool` and the `origin`/`clone` repos below are all
+# SYNTHETIC fixture data built fresh under `tmp_path` for each test — never
+# the real run-register-api incident, never this checkout. `clone` is a real
+# `git clone` of `origin`, so its `refs/remotes/origin/main` is the ref `git
+# clone` itself writes, and `clone`'s path is always under `tmp_path`, never
+# this repository's own checkout — a test cannot pass here by having
+# `classify_deploy_area` read THIS checkout's `origin/main` by accident.
+
+
+def _git(repo: pathlib.Path, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+         "-c", "commit.gpgsign=false", *args],
+        check=True, capture_output=True, text=True)
+
+
+def _rev(repo: pathlib.Path) -> str:
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture()
+def widget_history(tmp_path):
+    """A throwaway `origin` + its `clone`, four commits on `main`:
+
+      c1: adds bin/widget-tool (the area's one shipped file) and
+          docs/other-note.md (not shipped by the area)
+      c2: edits docs/other-note.md only
+      c3: edits bin/widget-tool only
+      c4: edits docs/other-note.md only
+
+    `clone`'s `origin/main` lands on c4. Returns `(clone, shas)`, `shas` a
+    dict of each commit's SHA by name."""
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    (origin / "bin").mkdir()
+    (origin / "bin" / "widget-tool").write_text("v1\n", encoding="utf-8")
+    (origin / "docs").mkdir()
+    (origin / "docs" / "other-note.md").write_text("v1\n", encoding="utf-8")
+    _git(origin, "add", "-A")
+    _git(origin, "commit", "-q", "-m", "c1")
+    c1 = _rev(origin)
+
+    (origin / "docs" / "other-note.md").write_text("v2\n", encoding="utf-8")
+    _git(origin, "commit", "-q", "-am", "c2")
+    c2 = _rev(origin)
+
+    (origin / "bin" / "widget-tool").write_text("v2\n", encoding="utf-8")
+    _git(origin, "commit", "-q", "-am", "c3")
+    c3 = _rev(origin)
+
+    (origin / "docs" / "other-note.md").write_text("v3\n", encoding="utf-8")
+    _git(origin, "commit", "-q", "-am", "c4")
+    c4 = _rev(origin)
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)],
+                   check=True, capture_output=True)
+    return clone, {"c1": c1, "c2": c2, "c3": c3, "c4": c4}
+
+
+def _deployed_commit_text(*, commit: str | None, installed_from: str | None) -> str:
+    lines = ["ref: main"]
+    if commit is not None:
+        lines.append(f"commit: {commit}")
+    lines.append("installed_at: 2030-01-01T00:00:00Z")
+    if installed_from is not None:
+        lines.append(f"installed_from: {installed_from}")
+    return "\n".join(lines) + "\n"
+
+
+def _make_area(deploy_root: pathlib.Path, name: str, *, text: str) -> pathlib.Path:
+    """A deploy area on disk shipping exactly one file, bin/widget-tool —
+    the area's own content, never read for its bytes, only for its PATH
+    (`classify_deploy_area` derives shipped paths from what sits on disk)."""
+    area = deploy_root / name
+    (area / "bin").mkdir(parents=True)
+    (area / "bin" / "widget-tool").write_text("deployed\n", encoding="utf-8")
+    (area / "DEPLOYED_COMMIT").write_text(text, encoding="utf-8")
+    return area
+
+
+def test_an_area_behind_main_is_reported_with_the_right_count(cdpj, tmp_path, widget_history):
+    """Fails against the code before this change existed: `classify_deploy_area`
+    did not exist at all, so this raised AttributeError. Deployed at c1; only
+    c3 (of c2/c3/c4) touches the shipped file, so the lag is exactly 1."""
+    clone, shas = widget_history
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c1"], installed_from=str(clone)))
+    result = cdpj.classify_deploy_area(area)
+    assert result == {"area": "widget-area", "status": "stale",
+                       "deployed_commit": shas["c1"], "lag": 1,
+                       "installed_from": str(clone)}
+
+
+def test_an_area_whose_only_later_commits_touch_unshipped_files_is_not_reported(
+        cdpj, tmp_path, widget_history):
+    """Deployed at c3 (the commit that DID touch the shipped file); the only
+    later commit on main, c4, touches only docs/other-note.md, which this
+    area does not ship. The fixture carries both kinds of commit (c3 ships-
+    touching, c4 not), and this case must read as current regardless."""
+    clone, shas = widget_history
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c3"], installed_from=str(clone)))
+    result = cdpj.classify_deploy_area(area)
+    assert result == {"area": "widget-area", "status": "current",
+                       "deployed_commit": shas["c3"], "lag": 0}
+
+
+def test_an_area_at_mains_head_is_not_reported(cdpj, tmp_path, widget_history):
+    clone, shas = widget_history
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c4"], installed_from=str(clone)))
+    result = cdpj.classify_deploy_area(area)
+    assert result == {"area": "widget-area", "status": "current",
+                       "deployed_commit": shas["c4"], "lag": 0}
+
+
+def test_an_area_missing_installed_from_is_uncheckable(cdpj, tmp_path, widget_history):
+    clone, shas = widget_history
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c1"], installed_from=None))
+    result = cdpj.classify_deploy_area(area)
+    assert result["area"] == "widget-area"
+    assert result["status"] == "uncheckable"
+    assert "installed_from" in result["reason"]
+
+
+def test_an_area_whose_commit_is_unknown_in_the_repository_is_uncheckable(
+        cdpj, tmp_path, widget_history):
+    clone, shas = widget_history
+    bogus = "0" * 40
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=bogus, installed_from=str(clone)))
+    result = cdpj.classify_deploy_area(area)
+    assert result["area"] == "widget-area"
+    assert result["status"] == "uncheckable"
+    assert result["deployed_commit"] == bogus
+    assert bogus in result["reason"]
+
+
+def test_an_area_whose_installed_from_repo_is_gone_is_uncheckable(cdpj, tmp_path, widget_history):
+    clone, shas = widget_history
+    gone = tmp_path / "nowhere"
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c1"], installed_from=str(gone)))
+    result = cdpj.classify_deploy_area(area)
+    assert result["status"] == "uncheckable"
+    assert str(gone) in result["reason"]
+
+
+def test_an_area_whose_deployed_commit_has_no_commit_line_is_uncheckable(
+        cdpj, tmp_path, widget_history):
+    clone, shas = widget_history
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=None, installed_from=str(clone)))
+    result = cdpj.classify_deploy_area(area)
+    assert result["area"] == "widget-area"
+    assert result["status"] == "uncheckable"
+    assert "commit" in result["reason"]
+    assert "deployed_commit" not in result
+
+
+def test_an_area_whose_origin_main_does_not_resolve_is_uncheckable(
+        cdpj, tmp_path, widget_history):
+    clone, shas = widget_history
+    _git(clone, "update-ref", "-d", "refs/remotes/origin/main")
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c1"], installed_from=str(clone)))
+    result = cdpj.classify_deploy_area(area)
+    assert result["status"] == "uncheckable"
+    assert result["deployed_commit"] == shas["c1"]
+    assert "origin/main" in result["reason"]
+
+
+def test_an_area_whose_rev_list_call_fails_is_uncheckable(cdpj, tmp_path, widget_history, monkeypatch):
+    clone, shas = widget_history
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c1"], installed_from=str(clone)))
+    real_run_git = cdpj._run_git
+
+    def fake_run_git(repo, *args):
+        if args and args[0] == "rev-list":
+            return None
+        return real_run_git(repo, *args)
+
+    monkeypatch.setattr(cdpj, "_run_git", fake_run_git)
+    result = cdpj.classify_deploy_area(area)
+    assert result["status"] == "uncheckable"
+    assert result["deployed_commit"] == shas["c1"]
+    assert "rev-list" in result["reason"]
+
+
+def test_an_area_whose_walk_cannot_list_a_subdirectory_is_uncheckable(
+        cdpj, tmp_path, widget_history, monkeypatch):
+    """Stubs `os.scandir` so the walk into `bin/` fails, rather than relying
+    on chmod (which the test runner may ignore). The missing listing also
+    means the one shipped file, bin/widget-tool, is never found — this must
+    still report uncheckable, not current."""
+    clone, shas = widget_history
+    area = _make_area(tmp_path / "deploy", "widget-area",
+                      text=_deployed_commit_text(commit=shas["c1"], installed_from=str(clone)))
+    blocked = str(area / "bin")
+    real_scandir = os.scandir
+
+    def fake_scandir(path="."):
+        if os.fspath(path) == blocked:
+            raise OSError(13, "Permission denied", blocked)
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    result = cdpj.classify_deploy_area(area)
+    assert result["area"] == "widget-area"
+    assert result["status"] == "uncheckable"
+    assert result["deployed_commit"] == shas["c1"]
+    assert blocked in result["reason"]
+
+
+def test_an_area_with_no_shipped_files_is_uncheckable(cdpj, tmp_path, widget_history):
+    clone, shas = widget_history
+    area = tmp_path / "deploy" / "widget-area"
+    area.mkdir(parents=True)
+    (area / "DEPLOYED_COMMIT").write_text(
+        _deployed_commit_text(commit=shas["c1"], installed_from=str(clone)), encoding="utf-8")
+    result = cdpj.classify_deploy_area(area)
+    assert result["area"] == "widget-area"
+    assert result["status"] == "uncheckable"
+    assert result["deployed_commit"] == shas["c1"]
+
+
+def test_shipped_paths_excludes_root_venv_and_any_pycache(cdpj, tmp_path):
+    """venv/ is only skipped at the area's own root; a nested directory that
+    happens to also be named venv/ is not an installer artifact and stays."""
+    area = tmp_path / "area"
+    (area / "bin").mkdir(parents=True)
+    (area / "bin" / "tool").write_text("x", encoding="utf-8")
+    (area / "venv" / "lib").mkdir(parents=True)
+    (area / "venv" / "lib" / "site.py").write_text("x", encoding="utf-8")
+    (area / "lib" / "__pycache__").mkdir(parents=True)
+    (area / "lib" / "__pycache__" / "mod.pyc").write_text("x", encoding="utf-8")
+    (area / "lib" / "mod.py").write_text("x", encoding="utf-8")
+    (area / "nested" / "venv").mkdir(parents=True)
+    (area / "nested" / "venv" / "kept.py").write_text("x", encoding="utf-8")
+    result = cdpj._shipped_paths(area)
+    assert result == ["bin/tool", "lib/mod.py", "nested/venv/kept.py"]
+
+
+# --- main(): the deploy-area lag check through the same reporting path -----
+
+
+def test_main_reports_a_stale_deploy_area_and_exits_two(cdpj, tmp_path, monkeypatch, widget_history):
+    clone, shas = widget_history
+    deploy_root = tmp_path / "deploy"
+    _make_area(deploy_root, "widget-area",
+              text=_deployed_commit_text(commit=shas["c1"], installed_from=str(clone)))
+    monkeypatch.setattr(cdpj, "_launchctl_list", lambda: "PID\tStatus\tLabel\n")
+    rc = cdpj.main(["--deploy-root", str(deploy_root), "--no-report"])
+    assert rc == 2
+
+
+def test_main_reports_an_uncheckable_deploy_area_and_exits_two(
+        cdpj, tmp_path, monkeypatch, widget_history):
+    clone, shas = widget_history
+    deploy_root = tmp_path / "deploy"
+    _make_area(deploy_root, "widget-area",
+              text=_deployed_commit_text(commit=shas["c1"], installed_from=None))
+    monkeypatch.setattr(cdpj, "_launchctl_list", lambda: "PID\tStatus\tLabel\n")
+    rc = cdpj.main(["--deploy-root", str(deploy_root), "--no-report"])
+    assert rc == 2
+
+
+def test_main_is_silent_when_every_deploy_area_is_current(cdpj, tmp_path, monkeypatch,
+                                                           widget_history, capsys):
+    clone, shas = widget_history
+    deploy_root = tmp_path / "deploy"
+    _make_area(deploy_root, "widget-area",
+              text=_deployed_commit_text(commit=shas["c4"], installed_from=str(clone)))
+    monkeypatch.setattr(cdpj, "_launchctl_list", lambda: "PID\tStatus\tLabel\n")
+    rc = cdpj.main(["--deploy-root", str(deploy_root)])
+    assert rc == 0
+    out = capsys.readouterr()
+    assert out.out == "" and out.err == ""
+
+
+def test_main_logs_stale_and_uncheckable_deploy_breaches_each_once(
+        cdpj, tmp_path, monkeypatch, widget_history):
+    clone, shas = widget_history
+    deploy_root = tmp_path / "deploy"
+    _make_area(deploy_root, "widget-area",
+              text=_deployed_commit_text(commit=shas["c1"], installed_from=str(clone)))
+    _make_area(deploy_root, "other-area",
+              text=_deployed_commit_text(commit=shas["c1"], installed_from=None))
+    monkeypatch.setattr(cdpj, "_launchctl_list", lambda: "PID\tStatus\tLabel\n")
+    calls = []
+    monkeypatch.setattr(cdpj, "_post_signal",
+                        lambda *a, **k: calls.append((a, k)) or {"status": "stub"})
+    rc = cdpj.main(["--deploy-root", str(deploy_root)])
+    assert rc == 2
+    kinds = {k["dedup_key"].split(":")[1] for _a, k in calls}
+    assert kinds == {"stale-deploy", "uncheckable-deploy"}
+    assert len(calls) == 2, "one signal per breach class present, not one per area"

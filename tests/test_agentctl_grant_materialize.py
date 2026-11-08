@@ -252,33 +252,33 @@ def test_spawn_dispatch_sends_an_explicit_profile_to_the_checkout(
     reached = _stub_through_the_budget_gate(agentctl, monkeypatch)
 
     args = _spawn_args(materialize_from_grant=True, issue="issue_test",
-                       agent="platform-coder", profile="agent-platform/overnight")
+                       agent="synthcrew-coder", profile="agent-platform/overnight")
     with pytest.raises(reached):
         agentctl._spawn_dispatch(args)
 
     assert grant_library.checkout_log == [
-        {"issue_id": "issue_test", "persona": "platform-coder",
+        {"issue_id": "issue_test", "persona": "synthcrew-coder",
          "profile": "agent-platform/overnight"}]
 
 
 def test_spawn_dispatch_sends_the_default_profile_to_the_checkout_when_none_given(
         agentctl, grant_library, monkeypatch):
     """No `--profile`: the checkout is told the same `default_profile` value
-    the run itself computes just afterward (`agent-platform/daytime` for
-    `platform-coder`, pinned by `test_default_profile_by_repo_and_role`)."""
+    the run itself computes just afterward (`widget-crew/daytime`, the
+    self-mapped synthetic default registry entry — CQ-546)."""
     from conftest import stub_profile_listing
     stub_profile_listing(agentctl, monkeypatch)
     grant_library.checkout_responses["issue_test"] = (200, _grant())
     reached = _stub_through_the_budget_gate(agentctl, monkeypatch)
 
     args = _spawn_args(materialize_from_grant=True, issue="issue_test",
-                       agent="platform-coder", profile=None)
+                       agent="synthcrew-coder", profile=None, on="widget-crew")
     with pytest.raises(reached):
         agentctl._spawn_dispatch(args)
 
     assert grant_library.checkout_log == [
-        {"issue_id": "issue_test", "persona": "platform-coder",
-         "profile": "agent-platform/daytime"}]
+        {"issue_id": "issue_test", "persona": "synthcrew-coder",
+         "profile": "widget-crew/daytime"}]
 
 
 # --- a missing or malformed field refuses the dispatch, naming the field ----------
@@ -492,6 +492,40 @@ def test_spawn_without_issue_refuses_materialize_from_grant_before_any_library_c
     assert agentctl.cmd_spawn(args) == 2
 
 
+def test_spawn_materialize_from_grant_refuses_outright_for_a_private_on(
+        agentctl, grant_library, runs_root, monkeypatch, capsys):
+    """The gap reviewer/security-reviewer found on PR #1100 round 1:
+    `--issue` alone drives the Library's ledger-cap check (`_checkout_item_grant`
+    never sends `repo`), so `--on <private crew> --issue <any item whose project
+    is currently capped> --materialize-from-grant` reached `_ledger_cap_refuse_
+    and_record`, which created a run directory under the shared RUNS_ROOT (no
+    `_private_run_root` gate) and wrote the real task text into it. Closed by
+    refusing a private `--on` outright, before the grant checkout that could
+    ever raise `_LedgerCapRefused` runs — so neither that function, nor any run
+    directory or record, is ever reached."""
+    monkeypatch.setattr(agentctl, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(agentctl.T, "RUNS_ROOT", runs_root)
+    monkeypatch.setattr(agentctl, "_warn_deployed_tree", lambda: None)
+    monkeypatch.setattr(agentctl, "_spawn_lib_gate", lambda: None)
+    monkeypatch.setattr(agentctl.projects, "private_slugs", lambda: {"private-crew"})
+
+    def _unreached(*a, **kw):
+        raise AssertionError("the grant checkout must not run for a private --on")
+    monkeypatch.setattr(agentctl, "resolve_agent_from_grant", _unreached)
+
+    marker = "MARKER-sensitive-task-9f3c7d21"
+    args = _spawn_args(materialize_from_grant=True, issue="issue_test",
+                       agent="coder", on="private-crew", task=marker)
+    rc, run_id = agentctl._spawn_dispatch(args)
+
+    assert rc != 0
+    assert run_id is None
+    assert grant_library.checkout_log == []
+    assert not list(runs_root.rglob("*")), "no file must exist under the shared RUNS_ROOT"
+    assert marker not in capsys.readouterr().err
+
+
+@pytest.mark.rich_registry
 def test_spawn_with_materialize_from_grant_and_issue_takes_the_grant_path_not_the_roster(
         agentctl, monkeypatch):
     from conftest import stub_profile_listing
@@ -580,7 +614,7 @@ def test_a_soft_capped_project_refuses_a_new_dispatch_while_a_run_already_going_
 
     # A run already going, started before the ledger crossed its soft cap.
     live = T.create_run_dir("run-live-01", date=today)
-    T.write_meta(live, run_id="run-live-01", agent="platform-coder", task="earlier work",
+    T.write_meta(live, run_id="run-live-01", agent="synthcrew-coder", task="earlier work",
                 started_at=T.now_iso(), repo="agent-platform",
                 worktree=str(tmp_path / "wt"), profile="agent-platform/overnight",
                 model="claude-sonnet-5")
@@ -594,7 +628,7 @@ def test_a_soft_capped_project_refuses_a_new_dispatch_while_a_run_already_going_
     })
 
     args = _spawn_args(materialize_from_grant=True, issue="issue_test",
-                       agent="platform-coder", task="new work",
+                       agent="synthcrew-coder", task="new work",
                        profile="agent-platform/overnight")
     rc, run_id = agentctl._spawn_dispatch(args)
     assert rc == 3

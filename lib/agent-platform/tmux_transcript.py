@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import subprocess
 import sys
 from datetime import date, datetime, timedelta
@@ -130,6 +131,85 @@ def session_table() -> dict[str, str]:
     return table
 
 
+def client_table(valid_sessions: "set[str] | None" = None) -> dict[str, list[dict]] | None:
+    """Every attached tmux client's `{pid}`, grouped by `#{client_session}`,
+    from one `tmux list-clients` call for the whole batch — the same
+    one-call-per-batch rule `session_table` above follows, here for
+    `session_state`'s `clients` field (CQ·521).
+
+    Only `#{client_session}` and `#{client_pid}` are requested, because pid
+    is the only field anything downstream of this table reads. That matters
+    for more than tidiness: `tmux`'s `-F` output has no per-field escaping,
+    and every OTHER client field is free text a connecting client sets
+    itself — `#{client_termname}` reflects the client's own `TERM`, which an
+    ssh client controls directly in its `pty-req` request regardless of
+    `AcceptEnv`. A `TERM` containing an embedded newline followed by a
+    forged `<session>|<pid>` line would have split into a second, fabricated
+    record under any session name once a free-text field followed the pid on
+    the line, attributing an arbitrary pid to a session the real client was
+    never attached to. Dropping those fields removes the inject point rather
+    than trying to sanitise it.
+
+    A record is kept only when it has exactly the two requested fields, the
+    pid parses as a positive integer, and the session name is one
+    `valid_sessions` names — sessions `TT.session_table()` has itself
+    confirmed are actually running, so a line naming any other session
+    (forged or not — `list-clients` should never report one) is rejected
+    rather than trusted at face value. `valid_sessions` left `None` resolves
+    its own `session_table()` for that check, for a direct caller that has
+    not already fetched one; `session_states()` passes down the one it
+    already has.
+
+    `None` only when the `tmux` call itself could not be read, so a caller
+    can tell that apart from a successful read that simply found no clients
+    anywhere at all (`{}`) — the distinction `clients_for_session` needs to
+    tell an unreadable poll from a session that genuinely has nobody
+    attached.
+    """
+    if valid_sessions is None:
+        valid_sessions = set(session_table())
+    out = _run(["tmux", "list-clients", "-F", "#{client_session}|#{client_pid}"])
+    if out is None:
+        return None
+    table: dict[str, list[dict]] = {}
+    for line in out.splitlines():
+        parts = line.split("|")
+        if len(parts) != 2:
+            continue
+        session, pid_s = parts
+        if session not in valid_sessions or not pid_s.isdigit():
+            continue
+        pid = int(pid_s)
+        if pid <= 0:
+            continue
+        table.setdefault(session, []).append({"pid": pid})
+    return table
+
+
+def local_machine_name() -> str | None:
+    """This machine's human-set name, for CQ·521's local-client label ("a
+    terminal on <name>").
+
+    `scutil --get ComputedName` reads the name macOS's Sharing pane shows,
+    which is what a person recognises the machine by. `socket.gethostname()`
+    is the fallback for a machine with no name set there, or for `scutil`
+    itself failing; it answers in the full `<host>.<domain>` form on a
+    networked mac, so only that fallback is truncated to the part before the
+    first dot — `scutil`'s own answer carries no such suffix to cut.
+
+    `None` when both reads fail, which `_client_via_label` turns into a null
+    label rather than guessing a name.
+    """
+    name = _run(["scutil", "--get", "ComputedName"])
+    if name:
+        return name
+    try:
+        host = socket.gethostname()
+    except OSError:
+        return None
+    return host.split(".", 1)[0] or None
+
+
 def _resolve_session_id(session_name: str, table: dict[str, str] | None = None) -> str:
     """The exact `#{session_id}` (e.g. `$26`) for a session name, or JoinError.
 
@@ -150,8 +230,9 @@ def _resolve_session_id(session_name: str, table: dict[str, str] | None = None) 
 
     A COLON-LESS TARGET HAS NO WINDOW-NAME FALLBACK — CHECKED, NOT ASSUMED.
     It is tempting to worry that a window could stand in for a session of the
-    same name: `ask--audio` has a window literally named `ask` on this
-    machine today. It does not reproduce. A colon-less `-t` on `list-panes`
+    same name: the walled-off crew's own `<crew>--<topic>` sub-session naming
+    convention has a window literally named for the bare crew on this machine
+    today. It does not reproduce. A colon-less `-t` on `list-panes`
     resolves as a target-window string, but `man tmux`'s target
     specification is explicit that a colon-less target-window is parsed
     purely by target-SESSION rules — id, then exact name, then session-name
@@ -359,8 +440,8 @@ def _run_roots() -> list[Path]:
 
     `session-event-log.py`'s SessionStart/Stop hook routes a private crew's
     identity record to `<crew home>/agent-runs/` instead of the shared root
-    (ADR-0043), and `meta_for_pid` used to search only the shared one — CFO's
-    long-running session kept resolving only because a pre-cutover record
+    (ADR-0043), and `meta_for_pid` used to search only the shared one — a private
+    crew's long-running session kept resolving only because a pre-cutover record
     happened to still sit in the shared root within this pid's search window;
     the next restart would have returned None and broken `session_state`
     earlier and harder than the sibling hook-log bug this shares its root
@@ -492,7 +573,7 @@ def _record_predates_process(meta: dict, process_started_at: "datetime") -> bool
     """Whether `meta`'s own `started_at` cannot be reconciled with having been
     written by the process that started at `process_started_at` — the
     collision this closes (2026-09-30, issue_01M3TBR04B10F04Q9HGJWKS8HG):
-    selector's live `co` session, pid 49951, started 2026-09-30T21:28:31Z and
+    a product crew's live `co` session, pid 49951, started 2026-09-30T21:28:31Z and
     wrote its own record's `started_at` six seconds later, but a search rooted
     a day earlier also reached a record an EARLIER process that had held pid
     49951 left behind the day before, `started_at` 2026-09-29T14:43:32Z. Both
@@ -559,8 +640,8 @@ def meta_for_pid(pid: int, days: int = SEARCH_DAYS) -> dict | None:
     filed under the day its session STARTED, and a co session runs for as long
     as it is left running — so a fixed "last N days" window loses every session
     older than N, and loses it precisely because it has been up a long time.
-    That is backwards, and it was not hypothetical: on 2026-07-23 the sous-chef
-    and vivy sessions, alive and healthy since 2026-07-20, both read
+    That is backwards, and it was not hypothetical: on 2026-07-23 two product-crew
+    sessions, alive and healthy since 2026-07-20, both read
     `state: unknown` in Deck's pane because their records sat one day outside a
     three-day window.
 

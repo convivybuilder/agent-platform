@@ -22,7 +22,9 @@
 #      (the /sessions route pulls in session_state.py and everything IT
 #      imports: session_lifecycle, session_input, claude_trust,
 #      tmux_transcript, private_crew, projects, signal_client, vault_plane,
-#      builder_root; the /runs/<run_id>/facts route pulls in review_protocol;
+#      builder_root, forwarding_transport (E12-2 slice S5c: vault_plane's
+#      sessions-only transport switch); the /runs/<run_id>/facts route pulls
+#      in review_protocol;
 #      the /runs/<run_id>/docs_fetched route pulls in fetched_documents —
 #      all stdlib-only, so this adds no new pip dependency to the venv build
 #      below) — into ~/.local/deploy/run-register-api/ (rule 2: copies, not
@@ -206,6 +208,7 @@ git -C "$REPO" archive "$SHA" -- \
     lib/agent-platform/agent_policy.py \
     lib/agent-platform/telemetry.py \
     lib/agent-platform/review_protocol.py \
+    lib/agent-platform/app_prefixes.py \
     lib/agent-platform/fetched_documents.py \
     lib/agent-platform/private_crew.py \
     lib/agent-platform/projects.py \
@@ -220,6 +223,7 @@ git -C "$REPO" archive "$SHA" -- \
     lib/agent-platform/signal_client.py \
     lib/agent-platform/vault_plane.py \
     lib/agent-platform/builder_root.py \
+    lib/agent-platform/forwarding_transport.py \
   > "$ARCHIVE"
 tar -x -C "$STAGE" -f "$ARCHIVE"
 rm -f "$ARCHIVE"

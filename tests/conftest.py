@@ -29,6 +29,8 @@ import sys
 import urllib.parse
 import tempfile
 import urllib.request
+import warnings
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -50,17 +52,23 @@ REPO = Path(__file__).resolve().parent.parent
 # IMPORT TIME to build ALLOWED_AUDIENCE/ALLOWED_CREWS, and a test file can
 # import it before any fixture runs.
 #
-# `roster_crew` alone is read out of this repo's own config/projects.json
-# (never a literal here) because `test_allowed_crews_is_the_registrys_crew_set`
-# requires knowledge.ALLOWED_CREWS to contain the SAME slug the registry
-# actually uses — a synthetic placeholder would make that real parity check
-# fail. The one structural trait that names the operator's own crew among the
-# registry's private ones is a `display` ending in ".com" (the same convention
-# `bin/co`'s window-naming comments describe); falling back to a synthetic
-# slug keeps this working where config/projects.json has no such entry.
+# `roster_crew` alone is read out of `tests/fixtures/rich_registry.json`
+# (never a literal here, and never this repo's own config/projects.json,
+# gone since CQ·565 — the crew registry lives in the Library now) because
+# `test_allowed_crews_is_the_registrys_crew_set` requires knowledge.
+# ALLOWED_CREWS to contain the SAME slug `_default_projects_registry` points
+# `rich_registry`-marked tests at — a synthetic placeholder independent of
+# that fixture would make that parity check fail. The one structural trait
+# that names the operator's own crew among the registry's private ones is a
+# `display` ending in ".com" (the same convention `bin/co`'s window-naming
+# comments describe); falling back to a synthetic slug keeps this working
+# where the fixture has no such entry.
+_RICH_REGISTRY_PATH = REPO / "tests" / "fixtures" / "rich_registry.json"
+
+
 def _default_roster_crew() -> str:
     try:
-        registry = json.loads((REPO / "config" / "projects.json").read_text())
+        registry = json.loads(_RICH_REGISTRY_PATH.read_text())
     except (OSError, json.JSONDecodeError):
         return "operator-crew"
     for slug, entry in registry.items():
@@ -70,13 +78,31 @@ def _default_roster_crew() -> str:
     return "operator-crew"
 
 
+# Same reasoning as `_default_roster_crew`, for the OTHER crew slug that
+# carries the operator's name. The structural trait that names it among the
+# registry's private ones, with no copy of either slug kept here, is a
+# private row whose own `note` names the roster crew's slug — the mark of
+# the row this one was split from.
+def _default_apps_crew(roster_crew: str) -> str:
+    try:
+        registry = json.loads(_RICH_REGISTRY_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return "operator-crew-apps"
+    for slug, entry in registry.items():
+        if isinstance(entry, dict) and entry.get("private") and roster_crew and \
+           roster_crew in str(entry.get("note", "")):
+            return slug
+    return "operator-crew-apps"
+
+
 _operator_config_dir = tempfile.mkdtemp(prefix="agent-platform-tests-operator-config-")
 _operator_config_path = Path(_operator_config_dir) / "operator.json"
 _operator_config_path.write_text(json.dumps({
     "excluded_crews": ["private-a", "private-b", "private-c", "private-d",
                        "private-e", "private-f", "private-g"],
     "operator_marker": "operator",
-    "roster_crew": _default_roster_crew(),
+    "roster_crew": (_roster_crew := _default_roster_crew()),
+    "apps_crew": _default_apps_crew(_roster_crew),
     "github_login": "operator-login",
     "tailnet_host": "tailnet.example",
 }))
@@ -86,6 +112,34 @@ for _libdir in ("lib/agent-platform", "lib/knowledge"):
     _p = str(REPO / _libdir)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+
+# `projects.py` reads `PROJECTS_JSON` at MODULE IMPORT TIME (CQ·563: unset
+# means "ask the Library", and there is no Library in a test run), and
+# `knowledge.py`'s own `ALLOWED_PROJECTS` reads THROUGH that, at ITS OWN
+# import time, before `_default_projects_registry`'s autouse fixture ever
+# runs — the same problem `_default_roster_crew` above reads the fixture
+# directly to avoid, one module down. `PROJECTS_JSON` is pointed at the rich
+# fixture (never this repo's own config/projects.json, gone since CQ·565) for
+# ONLY these two imports, then restored to whatever it was: that fixes
+# `ALLOWED_PROJECTS`'s own import-time baseline (every later reader sees the
+# live `_current_allowed_projects()` instead, so this is purely about the
+# baseline itself) without leaving `PROJECTS_JSON` set for the rest of the
+# session, where a dispatched run's own environment (`dispatch_env()` copies
+# `os.environ`) would otherwise carry a value nothing in the test actually
+# asked for.
+_prior_projects_json = os.environ.get("PROJECTS_JSON")
+os.environ["PROJECTS_JSON"] = str(_RICH_REGISTRY_PATH)
+# Side-effect-only imports (the module-level `ALLOWED_PROJECTS` computation),
+# via `importlib` rather than a bound `import projects`/`import knowledge`
+# statement — neither name is used again here, and both are imported again,
+# bound, further down in this file and in test modules; a bound name at
+# module scope would make every one of those a lint-flagged redefinition.
+importlib.import_module("projects")
+importlib.import_module("knowledge")
+if _prior_projects_json is None:
+    os.environ.pop("PROJECTS_JSON", None)
+else:
+    os.environ["PROJECTS_JSON"] = _prior_projects_json
 
 # A dispatched run's own environment carries `dispatch_env`'s GIT_OBJECT_DIRECTORY /
 # GIT_ALTERNATE_OBJECT_DIRECTORIES, redirecting git at the run's private object store
@@ -99,8 +153,22 @@ for _libdir in ("lib/agent-platform", "lib/knowledge"):
 # already run left every one of them holding the redirect anyway — this is the first lib
 # import in the whole file, before anything has had a chance to shadow it with the farm.
 import run_sandbox  # noqa: E402
+import ledger        # noqa: E402
 
 for _var in run_sandbox.GIT_OBJECT_REDIRECT_VARS:
+    os.environ.pop(_var, None)
+
+# The same leak, one step further up `dispatch_env`'s own chain: a platform-coder
+# dispatched to work ON agent-platform itself (this repo's own normal case) carries
+# `AGENTCTL_REAL_GIT`/`AGENTCTL_OWN_GIT_COMMON_DIR` (the git wrapper) and
+# `AGENTCTL_REAL_SWIFT` (the swift wrapper) in ITS OWN ambient environment, set by
+# the dispatcher that spawned this very test run. `dispatch_env()` with no `base`
+# copies `os.environ`, so `test_object_store_redirect_wrapper_vars_absent_without_a_
+# private_dir`'s "absent without a private dir" assertion failed under a nested
+# dispatch before this strip — confirmed on origin/main, unrelated to any dispatch_
+# env.py change: the three vars were already in this process's own os.environ before
+# the test ever ran.
+for _var in ("AGENTCTL_REAL_GIT", "AGENTCTL_OWN_GIT_COMMON_DIR", "AGENTCTL_REAL_SWIFT"):
     os.environ.pop(_var, None)
 
 # Pin the lib modules to THIS repo's copies before anything else can import them.
@@ -277,8 +345,29 @@ def _load_cli(filename: str):
     return mod
 
 
+@pytest.fixture(scope="session")
+def _library_app_key_config_path(tmp_path_factory):
+    """The inert config `_no_test_holds_the_library_app_key` points every test
+    at, built once: no test writes into this directory (one that means to
+    exercise the credential repoints `CONFIG_PATH` at its own `tmp_path`, per
+    that fixture's own docstring), so the one file is safe to share for the
+    whole session rather than rebuilt per test."""
+    import json
+
+    d = tmp_path_factory.mktemp("no-app-key")
+    config_path = d / "library-app.json"
+    config_path.write_text(json.dumps({
+        "repo": "convivy/knowledge",
+        "app_id": "4923626",
+        "bot_login": "convivy-library[bot]",
+        "bot_user_id": 328494887,
+        "key_path": str(d / "library-app.pem"),
+    }))
+    return config_path
+
+
 @pytest.fixture(autouse=True)
-def _no_test_holds_the_library_app_key(monkeypatch, tmp_path_factory):
+def _no_test_holds_the_library_app_key(monkeypatch, _library_app_key_config_path):
     """FAIL CLOSED: no in-process test can mint a real `convivy-library` token,
     and every test reads today's Convivy identity from a config fixture rather
     than a Convivy value held in `kb_merge.py` itself
@@ -304,23 +393,29 @@ def _no_test_holds_the_library_app_key(monkeypatch, tmp_path_factory):
     the real file (or none). No such test exists today; the first one must stub
     the identity itself and not lean on this fixture.
     """
+    import kb_merge
+    monkeypatch.setattr(kb_merge, "CONFIG_PATH", _library_app_key_config_path)
+
+
+@pytest.fixture(scope="session")
+def _docs_merge_app_key_config_path(tmp_path_factory):
+    """The inert config `_no_test_holds_the_docs_merge_app_key` points every
+    test at, built once — the same sharing argument as
+    `_library_app_key_config_path` just above, for the identical reason."""
     import json
 
-    import kb_merge
-    d = tmp_path_factory.mktemp("no-app-key")
-    config_path = d / "library-app.json"
+    d = tmp_path_factory.mktemp("no-docs-merge-app-key")
+    config_path = d / "docs-merge-app.json"
     config_path.write_text(json.dumps({
-        "repo": "convivy/knowledge",
-        "app_id": "4923626",
-        "bot_login": "convivy-library[bot]",
-        "bot_user_id": 328494887,
-        "key_path": str(d / "library-app.pem"),
+        "repos": ["example/repo"],
+        "app_id": "0",
+        "key_path": str(d / "docs-merge-app.pem"),
     }))
-    monkeypatch.setattr(kb_merge, "CONFIG_PATH", config_path)
+    return config_path
 
 
 @pytest.fixture(autouse=True)
-def _no_test_holds_the_docs_merge_app_key(monkeypatch, tmp_path_factory):
+def _no_test_holds_the_docs_merge_app_key(monkeypatch, _docs_merge_app_key_config_path):
     """FAIL CLOSED, the same contract `_no_test_holds_the_library_app_key`
     holds just above: no in-process test can mint a real documents-merge
     token by accident. Every `docs_merge` test either reads this fixture's
@@ -329,17 +424,8 @@ def _no_test_holds_the_docs_merge_app_key(monkeypatch, tmp_path_factory):
     itself, exactly as the Library fixture's docstring describes for
     `kb_merge`.
     """
-    import json
-
     import docs_merge
-    d = tmp_path_factory.mktemp("no-docs-merge-app-key")
-    config_path = d / "docs-merge-app.json"
-    config_path.write_text(json.dumps({
-        "repos": ["example/repo"],
-        "app_id": "0",
-        "key_path": str(d / "docs-merge-app.pem"),
-    }))
-    monkeypatch.setattr(docs_merge, "CONFIG_PATH", config_path)
+    monkeypatch.setattr(docs_merge, "CONFIG_PATH", _docs_merge_app_key_config_path)
 
 
 @pytest.fixture(autouse=True)
@@ -351,6 +437,13 @@ def _default_run_github_token(agentctl, monkeypatch):
     way it did before this gate existed, so the mint is stubbed here to succeed with a
     fixed fake token by default.
 
+    `_run_session`'s post-hold mint (CQ·518, second half) is a SEPARATE seam,
+    `_mint_run_github_token_out_of_process` — it shells out to a fresh `agentctl`
+    subprocess rather than calling `_mint_run_github_token` in-process (the fix for
+    the fork/exec segfault this moved it off of), so it needs its own default stub
+    here, or every test that drives `_run_session` without stubbing it itself would
+    actually exec a child process that tries to mint for real.
+
     This fails OPEN (succeed), the opposite of `_no_test_holds_the_library_app_key`'s
     fail-closed default just above — correct for each: `kb_merge`'s App actions are a
     small, deliberate set of tests that each know the gate is there, so refusing by
@@ -358,15 +451,94 @@ def _default_run_github_token(agentctl, monkeypatch):
     exercised by most of this file; refusing by default here would turn every one of
     those tests into a failure of this gate instead of whatever they actually drive.
 
-    A test of the mint ITSELF (success, failure, scope) restores the real function —
-    `agentctl._real_mint_run_github_token`, stashed below the first time this fixture
-    runs — with `monkeypatch.setattr(agentctl, "_mint_run_github_token",
-    agentctl._real_mint_run_github_token)`, then stubs `agentctl.GA`'s primitives
-    itself; test_agentctl.py's CQ·418 section does exactly this."""
+    A test of either mint ITSELF (success, failure, scope) restores the real function
+    — `agentctl._real_mint_run_github_token` / `agentctl._real_mint_run_github_token_out_of_process`,
+    each stashed below the first time this fixture runs — with
+    `monkeypatch.setattr(agentctl, "_mint_run_github_token", agentctl._real_mint_run_github_token)`
+    (or the out-of-process pair), then stubs `agentctl.GA`'s primitives itself;
+    test_agentctl.py's CQ·418 section does exactly this."""
     if not hasattr(agentctl, "_real_mint_run_github_token"):
         agentctl._real_mint_run_github_token = agentctl._mint_run_github_token
     monkeypatch.setattr(agentctl, "_mint_run_github_token",
                         lambda repo: ("ghs_test_stub_token", None))
+    if not hasattr(agentctl, "_real_mint_run_github_token_out_of_process"):
+        agentctl._real_mint_run_github_token_out_of_process = (
+            agentctl._mint_run_github_token_out_of_process)
+    monkeypatch.setattr(agentctl, "_mint_run_github_token_out_of_process",
+                        lambda repo: ("ghs_test_stub_token", None))
+
+
+@pytest.fixture(autouse=True)
+def _default_individuator_registration_succeeds(agentctl, monkeypatch):
+    """`_run_session` now registers an agent session with the local
+    Individuator daemon before `_spawn_claude` ever runs (E12·2 slice S4a),
+    refusing the whole run (`registration_refused`) when that fails. Almost
+    none of this suite's many spawn tests are testing THAT; they are testing
+    spawn's other behaviour, same reasoning as `_default_run_github_token`
+    just above. Left unstubbed, every one of them would call the real
+    `individuator_client.register`, which tries to connect to the real
+    daemon socket and refuses (there is no daemon in this test environment,
+    and this sandbox denies the connection outright) — breaking every test
+    that drives `_run_session` through to `_spawn_claude`, not only the ones
+    this slice added.
+
+    `individuator_installed()` is also stubbed `True` here, so this default
+    exercises the SAME path as before that check existed (every unstubbed
+    test calls the stubbed `register` above) regardless of whether the
+    machine actually running this suite has the Individuator installed —
+    this machine does (confirmed: `/Library/LaunchDaemons/com.convivy.
+    individuator.plist` exists here), but the suite must not depend on
+    that being true everywhere it runs.
+
+    A test of registration itself (`tests/test_individuator_registration.py`)
+    repatches `agentctl.IC.register` itself, later in its own body — restoring
+    the real function from `agentctl._real_individuator_register` (stashed
+    below the first time this fixture runs, outside monkeypatch, the same
+    pattern `_default_run_github_token` above uses) when it wants the real
+    connect-and-refuse behaviour rather than another canned result — which
+    wins. A test of the install-skip behaviour itself repatches
+    `agentctl.IC.individuator_installed` the same way."""
+    if not hasattr(agentctl, "_real_individuator_register"):
+        agentctl._real_individuator_register = agentctl.IC.register
+    monkeypatch.setattr(agentctl.IC, "register",
+                        lambda **_kw: agentctl.IC.RegisterResult(
+                            ok=True, handle="test-stub-handle", session_id="sess-test-stub"))
+    if not hasattr(agentctl, "_real_individuator_installed"):
+        agentctl._real_individuator_installed = agentctl.IC.individuator_installed
+    monkeypatch.setattr(agentctl.IC, "individuator_installed", lambda *_a, **_kw: True)
+
+
+@pytest.fixture(autouse=True)
+def _default_pr_gh_token(agentctl, monkeypatch):
+    """Every caller in `bin/agentctl` that reads or writes GitHub through `gh`
+    mints a convivy-bosun token first, ALL of them through this one choke
+    point (`_gh_run_env`: E10 S3/S4, platform/specs/github-credential-seam;
+    platform/decisions/0051), rather than running `gh` under the operator's
+    ambient login. That now covers `pr-open`, `pr-ready`, `review-post`,
+    `review-status`, `review-ci`, `spawn`'s `--pr` lookup and its open-PR
+    collision check, `publish`'s PR-branch check, a dying review run's
+    posted-stamp check, and the `gh` passthrough command — not only the
+    pr-open/pr-ready pair this fixture was first written for. Almost none of
+    this suite's many tests of those commands are testing the mint ITSELF;
+    they are testing each command's other behaviour, which must keep passing
+    exactly as it did before any of these gates existed, so the mint is
+    stubbed here, for every test, to yield a plain copy of the current
+    environment — no network, no App key, no `GH_CONFIG_DIR`.
+
+    A test of `_gh_run_env` ITSELF, or of one of the call sites above that
+    specifically exercises the real mint, restores the real function
+    (`agentctl._real_gh_run_env`, stashed below the first time this fixture
+    runs) with `monkeypatch.setattr(agentctl, "_gh_run_env", agentctl._real_gh_run_env)`,
+    the same pattern `_default_run_github_token` above uses for
+    `_mint_run_github_token`, then stubs `agentctl.GA`'s primitives itself."""
+    if not hasattr(agentctl, "_real_gh_run_env"):
+        agentctl._real_gh_run_env = agentctl._gh_run_env
+
+    @contextmanager
+    def _fake_gh_run_env(repo_slug, verb):
+        yield dict(os.environ)
+
+    monkeypatch.setattr(agentctl, "_gh_run_env", _fake_gh_run_env)
 
 
 @pytest.fixture
@@ -496,10 +668,13 @@ def co_rollover_cli():
 
 
 @pytest.fixture(scope="session")
-def issue_eligible():
-    """The `bin/issue-eligible` CLI — for its exit-code contract (ARCH-362), where
-    0 means the gate RAN and non-zero means it could not see the queue."""
-    return _load_cli("issue-eligible")
+def co_rollover_pickup_watch_cli():
+    """The `bin/co-rollover-pickup-watch` CLI module — its own `main`'s argv
+    parsing and wiring into `co_rollover.run_pickup_watch` (`mod.CR` is the
+    real `co_rollover` library module, monkeypatched per test). The
+    `os.setsid()` call is inside this file's own `if __name__ == "__main__"`
+    guard, so loading it this way never runs it."""
+    return _load_cli("co-rollover-pickup-watch")
 
 
 @pytest.fixture(scope="session")
@@ -581,6 +756,16 @@ def ci_result_capture():
 
 
 @pytest.fixture(scope="session")
+def check_ci_workflow_drift():
+    """The `bin/check-ci-workflow-drift` module (CQ·570,
+    issue_01M5VPQ9Z92C58R3MPGDNCA7JM) — the Bosun's read-only,
+    convivy-bosun-App-authenticated check for a registered repo whose
+    declared `ci_workflows` disagree with GitHub's own pull-request workflow
+    list."""
+    return _load_cli("check-ci-workflow-drift")
+
+
+@pytest.fixture(scope="session")
 def github_activity_capture():
     """The `bin/github-activity-capture` module (E25,
     issue_01M4ZB5C5ZX0MV206064MTRAE0) — the Bosun's read-only,
@@ -629,6 +814,13 @@ def model_scorecard():
 
 
 @pytest.fixture(scope="session")
+def trial_escaped_defects():
+    """The `bin/trial-escaped-defects` module — the CQ·527 per-pull-request
+    escaped-defect counter for a model trial."""
+    return _load_cli("trial-escaped-defects")
+
+
+@pytest.fixture(scope="session")
 def security_scorecard():
     """The `bin/security-scorecard` module — the ARCH-306 security-catch harvester."""
     return _load_cli("security-scorecard")
@@ -649,8 +841,8 @@ def velocity_report():
 @pytest.fixture(scope="session")
 def agent_activity_report():
     """The `bin/agent-activity-report` module (ARCH-241) — the /activity + cost-per-
-    outcome snapshot producer. Tests exercise its surfacing policy (PA task-text
-    redaction, ARCH-243) without touching the live corpus."""
+    outcome snapshot producer. Tests exercise its surfacing policy (demo-assistant
+    task-text redaction, ARCH-243) without touching the live corpus."""
     return _load_cli("agent-activity-report")
 
 
@@ -804,7 +996,7 @@ def runs_root(tmp_path, monkeypatch):
 # THE LEAK THIS CLOSES. `post_bug` gained a SECOND write in ARCH-373 — an issue on
 # the ops queue, alongside its Slack post. One pre-ARCH-373 test still mocked only
 # Slack, so from that day every agent run executing the suite filed a real issue:
-# 148 `[possible bug] something looks off` rows against vivy between 2026-07-19 and
+# 148 `[possible bug] something looks off` rows against widget between 2026-07-19 and
 # 07-23, one per run (the once_key carries AGENTCTL_RUN_ID, so each run minted a
 # fresh one). They outnumbered the real queue 148-to-27, and each looked like a
 # plausible report, so the pile never read as a defect.
@@ -849,6 +1041,30 @@ _OPS_HOSTS = {
 if vault_plane.LIBRARY_BASE_URL:
     _OPS_HOSTS.add(urllib.parse.urlsplit(vault_plane.LIBRARY_BASE_URL).netloc)
 _OPS_HOSTS.discard("")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_claude_account(monkeypatch, _no_claude_account_dir):
+    """`usage_window.live_account` asks the real `claude-sub` (which reads the
+    Keychain) and reads the real ~/.claude.json, and spawn calls it, so every
+    spawn test would make an extra `subprocess.run` call. Stub it to an unknown
+    account, the pre-CQ·517 behaviour, on any machine, and point both seams at
+    nothing behind it. A test of the resolution calls
+    `usage_window._resolve_live_account` and sets the seams itself."""
+    import usage_window
+    missing = _no_claude_account_dir
+    monkeypatch.setattr(usage_window, "live_account", lambda: None)
+    monkeypatch.setattr(usage_window, "CLAUDE_SUB_CMD", str(missing / "claude-sub"))
+    monkeypatch.setattr(usage_window, "CLAUDE_JSON_PATH", missing / ".claude.json")
+
+
+@pytest.fixture(scope="session")
+def _no_claude_account_dir(tmp_path_factory):
+    """The directory `_no_live_claude_account` points `CLAUDE_SUB_CMD`/
+    `CLAUDE_JSON_PATH` at, built once: neither name inside it is ever created
+    by any test (the point of both is that they are missing), so one
+    directory is safe to share for the whole session."""
+    return tmp_path_factory.mktemp("no-claude-account")
 
 
 @pytest.fixture(autouse=True)
@@ -961,12 +1177,39 @@ def _no_live_pinned_opener_calls(monkeypatch):
 # knowledge.py admits a document's `audience` against the Library's roster, read
 # from GET /roster on every decision. A validation in any test would therefore reach
 # the live Library, and `_no_live_ops_writes` above would fail it. This stubs the
-# read with the seed the loader reads from the literal, so validation sees the same
-# names it always did. test_knowledge_roster.py restores the real read to test it.
+# read with a roster this suite controls, so validation sees the names its fixtures
+# use. test_knowledge_roster.py restores the real read to test it.
+#
+# NOT `knowledge.ALLOWED_AUDIENCE`: that literal is the Builder fresh-install seed
+# (the four starter agents plus the people/group markers), the input
+# `library/load_crew_registry.py roster` reads once to populate an empty roster
+# table. A live installation's roster carries everything registered since through
+# `PUT /roster/{name}`, which is what this suite's fixtures were written against —
+# decision docs naming `architect`, `overnight-triage`, `deck-reviewer`, and the
+# rest. This constant is that stand-in, kept here rather than derived from the seed
+# literal, which no longer has them.
+_TEST_LIBRARY_ROSTER = frozenset({
+    "overnight-orchestrator", "galley-overnight-orchestrator", "knowledge-scribe",
+    "kb-sync-verifier", "overnight-triage", "overnight-fix-drain", "overnight-verify",
+    "planning-orchestrator", "planner", "architect", "coder", "refactorer", "reviewer",
+    "test-writer", "bug-investigator", "bug-fixer", "design-critic", "product-analyst",
+    "explainer", "curator", "observability-scribe", "security-reviewer",
+    "shadow-reviewer", "security-auditor", "product-manager", "positioning-strategist",
+    "commercial-writer", "platform-architect", "platform-planner", "platform-coder",
+    "deck-coder", "deck-reviewer", "deck-security-reviewer", "galley-architect",
+    "galley-coder", "galley-planner", "galley-reviewer", "galley-security-reviewer",
+    "sel-architect", "sel-coder", "sel-design-critic", "sel-planner", "sel-reviewer",
+    "sel-security-reviewer", "cart-architect", "cart-coder", "cart-planner",
+    "relay-architect", "relay-coder", "relay-planner", "relay-reviewer",
+    "relay-security-reviewer", "scout", "editor", "instructional-designer",
+    "rhetorician", "wb-reviewer", "orient-coder", "consultant", "team", "contractor",
+})
+
+
 @pytest.fixture(autouse=True)
 def _library_roster_is_the_seed(monkeypatch):
     import knowledge
-    seed = frozenset(knowledge.ALLOWED_AUDIENCE)
+    seed = _TEST_LIBRARY_ROSTER | {knowledge.OPERATOR_MARKER}
     monkeypatch.setattr(knowledge, "_fetch_roster", lambda: seed, raising=False)
     monkeypatch.setattr(knowledge, "_roster_cache", None, raising=False)
 
@@ -975,12 +1218,12 @@ def _library_roster_is_the_seed(monkeypatch):
 #
 # THE PROBLEM IT NAMES. Several guards in this suite assert that a constant here
 # agrees with the knowledge repo — ALLOWED_PROJECTS against the KB validator,
-# KNOWN_KB_PROJECTS against the real project directories, AGENTS_DIR against the
-# real roster. CI checks out agent-platform alone, so every one of them called
-# `pytest.skip` there. Both readings then agree and both are worthless: main is
-# green because the check did not run, and a machine WITH the KB fails the same
-# assertions the moment anyone looks. That is how PR E2's drift survived until
-# PR F found three more stale copies by hand.
+# AGENTS_DIR against the real roster. CI checks out agent-platform alone, so
+# every one of them called `pytest.skip` there. Both readings then agree and
+# both are worthless: main is green because the check did not run, and a
+# machine WITH the KB fails the same assertions the moment anyone looks. That
+# is how PR E2's drift survived until PR F found three more stale copies by
+# hand.
 #
 # THE FIX IS NOT TO MAKE CI CHECK OUT THE KB. That needs a standing credential
 # with read access to the whole private knowledge repo, available to every
@@ -1014,15 +1257,198 @@ def knowledge_repo() -> Path:
     return builder_root.root() / "knowledge"
 
 
+def _dir_listable(path: Path) -> bool:
+    """True iff `path` is a directory whose entries can actually be read.
+
+    `Path.is_dir()` alone is not enough (epic E33 slice 2): a dispatched run's
+    sandbox denies DATA reads under the real account home — opening a file,
+    listing a directory's entries — while leaving METADATA reads (`stat`, and
+    so `is_dir()`) open on a path outside the read allowlist. A guard that
+    checked only `is_dir()` therefore read a real-but-denied directory as
+    PRESENT on a dispatched run's own pytest, then either hit a loud
+    `PermissionError` opening a file under it, or, worse, a silently EMPTY
+    listing (`Path.glob` swallows a `PermissionError` from the `os.scandir` it
+    calls internally) that read as "nothing here" rather than "this could not
+    be read" — the wrong-answer-shaped-like-an-empty-one a guard must not hand
+    its assertion.
+
+    `os.listdir`, not `Path.glob`, is what this checks with: it is a direct
+    data read with no internal swallow, so the one `OSError` it can raise
+    (missing, not a directory, or denied) answers False here exactly the way
+    an absent directory always has. Shared by `_kb_checkout_listable` (the
+    real knowledge checkout) and by any other guard that reads a real,
+    un-allowlisted path on purpose (`test_primary_guard.py`'s own agent-
+    platform checkout check)."""
+    try:
+        os.listdir(path)
+    except OSError:
+        return False
+    return True
+
+
+def _kb_checkout_listable(path: Path) -> bool:
+    """`_dir_listable`, named for its one caller: the `needs_kb` skip
+    condition's own knowledge-checkout check."""
+    return _dir_listable(path)
+
+
+# --- no test depends on Convivy's own crew entries (CQ-546/CQ-565, platform/decisions/0098) --
+#
+# THE MOVE THIS COMPLETES. Decision 0098 moved the crew registry out of this
+# repo's own config/projects.json; CQ·563 made `projects.py` itself read the
+# Library's `GET /registry` by default, and CQ·565 deleted config/projects.json
+# outright (the one copy left in this repo, which only ever drifted from the
+# other two). This repo carries NO Convivy crew data of its own any more, so a
+# test that wants a rich, production-shaped registry reads the FIXTURE below
+# — made-up project, product, repo and person names throughout — never a real
+# file.
+#
+# THE OPT-IN IS THE `rich_registry` MARKER (renamed from `real_registry`,
+# which stopped being accurate the day config/projects.json stopped existing),
+# applied to a test (or a whole module, via `pytestmark`) that needs a bigger,
+# more varied registry than the tiny default below — several private crews, a
+# `repo_owners` override, every KB posture, aliases, products. A test that
+# reads the registry only because it was convenient — most of the suite,
+# which already builds its own tiny registry under `tmp_path` and
+# monkeypatches `projects.PROJECTS_JSON` itself — needs no marker at all: its
+# own later `monkeypatch.setattr(projects, "PROJECTS_JSON", ...)` simply
+# overrides the default this fixture sets, the same way `crafted_registry` and
+# its many siblings across the suite already override one another.
+@pytest.fixture(scope="session")
+def _synthetic_projects_registry_path(tmp_path_factory) -> Path:
+    """The made-up registry `_default_projects_registry` points every
+    non-opted-in test's `projects.PROJECTS_JSON` at: one project, one product,
+    one scope, naming nothing a real Convivy crew answers to — except this
+    repo's own `bosun`/`agent-platform` row below, minimal and matching
+    `tests/fixtures/rich_registry.json`'s real one, because `agent-platform`
+    is this suite's own name for itself and countless tests across the suite
+    dispatch against it by that literal name. Built once and never written to
+    by a test — a test that must edit a registry file builds its own under
+    its own `tmp_path`, as the suite already does throughout."""
+    d = tmp_path_factory.mktemp("synthetic-projects-registry")
+    path = d / "projects.json"
+    path.write_text(json.dumps({
+        "_meta": {"doc": "synthetic default test registry (CQ-546)"},
+        "_products": {"widgets": {"display": "Widgets", "owner": "test-owner"}},
+        "_scopes": {"platform": {"display": "Platform"}},
+        # Declared through `_kb_legacy` (below) rather than `kb: central`, so a
+        # test asserting on this unit's other fields (`kb: local`, no
+        # `kb_project`) is unaffected by this row existing — the same shape
+        # `projects._validate_kb_project_targets`'s own docstring describes for
+        # a `kb: local` unit naming its own repo's slice.
+        "widget-crew": {
+            "class": "project", "display": "Widget Crew", "owner": "test-owner",
+            "home_dir": "<root>/widget-crew", "dirs": [], "crew": "widget-crew",
+            "lifecycle": "active", "products": ["widgets"],
+            "repos": ["widget-crew"], "aliases": [], "kb": "local",
+            "task_text_public": False, "overnight": False,
+            "kb_project_by_repo": {
+                "widget-crew": {
+                    "kb_project": "widget-crew",
+                    "reason": "the synthetic default test registry's own project, "
+                              "self-mapped so a test naming it as a dispatch target "
+                              "resolves a profile with no real registry row (CQ-546).",
+                },
+            },
+        },
+        # A synthetic BLACK BOX crew (platform/decisions/0043), naming nothing a
+        # real Convivy crew answers to, for any test exercising a private-repo
+        # dispatch against the shared default registry rather than a hand-built
+        # one of its own.
+        "example-private-crew": {
+            "class": "project", "display": "Example Private Crew", "owner": "test-owner",
+            "home_dir": "<root>/example-private-repo", "dirs": [],
+            "crew": "example-private-crew", "lifecycle": "active", "products": [],
+            "repos": ["example-private-repo"], "aliases": [], "kb": "local",
+            "task_text_public": False, "overnight": False, "private": True,
+        },
+        # A synthetic crew with a registered `agent_prefix`, naming nothing a real
+        # Convivy crew answers to, for a test exercising crew-prefixed dispatch
+        # (ARCH-397 Phase 2) against the shared default registry. Two prefixes,
+        # the same list shape a crew with a live prefix and a retired one it still
+        # has to authenticate old review stamps under uses in config/projects.json.
+        "synth-crew": {
+            "class": "project", "display": "Synth Crew", "owner": "test-owner",
+            "home_dir": "<root>/synth-crew", "dirs": [], "crew": "synth-crew",
+            "agent_prefix": ["synthcrew-", "synthpa-"],
+            "lifecycle": "active", "products": [],
+            "repos": ["synth-crew"], "aliases": [], "kb": "local",
+            "task_text_public": False, "overnight": False,
+        },
+        # NOT synthetic: this repo's own real crew (`tests/fixtures/rich_registry.json`'s
+        # `bosun` row), kept minimal. `agent-platform` is a name this suite dispatches
+        # against throughout, including outside `test_agentctl.py` (e.g.
+        # `test_codex_review_dispatch.py`), not an invented placeholder, so it is
+        # registered like any other real repo rather than treated as unregistered
+        # (issue_01M69GD4HG7FNCF8C6Q3DS02SP).
+        "bosun": {
+            "class": "project", "display": "Bosun", "owner": "test-owner",
+            "home_dir": "<root>/agent-platform", "dirs": [], "crew": "bosun",
+            "lifecycle": "active", "products": [],
+            "repos": ["agent-platform"], "aliases": [], "kb": "local",
+            "task_text_public": False, "overnight": False,
+        },
+        "_kb_legacy": ["widget-crew"],
+    }, indent=2) + "\n")
+    return path
+
+
+def _clear_load_raw_cache(projects) -> None:
+    """`projects._load_raw.cache_clear()`, tolerating a test that has replaced
+    `_load_raw` itself with a plain stub function (several registry tests do
+    this to simulate an unreadable file) — that stub carries no
+    `cache_clear`, and at THIS fixture's own teardown the stub is still in
+    place: `monkeypatch`'s own revert runs after this fixture's, since this
+    fixture depends on it and teardown unwinds in the reverse of setup
+    order."""
+    clear = getattr(projects._load_raw, "cache_clear", None)
+    if clear is not None:
+        clear()
+
+
+@pytest.fixture(autouse=True)
+def _default_projects_registry(request, monkeypatch, _synthetic_projects_registry_path):
+    """Repoint `projects.PROJECTS_JSON` at the small synthetic registry above
+    for every test, except one marked `rich_registry` — see the block comment
+    just above. `_load_raw` is a bare `functools.lru_cache` with no argument
+    to key on, so it is cleared on both ends: on entry, so this test does not
+    inherit whatever the previous test's registry parsed to, and on exit, so
+    the next test — whether it opts in or not — starts without this test's
+    answer cached either. `_load_raw_live`'s own Library-mode cache
+    (`_live_library_cache`, CQ·563) is keyed on a clock rather than a file
+    path, so it is reset the same way: a test that sets `PROJECTS_JSON` to
+    `None` to exercise that branch must not inherit a prior such test's
+    cached document, within the 60s window, across the suite."""
+    import projects
+
+    if request.node.get_closest_marker("rich_registry") is None:
+        monkeypatch.setattr(projects, "PROJECTS_JSON", _synthetic_projects_registry_path)
+    else:
+        monkeypatch.setattr(projects, "PROJECTS_JSON", _RICH_REGISTRY_PATH)
+    _clear_load_raw_cache(projects)
+    projects._live_library_cache = None
+    yield
+    _clear_load_raw_cache(projects)
+    projects._live_library_cache = None
+
+
 def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "needs_kb: asserts agreement with the knowledge repo; skipped where no "
         "checkout exists (CI). Run daily by bin/check-kb-guards.")
+    config.addinivalue_line(
+        "markers",
+        "rich_registry: this test needs a bigger, production-shaped registry "
+        "than _synthetic_projects_registry_path's one project — "
+        "_default_projects_registry points it at tests/fixtures/rich_registry.json "
+        "instead (renamed from real_registry, CQ-546/CQ-565, platform/decisions/0098: "
+        "this repo's own config/projects.json, the thing that marker used to name, "
+        "is gone).")
 
 
 def pytest_runtest_setup(item):
-    if item.get_closest_marker("needs_kb") and not (knowledge_repo() / "projects").is_dir():
+    if item.get_closest_marker("needs_kb") and not _kb_checkout_listable(knowledge_repo() / "projects"):
         pytest.skip(
             f"no knowledge checkout at {knowledge_repo()}; this guard runs where "
             f"the KB is (bin/check-kb-guards), not in CI")
@@ -1072,13 +1498,37 @@ def pytest_runtest_setup(item):
 # they assert is exactly empty, and a file dropped into it by this fixture broke
 # four of them the first time this landed.
 @pytest.fixture(autouse=True)
-def _isolate_knowledge_index_db(monkeypatch, tmp_path_factory):
+def _isolate_knowledge_index_db(monkeypatch, tmp_path_factory, _knowledge_index_db_template):
+    import shutil
+
     import indexer
 
     db = tmp_path_factory.mktemp("isolated-index") / "index.db"
+    shutil.copy2(_knowledge_index_db_template, db)
     monkeypatch.setattr(indexer, "DB", db)
-    indexer.ensure_db()
     return db
+
+
+@pytest.fixture(scope="session")
+def _knowledge_index_db_template(tmp_path_factory):
+    """`indexer.ensure_db()`'s own output — schema file read, WAL pragma, migrate,
+    `executescript`, the FTS-leak check's two COUNT queries — applied ONCE for the
+    whole session, rather than by every one of this suite's 11000+ tests. The
+    result is the same deterministic bytes every time (no row, no timestamp, no
+    random ID): `_migrate` only adds a column when `docs` already exists, which a
+    freshly created database never does, and the schema file itself is
+    `CREATE ... IF NOT EXISTS` throughout. `_isolate_knowledge_index_db` copies
+    this file rather than re-deriving it per test."""
+    import indexer
+
+    template = tmp_path_factory.mktemp("index-template") / "index.db"
+    real_db = indexer.DB
+    indexer.DB = template
+    try:
+        indexer.ensure_db()
+    finally:
+        indexer.DB = real_db
+    return template
 
 
 @pytest.fixture(autouse=True)
@@ -1158,11 +1608,62 @@ def _tool_session_scratch_dir_off_the_real_account_home(agentctl, tmp_path_facto
     all, and which `_no_directory_appears_under_the_real_tool_session_scratch_root`,
     below, fails the whole session over. Defaults to a fresh tmp directory for every
     test that applies it; a test that stubs `create_tool_session_scratch_dir` itself,
-    later in its own body, wins over this default."""
+    later in its own body, wins over this default.
+
+    ALSO REDIRECTS `create_review_draft_dir` (platform/specs/reviewers-run-under-
+    their-allow-list), the identical hazard one layer over: a real dispatch of
+    `reviewer`/`security-reviewer` — the default agent every `tests/test_spawn_
+    sandbox.py` call drives — now also creates a directory under THIS machine's
+    own `~/.local/state/agent-platform/review-drafts`, keyed on the worktree's
+    name, before this run's claude ever starts. Same fix, same shape: one fake
+    home for the whole test, and `_no_directory_appears_under_the_real_review_
+    draft_root` below is this one's own backstop."""
     real_create = agentctl.RS.create_tool_session_scratch_dir
+    real_create_draft = agentctl.RS.create_review_draft_dir
     fake_home = tmp_path_factory.mktemp("tool-session-home")
     monkeypatch.setattr(agentctl.RS, "create_tool_session_scratch_dir",
                         lambda home=None: real_create(fake_home))
+    monkeypatch.setattr(agentctl.RS, "create_review_draft_dir",
+                        lambda home=None, worktree=None: real_create_draft(fake_home, worktree))
+
+
+def _listing_or_unobservable(root: Path, which: str) -> "set[Path] | None":
+    """The entries directly under `root`, or None when `root` EXISTS but this
+    process cannot LIST it — a PermissionError, not a missing directory. A
+    dispatched run's own sandbox denies the real account home wholesale (epic
+    E33 slice 2), and both backstops below sit under it, so a test session
+    running inside such a sandbox cannot list either root at all. In that
+    case this process could not have written under `root` either, so the
+    backstop has nothing to catch: one warning names `which` and the caller
+    skips its before/after comparison entirely rather than failing on a
+    PermissionError the backstop was never meant to catch."""
+    if not root.is_dir():
+        return set()
+    try:
+        return set(root.iterdir())
+    except PermissionError as exc:
+        warnings.warn(
+            f"{which} ({root}) cannot be listed from this process ({exc}); "
+            "skipping its before/after comparison for this test session.")
+        return None
+
+
+def _assert_no_new_entries(root: Path, which: str, before: "set[Path] | None") -> None:
+    """The backstop's own assertion, shared by both fixtures below: fails if an
+    entry under `root` was not in `before`. A no-op when `before` is None —
+    `_listing_or_unobservable` already warned that `root` cannot be listed, and
+    a process that cannot list a root cannot have written under it either."""
+    if before is None:
+        return
+    after = _listing_or_unobservable(root, which)
+    if after is None:
+        return
+    new = after - before
+    assert not new, (
+        f"{len(new)} new entry(ies) appeared under {which} ({root}) during "
+        f"this test session: {sorted(p.name for p in new)}. A test drove real "
+        "dispatch code without stubbing it onto a temporary home — apply "
+        "_tool_session_scratch_dir_off_the_real_account_home.")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1174,13 +1675,57 @@ def _no_directory_appears_under_the_real_tool_session_scratch_root():
     the_real_account_home` is applied to today. Only ever lists the root
     (`Path.iterdir`); never opens, renames or removes anything under it."""
     root = run_sandbox.tool_session_scratch_root(run_sandbox.passwd_home())
-    before = set(root.iterdir()) if root.is_dir() else set()
+    before = _listing_or_unobservable(root, "the real tool-session scratch root")
     yield
-    after = set(root.iterdir()) if root.is_dir() else set()
-    new = after - before
-    assert not new, (
-        f"{len(new)} new entry(ies) appeared under the REAL tool-session scratch "
-        f"root ({root}) during this test session: {sorted(p.name for p in new)}. "
-        "A test drove real dispatch code (_run_session/_spawn_claude/"
-        "create_tool_session_scratch_dir) without stubbing it onto a temporary "
-        "home — apply _tool_session_scratch_dir_off_the_real_account_home.")
+    _assert_no_new_entries(root, "the real tool-session scratch root", before)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_directory_appears_under_the_real_review_draft_root():
+    """platform/specs/reviewers-run-under-their-allow-list: the same backstop as
+    `_no_directory_appears_under_the_real_tool_session_scratch_root`, for
+    `run_sandbox.REVIEW_DRAFT_RELDIR` under the real account home. Only ever
+    lists the root; never opens, renames or removes anything under it."""
+    root = run_sandbox.passwd_home() / run_sandbox.REVIEW_DRAFT_RELDIR
+    before = _listing_or_unobservable(root, "the real review-draft root")
+    yield
+    _assert_no_new_entries(root, "the real review-draft root", before)
+
+
+# --- no test writes under the REAL ledger-refusal-marker root (round 2, PR
+# #1021 round 1 finding) ------------------------------------------------------
+#
+# `ledger.write_refusal_marker`/`_read_refused_marker_usd` resolve `home`
+# through `run_sandbox.passwd_home()` when not given explicitly — the real
+# account home, by design, same as `tool_session_scratch_root` above. A test
+# that drives `agentctl._post_live_ledger_delta`, `ledger.post_run_ledger_
+# entry` or `model-scorecard`'s `report_to_ledger` for real, without
+# redirecting this, creates (or reads) a real file under THIS machine's own
+# `~/.local/state/agent-platform/ledger-refusals`.
+@pytest.fixture
+def _ledger_refusal_marker_off_the_real_account_home(tmp_path_factory, monkeypatch):
+    """Redirects `run_sandbox.passwd_home()` — the one function `ledger.py`'s
+    refusal-marker read/write resolves `home` through by default — to a
+    fresh tmp directory for the life of one test. `run_sandbox` is a single
+    cached module (`ledger.RS` and `agentctl.RS` are the same object), so
+    this redirects every consumer regardless of which alias imported it;
+    `_no_directory_appears_under_the_real_ledger_refusal_root`, below, is
+    the session-wide backstop for a test that forgets to apply this."""
+    fake_home = tmp_path_factory.mktemp("ledger-refusal-home")
+    monkeypatch.setattr(run_sandbox, "passwd_home", lambda: fake_home)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_directory_appears_under_the_real_ledger_refusal_root():
+    """The backstop described above the fixture this depends on: records
+    what `run_sandbox.passwd_home() / ledger.REFUSAL_MARKER_RELDIR` already
+    holds before this session runs, and fails if a NEW entry appears there
+    after it. Only ever lists the root; never opens, renames or removes
+    anything under it. Uses `_listing_or_unobservable`/`_assert_no_new_entries`
+    for the same reason as the review-draft backstop above: a dispatched
+    run's own sandbox denies the real account home wholesale (epic E33
+    slice 2), and this root sits under it too."""
+    root = run_sandbox.passwd_home() / ledger.REFUSAL_MARKER_RELDIR
+    before = _listing_or_unobservable(root, "the real ledger-refusal root")
+    yield
+    _assert_no_new_entries(root, "the real ledger-refusal root", before)

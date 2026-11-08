@@ -11,7 +11,11 @@ The risks these guard:
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import cost_join as cj
 import pytest
@@ -31,7 +35,7 @@ def cj_root(tmp_path, monkeypatch):
 
 def _mk_run(runs, date, name, *, usd=0.0, by_model=None, cost_source=None,
             agent="coder", model="claude-sonnet-4-6", parent_run=None,
-            started=None, ended=None, repo="vivy", origin=None, profile="",
+            started=None, ended=None, repo="widget", origin=None, profile="",
             pr=None, exit_status="completed", co_session=None, overnight_wave=None):
     d = runs / "agent-runs" / date / name
     d.mkdir(parents=True)
@@ -60,7 +64,7 @@ def _mk_run(runs, date, name, *, usd=0.0, by_model=None, cost_source=None,
 
 
 def _mk_sub(runs, date, agent_id, *, uuid, usd=0.0, agent="reviewer",
-            model="claude-sonnet-4-6", started=None, repo="vivy"):
+            model="claude-sonnet-4-6", started=None, repo="widget"):
     d = runs / "agent-runs" / date / f"sub-{agent_id}"
     d.mkdir(parents=True)
     meta = {"run_id": f"sub-{agent_id}", "agent": agent, "model": model,
@@ -75,7 +79,7 @@ def _mk_sub(runs, date, agent_id, *, uuid, usd=0.0, agent="reviewer",
     return d
 
 
-def _mk_transcript(root, uuid, turns, projdir="-Users-example-Convivy-vivy", cwd=None):
+def _mk_transcript(root, uuid, turns, projdir="-Users-example-Convivy-widget", cwd=None):
     """Write a co-session transcript: turns is a list of (model, usage-dict).
 
     `cwd` (the session's working dir, recorded per Claude Code record) is what
@@ -100,27 +104,52 @@ WIN_START = datetime(2026, 6, 1, tzinfo=timezone.utc)
 WIN_END = datetime(2026, 6, 30, tzinfo=timezone.utc)
 
 
-def test_canonical_product_reports_the_three_nyh_projects_separately():
-    # The NYH repos are three PROJECTS, each reporting for itself (ARCH-426
-    # amendment, operator, 2026-07-31). They were folded into one "NYH Studio" bucket
-    # while the umbrella directory was the only thing holding them together; NYH
-    # Studio survives as the product all three build.
-    assert cj._canonical_product("nyh-arch-tools") == "NYH Arch Tools"
-    assert cj._canonical_product("nyh-etc") == "East Texas Circle"
-    assert cj._canonical_product("nyh-park-villa") == "Park Villa"
-    # the bare umbrella is one historical session (2026-06-08), attributed to the
-    # studio-wide project rather than left as a raw one-row sliver
-    assert cj._canonical_product("nyh-architecture") == "NYH Arch Tools"
-    # A FOURTH property must appear as itself or not at all — the table replaced a
-    # `nyh-*` prefix match precisely so a new building cannot be swallowed silently.
-    assert cj._canonical_product("nyh-somewhere-new") == "nyh-somewhere-new"
-    # Hollis (formerly personal-assistant, ARCH-290) folds its three tags into one.
-    assert cj._canonical_product("hollis") == "Hollis"
-    assert cj._canonical_product("personal-assistant") == "Hollis"
-    assert cj._canonical_product("pa") == "Hollis"
-    # other products pass through untouched; None → "?"
-    assert cj._canonical_product("vivy") == "vivy"
+def test_canonical_product_reads_the_registry_cost_fold_map(monkeypatch):
+    # `_canonical_product` delegates to `projects.cost_fold_map()` rather than
+    # hand-maintaining its own copy of a few products' legacy and umbrella
+    # names (projects.py's module docstring names that copy as one of the
+    # scattered lists the registry replaces). Several raw strings may fold to
+    # the same unit's display, e.g. an umbrella alias and a retired crew's
+    # alias onto the crew that inherited its work.
+    monkeypatch.setattr(cj.projects, "cost_fold_map", lambda: {
+        "acme-old-name": "Acme", "acme-legacy-alias": "Acme"})
+    assert cj._canonical_product("acme-old-name") == "Acme"
+    assert cj._canonical_product("acme-legacy-alias") == "Acme"
+    # A raw string with no fold is its own bucket — every registered unit's
+    # own slug, by default.
+    assert cj._canonical_product("acme-unmapped") == "acme-unmapped"
     assert cj._canonical_product(None) == "?"
+
+
+def test_canonical_product_degrades_to_unfolded_on_an_unreadable_registry(monkeypatch):
+    """A cost report is not worth crashing over: when `cost_fold_map()` cannot
+    read the registry, `_canonical_product` reports the raw string unfolded
+    rather than raising."""
+    def _raise():
+        raise FileNotFoundError("no such file")
+    monkeypatch.setattr(cj.projects, "cost_fold_map", _raise)
+    assert cj._canonical_product("acme-old-name") == "acme-old-name"
+
+
+def test_importing_cost_join_survives_an_unreadable_registry(tmp_path):
+    """`cost_join.py` is imported at module load by `bin/work-item-cost` and
+    `bin/agent-activity-report`; a missing or unreadable config/projects.json
+    must not take either down. `_canonical_product`'s own registry read is
+    already lazy (inside the function, not at import), so this mainly
+    confirms the import itself carries no module-level registry read either
+    — the same shape `run_sandbox.py`'s `POSTGRES_SOCKET_REPOS` got wrong."""
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    env = dict(os.environ)
+    env["HOME"] = str(empty_home)
+    env["PROJECTS_JSON"] = str(tmp_path / "no-such-file.json")
+    lib_dir = Path(__file__).resolve().parent.parent / "lib" / "agent-platform"
+    result = subprocess.run(
+        [sys.executable, "-c", f"import sys; sys.path.insert(0, {str(lib_dir)!r}); "
+                                "import cost_join"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_agentctl_tree_sums_cost_across_chain(cj_root):
@@ -213,7 +242,7 @@ def test_co_main_loop_dedupes_repeated_message_id(cj_root):
     # occurrence double-counts a co main-loop's cost (~2x observed, ARCH-383); the
     # reconstruction must count a repeated response once, matching ccusage.
     uuid = "dddddddd-0000-1111-2222-333333333333"
-    proj = cj_root / "projects" / "-Users-example-Convivy-vivy"
+    proj = cj_root / "projects" / "-Users-example-Convivy-widget"
     proj.mkdir(parents=True, exist_ok=True)
     usage = {"input_tokens": 1000, "output_tokens": 500,
              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
@@ -239,7 +268,7 @@ def test_co_main_loop_counts_keyless_records(cj_root):
     # A record with neither message.id nor requestId is counted, never collapsed
     # with other keyless records (the dedup guard only fires on a present key).
     uuid = "eeeeeeee-0000-1111-2222-333333333333"
-    proj = cj_root / "projects" / "-Users-example-Convivy-vivy"
+    proj = cj_root / "projects" / "-Users-example-Convivy-widget"
     proj.mkdir(parents=True, exist_ok=True)
     u = {"input_tokens": 1000, "output_tokens": 500}
 
@@ -317,7 +346,7 @@ def test_overnight_wave_groups_stage_runs_into_one_night(cj_root):
     """ARCH-268 phase-split stage runs (no parent_run, no co_session) sharing a
     wave key nest under one synthetic 'overnight night' row instead of orphaning
     each as a top-level root (canary follow-up 2026-06-27)."""
-    wave = "sous-chef/2026-06-10"
+    wave = "initech/2026-06-10"
     for stage, agent, t in [
         ("triage", "overnight-triage", "01:00:00"),
         ("fixdrain", "overnight-fix-drain", "01:10:00"),
@@ -326,19 +355,19 @@ def test_overnight_wave_groups_stage_runs_into_one_night(cj_root):
     ]:
         _mk_run(cj_root, "2026-06-10", f"run-{stage}", usd=1.0, agent=agent,
                 parent_run=None, overnight_wave=wave, origin="scheduled",
-                repo="sous-chef", started=f"2026-06-10T{t}Z")
+                repo="initech", started=f"2026-06-10T{t}Z")
     # a fix-drain worker nests by run-id (it carries the inherited wave too, but
     # parent_run takes precedence) — it must NOT spawn a second night row.
     _mk_run(cj_root, "2026-06-10", "run-fd-worker", usd=2.0, agent="coder",
             parent_run="run-fixdrain", overnight_wave=wave, origin="scheduled",
-            repo="sous-chef", started="2026-06-10T01:15:00Z")
+            repo="initech", started="2026-06-10T01:15:00Z")
     sessions = cj.build_sessions(WIN_START, WIN_END)
     assert len(sessions) == 1                       # one night, no orphan roots
     [s] = sessions
     assert s["kind"] == "overnight"
     assert s["session_id"] == f"overnight:{wave}"
-    assert s["product"] == "sous-chef"
-    assert s["label"] == "overnight · sous-chef · 2026-06-10"
+    assert s["product"] == "initech"
+    assert s["label"] == "overnight · initech · 2026-06-10"
     assert s["worker_count"] == 1                    # 5 nodes - 4 stage roots
     assert s["total_usd"] == pytest.approx(6.0)      # 4 stages + 1 worker
     # the worker is nested one level under its fix-drain stage root.
@@ -353,11 +382,11 @@ def test_curation_wave_groups_dispatches_into_one_row(cj_root):
     top-level scheduled session (operator, 2026-06-28)."""
     wave = "curation:2026-06-10"
     for agent, repo, t in [
-        ("security-auditor", "constance", "10:01:00"),
-        ("security-auditor", "vivy", "10:11:00"),
-        ("security-auditor", "sous-chef", "10:23:00"),
-        ("observability-scribe", "sous-chef", "10:30:00"),
-        ("curator", "sous-chef", "10:37:00"),
+        ("security-auditor", "globex", "10:01:00"),
+        ("security-auditor", "widget", "10:11:00"),
+        ("security-auditor", "initech", "10:23:00"),
+        ("observability-scribe", "initech", "10:30:00"),
+        ("curator", "initech", "10:37:00"),
     ]:
         _mk_run(cj_root, "2026-06-10", f"run-{agent}-{repo}", usd=1.0, agent=agent,
                 parent_run=None, overnight_wave=wave, origin="scheduled",
@@ -395,7 +424,7 @@ def test_build_outcomes_sums_subtree_per_pr(cj_root):
     assert len(outcomes) == 1
     o = outcomes[0]
     assert o["pr_number"] == 512
-    assert o["product"] == "vivy"
+    assert o["product"] == "widget"
     # subtree of run-coder = 4.0 + 1.5 (its helper); the orchestrator is NOT included
     assert o["chain_usd"] == pytest.approx(5.5)
     assert o["node_usd"] == pytest.approx(4.0)
@@ -408,57 +437,59 @@ def test_build_outcomes_empty_when_no_pr(cj_root):
     assert cj.build_outcomes(WIN_START, WIN_END) == []
 
 
-# --- main-loop-only surfacing (all products, not just PA) -----------------------
+# --- main-loop-only surfacing (all products, not just demo-assistant) -----------------------
 
-_PA_DIR = "-Users-example-Convivy-personal-assistant"
+_DEMO_DIR = "-Users-example-Convivy-demo-assistant"
 
 
+@pytest.mark.rich_registry
 def test_lab_product_mainloop_only_session_surfaced(cj_root):
-    """A PA co session that dispatched NO subagents (no sub-* run-dir) is surfaced
+    """A demo-assistant co session that dispatched NO subagents (no sub-* run-dir) is surfaced
     from its transcript alone — the cost that was invisible before ARCH-243."""
     uuid = "deadbeef-0000-1111-2222-333333333333"
     _mk_transcript(cj_root, uuid, [
         ("claude-sonnet-4-6", {"input_tokens": 100000, "output_tokens": 20000,
                                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
-    ], projdir=_PA_DIR, cwd="/repo/personal-assistant")
+    ], projdir=_DEMO_DIR, cwd="/repo/demo-assistant")
     [s] = cj.build_sessions(WIN_START, WIN_END)
     assert s["kind"] == "interactive"
-    assert s["product"] == "Hollis"
+    assert s["product"] == "Atlas"
     assert s["worker_count"] == 0
     assert s["main_loop_captured"] is True
     assert s["total_usd"] > 0
     assert len(s["nodes"]) == 1 and s["nodes"][0]["depth"] == 0
 
 
+@pytest.mark.rich_registry
 def test_lab_product_with_subagents_not_double_surfaced(cj_root):
-    """A PA session that DID dispatch a subagent is surfaced once (via the normal
+    """A demo-assistant session that DID dispatch a subagent is surfaced once (via the normal
     interactive path with its child), not also re-added by the main-loop scan."""
     uuid = "cafef00d-4444-5555-6666-777777777777"
     _mk_transcript(cj_root, uuid, [
         ("claude-sonnet-4-6", {"input_tokens": 5000, "output_tokens": 1000,
                                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
-    ], projdir=_PA_DIR, cwd="/repo/personal-assistant")
+    ], projdir=_DEMO_DIR, cwd="/repo/demo-assistant")
     _mk_sub(cj_root, "2026-06-10", "pasub", uuid=uuid, usd=0.4,
-            agent="pa-reviewer", repo="personal-assistant", started="2026-06-10T12:05:00Z")
+            agent="aide-reviewer", repo="demo-assistant", started="2026-06-10T12:05:00Z")
     sessions = [s for s in cj.build_sessions(WIN_START, WIN_END)
                 if s["session_id"] == uuid]
     assert len(sessions) == 1            # exactly one, no double-count
     assert sessions[0]["worker_count"] == 1
-    assert sessions[0]["product"] == "Hollis"
+    assert sessions[0]["product"] == "Atlas"
 
 
 def test_mainloop_scan_surfaces_every_product(cj_root):
-    """The scan is no longer PA-scoped (operator, 2026-06-30): a vivy co session with no
+    """The scan is no longer demo-assistant-scoped (operator, 2026-06-30): a widget co session with no
     subagents surfaces too — its main-loop cost was the dominant, previously-dropped
     spend (ARCH-280). Product comes from the transcript's own cwd."""
     uuid = "0badf00d-8888-9999-aaaa-bbbbbbbbbbbb"
     _mk_transcript(cj_root, uuid, [
         ("claude-opus-4-8", {"input_tokens": 1000, "output_tokens": 500,
                              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
-    ], projdir="-Users-example-Convivy-vivy", cwd="/repo/vivy")
+    ], projdir="-Users-example-Convivy-widget", cwd="/repo/widget")
     [s] = cj.build_sessions(WIN_START, WIN_END)
     assert s["kind"] == "interactive"
-    assert s["product"] == "vivy"
+    assert s["product"] == "widget"
     assert s["worker_count"] == 0
     assert s["main_loop_captured"] is True
 
@@ -470,7 +501,7 @@ def test_mainloop_scan_skips_worktree_dirs(cj_root):
     _mk_transcript(cj_root, uuid, [
         ("claude-opus-4-8", {"input_tokens": 1000, "output_tokens": 500,
                              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}),
-    ], projdir="-Users-example-Convivy-worktrees-vivy-coder-fix-x", cwd="/repo/worktrees/x")
+    ], projdir="-Users-example-Convivy-worktrees-widget-coder-fix-x", cwd="/repo/worktrees/x")
     assert cj.build_sessions(WIN_START, WIN_END) == []
 
 
@@ -481,7 +512,7 @@ def test_worker_session_suppressed_when_transcript_in_worktree(cj_root):
     worker_uuid = "9999aaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     _mk_transcript(cj_root, worker_uuid, [
         ("claude-sonnet-4-6", {"input_tokens": 1000, "output_tokens": 200}),
-    ], projdir="-Users-example-Convivy-worktrees-vivy-reviewer-pr-9", cwd="/repo/worktrees/r")
+    ], projdir="-Users-example-Convivy-worktrees-widget-reviewer-pr-9", cwd="/repo/worktrees/r")
     _mk_sub(cj_root, "2026-06-10", "wsub", uuid=worker_uuid, usd=0.3,
             started="2026-06-10T12:05:00Z")
     assert cj.build_sessions(WIN_START, WIN_END) == []
@@ -496,11 +527,12 @@ def test_sdk_worker_session_suppressed_by_worktree_children(cj_root):
     # give the sub a worktree cwd so the kids-based guard fires
     sub_meta = cj_root / "agent-runs" / "2026-06-10" / "sub-sdksub" / "meta.json"
     m = json.loads(sub_meta.read_text())
-    m["worktree"] = "/srv/convivy/personal-assistant/.claude/worktrees/agent-a562bc71051ec4c2d"
+    m["worktree"] = "/srv/convivy/demo-assistant/.claude/worktrees/agent-a562bc71051ec4c2d"
     sub_meta.write_text(json.dumps(m))
     assert cj.build_sessions(WIN_START, WIN_END) == []
 
 
+@pytest.mark.rich_registry
 def test_co_session_product_from_mainloop_not_worktree_child(cj_root):
     """A real co session whose captured subagent carries a stale worktree-basename
     product is still labeled with the co's OWN product (from its main-loop cwd), not
@@ -508,11 +540,11 @@ def test_co_session_product_from_mainloop_not_worktree_child(cj_root):
     uuid = "12ab34cd-5555-6666-7777-888888888888"
     _mk_transcript(cj_root, uuid, [
         ("claude-opus-4-8", {"input_tokens": 2000, "output_tokens": 1000}),
-    ], projdir=_PA_DIR, cwd="/repo/personal-assistant")
+    ], projdir=_DEMO_DIR, cwd="/repo/demo-assistant")
     _mk_sub(cj_root, "2026-06-10", "gsub", uuid=uuid, usd=0.4,
             started="2026-06-10T12:05:00Z", repo="agent-abc123deadbeef")  # garbage product
     [s] = [x for x in cj.build_sessions(WIN_START, WIN_END) if x["session_id"] == uuid]
-    assert s["product"] == "Hollis"
+    assert s["product"] == "Atlas"
 
 
 def test_orphaned_scheduled_workers_grouped_into_followup(cj_root):
@@ -520,29 +552,29 @@ def test_orphaned_scheduled_workers_grouped_into_followup(cj_root):
     parent_run, no wave) group into one synthetic per-(product, night) follow-up row
     instead of scattering as standalone top-level sessions — #4b."""
     _mk_run(cj_root, "2026-06-10", "run-cl1", usd=0.4, agent="bug-fixer", parent_run=None,
-            origin="scheduled", repo="vivy", started="2026-06-10T09:28:00Z",
+            origin="scheduled", repo="widget", started="2026-06-10T09:28:00Z",
             ended="2026-06-10T09:29:00Z")
     _mk_run(cj_root, "2026-06-10", "run-cl2", usd=0.6, agent="reviewer", parent_run=None,
-            origin="scheduled", repo="vivy", started="2026-06-10T09:40:00Z",
+            origin="scheduled", repo="widget", started="2026-06-10T09:40:00Z",
             ended="2026-06-10T09:41:00Z")
     followups = [s for s in cj.build_sessions(WIN_START, WIN_END)
                  if s["agent"] == "overnight-followup"]
     assert len(followups) == 1
     f = followups[0]
-    assert f["product"] == "vivy"
+    assert f["product"] == "widget"
     assert f["worker_count"] == 2
     assert f["total_usd"] == pytest.approx(1.0)
-    assert f["session_id"] == "overnight-followup:vivy/2026-06-10"
+    assert f["session_id"] == "overnight-followup:widget/2026-06-10"
 
 
 def test_scheduled_orchestrator_with_children_not_grouped(cj_root):
     """A scheduled run that DID dispatch children is a real orchestrator session, not an
     orphan — it must stay its own agentctl row, not fold into a follow-up (#4b guard)."""
     _mk_run(cj_root, "2026-06-10", "run-orch", usd=1.0, agent="overnight-orchestrator",
-            parent_run=None, origin="scheduled", repo="vivy", started="2026-06-10T08:00:00Z",
+            parent_run=None, origin="scheduled", repo="widget", started="2026-06-10T08:00:00Z",
             ended="2026-06-10T09:00:00Z")
     _mk_run(cj_root, "2026-06-10", "run-w", usd=2.0, parent_run="run-orch",
-            origin="scheduled", repo="vivy", started="2026-06-10T08:10:00Z")
+            origin="scheduled", repo="widget", started="2026-06-10T08:10:00Z")
     sessions = cj.build_sessions(WIN_START, WIN_END)
     assert [s["agent"] for s in sessions if s["agent"] == "overnight-followup"] == []
     [s] = sessions
@@ -550,10 +582,10 @@ def test_scheduled_orchestrator_with_children_not_grouped(cj_root):
 
 
 def test_mainloop_transcript_outside_window_excluded(cj_root):
-    """A PA transcript whose turns predate the window is not surfaced (mirrors the
+    """A demo-assistant transcript whose turns predate the window is not surfaced (mirrors the
     agentctl/interactive window guards) — PR #56 reviewer gap."""
     uuid = "11112222-3333-4444-5555-666677778888"
-    proj = cj_root / "projects" / _PA_DIR
+    proj = cj_root / "projects" / _DEMO_DIR
     proj.mkdir(parents=True, exist_ok=True)
     (proj / f"{uuid}.jsonl").write_text(json.dumps({
         "type": "assistant", "timestamp": "2026-05-01T12:00:00.000Z",
@@ -565,59 +597,63 @@ def test_mainloop_transcript_outside_window_excluded(cj_root):
 
 # --- producer redacts data-local task/label before the shared surface -----------
 # Fail-closed after PR #92 broadened the scan: only the engineering allowlist shows
-# task/label; every other product (PA, ask, selector, NYH, unknown) is redacted.
+# task/label; every other product (demo-assistant, parlor, beacon, a vacation-rental
+# product, unknown) is redacted.
 
-def test_producer_redacts_pa_task_and_label(agent_activity_report, monkeypatch):
-    """The /activity snapshot MUST NOT carry PA task/label text (personal content),
-    but MUST keep cost/agent/model/product. Non-PA rows are unaffected."""
+@pytest.mark.rich_registry
+def test_producer_redacts_demo_assistant_task_and_label(agent_activity_report, monkeypatch):
+    """The /activity snapshot MUST NOT carry demo-assistant task/label text (personal
+    content), but MUST keep cost/agent/model/product. Non-demo-assistant rows are
+    unaffected."""
     aar = agent_activity_report
-    pa_session = {
-        "session_id": "u1", "kind": "interactive", "product": "personal-assistant",
+    demo_session = {
+        "session_id": "u1", "kind": "interactive", "product": "demo-assistant",
         "agent": "co-session", "label": "secret personal label", "task": "draft email to mom about X",
         "total_usd": 9.0, "worker_count": 1,
-        "nodes": [{"product": "personal-assistant", "agent": "pa-coder",
+        "nodes": [{"product": "demo-assistant", "agent": "aide-coder",
                    "task": "private content here", "label": "leaky", "usd": 9.0}],
     }
-    vivy_session = {
-        "session_id": "u2", "kind": "agentctl", "product": "vivy",
+    finch_session = {
+        "session_id": "u2", "kind": "agentctl", "product": "finch",
         "agent": "coder", "label": "recursion-guard", "task": "Fix the recursion guard",
         "total_usd": 3.0, "worker_count": 0, "nodes": [],
     }
-    monkeypatch.setattr(aar.cj, "sessions_for_days", lambda days: [pa_session, vivy_session])
+    monkeypatch.setattr(aar.cj, "sessions_for_days", lambda days: [demo_session, finch_session])
     snap = aar.build_snapshot(30)
-    pa = next(s for s in snap["sessions"] if s["product"] == "personal-assistant")
-    vivy = next(s for s in snap["sessions"] if s["product"] == "vivy")
-    # PA: content redacted, cost/agent/product preserved
-    assert pa["task"] == aar._REDACTED and pa["label"] == aar._REDACTED
-    assert pa["nodes"][0]["task"] == aar._REDACTED and pa["nodes"][0]["label"] is None
-    assert pa["total_usd"] == 9.0 and pa["agent"] == "co-session"
-    # vivy: untouched (real task text trimmed, not redacted)
-    assert vivy["task"] == "Fix the recursion guard" and vivy["label"] == "recursion-guard"
+    demo = next(s for s in snap["sessions"] if s["product"] == "demo-assistant")
+    finch = next(s for s in snap["sessions"] if s["product"] == "finch")
+    # demo-assistant: content redacted, cost/agent/product preserved
+    assert demo["task"] == aar._REDACTED and demo["label"] == aar._REDACTED
+    assert demo["nodes"][0]["task"] == aar._REDACTED and demo["nodes"][0]["label"] is None
+    assert demo["total_usd"] == 9.0 and demo["agent"] == "co-session"
+    # finch: untouched (real task text trimmed, not redacted)
+    assert finch["task"] == "Fix the recursion guard" and finch["label"] == "recursion-guard"
 
 
 def test_producer_redacts_cross_product_child_node(agent_activity_report, monkeypatch):
-    """PR #56 security finding: a PA session's child node tagged with a DIFFERENT
+    """PR #56 security finding: a demo-assistant session's child node tagged with a DIFFERENT
     product must still be redacted — the gate keys on the session, not just the node,
     so a cross-product / mistagged child can't leak personal content."""
     aar = agent_activity_report
-    pa_session = {
-        "session_id": "u1", "kind": "interactive", "product": "personal-assistant",
+    demo_assistant_session = {
+        "session_id": "u1", "kind": "interactive", "product": "demo-assistant",
         "agent": "co-session", "label": "x", "task": "y", "total_usd": 1.0, "worker_count": 1,
-        "nodes": [{"product": "vivy", "agent": "coder",  # mistagged child, NOT personal-assistant
+        "nodes": [{"product": "widget", "agent": "coder",  # mistagged child, NOT demo-assistant
                    "task": "leaked personal content", "label": "leaky", "usd": 1.0}],
     }
-    monkeypatch.setattr(aar.cj, "sessions_for_days", lambda days: [pa_session])
-    [pa] = aar.build_snapshot(30)["sessions"]
-    assert pa["nodes"][0]["task"] == aar._REDACTED and pa["nodes"][0]["label"] is None
+    monkeypatch.setattr(aar.cj, "sessions_for_days", lambda days: [demo_assistant_session])
+    [demo] = aar.build_snapshot(30)["sessions"]
+    assert demo["nodes"][0]["task"] == aar._REDACTED and demo["nodes"][0]["label"] is None
 
 
-def test_producer_redacts_non_pa_data_local_products(agent_activity_report, monkeypatch):
-    """Fail-closed redaction (PR #92): a data-local product that is NOT personal-assistant
-    — `ask`/`selector`/NYH, now surfaced by the opt-out scan — must also redact task/label,
-    and an unknown product redacts by default. Only the engineering allowlist shows text."""
+def test_producer_redacts_non_demo_assistant_data_local_products(agent_activity_report, monkeypatch):
+    """Fail-closed redaction (PR #92): a data-local product that is NOT demo-assistant
+    — `parlor`/`beacon`/a vacation-rental product, now surfaced by the opt-out scan —
+    must also redact task/label, and an unknown product redacts by default. Only the
+    engineering allowlist shows text."""
     aar = agent_activity_report
-    ask_session = {
-        "session_id": "u1", "kind": "interactive", "product": "ask",
+    parlor_session = {
+        "session_id": "u1", "kind": "interactive", "product": "parlor",
         "agent": "co-session", "label": "personal", "task": "what should I say to my landlord",
         "total_usd": 5.0, "worker_count": 0, "nodes": [],
     }
@@ -627,19 +663,20 @@ def test_producer_redacts_non_pa_data_local_products(agent_activity_report, monk
         "worker_count": 0, "nodes": [],
     }
     monkeypatch.setattr(aar.cj, "sessions_for_days",
-                        lambda days: [ask_session, unknown_session])
+                        lambda days: [parlor_session, unknown_session])
     snap = aar.build_snapshot(30)
     for s in snap["sessions"]:
         assert s["task"] == aar._REDACTED and s["label"] == aar._REDACTED
         assert s["total_usd"] in (5.0, 1.0) and s["agent"] == "co-session"  # metadata kept
 
 
+@pytest.mark.rich_registry
 def test_producer_session_allowlist_drops_unknown_fields(agent_activity_report, monkeypatch):
     """PR #56 security hardening: _trim_session is a fail-closed allowlist — a future
     content-bearing session field passes through ONLY if added to _SESSION_KEEP."""
     aar = agent_activity_report
     sess = {
-        "session_id": "u1", "kind": "agentctl", "product": "vivy", "agent": "coder",
+        "session_id": "u1", "kind": "agentctl", "product": "finch", "agent": "coder",
         "label": "ok", "task": "ok", "total_usd": 1.0, "worker_count": 0, "nodes": [],
         "prompt_preview": "SOME FUTURE FIELD WITH RAW CONTENT",  # not in _SESSION_KEEP
     }
@@ -779,7 +816,7 @@ def test_build_outcomes_never_sums_an_unpriced_chain_as_zero(cj_root):
     assert o["unpriced_models"] == ["mystery/model-x"]
 
 
-def _mk_attributed_run(root, date, name, *, agent="coder", repo="vivy",
+def _mk_attributed_run(root, date, name, *, agent="coder", repo="widget",
                        model="claude-sonnet-4-6", billing_source="subscription_credit",
                        usd=1.0, by_model=None, issue=None, pr=None, pr_url=None,
                        started="2026-06-10T08:00:00Z", task=""):
@@ -803,7 +840,7 @@ def _mk_attributed_run(root, date, name, *, agent="coder", repo="vivy",
     return d
 
 
-def _item(item_id, *, product="vivy", pr_url=None, pr_repo=None, pr=None, state="pr-open",
+def _item(item_id, *, product="widget", pr_url=None, pr_repo=None, pr=None, state="pr-open",
          type="task", parent_id=None):
     """A work item as the Library's list returns it, with only the fields the join reads
     plus the state, title, type and parent_id the per-epic report reads."""
@@ -820,21 +857,58 @@ def _all_placed_run_ids(report):
 
 def test_load_node_carries_the_item_pr_repo_and_billing_lane(cj_root):
     _mk_attributed_run(cj_root, "2026-06-10", "run-a", issue="issue_A", pr=7,
-                       repo="vivy", billing_source="provider_api:openai")
+                       repo="widget", billing_source="provider_api:openai")
     node = cj.load_node(cj_root / "agent-runs" / "2026-06-10" / "run-a")
     assert node["issue"] == "issue_A"
     assert node["pr"] == 7
-    assert node["repo"] == "vivy"
+    assert node["repo"] == "widget"
     assert node["billing_source"] == "provider_api:openai"
+
+
+def test_load_node_counts_a_black_box_crews_accounting_stub(cj_root):
+    """ADR-0043's fourth surface: a private dispatch's shared-side record is a
+    BARE stub — meta.json/cost.json/outcome.json only, no transcript.jsonl, no
+    tool_calls.jsonl, no prompts/, and `meta.json["task"]` redacted
+    (`bin/agentctl`'s `_PRIVATE_TASK_PLACEHOLDER`) — and `load_node`/
+    `index_nodes` must still count it: the whole point of the stub is that
+    the cost report keeps seeing this run happened, on which model, for how
+    long, and at what cost, even though none of its content does."""
+    placeholder = "(withheld — black-box crew, platform/decisions/0043)"
+    _mk_run(cj_root, "2026-06-10", "run-priv1", usd=1.25, repo="nightjar-repo",
+           agent="reviewer", model="claude-sonnet-4-6",
+           started="2026-06-10T00:00:00Z", ended="2026-06-10T00:05:00Z")
+    stub_dir = cj_root / "agent-runs" / "2026-06-10" / "run-priv1"
+    meta = json.loads((stub_dir / "meta.json").read_text())
+    meta["task"] = placeholder
+    meta["worktree"] = placeholder
+    (stub_dir / "meta.json").write_text(json.dumps(meta))
+    assert not (stub_dir / "transcript.jsonl").exists()
+    assert not (stub_dir / "tool_calls.jsonl").exists()
+    assert not (stub_dir / "prompts").exists()
+
+    node = cj.load_node(stub_dir)
+    assert node is not None
+    assert node["run_id"] == "run-priv1"
+    assert node["repo"] == "nightjar-repo"
+    assert node["agent"] == "reviewer"
+    assert node["model"] == "claude-sonnet-4-6"
+    assert node["usd"] == 1.25
+    assert node["task"] == placeholder
+    assert node["exit_status"] == "completed"
+
+    nodes = cj.index_nodes(datetime(2026, 6, 10, tzinfo=timezone.utc),
+                           datetime(2026, 6, 11, tzinfo=timezone.utc))
+    assert "run-priv1" in nodes, "the stub must be counted by the cost report"
+    assert nodes["run-priv1"]["usd"] == 1.25
 
 
 def test_meta_issue_wins_over_the_item_its_pr_links_to(cj_root):
     """meta.issue names A; the PR the run opened is linked to B. The run joins A, the
     disagreement is counted, and B gets nothing from it."""
     _mk_attributed_run(cj_root, "2026-06-10", "run-a", issue="issue_A", pr=9, usd=2.0,
-                       pr_url="https://github.com/convivy/vivy/pull/9")
+                       pr_url="https://github.com/convivy/widget/pull/9")
     items = [_item("issue_A"),
-             _item("issue_B", pr_url="https://github.com/convivy/vivy/pull/9")]
+             _item("issue_B", pr_url="https://github.com/convivy/widget/pull/9")]
     report = cj.build_item_costs(WIN_START, WIN_END, items)
     rows = {r["id"]: r for r in report["items"]}
     assert rows["issue_A"]["run_ids"] == ["run-a"]
@@ -848,9 +922,9 @@ def test_a_pr_only_run_joins_through_its_pr_url(cj_root):
     """No meta.issue. The item's product is not the run's repo here, so a join by
     product would miss; only the PR URL can attribute the run."""
     _mk_attributed_run(cj_root, "2026-06-10", "run-coder", issue=None, pr=5, usd=3.0,
-                       pr_url="https://github.com/convivy/vivy/pull/5")
-    items = [_item("issue_B", product="constance",
-                   pr_url="https://github.com/convivy/vivy/pull/5")]
+                       pr_url="https://github.com/convivy/widget/pull/5")
+    items = [_item("issue_B", product="globex",
+                   pr_url="https://github.com/convivy/widget/pull/5")]
     report = cj.build_item_costs(WIN_START, WIN_END, items)
     [row] = report["items"]
     assert row["run_ids"] == ["run-coder"]
@@ -861,12 +935,12 @@ def test_a_pr_only_run_joins_through_its_pr_url(cj_root):
 
 def test_a_pr_number_joins_through_its_repo_and_never_through_the_product(cj_root):
     """A reviewer has meta.pr but no pr-link.json, so only repo and number can match.
-    Item X has the run's product (vivy) but its PR is in constance; item Y has the
+    Item X has the run's product (widget) but its PR is in globex; item Y has the
     run's repo in pr_repo. The run must join Y, not X."""
     _mk_attributed_run(cj_root, "2026-06-10", "run-reviewer", agent="reviewer",
-                       repo="vivy", pr=7, usd=0.5)
-    items = [_item("issue_X", product="vivy", pr_repo="convivy/constance", pr=7),
-             _item("issue_Y", product="constance", pr_repo="convivy/vivy", pr=7)]
+                       repo="widget", pr=7, usd=0.5)
+    items = [_item("issue_X", product="widget", pr_repo="convivy/globex", pr=7),
+             _item("issue_Y", product="globex", pr_repo="convivy/widget", pr=7)]
     report = cj.build_item_costs(WIN_START, WIN_END, items)
     rows = {r["id"]: r for r in report["items"]}
     assert rows["issue_Y"]["run_ids"] == ["run-reviewer"]
@@ -930,14 +1004,14 @@ def test_every_run_sits_in_one_row_or_the_unattributed_bucket(cj_root):
     May, so the start-time window, not the directory, is what excludes it."""
     _mk_attributed_run(cj_root, "2026-06-10", "run-a", issue="issue_A", usd=1.0)
     _mk_attributed_run(cj_root, "2026-06-10", "run-pr", pr=5, usd=2.0,
-                       pr_url="https://github.com/convivy/vivy/pull/5")
+                       pr_url="https://github.com/convivy/widget/pull/5")
     _mk_attributed_run(cj_root, "2026-06-10", "run-brief", usd=4.0,
                        task="Fix issue_A: the flag parser")
     _mk_sub(cj_root, "2026-06-10", "abc", uuid="co-uuid", usd=0.25,
             started="2026-06-10T08:00:00Z")
     _mk_attributed_run(cj_root, "2026-06-10", "run-old", issue="issue_A", usd=9.0,
                        started="2026-05-31T23:00:00Z")
-    items = [_item("issue_A"), _item("issue_B", pr_url="https://github.com/convivy/vivy/pull/5")]
+    items = [_item("issue_A"), _item("issue_B", pr_url="https://github.com/convivy/widget/pull/5")]
     report = cj.build_item_costs(WIN_START, WIN_END, items)
     assert report["run_count"] == 4
     assert _all_placed_run_ids(report) == sorted(["run-a", "run-pr", "run-brief", "sub-abc"])
@@ -947,35 +1021,35 @@ def test_every_run_sits_in_one_row_or_the_unattributed_bucket(cj_root):
 
 def test_a_pr_two_items_link_to_is_unattributed_not_split(cj_root):
     _mk_attributed_run(cj_root, "2026-06-10", "run-pr", pr=5, usd=2.0,
-                       pr_url="https://github.com/convivy/vivy/pull/5")
-    items = [_item("issue_A", pr_url="https://github.com/convivy/vivy/pull/5"),
-             _item("issue_B", pr_url="https://github.com/convivy/vivy/pull/5")]
+                       pr_url="https://github.com/convivy/widget/pull/5")
+    items = [_item("issue_A", pr_url="https://github.com/convivy/widget/pull/5"),
+             _item("issue_B", pr_url="https://github.com/convivy/widget/pull/5")]
     report = cj.build_item_costs(WIN_START, WIN_END, items)
     assert all(row["run_count"] == 0 for row in report["items"])
     assert report["unattributed"]["by_reason"] == {"pr-ambiguous": 1}
 
 
-@pytest.mark.parametrize("pr_repo", ["someone/vivy", "convivyx/vivy", "vivy"])
+@pytest.mark.parametrize("pr_repo", ["someone/widget", "convivyx/widget", "widget"])
 def test_an_item_linking_a_repo_outside_convivy_joins_nothing(cj_root, pr_repo):
     """POST /items stores a filer's pr_repo unchanged, so the join indexes only convivy's
     repos. The run's repo name and PR number match the item's, and the run still joins
     nothing: the owner is not convivy (or there is no owner to check)."""
-    _mk_attributed_run(cj_root, "2026-06-10", "run-pr", repo="vivy", pr=7, usd=2.0)
+    _mk_attributed_run(cj_root, "2026-06-10", "run-pr", repo="widget", pr=7, usd=2.0)
     report = cj.build_item_costs(WIN_START, WIN_END, [_item("issue_X", pr_repo=pr_repo, pr=7)])
     assert report["items"][0]["run_count"] == 0
     assert report["unattributed"]["by_reason"] == {"no-link": 1}
 
 
 @pytest.mark.parametrize("pr_url", [
-    "https://github.com/someone/vivy/pull/5",
-    "https://github.com/convivyx/vivy/pull/5",
-    "http://github.com/convivy/vivy/pull/5",
-    "https://github.com/convivy/vivy/issues/5",
+    "https://github.com/someone/widget/pull/5",
+    "https://github.com/convivyx/widget/pull/5",
+    "http://github.com/convivy/widget/pull/5",
+    "https://github.com/convivy/widget/issues/5",
 ])
 def test_an_item_linking_a_url_that_is_not_a_convivy_pull_joins_nothing(cj_root, pr_url):
     """The run's own PR link is the same URL as the item's, so only the item's pr_url could
     join it. A URL that is not https://github.com/convivy/<repo>/pull/<n> is not indexed."""
-    _mk_attributed_run(cj_root, "2026-06-10", "run-pr", repo="vivy", pr=5, usd=2.0,
+    _mk_attributed_run(cj_root, "2026-06-10", "run-pr", repo="widget", pr=5, usd=2.0,
                        pr_url=pr_url)
     report = cj.build_item_costs(WIN_START, WIN_END, [_item("issue_B", pr_url=pr_url)])
     assert report["items"][0]["run_count"] == 0
@@ -987,8 +1061,8 @@ def test_a_meta_issue_missing_from_the_list_stays_unattributed_and_disagrees(cj_
     no row to join, so the run stays unattributed rather than falling through to A; the
     disagreement is still counted."""
     _mk_attributed_run(cj_root, "2026-06-10", "run-a", issue="issue_GONE", pr=3, usd=1.0,
-                       pr_url="https://github.com/convivy/vivy/pull/3")
-    items = [_item("issue_A", pr_url="https://github.com/convivy/vivy/pull/3")]
+                       pr_url="https://github.com/convivy/widget/pull/3")
+    items = [_item("issue_A", pr_url="https://github.com/convivy/widget/pull/3")]
     report = cj.build_item_costs(WIN_START, WIN_END, items)
     assert report["items"][0]["run_count"] == 0
     assert report["unattributed"]["by_reason"] == {"issue-not-listed": 1}
@@ -1125,9 +1199,41 @@ def test_a_subagent_stays_unattributed_when_its_parent_run_holds_an_item(cj_root
     assert report["unattributed"]["by_reason"] == {"subagent": 1}
 
 
+# --- item_for_pr: the shared PR-match rule the ledger posters reuse (E16) ----
+
+
+def test_item_for_pr_matches_by_url():
+    items = [_item("issue_A", pr_url="https://github.com/convivy/widget/pull/5")]
+    assert cj.item_for_pr(
+        "https://github.com/convivy/widget/pull/5", None, "widget", items) == "issue_A"
+
+
+def test_item_for_pr_matches_by_repo_and_number():
+    items = [_item("issue_A", pr_repo="convivy/widget", pr=7)]
+    assert cj.item_for_pr(None, 7, "widget", items) == "issue_A"
+
+
+def test_item_for_pr_none_when_two_items_link_the_same_pr():
+    items = [_item("issue_A", pr_url="https://github.com/convivy/widget/pull/5"),
+             _item("issue_B", pr_url="https://github.com/convivy/widget/pull/5")]
+    assert cj.item_for_pr(
+        "https://github.com/convivy/widget/pull/5", None, "widget", items) is None
+
+
+def test_item_for_pr_none_when_no_item_links_it():
+    items = [_item("issue_A", pr_url="https://github.com/convivy/widget/pull/9")]
+    assert cj.item_for_pr(
+        "https://github.com/convivy/widget/pull/5", 5, "widget", items) is None
+
+
+def test_item_for_pr_none_with_neither_url_nor_number():
+    items = [_item("issue_A", pr_url="https://github.com/convivy/widget/pull/5")]
+    assert cj.item_for_pr(None, None, "widget", items) is None
+
+
 def test_producer_carries_the_unmeasured_marker(agent_activity_report, monkeypatch):
     aar = agent_activity_report
-    sess = {"session_id": "u1", "kind": "interactive", "product": "vivy", "agent": "co-session",
+    sess = {"session_id": "u1", "kind": "interactive", "product": "widget", "agent": "co-session",
             "total_usd": None, "unpriced_models": ["mystery/model-x"], "worker_count": 0,
             "nodes": [{"run_id": "co-u1", "kind": "co", "depth": 0, "usd": None,
                        "unpriced_models": ["mystery/model-x"]}]}
@@ -1146,7 +1252,7 @@ def _course(entries, *, reached=(), in_flight=(), remaining=(), resolved_items=(
     the Course's own `position`."""
     missing = len(entries) - len(reached) - len(in_flight) - len(remaining)
     return {
-        "id": "course_1", "product": "vivy", "entries": list(entries),
+        "id": "course_1", "product": "widget", "entries": list(entries),
         "items": list(resolved_items),
         "position": {
             "entries": len(entries), "reached": len(reached), "reached_ids": list(reached),
@@ -1441,6 +1547,28 @@ def test_reconcile_epic_cost_ignores_a_voided_entry():
     assert result["ledger_only"] == {"count": 0, "usd": 0.0, "run_ids": []}
 
 
+def test_reconcile_epic_cost_sums_every_entry_sharing_a_run_id():
+    """A run's live-ledger checkpoints (`dedup_key=f"{run_id}:live:{seq}"`,
+    CQ·446) and its at-finish/backstop entry (`dedup_key=run_id`) are
+    DISTINCT rows at the Library that all carry the same `run_id` — the
+    ledger's own total for a run is their sum, not whichever one a naive
+    `{e["run_id"]: e for e in entries}` happens to keep last. A reconciliation
+    that only read the small finish remainder (after live postings had
+    already covered most of the run) would report a mismatch against the
+    run's full recorded cost even though the Library holds the right total
+    once every row for this run_id is added up."""
+    run_costs = {"run-a": {"priced_usd": 16.9242, "billing_source": "subscription_credit"}}
+    entries = [
+        _ledger_entry("run-a", 8.0, lane="subscription"),
+        _ledger_entry("run-a", 8.7342, lane="subscription"),
+        _ledger_entry("run-a", 0.19, lane="subscription"),
+    ]
+    result = cj.reconcile_epic_cost(run_costs, entries, {"run-a": "issue_E"}, "issue_E")
+    assert result["mismatches"] == []
+    assert result["ok"] is True
+    assert result["ledger_total_by_lane"] == {"subscription": 16.9242}
+
+
 def test_reconcile_epic_cost_never_sums_across_lanes():
     run_costs = {
         "run-sub": {"priced_usd": 2.0, "billing_source": "subscription_credit"},
@@ -1567,9 +1695,9 @@ def test_outcome_table_coverage_counts_a_pr_link_only_run_as_covered(cj_root):
     already explains its spend."""
     _mk_attributed_run(cj_root, "2026-06-10", "run-pr", agent="coder",
                        model="claude-sonnet-4-6", pr=5, usd=3.0,
-                       pr_url="https://github.com/convivy/vivy/pull/5")
+                       pr_url="https://github.com/convivy/widget/pull/5")
     items = [_item("issue_A", type="task", parent_id=None,
-                   pr_url="https://github.com/convivy/vivy/pull/5")]
+                   pr_url="https://github.com/convivy/widget/pull/5")]
     table = cj.build_outcome_table(WIN_START, WIN_END, items, set())
     assert len(table["rows"]) == 1
     assert table["coverage"]["by_agent"]["coder"] == {

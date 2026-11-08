@@ -32,7 +32,7 @@ def guard():
 
 
 def _run(**kw):
-    base = {"run_id": "run-1", "agent": "reviewer", "repo": "vivy",
+    base = {"run_id": "run-1", "agent": "reviewer", "repo": "widget",
             "review_sha": OTHER, "ended_at": None}
     base.update(kw)
     return base
@@ -43,7 +43,7 @@ def _run(**kw):
 
 @pytest.mark.parametrize("agent,want", [
     ("reviewer", True), ("security-reviewer", True),
-    ("hollis-reviewer", True), ("svc-security-reviewer", True),
+    ("galley-reviewer", True), ("relay-security-reviewer", True),
     ("coder", False), ("bug-fixer", False), ("design-critic", False),
 ])
 def test_review_agent_detection(guard, agent, want):
@@ -75,31 +75,31 @@ def test_a_path_outside_the_root_has_no_repo(guard):
 
 
 def test_a_review_pinned_elsewhere_is_doomed(guard):
-    assert len(guard.doomed_reviews([_run()], "vivy", HEAD)) == 1
+    assert len(guard.doomed_reviews([_run()], "widget", HEAD)) == 1
 
 
 def test_a_review_pinned_to_what_we_are_pushing_is_not(guard):
     """The no-op case: pushing the very commit under review does not invalidate
     it, and denying that would be noise."""
-    assert guard.doomed_reviews([_run(review_sha=HEAD)], "vivy", HEAD) == []
+    assert guard.doomed_reviews([_run(review_sha=HEAD)], "widget", HEAD) == []
 
 
 def test_an_ended_run_is_not_doomed(guard):
-    assert guard.doomed_reviews([_run(ended_at="2026-07-19T12:00:00")], "vivy", HEAD) == []
+    assert guard.doomed_reviews([_run(ended_at="2026-07-19T12:00:00")], "widget", HEAD) == []
 
 
 def test_another_repos_review_is_ignored(guard):
-    assert guard.doomed_reviews([_run(repo="constance")], "vivy", HEAD) == []
+    assert guard.doomed_reviews([_run(repo="globex")], "widget", HEAD) == []
 
 
 def test_a_non_review_agent_is_ignored(guard):
     """A coder pushing its own branch is not what this guards."""
-    assert guard.doomed_reviews([_run(agent="coder")], "vivy", HEAD) == []
+    assert guard.doomed_reviews([_run(agent="coder")], "widget", HEAD) == []
 
 
 def test_a_run_with_no_pin_is_ignored(guard):
     """An unpinned run has no stamp to invalidate."""
-    assert guard.doomed_reviews([_run(review_sha=None)], "vivy", HEAD) == []
+    assert guard.doomed_reviews([_run(review_sha=None)], "widget", HEAD) == []
 
 
 # --- the message --------------------------------------------------------------
@@ -110,7 +110,7 @@ def test_no_doomed_runs_means_no_message(guard):
 
 
 def test_the_message_names_the_run_and_both_ways_out(guard):
-    doomed = guard.doomed_reviews([_run()], "vivy", HEAD)
+    doomed = guard.doomed_reviews([_run()], "widget", HEAD)
     msg = guard.deny_reason(doomed, HEAD)
     assert "run-1" in msg                      # which run
     assert OTHER[:9] in msg and HEAD[:9] in msg  # both commits
@@ -122,7 +122,7 @@ def test_the_kill_line_covers_every_doomed_run(guard):
     """Two reviewers dispatched together both go stale on one push; a kill line
     naming only the first would leave the other burning."""
     runs = [_run(run_id="run-1"), _run(run_id="run-2", agent="security-reviewer")]
-    msg = guard.deny_reason(guard.doomed_reviews(runs, "vivy", HEAD), HEAD)
+    msg = guard.deny_reason(guard.doomed_reviews(runs, "widget", HEAD), HEAD)
     assert "--final run-1" in msg and "--final run-2" in msg
 
 
@@ -139,14 +139,14 @@ def test_a_review_on_another_branch_is_not_doomed(guard):
     """The false positive. A live review pinned to a commit that is NOT an
     ancestor of what we are pushing is on unrelated work."""
     runs = [_run(review_sha=OTHER)]
-    assert guard.doomed_reviews(runs, "vivy", HEAD, on_this_branch=lambda sha: False) == []
+    assert guard.doomed_reviews(runs, "widget", HEAD, on_this_branch=lambda sha: False) == []
 
 
 def test_a_review_on_this_branch_is_still_doomed(guard):
     """The case that matters: the reviewed commit IS an ancestor, so this push
     moves the head past it and ARCH-193 will discard the stamp."""
     runs = [_run(review_sha=OTHER)]
-    got = guard.doomed_reviews(runs, "vivy", HEAD, on_this_branch=lambda sha: True)
+    got = guard.doomed_reviews(runs, "widget", HEAD, on_this_branch=lambda sha: True)
     assert len(got) == 1
 
 
@@ -154,7 +154,7 @@ def test_without_a_branch_test_it_falls_back_to_repo_only(guard):
     """If git is unavailable the filter stays broad rather than silently allowing
     the case the guard exists for."""
     runs = [_run(review_sha=OTHER)]
-    assert len(guard.doomed_reviews(runs, "vivy", HEAD)) == 1
+    assert len(guard.doomed_reviews(runs, "widget", HEAD)) == 1
 
 
 def test_the_branch_test_is_not_consulted_for_an_already_excluded_run(guard):
@@ -167,9 +167,9 @@ def test_the_branch_test_is_not_consulted_for_an_already_excluded_run(guard):
         called.append(sha)
         return True
 
-    runs = [_run(repo="constance"), _run(agent="coder"),
+    runs = [_run(repo="globex"), _run(agent="coder"),
             _run(ended_at="2026-07-19T00:00:00"), _run(review_sha=HEAD)]
-    assert guard.doomed_reviews(runs, "vivy", HEAD, on_this_branch=spy) == []
+    assert guard.doomed_reviews(runs, "widget", HEAD, on_this_branch=spy) == []
     assert called == [], f"branch check consulted for excluded runs: {called}"
 
 
@@ -185,7 +185,7 @@ def test_a_rebased_away_commit_is_still_doomed(guard):
     """
     runs = [_run(review_sha=OTHER)]
     on_branch_via_upstream = lambda sha: True   # noqa: E731 — HEAD says no, upstream says yes
-    got = guard.doomed_reviews(runs, "vivy", HEAD, on_this_branch=on_branch_via_upstream)
+    got = guard.doomed_reviews(runs, "widget", HEAD, on_this_branch=on_branch_via_upstream)
     assert len(got) == 1, "a rebase must not smuggle a doomed review past the guard"
 
 
@@ -198,6 +198,6 @@ def test_the_two_failure_directions_are_both_covered(guard):
     runs = [_run(run_id="other-branch", review_sha=OTHER),
             _run(run_id="this-branch", review_sha="c" * 40)]
     doomed = guard.doomed_reviews(
-        runs, "vivy", HEAD,
+        runs, "widget", HEAD,
         on_this_branch=lambda sha: sha == "c" * 40)
     assert [d["run_id"] for d in doomed] == ["this-branch"]

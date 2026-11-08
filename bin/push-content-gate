@@ -13,13 +13,14 @@ hook as `$1` and `$2` (githooks(5)); stdin carries one line per ref being
 pushed: `<local ref> <local sha1> <remote ref> <remote sha1>`.
 
 This program decides which commits that stdin describes are NEW to the
-remote, resolves `wt` (the worktree running the push) and hands every one of
-them, oldest first, to `publish_scan.scan_commits` — the same Builder
-content scan `agentctl publish` already runs on the tip of a push, extended
-here to run on EVERY commit a push sends, not only its tip: a name added in
-one commit and removed by a later one in the same push must still be
-refused, since the finding reached a ref on `origin` the instant the first
-commit did.
+remote (`_shas_for_line`, through `publish_scan.commits_new_to_remote` — the
+same computation `agentctl publish` runs for the one branch it pushes, so
+the two agree), resolves `wt` (the worktree running the push) and hands
+every one of them, oldest first, to `publish_scan.scan_commits` — the same
+Builder content scan `agentctl publish` runs, extended here to run on EVERY
+commit a push sends, not only its tip: a name added in one commit and
+removed by a later one in the same push must still be refused, since the
+finding reached a ref on `origin` the instant the first commit did.
 
 FAILS CLOSED, WITH NO SKIP PATH. A finding, a scan that could not run, a
 malformed `pre-push` line, or any other failure here all read the same way:
@@ -29,9 +30,11 @@ acceptable.
 """
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 
@@ -50,47 +53,177 @@ def _all_zero(sha: str) -> bool:
 def _peel(sha: str) -> str:
     """`<sha>^{commit}`: the commit `sha` names, resolving an annotated tag
     object to the commit it points at. A no-op for a sha that already names
-    a commit, so every rev-list call below can use this unconditionally
-    rather than special-casing a tag ref by name."""
+    a commit, so `_commit_exists` below can use this unconditionally rather
+    than special-casing a tag ref by name."""
     return sha + "^{commit}"
 
 
 def _git(wt: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(wt), *args], capture_output=True, text=True)
-
-
-def _rev_list(wt: Path, args: list[str]) -> list[str]:
-    result = _git(wt, "rev-list", "--reverse", *args)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"git rev-list {' '.join(args)} failed: {result.stderr.strip()}"
-        )
-    return [line for line in result.stdout.splitlines() if line]
+    return subprocess.run(["git", "-C", str(wt), *args], capture_output=True, text=True,
+                          env=PS.no_replace_env())
 
 
 def _commit_exists(wt: Path, sha: str) -> bool:
     return _git(wt, "cat-file", "-e", _peel(sha)).returncode == 0
 
 
-def _shas_for_line(wt: Path, local_sha: str, remote_sha: str, remote_name: str) -> list[str]:
+_SCP_LIKE = re.compile(r"^(?:[^@/]+@)?(?P<host>[^:/]+):(?P<path>.+)$")
+
+
+def _repo_slug(url: str) -> tuple[str, str] | None:
+    """`(host, "owner/repo")`, both lowercased, for a git remote URL naming a
+    repository, with the scheme, an `ssh://` or `git@host:` form, user info
+    and a trailing `.git` ignored. `None` when `url` is not a host-plus-
+    exactly-two-path-segments repository URL at all (a bare remote name such
+    as `origin`, among other things)."""
+    url = url.strip()
+    if "://" in url:
+        parts = urlsplit(url)
+        host, path = parts.hostname, parts.path
+    else:
+        match = _SCP_LIKE.match(url)
+        if not match:
+            return None
+        host, path = match.group("host"), match.group("path")
+    if not host:
+        return None
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[: -len(".git")]
+    segments = [s for s in path.split("/") if s]
+    if len(segments) != 2:
+        return None
+    return host.lower(), f"{segments[0].lower()}/{segments[1].lower()}"
+
+
+def _configured_remotes(wt: Path) -> list[tuple[str, str]]:
+    """`(name, url)` for every configured remote, one entry each, preferring
+    a remote's push URL over its fetch URL when `git remote -v` lists both
+    (a push's own target is what matters here)."""
+    result = _git(wt, "remote", "-v")
+    if result.returncode != 0:
+        return []
+    by_name: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        name, url, kind = parts[0], parts[1], parts[2]
+        if name not in by_name or kind == "(push)":
+            by_name[name] = url
+    return list(by_name.items())
+
+
+def _resolve_remote_name(wt: Path, remote_name: str) -> str:
+    """`remote_name` unchanged when it already names a configured remote
+    rather than a URL, or does not parse as a host-plus-repository URL at
+    all (`_repo_slug` returns `None`). Otherwise, the name of the one
+    configured remote whose URL names the same host and repository, so the
+    scan below (`commits_new_to_remote`'s own ref sweep) bounds a new
+    branch's scan to that remote's refs exactly as it would for a push to
+    the remote by name — this is the `agentctl publish` case: it pushes to
+    an explicit `https://github.com/<slug>.git` URL, as the convivy-bosun
+    App, rather than to `origin`, so a `pre-push` hook sees that URL as
+    `remote_name`.
+
+    When no configured remote matches, or more than one does, `remote_name`
+    is returned unchanged: no ref lives under `refs/remotes/<url>/*`, so the
+    scan finds nothing to trust there, and the whole-history scan that falls
+    out of that is today's existing fail-closed behaviour, not a new one.
+    Trusting commits reachable from an unrelated remote just because none
+    of the configured ones matched would
+    be a new, and wrong, way to fail open."""
+    target = _repo_slug(remote_name)
+    if target is None:
+        return remote_name
+    matches = [
+        name for name, url in _configured_remotes(wt)
+        if _repo_slug(url) == target
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return remote_name
+
+
+def _shas_for_line(wt: Path, local_sha: str, remote_sha: str, remote_name: str,
+                    remote_ref: str) -> list[str]:
     """The commits one `pre-push` stdin line adds to the remote, oldest
-    first. A deletion (`local_sha` all zero) adds nothing. A new ref
-    (`remote_sha` all zero), or an update whose remote sha is not present in
-    this worktree at all (a force-push, or a remote this worktree has never
-    fetched), is scanned as everything reachable from `local_sha` that is
-    not already on some ref under `remote_name`. An ordinary update is
-    scanned as the range between the two."""
+    first, computed by `publish_scan.commits_new_to_remote` — the one
+    helper that also backs `agentctl publish`'s own scan, so the two agree
+    on which commits are new. A deletion (`local_sha` all zero) adds
+    nothing.
+
+    Every other line is resolved as everything reachable from `local_sha`
+    that is not already known to `remote_name`: reachable from `remote_sha`
+    itself — trusted when it is a commit already in this worktree (it comes
+    from the remote via git's own `pre-push` stdin), and treated as absent
+    otherwise (git's own all-zero sha for a brand-new ref, or a force-push
+    / a remote this worktree has never fetched, whose reported `remote_sha`
+    names no object here) — or reachable from any OTHER tracking ref
+    `commits_new_to_remote` trusts (see that function's own docstring; it
+    reads `refs/remotes/<remote_name>/*`, excluding `dest`'s own ref, a ref
+    literally named `<remote_name>/HEAD`, and any symbolic ref under any
+    name). `remote_ref` itself, under `refs/heads/<dest>`, names `dest`;
+    that destination's own tracking ref, `refs/remotes/<remote_name>/<dest>`,
+    is excluded rather than trusted, exactly like an unusable `remote_sha`:
+    it is the one tracking ref a dispatched run can write on its own branch
+    (`run_sandbox.py`), so a run could otherwise plant an earlier commit
+    there with `git update-ref` and have this scan treat it as
+    already-seen history. A remote ref outside `refs/heads/` is excluded
+    from nothing extra, keeping today's behaviour.
+
+    AN ORDINARY UPDATE NOW SCANS THROUGH THIS SAME TRUSTED-TRACKING-REF
+    LOOKUP TOO, not the plain `remote_sha..local_sha` range this used
+    before: a merge of `origin/main` into an existing PR branch reaches
+    commits already on `origin/main` that the PR branch's own previous tip
+    (`remote_sha`) never reached, and the plain range read every one of
+    them as added — the four occurrences (two clone pushes, two
+    `agentctl publish` calls, 2026-10-23) this fixes."""
     if _all_zero(local_sha):
         return []
-    if _all_zero(remote_sha) or not _commit_exists(wt, remote_sha):
-        return _rev_list(wt, [_peel(local_sha), "--not", f"--remotes={remote_name}"])
-    return _rev_list(wt, [f"{_peel(remote_sha)}..{_peel(local_sha)}"])
+    prefix = "refs/heads/"
+    dest = remote_ref[len(prefix):] if remote_ref.startswith(prefix) else None
+    resolved_remote_sha = (
+        remote_sha if not _all_zero(remote_sha) and _commit_exists(wt, remote_sha) else None
+    )
+    return PS.commits_new_to_remote(wt, local_sha, resolved_remote_sha, remote_name, dest)
 
 
-def _commits_to_scan(wt: Path, remote_name: str, stdin_text: str) -> list[str]:
+def _commits_to_scan(wt: Path, remote_name: str, remote_url: str, stdin_text: str) -> list[str]:
     """Every commit `stdin_text`'s ref lines send to the remote, oldest
     first and de-duplicated across lines (the same commit reachable from two
-    pushed refs is scanned once)."""
+    pushed refs is scanned once).
+
+    Refreshes EVERY `refs/remotes/<resolved_remote_name>/*` ref from
+    `remote_url` (git's own `pre-push` `$2` — the exact URL this push is
+    going to, authenticated however the enclosing `git push` already is)
+    before resolving any line: `_shas_for_line`'s own trusted-tracking-ref
+    sweep, below, otherwise trusts whatever is already sitting at one of
+    those refs, including a NEW one a dispatched run wrote directly
+    (`run_sandbox.py`'s write protection only covers ref paths that existed
+    when the sandbox was built — security review of PR #1002). Done once,
+    here, rather than once per line: every line in one `pre-push` invocation
+    names the same remote."""
+    resolved_remote_name = _resolve_remote_name(wt, remote_name)
+    # A bare remote name (e.g. "origin") never contains "/" or ":" — git
+    # itself refuses to configure one that does. `resolved_remote_name`
+    # fails that test only when `_resolve_remote_name` could not map
+    # `remote_name` back to a configured remote at all (no match, or a URL
+    # shape `_repo_slug` cannot even parse into a slug, such as a `file://`
+    # one — NOT the same test as `_repo_slug(...) is None`, which returns
+    # None for a `file://` URL too and so wrongly read this case as safe
+    # before this comment was written), and it is still the literal URL git
+    # was told to push to: today's existing, intentional fail-closed path
+    # below (no ref lives under refs/remotes/<url>/*, so everything is
+    # scanned) — skip the refresh rather than pass that URL to git as a ref
+    # path component.
+    if "/" not in resolved_remote_name and ":" not in resolved_remote_name:
+        refresh = PS.refresh_remote_tracking_refs(wt, remote_url, resolved_remote_name)
+        if refresh.returncode != 0:
+            raise PS.PublishScanRefused(
+                f"could not refresh {resolved_remote_name}'s tracking refs from "
+                f"{remote_url} before scanning: {refresh.stderr.strip()}"
+            )
     ordered: list[str] = []
     seen: set[str] = set()
     for line in stdin_text.splitlines():
@@ -99,8 +232,8 @@ def _commits_to_scan(wt: Path, remote_name: str, stdin_text: str) -> list[str]:
         parts = line.split()
         if len(parts) != 4:
             raise RuntimeError(f"malformed pre-push input line: {line!r}")
-        _local_ref, local_sha, _remote_ref, remote_sha = parts
-        for sha in _shas_for_line(wt, local_sha, remote_sha, remote_name):
+        _local_ref, local_sha, remote_ref, remote_sha = parts
+        for sha in _shas_for_line(wt, local_sha, remote_sha, resolved_remote_name, remote_ref):
             if sha not in seen:
                 seen.add(sha)
                 ordered.append(sha)
@@ -110,6 +243,7 @@ def _commits_to_scan(wt: Path, remote_name: str, stdin_text: str) -> list[str]:
 def _show_toplevel() -> Path:
     result = subprocess.run(
         ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True,
+        env=PS.no_replace_env(),
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -127,12 +261,18 @@ def main(argv: list[str]) -> int:
         print("nothing was sent", file=sys.stderr)
         return 1
 
-    repo_name, remote_name = argv[1], argv[2]
+    repo_name, remote_name, remote_url = argv[1], argv[2], argv[3]
     try:
         wt = _show_toplevel()
-        shas = _commits_to_scan(wt, remote_name, sys.stdin.read())
+        shas = _commits_to_scan(wt, remote_name, remote_url, sys.stdin.read())
         if shas:
-            PS.scan_commits(repo_name, wt, shas)
+            # `remote_url` is git's own `$2` — the literal URL THIS push is going
+            # to — so a missing Shipwright checkout still refuses for one of
+            # publish-engine's five scannable repositories even if `repo_name`
+            # (baked into this hook at install time from the clone's directory
+            # name) ever drifted from it (publish_scan.py's own
+            # `_names_a_locally_known_scannable_repo`).
+            PS.scan_commits(repo_name, wt, shas, push_remote=remote_url)
     except PS.PublishScanRefused as exc:
         print(f"push refused by the content gate: {exc}", file=sys.stderr)
         print("nothing was sent", file=sys.stderr)

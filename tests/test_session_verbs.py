@@ -166,7 +166,7 @@ def test_the_clear_never_uses_ctrl_c_in_any_state(SI, tmux, session_is):
     after it cut off a tool call — but kept `waiting` in the allowed set, and
     `waiting` is exactly what a main agent reads while a background subagent
     works on behind it. So every message into a session with background work
-    killed that work, intermittently. The operator lost two selector build runs to it on
+    killed that work, intermittently. The operator lost two beacon build runs to it on
     2026-07-24.
 
     Asserted across every state rather than only the clearable ones: the bug
@@ -1867,7 +1867,7 @@ def test_a_dead_process_still_outranks_a_working_event(SS, monkeypatch, tmp_path
 #
 # THE BUG, reproduced end to end. `session-event-log.py` routes a private
 # crew's hook log to `<crew home>/hook-log/`, not the shared `HOOK_LOG_ROOT`.
-# `session_state()` kept searching only the shared root, so a healthy CFO
+# `session_state()` kept searching only the shared root, so a healthy TREASURY
 # session read `state: unknown` — not because nothing was running, but because
 # the reader was looking in a directory the writer had stopped using three
 # days earlier. Deck's answer to `unknown` is a disabled composer.
@@ -1896,7 +1896,7 @@ def test_a_private_crews_hook_log_is_found_via_its_own_home(SS, monkeypatch, tmp
     crew's home must read that crew's OWN hook-log root, not the shared one."""
     import datetime as dt
     shared = tmp_path / "shared-hook-log"
-    crew_home = tmp_path / "CFO"
+    crew_home = tmp_path / "TREASURY"
     crew_home.mkdir()
     monkeypatch.setattr(SS, "HOOK_LOG_ROOT", shared)
     _private_crew_aware(monkeypatch, SS, crew_home)
@@ -1909,7 +1909,7 @@ def test_a_private_crews_hook_log_is_found_via_its_own_home(SS, monkeypatch, tmp
         "session_id": "aaa", "cwd": str(crew_home), "transcript_path": None})
     monkeypatch.setattr(SS, "_pid_alive", lambda pid: True)
 
-    got = SS.session_state("cfo")
+    got = SS.session_state("treasury")
     assert got["last_event"] == "UserPromptSubmit", \
         "the private crew's own hook-log root must be searched"
     assert got["reason"] is None
@@ -1921,7 +1921,7 @@ def test_a_private_crews_session_does_not_fall_back_to_the_shared_root(SS, monke
     roots are alternatives, not a search order."""
     import datetime as dt
     shared = tmp_path / "shared-hook-log"
-    crew_home = tmp_path / "CFO"
+    crew_home = tmp_path / "TREASURY"
     crew_home.mkdir()
     monkeypatch.setattr(SS, "HOOK_LOG_ROOT", shared)
     _private_crew_aware(monkeypatch, SS, crew_home)
@@ -1935,7 +1935,7 @@ def test_a_private_crews_session_does_not_fall_back_to_the_shared_root(SS, monke
         "session_id": "aaa", "cwd": str(crew_home), "transcript_path": None})
     monkeypatch.setattr(SS, "_pid_alive", lambda pid: True)
 
-    got = SS.session_state("cfo")
+    got = SS.session_state("treasury")
     assert got["reason"] == "no hook log for this session", \
         "the crew's own root has nothing, and the shared decoy must not be read instead"
 
@@ -1945,7 +1945,7 @@ def test_an_ordinary_crew_still_reads_the_shared_root(SS, monkeypatch, tmp_path)
     the routing adds a destination, it does not remove the default one."""
     import datetime as dt
     shared = tmp_path / "shared-hook-log"
-    crew_home = tmp_path / "CFO"
+    crew_home = tmp_path / "TREASURY"
     crew_home.mkdir()
     monkeypatch.setattr(SS, "HOOK_LOG_ROOT", shared)
     _private_crew_aware(monkeypatch, SS, crew_home)
@@ -1955,10 +1955,10 @@ def test_an_ordinary_crew_still_reads_the_shared_root(SS, monkeypatch, tmp_path)
 
     monkeypatch.setattr(SS.TT, "claude_pane", lambda n: ("%1", 4242))
     monkeypatch.setattr(SS.TT, "meta_for_pid", lambda pid, days=3: {
-        "session_id": "aaa", "cwd": str(tmp_path / "vivy"), "transcript_path": None})
+        "session_id": "aaa", "cwd": str(tmp_path / "finch"), "transcript_path": None})
     monkeypatch.setattr(SS, "_pid_alive", lambda pid: True)
 
-    got = SS.session_state("vivy")
+    got = SS.session_state("finch")
     assert got["last_event"] == "UserPromptSubmit"
 
 
@@ -1991,7 +1991,8 @@ def test_states_returns_a_brief_entry_per_name_keyed(SS, monkeypatch):
     ssh round trip. Each entry is brief — no vitals — because a row draws none of
     the status area, and a name that fails still gets an entry rather than
     vanishing from the rail."""
-    def fake(name, days=3, brief=False, table=None):
+    def fake(name, days=3, brief=False, table=None, client_table=None, machine_name=None,
+              whois_cache=None):
         assert brief is True, "the rail's batch must ask for brief state"
         if name == "boom":
             raise RuntimeError("no such session")
@@ -1999,10 +2000,10 @@ def test_states_returns_a_brief_entry_per_name_keyed(SS, monkeypatch):
     monkeypatch.setattr(SS, "session_state", fake)
     monkeypatch.setattr(SS.TT, "session_table", lambda: {})
 
-    got = SS.session_states(["vivy", "boom", "deck"])
-    assert set(got) == {"vivy", "boom", "deck"}
-    assert got["vivy"]["state"] == "working" and got["vivy"]["alive"] is True
-    assert "vitals" not in got["vivy"]
+    got = SS.session_states(["finch", "boom", "deck"])
+    assert set(got) == {"finch", "boom", "deck"}
+    assert got["finch"]["state"] == "working" and got["finch"]["alive"] is True
+    assert "vitals" not in got["finch"]
     assert got["boom"]["state"] == "unknown" and got["boom"]["alive"] is False
 
 
@@ -2037,7 +2038,7 @@ def test_brief_state_skips_the_vitals_block(SS, monkeypatch, has_meta):
 def test_a_gate_is_resolved_once_the_transcript_outruns_it(SS):
     """Answering an AskUserQuestion emits NO hook event, so the stream reports
     blocked from the moment a question is asked until the turn ends — an hour,
-    sometimes. Observed live: steward and svc both read blocked on questions
+    sometimes. Observed live: steward and harbor both read blocked on questions
     already answered, transcripts 19 and 68 minutes past their gates."""
     import datetime as dt
     gate = dt.datetime.now(dt.timezone.utc) - dt.timedelta(minutes=20)
@@ -2078,7 +2079,7 @@ def _ask(ts):
 def test_newest_main_agent_ts_ignores_control_and_subagent_writes(SS, tmp_path):
     """THE BUG THIS CLOSES. A blocked session's transcript still advances — a
     queued message, an attachment, a subagent finishing — and none of that is the
-    main agent answering. selector's picker vanished from the pane because the
+    main agent answering. beacon's picker vanished from the pane because the
     FILE mtime moved on exactly these records. Only a non-sidechain, non-meta
     conversational record counts, so the newest one here is the question itself."""
     import datetime as dt
@@ -2097,7 +2098,7 @@ def test_newest_main_agent_ts_ignores_control_and_subagent_writes(SS, tmp_path):
 
 
 def test_a_gate_stays_open_while_only_control_and_subagent_records_follow(SS, tmp_path):
-    """The selector incident, 2026-07-24: the gate at 19:32 was not answered until
+    """The beacon incident, 2026-07-24: the gate at 19:32 was not answered until
     19:57, and everything written in between was control-plane or subagent. Judged
     by the file mtime the picker vanished at 19:35; judged by the main agent's own
     writes it stays open the whole 25 minutes."""
@@ -2146,7 +2147,7 @@ def test_a_resolved_gate_flips_the_session_back_to_working(SS, monkeypatch, tmp_
 
     The answer is a conversational record after the gate, not just a fresher file
     mtime — a bare mtime bump is a queued message or a subagent, and must not
-    resolve the gate. That distinction is the selector fix; see the sibling below.
+    resolve the gate. That distinction is the beacon fix; see the sibling below.
     """
     import datetime as dt
     utc_today = dt.datetime.now(dt.timezone.utc).date().isoformat()
@@ -2173,7 +2174,7 @@ def test_a_resolved_gate_flips_the_session_back_to_working(SS, monkeypatch, tmp_
 
 
 def test_a_live_gate_survives_a_transcript_that_only_control_records_touch(SS, monkeypatch, tmp_path):
-    """THE SELECTOR INCIDENT, END TO END (2026-07-24). A session blocked on an
+    """THE BEACON INCIDENT, END TO END (2026-07-24). A session blocked on an
     AskUserQuestion had control-plane records — a queued message, an attachment —
     written minutes after its gate. The file mtime moved, so the old logic cleared
     the gate and the picker vanished from the pane before the operator could answer it. The
@@ -2283,12 +2284,12 @@ def test_unreadable_remote_control_is_unknown_rather_than_off(SS, monkeypatch, t
 
 def test_agents_in_flight_are_scoped_to_this_products_repo(SS, monkeypatch, tmp_path):
     """Unscoped, every product's co reported another product's coder as its own —
-    constance reading "coder in flight" when the coder was sous-chef's (the operator
+    atlas reading "coder in flight" when the coder was galley's (the operator
     2026-07-05). The steward works across repos and keeps the fleet-wide view."""
     active = tmp_path / "active.json"
     active.write_text(json.dumps({"runs": [
         {"pid": 1, "repo": "convivy-deck", "agent": "deck-reviewer"},
-        {"pid": 2, "repo": "sous-chef", "agent": "coder"},
+        {"pid": 2, "repo": "galley", "agent": "coder"},
     ]}))
     monkeypatch.setattr(SS, "ACTIVE_JSON", active)
     monkeypatch.setattr(SS, "_pid_alive", lambda pid: True)
@@ -2304,6 +2305,89 @@ def test_agents_in_flight_are_scoped_to_this_products_repo(SS, monkeypatch, tmp_
     steward = SS.live_agents("/srv/convivy/substrate")
     assert steward["fleet_wide"] is True
     assert sorted(steward["agents"]) == ["coder", "deck-reviewer"]
+
+
+def test_agents_in_flight_scope_correctly_for_a_nested_project_home_dir(
+        SS, monkeypatch, tmp_path):
+    """The OAK business-area move (agent-platform PR 964) nested
+    oak-park-villa's `home_dir` at `<root>/oak/oak-park-villa`. Unscoped by
+    the registry, `_product_under_root` took the first path segment below
+    root (`oak`) instead of the project's own directory, so a dispatched run
+    recorded under `repo: "oak-park-villa"` never matched and the crew's co
+    reported no agents in flight at all — the same first-path-segment bug
+    `bin/knowledge-ctx`'s `detect_product` had for the same move.
+
+    A fixture registry rooted at a disposable directory, never the real
+    registry or $HOME: `CREWS_ROOT`/`projects.ROOT_OVERRIDE` both point at
+    `root`, so the registry's `home_dir` actually contains the cwds this
+    test builds (unlike the plain `/srv/convivy/...` cwds the other tests in
+    this file use, which the real, un-overridden registry can never match).
+    """
+    root = tmp_path / "root"
+    root.mkdir()
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({
+        "oak-park-villa": {"home_dir": "<root>/oak/oak-park-villa", "aliases": []},
+    }))
+    monkeypatch.setattr(SS, "CREWS_ROOT", root)
+    monkeypatch.setattr(SS.projects, "PROJECTS_JSON", registry)
+    monkeypatch.setattr(SS.projects, "ROOT_OVERRIDE", root)
+    SS.projects._load_raw.cache_clear()
+
+    active = tmp_path / "active.json"
+    active.write_text(json.dumps({"runs": [
+        {"pid": 1, "repo": "oak-park-villa", "agent": "coder"},
+    ]}))
+    monkeypatch.setattr(SS, "ACTIVE_JSON", active)
+    monkeypatch.setattr(SS, "_pid_alive", lambda pid: True)
+
+    try:
+        mine = SS.live_agents(str(root / "oak" / "oak-park-villa" / "sub"))
+    finally:
+        SS.projects._load_raw.cache_clear()
+    assert mine["agents"] == ["coder"]
+    assert mine["fleet_wide"] is False
+
+
+def test_agents_in_flight_scope_correctly_when_one_registry_row_is_malformed(
+        SS, monkeypatch, tmp_path):
+    """`_product_under_root` used to wrap its whole registry loop in one
+    `try/except`, so a single row whose `home_dir` raises in `home_path`
+    (`crew_registration.build_row` and `projects.load()` do not validate
+    `home_dir`; only `projects._expand_own_home`, called lazily from
+    `home_path()`, refuses a bad value) fell every OTHER row back to
+    first-path-segment scoping too, not just the bad one — PR 975 round 2.
+
+    `bad-row`'s `~root/x` is exactly the value `_expand_own_home` refuses:
+    it is neither `<root>/`- nor `~/`-prefixed, so `home_path("bad-row")`
+    raises ValueError. `oak-park-villa` is a valid nested row, same shape as
+    the sibling test above. A cwd under the valid row must still resolve to
+    it, not to the first path segment (`oak`)."""
+    root = tmp_path / "root"
+    root.mkdir()
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps({
+        "bad-row": {"home_dir": "~root/x", "aliases": []},
+        "oak-park-villa": {"home_dir": "<root>/oak/oak-park-villa", "aliases": []},
+    }))
+    monkeypatch.setattr(SS, "CREWS_ROOT", root)
+    monkeypatch.setattr(SS.projects, "PROJECTS_JSON", registry)
+    monkeypatch.setattr(SS.projects, "ROOT_OVERRIDE", root)
+    SS.projects._load_raw.cache_clear()
+
+    active = tmp_path / "active.json"
+    active.write_text(json.dumps({"runs": [
+        {"pid": 1, "repo": "oak-park-villa", "agent": "coder"},
+    ]}))
+    monkeypatch.setattr(SS, "ACTIVE_JSON", active)
+    monkeypatch.setattr(SS, "_pid_alive", lambda pid: True)
+
+    try:
+        mine = SS.live_agents(str(root / "oak" / "oak-park-villa" / "sub"))
+    finally:
+        SS.projects._load_raw.cache_clear()
+    assert mine["agents"] == ["coder"]
+    assert mine["fleet_wide"] is False
 
 
 def test_a_run_whose_process_is_gone_is_not_in_flight(SS, monkeypatch, tmp_path):
@@ -2400,7 +2484,7 @@ def test_every_early_return_still_carries_an_agents_key(SS, monkeypatch, tmp_pat
     """
     active = tmp_path / "active.json"
     active.write_text(json.dumps({"runs": [
-        {"pid": 1, "repo": "sous-chef", "agent": "coder"},
+        {"pid": 1, "repo": "galley", "agent": "coder"},
     ]}))
     monkeypatch.setattr(SS, "ACTIVE_JSON", active)
     monkeypatch.setattr(SS, "_pid_alive", lambda pid: True)
@@ -2429,7 +2513,8 @@ def test_the_batchs_hand_built_failure_entry_carries_agents_too(SS, monkeypatch)
     everywhere except here. `agents` was absent on this path — against the rail,
     the one consumer the always-present guarantee exists for.
     """
-    def boom(name, days=3, brief=False, table=None):
+    def boom(name, days=3, brief=False, table=None, client_table=None, machine_name=None,
+             whois_cache=None):
         raise RuntimeError("tmux is not running")
     monkeypatch.setattr(SS, "session_state", boom)
     monkeypatch.setattr(SS.TT, "session_table", lambda: {})
@@ -2835,7 +2920,8 @@ def test_the_batchs_hand_built_failure_entry_carries_ctx_pct_and_rollover_too(SS
     `session_states` hand-builds its failure entry rather than getting one
     from `session_state`, so a field added to the latter's seed reaches every
     path except this one unless it is added here too."""
-    def boom(name, days=3, brief=False, table=None):
+    def boom(name, days=3, brief=False, table=None, client_table=None, machine_name=None,
+             whois_cache=None):
         raise RuntimeError("tmux is not running")
     monkeypatch.setattr(SS, "session_state", boom)
     monkeypatch.setattr(SS.TT, "session_table", lambda: {})
@@ -3000,7 +3086,8 @@ def test_the_batchs_hand_built_failure_entry_carries_the_ask_counts_too(SS, monk
     getting one from `session_state`."""
     SS.SLT.post_ask("deck", "still open?")
 
-    def boom(name, days=3, brief=False, table=None):
+    def boom(name, days=3, brief=False, table=None, client_table=None, machine_name=None,
+             whois_cache=None):
         raise RuntimeError("tmux is not running")
     monkeypatch.setattr(SS, "session_state", boom)
     monkeypatch.setattr(SS.TT, "session_table", lambda: {})
@@ -3877,7 +3964,8 @@ def test_the_batchs_hand_built_failure_entry_carries_working_on_too(SS, monkeypa
     (tmp_path / "working-deck.json").write_text(json.dumps({
         "text": "still here", "written_at": 1_000_000_000}))
 
-    def boom(name, days=3, brief=False, table=None):
+    def boom(name, days=3, brief=False, table=None, client_table=None, machine_name=None,
+             whois_cache=None):
         raise RuntimeError("tmux is not running")
     monkeypatch.setattr(SS, "session_state", boom)
     monkeypatch.setattr(SS.TT, "session_table", lambda: {})
@@ -4040,15 +4128,15 @@ def test_private_crew_serves_the_derived_line_absent_not_partial(SS, monkeypatch
     runs_root = tmp_path / "runs"
     day = "2026-08-29"
     _write_run_meta(runs_root, "run-x", day, task="private crew work",
-                     repo="cfo", pr=99, co_session="sess-priv")
+                     repo="treasury", pr=99, co_session="sess-priv")
     _write_active_json(tmp_path / "active.json", [
         {"run_id": "run-x", "agent": "coder", "task": "private crew work",
-         "started_at": "2026-08-29T10:00:00Z", "repo": "cfo",
+         "started_at": "2026-08-29T10:00:00Z", "repo": "treasury",
          "worktree": "/tmp/wt", "pid": 111}])
     monkeypatch.setattr(SS, "private_home_for",
-                         lambda cwd: "/srv/convivy/CFO")
+                         lambda cwd: "/srv/convivy/TREASURY")
 
-    got = SS.working_on_derived("cfo-session", cwd="/srv/convivy/CFO",
+    got = SS.working_on_derived("treasury-session", cwd="/srv/convivy/TREASURY",
                                  session_id="sess-priv")
     assert got == {"text": None, "age": None, "stale": None, "since": None,
                     "derived_from": None, "identity_kind": None}
@@ -4073,7 +4161,7 @@ def test_a_public_session_dispatching_into_a_black_box_leaks_neither_text_nor_id
     # A PUBLIC session: outside every private home, so the crew gate passes.
     keel_cwd = "/srv/convivy/agent-platform"
     monkeypatch.setattr(SS, "private_home_for", lambda cwd: None)
-    monkeypatch.setattr(SS.projects, "private_slugs", lambda: {"cfo"})
+    monkeypatch.setattr(SS.projects, "private_slugs", lambda: {"treasury"})
 
     def _dispatch(run_id, repo, task, pr):
         _write_run_meta(runs_root, run_id, day, task=task, repo=repo, pr=pr,
@@ -4089,7 +4177,7 @@ def test_a_public_session_dispatching_into_a_black_box_leaks_neither_text_nor_id
     assert public["text"] == "public crew work"
     assert public["identity_kind"] == "pr"
 
-    private = _dispatch("run-priv", "cfo", "SENSITIVE private crew work", 99)
+    private = _dispatch("run-priv", "treasury", "SENSITIVE private crew work", 99)
 
     # The filtered run contributes NOTHING, so the line carries forward the last
     # public work rather than going blank — that is `_fresh_derivation`'s ordinary
@@ -4100,7 +4188,7 @@ def test_a_public_session_dispatching_into_a_black_box_leaks_neither_text_nor_id
         "the private dispatch must not become this session's line"
     assert "SENSITIVE" not in json.dumps(private), \
         "a black box's task text must not reach the shared payload"
-    assert "cfo" not in json.dumps(private).lower(), \
+    assert "treasury" not in json.dumps(private).lower(), \
         "nor its repo slug, which is a roster row on its own (#464)"
 
 
@@ -4108,16 +4196,16 @@ def test_agents_dir_bypass_leaks_neither_text_nor_identity(SS, monkeypatch, tmp_
     """The bypass security-reviewer found in round 2 of this PR (run-089d9dca):
     `repo` alone can't say a dispatch reached a black box, because
     `resolve_agent()` (bin/agentctl) honours `--agents-dir` before it ever
-    looks at `repo` — so `--on constance --agents-dir
-    ~/Convivy/CFO/.claude/agents` writes `repo: "constance"` (a public slug)
-    into `meta.json` while loading a CFO agent. `meta["agent_source"]` (the
+    looks at `repo` — so `--on atlas --agents-dir
+    ~/Convivy/TREASURY/.claude/agents` writes `repo: "atlas"` (a public slug)
+    into `meta.json` while loading a TREASURY agent. `meta["agent_source"]` (the
     file `resolve_agent()` actually read) is the second signal that catches
     it, checked against every private crew's `home_path()`.
 
     Asserted as a DELTA against an otherwise identical fully-public dispatch,
     same as the sibling `repo`-string test above — "the private line is
     absent" alone passes against an implementation that derives nothing at
-    all. `repo` is "constance" (non-private) for BOTH dispatches here, so a
+    all. `repo` is "atlas" (non-private) for BOTH dispatches here, so a
     repo-only check cannot distinguish them; only `agent_source` can.
     """
     _setup_derived_env(SS, monkeypatch, tmp_path)
@@ -4139,24 +4227,24 @@ def test_agents_dir_bypass_leaks_neither_text_nor_identity(SS, monkeypatch, tmp_
     public_agents_dir.mkdir()
 
     def _dispatch(run_id, task, pr, agent_source):
-        _write_run_meta(runs_root, run_id, day, task=task, repo="constance", pr=pr,
+        _write_run_meta(runs_root, run_id, day, task=task, repo="atlas", pr=pr,
                          co_session="sess-keel", agent_source=agent_source)
         _write_active_json(tmp_path / "active.json", [
             {"run_id": run_id, "agent": "coder", "task": task,
-             "started_at": "2026-08-29T10:00:00Z", "repo": "constance",
+             "started_at": "2026-08-29T10:00:00Z", "repo": "atlas",
              "worktree": "/tmp/wt", "pid": 111}])
         return SS.working_on_derived("keel", cwd=keel_cwd, session_id="sess-keel")
 
     # The half that must still work — otherwise the assertion below is vacuous.
-    public = _dispatch("run-pub2", "public crew work via constance", 321,
+    public = _dispatch("run-pub2", "public crew work via atlas", 321,
                         str(public_agents_dir / "coder.md"))
-    assert public["text"] == "public crew work via constance"
+    assert public["text"] == "public crew work via atlas"
     assert public["identity_kind"] == "pr"
 
-    private = _dispatch("run-priv2", "SENSITIVE constance-labelled work", 99,
-                         str(private_agents_dir / "cfo-classify.md"))
+    private = _dispatch("run-priv2", "SENSITIVE atlas-labelled work", 99,
+                         str(private_agents_dir / "treasury-classify.md"))
 
-    assert private["text"] == "public crew work via constance", \
+    assert private["text"] == "public crew work via atlas", \
         "the --agents-dir dispatch must not become this session's line"
     assert "SENSITIVE" not in json.dumps(private), \
         "a black box's task text must not reach the shared payload via --agents-dir"
@@ -5543,13 +5631,13 @@ def _stub_crew_registry(tmp_path, monkeypatch, SS):
     registry.write_text(json.dumps({
         "_meta": {"note": "underscore keys are skipped"},
         "convivy-deck": {"private": False},
-        "cfo": {"private": True, "home_dir": "~/Convivy/CFO"},
+        "treasury": {"private": True, "home_dir": "~/Convivy/TREASURY"},
     }))
     monkeypatch.setattr(_private_crew(SS), "_REGISTRY", str(registry))
-    monkeypatch.setattr(SS.projects, "private_slugs", lambda: {"cfo"})
+    monkeypatch.setattr(SS.projects, "private_slugs", lambda: {"treasury"})
     monkeypatch.setattr(
         SS.projects, "home_path",
-        lambda slug: (tmp_path / "CFO") if slug == "cfo" else None)
+        lambda slug: (tmp_path / "TREASURY") if slug == "treasury" else None)
 
 
 def _active_with(tmp_path, monkeypatch, SS, **entry):
@@ -5898,7 +5986,7 @@ def test_a_malformed_run_record_cannot_take_down_agent_runs_either(
 def test_a_private_crews_task_never_reaches_the_payload(SS, monkeypatch, tmp_path):
     """ADR-0043's black box: a private crew's dispatch prompt must not leave the
     crew's own directory, and `active.json` is machine-wide — so a fleet-wide
-    read walks CFO's entries too, and this payload is rendered by Deck on the
+    read walks TREASURY's entries too, and this payload is rendered by Deck on the
     laptop. The agent NAME is unchanged from what `agents` already exposed;
     only the new free text is withheld."""
     # THE REAL LOOKUP, NOT A MOCKED GATE. Mocking `private_home_for` meant a
@@ -5907,12 +5995,12 @@ def test_a_private_crews_task_never_reaches_the_payload(SS, monkeypatch, tmp_pat
     # #464). This stubs the REGISTRY instead, one layer further out, so the
     # slug matching and the fail-closed policy both run for real.
     _active_with(tmp_path, monkeypatch, SS,
-                 repo="CFO", agent="cfo-analyst", run_id="run-priv",
+                 repo="TREASURY", agent="treasury-analyst", run_id="run-priv",
                  task="reconcile the September ledger against the bank export")
     registry = tmp_path / "projects.json"
     registry.write_text(json.dumps({
         "_meta": {"note": "underscore keys are skipped"},
-        "cfo": {"private": True, "home_dir": "~/Convivy/CFO"},
+        "treasury": {"private": True, "home_dir": "~/Convivy/TREASURY"},
         "convivy-deck": {"private": False},
     }))
     monkeypatch.setattr(_private_crew(SS), "_REGISTRY", str(registry))
@@ -5922,14 +6010,14 @@ def test_a_private_crews_task_never_reaches_the_payload(SS, monkeypatch, tmp_pat
     # (issue_01M2KVQGDRS6CA4J0DY8R50T71: "the same resolution", not a second
     # check re-deriving the answer).
     today = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
-    _write_meta(tmp_path, today, "run-priv", {"repo": "CFO"})
+    _write_meta(tmp_path, today, "run-priv", {"repo": "TREASURY"})
     _write_cost_partial(tmp_path, today, "run-priv",
                         usd=3.5, cost_source="estimate_fallback")
 
     out = SS.live_agents("/srv/convivy/substrate")   # fleet-wide
     assert out["fleet_wide"] is True
     (run,) = out["agent_runs"]
-    assert run["agent"] == "cfo-analyst", "the run still draws; the fleet is not under-reported"
+    assert run["agent"] == "treasury-analyst", "the run still draws; the fleet is not under-reported"
     # THE WHOLE ROW, not just the task. `agents` already leaked a bare NAME
     # before this feature and a name binds to nothing; `repo` says which private
     # crew is live, `started_at` when, `model` what it runs, and `run_id`
@@ -5948,10 +6036,10 @@ def test_agents_dir_bypass_is_closed_for_agent_runs_too(SS, monkeypatch, tmp_pat
     """THE SAME BYPASS `test_agents_dir_bypass_leaks_neither_text_nor_identity`
     closed for `_dispatched_by`, still open here: `_crew_is_shareable` read only
     `repo`, but `resolve_agent()` (bin/agentctl) honours `--agents-dir` before it
-    ever looks at `repo` — so `--on constance --agents-dir
-    ~/Convivy/CFO/.claude/agents` writes `repo: "constance"` (a public slug)
+    ever looks at `repo` — so `--on atlas --agents-dir
+    ~/Convivy/TREASURY/.claude/agents` writes `repo: "atlas"` (a public slug)
     into `active.json` while the run's `meta.json` carries an `agent_source`
-    pointing inside CFO's home. A repo-only check answers "not private" and the
+    pointing inside TREASURY's home. A repo-only check answers "not private" and the
     row leaks task, started_at, run_id, repo and model to Deck — the ADR-0043
     black box this function's own docstring claims to close.
 
@@ -5966,12 +6054,12 @@ def test_agents_dir_bypass_is_closed_for_agent_runs_too(SS, monkeypatch, tmp_pat
     # Path.home(), so the redirect has to name the data root too.
     monkeypatch.setenv("BUILDER_ROOT", str(tmp_path / "Convivy"))
     monkeypatch.setattr(SS.projects, "private_slugs", lambda: {"private-crew"})
-    # `constance` must read as non-private on the LEGACY registry too, so a
+    # `atlas` must read as non-private on the LEGACY registry too, so a
     # pre-fix run isolates the bypass itself rather than failing merely because
     # an unreadable registry (this test's `HOME` has none) redacts both rows
     # for an unrelated reason.
     legacy_registry = tmp_path / "legacy-projects.json"
-    legacy_registry.write_text(json.dumps({"constance": {"private": False}}))
+    legacy_registry.write_text(json.dumps({"atlas": {"private": False}}))
     monkeypatch.setattr(_private_crew(SS), "_REGISTRY", str(legacy_registry))
 
     private_home = tmp_path / "private-crew-home"
@@ -5986,25 +6074,25 @@ def test_agents_dir_bypass_is_closed_for_agent_runs_too(SS, monkeypatch, tmp_pat
     local_day = datetime.datetime(2026, 8, 29, 10, 0, 0,
                                   tzinfo=datetime.timezone.utc).astimezone().strftime("%Y-%m-%d")
     active.write_text(json.dumps({"runs": [
-        {"pid": 1, "repo": "constance", "agent": "coder", "run_id": "run-pub",
-         "task": "public crew work via constance", "started_at": started_at},
-        {"pid": 1, "repo": "constance", "agent": "cfo-classify", "run_id": "run-priv",
-         "task": "SENSITIVE constance-labelled work", "started_at": started_at},
+        {"pid": 1, "repo": "atlas", "agent": "coder", "run_id": "run-pub",
+         "task": "public crew work via atlas", "started_at": started_at},
+        {"pid": 1, "repo": "atlas", "agent": "treasury-classify", "run_id": "run-priv",
+         "task": "SENSITIVE atlas-labelled work", "started_at": started_at},
     ]}))
     _write_meta(tmp_path, local_day, "run-pub",
                 {"agent_source": str(public_agents_dir / "coder.md")})
     _write_meta(tmp_path, local_day, "run-priv",
-                {"agent_source": str(private_agents_dir / "cfo-classify.md")})
+                {"agent_source": str(private_agents_dir / "treasury-classify.md")})
 
     public, private = SS.live_agents(
         "/srv/convivy/substrate")["agent_runs"]
 
     # The half that must still work — otherwise the assertion below is vacuous.
-    assert public["task"] == "public crew work via constance"
+    assert public["task"] == "public crew work via atlas"
     assert public["run_id"] == "run-pub"
-    assert public["repo"] == "constance"
+    assert public["repo"] == "atlas"
 
-    assert private["agent"] == "cfo-classify"
+    assert private["agent"] == "treasury-classify"
     assert "SENSITIVE" not in json.dumps(private)
     for field in ("task", "repo", "run_id", "started_at", "model"):
         assert private[field] is None, f"{field} crossed the agents-dir bypass"
@@ -6096,15 +6184,15 @@ def test_an_extreme_started_at_degrades_one_field_not_the_whole_read(
 
 def test_a_repo_that_is_not_a_slug_withholds_even_though_it_names_the_crew(
         SS, monkeypatch, tmp_path):
-    """`"../CFO"` is not a registry slug, so the lookup answers "not private" —
-    while still naming CFO to anyone reading the row. Evading the gate and
+    """`"../TREASURY"` is not a registry slug, so the lookup answers "not private" —
+    while still naming TREASURY to anyone reading the row. Evading the gate and
     identifying the crew are not mutually exclusive, which an earlier version
     of this gate's reasoning assumed. The charset check is what closes it."""
     _active_with(tmp_path, monkeypatch, SS,
-                 repo="../CFO", agent="cfo-analyst", run_id="run-sneak",
+                 repo="../TREASURY", agent="treasury-analyst", run_id="run-sneak",
                  task="ledger work")
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"cfo": {"private": True}}))
+    registry.write_text(json.dumps({"treasury": {"private": True}}))
     monkeypatch.setattr(_private_crew(SS), "_REGISTRY", str(registry))
 
     (run,) = SS.live_agents("/srv/convivy/substrate")["agent_runs"]
@@ -6113,12 +6201,12 @@ def test_a_repo_that_is_not_a_slug_withholds_even_though_it_names_the_crew(
 
 
 def test_a_private_crew_is_matched_case_insensitively(SS, monkeypatch, tmp_path):
-    """The registry's slug is `cfo` and its home is `CFO`. A privacy question
+    """The registry's slug is `treasury` and its home is `TREASURY`. A privacy question
     matched case-sensitively would answer "not private" for one spelling of the
     same crew, and matching more broadly withholds more."""
     registry = tmp_path / "projects.json"
-    registry.write_text(json.dumps({"cfo": {"private": True}}))
-    for spelling in ("cfo", "CFO", "Cfo"):
+    registry.write_text(json.dumps({"treasury": {"private": True}}))
+    for spelling in ("treasury", "TREASURY", "Treasury"):
         _active_with(tmp_path, monkeypatch, SS, repo=spelling,
                      agent="a", run_id="r", task="t")
         monkeypatch.setattr(_private_crew(SS), "_REGISTRY", str(registry))

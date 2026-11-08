@@ -1,0 +1,597 @@
+#!/usr/bin/env python3.11
+"""trial-escaped-defects — escaped-defect count per merged pull request of a
+model trial (E32 design question 6; CQ·527).
+
+Review passing is a proxy for code that holds up, not the thing itself. This
+counts, per pull request a trial's runs merged, the defects that escaped
+review: a fix landed on the default branch within `--days` (default 14) of
+the pull request's merge that changes lines that pull request added, plus
+any logged escaped-defect signal naming the pull request.
+
+MEMBERSHIP. A trial's pull requests are found the way `bin/model-scorecard`
+already finds a run's pull request: each run dir under the agent-runs root
+(`builder_root.runs_root()`) holds a `meta.json` (`trial` names the trial,
+`repo` names the bare repo) and, for a run that opened one, a `pr-link.json`
+(`pr_number`). Several runs can link to the same pull request (a revise
+round dispatched with `--pr` already known); the earliest-started one's
+`model`/`agent` represents the pull request, since every run tied to one
+pull request is the same trial slice.
+
+THE MERGE COMMIT, LOCALLY. Every repo this trial touches merges pull requests
+with GitHub's ordinary "Merge pull request #N from ..." commit, never a
+squash — confirmed against agent-platform's, acme's, convivy-orient's and
+shipwright's own history. The merge commit is found by grepping
+`origin/main`'s log for that exact subject line, never by asking `gh`: the
+repos are read through their local primary checkouts, read-only, with
+`git -C`, and this process never runs `git fetch` — a checkout behind
+origin simply has not learned about a pull request yet, the same way
+`check-primary-checkouts` degrades on a missing checkout.
+
+LINE TRACKING ACROSS LATER COMMITS. The pull request's added lines are the
+new side of the diff between its merge commit's two parents' merge base and
+its head (the second parent) — exactly what GitHub shows as "Files changed".
+Whether a later commit "changes" one of those lines is not a single `git
+log -L` or `git blame` call: `-L` tracks a line range backward from a given
+endpoint and silently drops a line once something deletes it rather than
+reporting the deletion (verified empirically — a delete-only hunk never
+surfaces), and anchoring `blame` at a single later ref can't tell a line
+that was never touched from one deleted along the way either. Instead this
+walks the default branch's first-parent history forward from the merge
+commit one commit at a time, replaying each commit's own `-U0` diff against
+a live per-file array of "is this position still a line the trial PR added"
+booleans (seeded True at the PR's added positions, False everywhere else).
+A hunk's removed range overlapping a True entry is a hit, whether the
+replacement is new content (modify) or nothing (delete) — the same check
+either way, and the live array is updated after each commit so later
+commits are checked against the file's current shape rather than the
+shape at merge time. `-U0` hunks carry exact line positions with no
+context-line ambiguity, and processing a commit's hunks for one file in
+descending start order means an earlier edit never shifts the as-yet-
+unprocessed, lower-numbered hunks below it. Every diff here pins rename
+detection on (`-M`) rather than leaving it to the checkout's own
+`diff.renames` config, and the per-commit diff is read unrestricted by
+pathspec so a rename's new path — unknown to this process until the diff
+names it — still pairs with its old one; the tracking array then moves to
+the new path under the SAME key the hunks below the rename header use,
+unmarked as a fix on the rename alone (nothing was modified) but still
+live for the next commit's edits.
+
+ESCAPED-DEFECT SIGNALS. `_default_signal_search` calls the same `GET
+/api/signals/search` route `memory_archive._default_searcher` already calls
+directly (no MCP layer here — this is a headless harvester, like
+`model-scorecard`'s `gh` joins). `product` is deliberately left unset: the
+one real escaped-defect signal on file today (sig_01M5CMSR3VNZ87BERBD2D2TJ95,
+on convivy-orient#393) is stamped `product: "bosun"`, the filing crew, not
+the repo the defect was found in — scoping the search to the repo's own
+project would have missed the only real example there is. A result counts
+only when its body or url text actually names `<repo>#<pr_number>` (or the
+pull/issues URL form) — the search itself is semantic, so this is the exact-
+reference check that turns "maybe related" into "names this PR". None (not
+0) when the Library is unreachable or this process holds no signal token, so
+a report line can say "unavailable" rather than a false, confident zero.
+
+Never runs `git fetch`, never checks out or switches a branch in a primary
+checkout, and never writes anything — every git call here is read-only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+import builder_root as BR    # noqa: E402
+import git_refs as GR        # noqa: E402
+import projects              # noqa: E402
+import signal_client         # noqa: E402
+import vault_plane as VP     # noqa: E402
+
+RUNS_ROOT = BR.runs_root()
+DEFAULT_DAYS = 14
+_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_GIT_TIMEOUT_S = 30
+
+# A bare repo NAME, never a path: no "/", not "." or "..", and nothing outside
+# this conservative charset. `meta.json["repo"]` is written by the run itself
+# (not by the dispatching session), so a value built from it must be refused
+# before it ever becomes `BR.root() / repo` — the same concern
+# `model-scorecard._validated_run_repo` raises for the same field, but that
+# guard alone (`projects.registered_repo_github_slug`) accepts an unregistered
+# bare name unconditionally, "." and ".." included, since it only refuses a
+# forged `owner/repo`.
+_SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _safe_bare_repo(repo) -> bool:
+    return (isinstance(repo, str) and bool(repo) and "/" not in repo
+            and repo not in (".", "..") and bool(_SAFE_REPO_RE.match(repo)))
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _sanitised_field(value) -> str | None:
+    """A `meta.json` string field (`model`, `agent`, `repo`) for display —
+    the field comes from a record a dispatched run writes about itself, so
+    it is sanitised at the point it enters a row, the same `sanitise()`
+    every other unauthored-string-reaching-a-report caller in this codebase
+    uses (never a second, bespoke sanitiser). None for anything that is not
+    a non-empty string, matching `row.get(...) or "?"` at render time."""
+    return signal_client.sanitise(value) if isinstance(value, str) and value else None
+
+
+def _linked_pr_number(pr_link: dict | None) -> int | None:
+    """The run's `pr-link.json` `pr_number`, the same first-class run->PR link
+    `model-scorecard.linked_pr_number` reads — reimplemented here rather than
+    imported, since `bin/` CLIs are extension-less and not meant to import one
+    another's internals for a three-line helper."""
+    if not pr_link:
+        return None
+    n = pr_link.get("pr_number")
+    if isinstance(n, bool):
+        return None
+    if isinstance(n, int):
+        return n
+    if isinstance(n, str) and n.isdigit():
+        return int(n)
+    return None
+
+
+# --- membership: which (repo, pr) pairs belong to this trial -----------------
+
+
+def list_trial_prs(trial: str, runs_root: Path) -> list[dict]:
+    """Every (repo, pr_number) a run of this trial linked, deduped — several
+    runs (a revise round dispatched with `--pr` already known) can link to
+    the same pull request, and the earliest-started one's `model`/`agent`
+    represents it, since every run tied to one pull request is one trial
+    slice. Sorted by (repo, pr_number) for a deterministic report."""
+    by_key: dict[tuple[str, int], dict] = {}
+    if not runs_root.is_dir():
+        return []
+    for day_dir in sorted(p for p in runs_root.iterdir() if _DATE_DIR_RE.match(p.name)):
+        for run_dir in sorted(d for d in day_dir.iterdir() if d.is_dir()):
+            meta = _read_json(run_dir / "meta.json")
+            if not meta or meta.get("trial") != trial:
+                continue
+            pr_number = _linked_pr_number(_read_json(run_dir / "pr-link.json"))
+            if pr_number is None:
+                continue
+            repo = meta.get("repo")
+            if not _safe_bare_repo(repo) or projects.registered_repo_github_slug(repo) is None:
+                continue
+            key = (repo, pr_number)
+            started = meta.get("started_at") or ""
+            existing = by_key.get(key)
+            if existing is None or started < existing["started_at"]:
+                by_key[key] = {"repo": _sanitised_field(repo), "pr_number": pr_number,
+                               "model": _sanitised_field(meta.get("model")),
+                               "agent": _sanitised_field(meta.get("agent")),
+                               "run_id": meta.get("run_id") or run_dir.name,
+                               "started_at": started}
+    return sorted(by_key.values(), key=lambda r: (r["repo"], r["pr_number"]))
+
+
+def repo_checkout_dir(repo: str, root: Path) -> Path | None:
+    """The local primary checkout of a bare repo NAME — `<root>/<repo>`, the
+    same layout `docs_merge.repo_root` resolves for an `owner/name` slug's
+    name half. None when `repo` fails the safety/registry checks above, or
+    the directory simply isn't there (a missing checkout degrades gracefully,
+    the same posture `check-primary-checkouts` takes)."""
+    if not _safe_bare_repo(repo) or projects.registered_repo_github_slug(repo) is None:
+        return None
+    path = root / repo
+    return path if path.is_dir() else None
+
+
+# --- git, read-only -----------------------------------------------------------
+
+
+def _run_git(repo_dir: Path, args: list[str]) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(["git", "-C", str(repo_dir), *args],
+                              capture_output=True, text=True, timeout=_GIT_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def find_merge_commit(repo_dir: Path, branch_sha: str, pr_number: int) -> str | None:
+    """The sha of `branch_sha`'s history whose subject is exactly "Merge pull
+    request #<pr_number> from ..." — GitHub's ordinary merge commit, the only
+    merge shape every repo this trial touches uses (verified against
+    agent-platform's, acme's, convivy-orient's and shipwright's own `git log
+    --merges`). None when no such commit exists in this checkout's history —
+    not merged yet, merged by another shape, or this checkout hasn't learned
+    about it (this never runs `git fetch`)."""
+    pattern = f"^Merge pull request #{pr_number} from "
+    cp = _run_git(repo_dir, ["log", "--format=%H", "-E", f"--grep={pattern}", branch_sha])
+    if cp is None or cp.returncode != 0:
+        return None
+    shas = [s for s in cp.stdout.splitlines() if s.strip()]
+    return shas[0] if shas else None
+
+
+def commit_ts(repo_dir: Path, sha: str) -> int | None:
+    cp = _run_git(repo_dir, ["show", "-s", "--format=%ct", sha])
+    if cp is None or cp.returncode != 0 or not cp.stdout.strip():
+        return None
+    try:
+        return int(cp.stdout.strip().splitlines()[0])
+    except ValueError:
+        return None
+
+
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def parse_u0_diff(diff_text: str) -> tuple[dict[str, list[tuple[int, int, int, int]]],
+                                            set[str], dict[str, str]]:
+    """A `-U0` unified diff into ({new_path: [(old_start, old_count, new_start,
+    new_count), ...]}, {old_path of a file this diff deletes entirely},
+    {old_path: new_path for a file this diff renames, pure or with edits}).
+
+    `-U0` (no context lines) is what makes a hunk's new-side range exactly
+    the lines this diff added or changed, with no ambiguity from surrounding
+    unchanged lines — every caller here relies on that.
+
+    Every caller passes `-M` explicitly (rename detection pinned ON, never
+    left to the machine's `diff.renames` config) so a renamed file's content
+    is diffed against its old self rather than reading as an unrelated
+    delete+add. `git diff -M` emits "rename from <old>"/"rename to <new>"
+    immediately after the "diff --git" line, before any "--- "/"+++ " pair —
+    present even for a pure (100%-similarity, no-hunk) rename, where no
+    "--- "/"+++ " lines are emitted at all. A rename WITH edits still emits
+    "--- a/<old>"/"+++ b/<new>" and ordinary hunks below the rename header,
+    keyed by `<new>` exactly like a plain modify."""
+    hunks: dict[str, list[tuple[int, int, int, int]]] = {}
+    deleted: set[str] = set()
+    renames: dict[str, str] = {}
+    cur_new: str | None = None
+    cur_old: str | None = None
+    rename_from: str | None = None
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            cur_new = None
+            cur_old = None
+            rename_from = None
+            continue
+        if line.startswith("rename from "):
+            rename_from = line[len("rename from "):]
+            continue
+        if line.startswith("rename to "):
+            if rename_from is not None:
+                renames[rename_from] = line[len("rename to "):]
+            rename_from = None
+            continue
+        if line.startswith("--- "):
+            p = line[4:]
+            cur_old = None if p == "/dev/null" else (p[2:] if p.startswith("a/") else p)
+            continue
+        if line.startswith("+++ "):
+            p = line[4:]
+            if p == "/dev/null":
+                cur_new = None
+                if cur_old:
+                    deleted.add(cur_old)
+            else:
+                cur_new = p[2:] if p.startswith("b/") else p
+            continue
+        if cur_new is None:
+            continue
+        m = _HUNK_RE.match(line)
+        if not m:
+            continue
+        old_start = int(m.group(1))
+        old_count = int(m.group(2)) if m.group(2) is not None else 1
+        new_start = int(m.group(3))
+        new_count = int(m.group(4)) if m.group(4) is not None else 1
+        hunks.setdefault(cur_new, []).append((old_start, old_count, new_start, new_count))
+    return hunks, deleted, renames
+
+
+def pr_added_lines(repo_dir: Path, merge_sha: str) -> dict[str, list[bool]] | None:
+    """{path: [is-this-position-a-line-the-PR-added, ...]} for every file the
+    pull request's own diff touches, the array's length being that file's
+    total line count at the merge commit's head side. None when `merge_sha`
+    is not an ordinary 2-parent merge commit."""
+    cp = _run_git(repo_dir, ["rev-list", "--parents", "-n", "1", merge_sha])
+    if cp is None or cp.returncode != 0 or not cp.stdout.strip():
+        return None
+    parts = cp.stdout.strip().split()
+    if len(parts) != 3:
+        return None  # not an ordinary 2-parent merge commit (e.g. a squash)
+    _mc, p1, p2 = parts
+    mb_cp = _run_git(repo_dir, ["merge-base", p1, p2])
+    if mb_cp is None or mb_cp.returncode != 0 or not mb_cp.stdout.strip():
+        return None
+    merge_base = mb_cp.stdout.strip()
+    diff_cp = _run_git(repo_dir, ["diff", "--no-color", "--no-ext-diff", "--no-textconv",
+                                  "-M", "-U0", merge_base, p2])
+    if diff_cp is None or diff_cp.returncode != 0:
+        return None
+    hunks, _deleted, _renames = parse_u0_diff(diff_cp.stdout)
+    live: dict[str, list[bool]] = {}
+    for path, hlist in hunks.items():
+        show_cp = _run_git(repo_dir, ["show", f"{p2}:{path}"])
+        if show_cp is None or show_cp.returncode != 0:
+            continue
+        length = len(show_cp.stdout.splitlines())
+        arr = [False] * length
+        for (_old_start, _old_count, new_start, new_count) in hlist:
+            for i in range(new_start - 1, new_start - 1 + new_count):
+                if 0 <= i < length:
+                    arr[i] = True
+        if any(arr):
+            live[path] = arr
+    return live
+
+
+def mainline_commits_after(repo_dir: Path, merge_sha: str, branch_sha: str,
+                           merge_ts: int, days: int) -> list[tuple[str, int]]:
+    """[(sha, committer_ts), ...] for every commit on the default branch's
+    first-parent history after `merge_sha` (its own content included via its
+    own merge diff) up to `branch_sha`, oldest first, clipped to `merge_ts`
+    + `days` days — the window `--reverse` lets this stop early at, rather
+    than fetching the whole remaining history."""
+    cp = _run_git(repo_dir, ["log", "--first-parent", "--reverse", "--format=%H %ct",
+                             f"{merge_sha}..{branch_sha}"])
+    if cp is None or cp.returncode != 0:
+        return []
+    until_ts = merge_ts + days * 86400
+    out = []
+    for line in cp.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        sha, _, ts = line.partition(" ")
+        try:
+            ts_i = int(ts)
+        except ValueError:
+            continue
+        if ts_i > until_ts:
+            break
+        out.append((sha, ts_i))
+    return out
+
+
+def escaped_defects_for_pr(repo_dir: Path, pr_number: int, branch_sha: str,
+                          days: int = DEFAULT_DAYS) -> dict:
+    """{"merged": bool, "merge_sha": str | None, "merge_ts": int | None,
+    "fixes": [{"sha", "short_sha", "committer_ts"}, ...]} for one pull
+    request. `fixes` is empty, never partial, when the pull request itself
+    cannot be resolved to a local merge commit (`merged` is False then)."""
+    merge_sha = find_merge_commit(repo_dir, branch_sha, pr_number)
+    if merge_sha is None:
+        return {"merged": False, "merge_sha": None, "merge_ts": None, "fixes": []}
+    merge_ts = commit_ts(repo_dir, merge_sha)
+    if merge_ts is None:
+        return {"merged": False, "merge_sha": merge_sha, "merge_ts": None, "fixes": []}
+    live = pr_added_lines(repo_dir, merge_sha) or {}
+    fixes: list[dict] = []
+    if live:
+        for sha, ts in mainline_commits_after(repo_dir, merge_sha, branch_sha, merge_ts, days):
+            if not live:
+                break
+            # No pathspec restriction here, even though only the paths
+            # `live` already tracks matter: `-M` rename detection only
+            # pairs an old path with its new one when BOTH sides are in the
+            # diff's output, and a pathspec of the old path alone excludes
+            # the new path from that output, silently turning the rename
+            # back into an unmatched delete. The whole commit's diff is
+            # read and only `live`/`deleted`/`renames` entries are acted on.
+            cp = _run_git(repo_dir, ["diff", "--no-color", "--no-ext-diff", "--no-textconv",
+                                     "-M", "-U0", f"{sha}^1", sha])
+            if cp is None or cp.returncode != 0:
+                continue
+            hunks, deleted, renames = parse_u0_diff(cp.stdout)
+            touched = False
+            # Built from a snapshot of `live` as it stood before this
+            # commit's renames, then applied in one step: a commit that
+            # chains two renames (e.g. `b.py`->`c.py` and `a.py`->`b.py`
+            # together) would otherwise have an old-path pop/new-path assign
+            # done one rename at a time alias one file's array onto another
+            # and lose the first depending on dict-iteration order.
+            if renames:
+                before_renames = dict(live)
+                for old_path in renames:
+                    live.pop(old_path, None)
+                for old_path, new_path in renames.items():
+                    arr = before_renames.get(old_path)
+                    if arr is not None:
+                        live[new_path] = arr
+            for path in list(deleted):
+                arr = live.pop(path, None)
+                if arr is not None and any(arr):
+                    touched = True
+            for path, hlist in hunks.items():
+                arr = live.get(path)
+                if arr is None:
+                    continue
+                for (old_start, old_count, _new_start, new_count) in sorted(
+                        hlist, key=lambda h: h[0], reverse=True):
+                    start_idx = old_start if old_count == 0 else old_start - 1
+                    end_idx = start_idx + old_count
+                    if any(arr[start_idx:end_idx]):
+                        touched = True
+                    arr[start_idx:end_idx] = [False] * new_count
+                if not any(arr):
+                    live.pop(path, None)
+            if touched:
+                fixes.append({"sha": sha, "short_sha": sha[:10], "committer_ts": ts})
+    return {"merged": True, "merge_sha": merge_sha, "merge_ts": merge_ts, "fixes": fixes}
+
+
+# --- escaped-defect signals ---------------------------------------------------
+
+
+_SIGNAL_SEARCH_LIMIT = 10
+_SIGNAL_TIMEOUT_S = 10
+
+
+def _references_pr(text: str, repo: str, pr_number: int) -> bool:
+    """Whether `text` actually names `<repo>#<pr_number>` or links its pull
+    request — the exact-reference check that turns a semantic search's
+    "maybe related" result into "names this PR".
+
+    Every alternative is scoped to `repo` itself: a bare `pull/<N>` or
+    `issues/<N>` alternative (unscoped) would match ANY repo's PR/issue link
+    sharing the number, since this trial spans several repos with small,
+    overlapping PR numbers (acme#15 vs shipwright#15). Requiring the repo
+    name immediately before `/pull/` or `/issues/` disambiguates without
+    needing the URL's owner to match this repo's registered owner. The
+    no-digit-follows lookahead after the number is the trailing boundary
+    that keeps `#15` from matching `#150`; `0*` tolerates a zero-padded
+    number without widening that boundary."""
+    repo_re = re.escape(repo)
+    pattern = rf"(?:{repo_re}#|{repo_re}/pull/|{repo_re}/issues/)0*{pr_number}(?!\d)"
+    return re.search(pattern, text or "") is not None
+
+
+def _default_signal_search(repo: str, pr_number: int) -> list[dict] | None:
+    """Logged signals naming `repo#pr_number`, via the same `GET
+    /api/signals/search` route `memory_archive._default_searcher` already
+    calls directly — see the module docstring for why `product` is left
+    unset. None when unreachable or this process holds no signal token
+    (never a confident empty list on failure); `[]` when reachable but
+    nothing in the page names this pull request."""
+    tok = signal_client.token()
+    if not tok:
+        return None
+    query = f"{repo}#{pr_number}"
+    url = VP.url("/api/signals/search") + "?" + urllib.parse.urlencode(
+        {"q": query, "limit": _SIGNAL_SEARCH_LIMIT})
+    try:
+        req = urllib.request.Request(url, headers=VP.headers(token=tok))
+        with urllib.request.urlopen(req, timeout=_SIGNAL_TIMEOUT_S) as resp:
+            body = json.loads(resp.read())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    rows = body.get("signals") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        return None
+    out = []
+    for sig in rows:
+        if not isinstance(sig, dict):
+            continue
+        url_field = sig.get("url") or (sig.get("refs") or {}).get("url") or ""
+        text = f"{sig.get('body', '')}\n{url_field}"
+        if _references_pr(text, repo, pr_number):
+            out.append(sig)
+    return out
+
+
+# --- report --------------------------------------------------------------------
+
+
+def _signal_count(row: dict) -> int | None:
+    signals = row.get("signals")
+    return len(signals) if isinstance(signals, list) else None
+
+
+def escaped_count(row: dict) -> int:
+    """Fixes found locally plus signals naming the pull request — additive,
+    on the design answer's own wording ("a fix ... that changes lines ...,
+    OR a logged escaped-defect signal naming it"): two independent detectors
+    for the same underlying question, not deduplicated against each other."""
+    return len(row.get("fixes") or []) + (_signal_count(row) or 0)
+
+
+def _escape_cell(value) -> str:
+    """`value`, already past `sanitise()`, escaped for the GFM table-cell
+    convention this codebase's own markdown reader documents
+    (`session_view.py`'s `_table_cells`: a backslash before `|` is how a cell
+    carries a literal pipe). `sanitise()` strips control sequences and
+    newlines but leaves `|` untouched, so a run-record field such as `model`
+    containing `| x | y` would otherwise split its own row into extra cells
+    and push the real escaped-defect count past the table's last column,
+    where GFM drops it. The backslash is escaped first so an existing
+    backslash can't un-escape the pipe this adds."""
+    return str(value).replace("\\", "\\\\").replace("|", "\\|")
+
+
+def render_report(rows: list[dict], skipped: list[tuple[str, int, str]]) -> str:
+    lines = ["| Repo | PR | Arm (model) | Escaped defects | Fixing commits | Signals |",
+             "|---|---|---|---|---|---|"]
+    totals: dict = defaultdict(lambda: {"prs": 0, "defects": 0})
+    for r in rows:
+        n = escaped_count(r)
+        shas = ", ".join(f["short_sha"] for f in (r.get("fixes") or []))
+        sig = _signal_count(r)
+        sig_cell = str(sig) if sig is not None else "unavailable"
+        model = r.get("model") or "?"
+        lines.append(f"| {_escape_cell(r['repo'])} | #{r['pr_number']} "
+                     f"| {_escape_cell(model)} | {n} "
+                     f"| {shas or '—'} | {sig_cell} |")
+        totals[model]["prs"] += 1
+        totals[model]["defects"] += n
+    lines.append("")
+    lines.append("| Arm (model) | PRs | Escaped defects |")
+    lines.append("|---|---|---|")
+    for model, t in sorted(totals.items(), key=lambda kv: kv[0] or ""):
+        lines.append(f"| {_escape_cell(model)} | {t['prs']} | {t['defects']} |")
+    if skipped:
+        lines.append("")
+        lines.append("Skipped (no local checkout, or no merge commit found locally):")
+        for repo, pr_number, reason in skipped:
+            lines.append(f"- {repo}#{pr_number}: {reason}")
+    return "\n".join(lines) + "\n"
+
+
+# --- entry ---------------------------------------------------------------------
+
+
+def main(argv=None) -> int:
+    p = argparse.ArgumentParser(
+        description="Count escaped defects over a model trial's merged pull requests.")
+    p.add_argument("trial", help="the trial name, e.g. model-trial-1")
+    p.add_argument("--days", type=int, default=DEFAULT_DAYS,
+                   help=f"the escape window in days (default {DEFAULT_DAYS})")
+    p.add_argument("--runs-root", default=str(RUNS_ROOT), help="override the agent-runs root")
+    p.add_argument("--root", default=str(BR.root()),
+                   help="where the local primary checkouts live")
+    p.add_argument("--no-signals", action="store_true",
+                   help="skip the ops signal search half")
+    args = p.parse_args(argv)
+
+    runs_root = Path(args.runs_root)
+    root = Path(args.root)
+    prs = list_trial_prs(args.trial, runs_root)
+    if not prs:
+        print(f"no runs found for trial {args.trial!r} under {runs_root}", file=sys.stderr)
+        return 1
+
+    rows: list[dict] = []
+    skipped: list[tuple[str, int, str]] = []
+    for pr in prs:
+        checkout = repo_checkout_dir(pr["repo"], root)
+        if checkout is None:
+            skipped.append((pr["repo"], pr["pr_number"], "no local primary checkout"))
+            continue
+        branch_sha = GR.exact_ref_sha(checkout, GR.ORIGIN_MAIN_REF)
+        if branch_sha is None:
+            skipped.append((pr["repo"], pr["pr_number"], "origin/main ref not found"))
+            continue
+        result = escaped_defects_for_pr(checkout, pr["pr_number"], branch_sha, days=args.days)
+        if not result["merged"]:
+            skipped.append((pr["repo"], pr["pr_number"], "no merge commit found locally"))
+            continue
+        signals = None if args.no_signals else _default_signal_search(pr["repo"], pr["pr_number"])
+        rows.append({**pr, **result, "signals": signals})
+
+    sys.stdout.write(render_report(rows, skipped))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

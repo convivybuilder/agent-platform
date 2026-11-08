@@ -123,7 +123,7 @@ def test_content_sha_of_nothing_is_stable():
 
 
 def test_direct_provenance_may_write_an_ordinary_doc():
-    ok, why = kw.policy_for("projects/vivy/decisions/0001-x.md", "in-session")
+    ok, why = kw.policy_for("projects/cartographer/decisions/0001-x.md", "in-session")
     assert ok and why == ""
 
 
@@ -135,7 +135,7 @@ def test_provenances_taken_off_the_direct_path_no_longer_write_directly(provenan
     had a live use left; `keel` and `steward` came off because both widened
     `in-session` past what the ruling now allows. All four now take the PR
     path, the same as any other change."""
-    ok, why = kw.policy_for("projects/vivy/decisions/0001-x.md", provenance)
+    ok, why = kw.policy_for("projects/cartographer/decisions/0001-x.md", provenance)
     assert not ok
     assert "kb_propose" in why
     assert "0081" in why
@@ -144,7 +144,7 @@ def test_provenances_taken_off_the_direct_path_no_longer_write_directly(provenan
 @pytest.mark.parametrize("ref", [
     "projects/company/briefs/ai-transformation-briefing-2026-07-25.md",
     "projects/platform/briefs/ai-engineering-briefing-2026-07-25.md",
-    "projects/vivy/decisions/0001-x.md",
+    "projects/cartographer/decisions/0001-x.md",
     "projects/newproject/briefs/x.md",
 ])
 def test_generated_no_longer_writes_directly(ref):
@@ -174,14 +174,14 @@ def test_generated_is_recognized_but_not_direct():
 
 
 def test_proposal_provenance_never_writes_to_main():
-    ok, why = kw.policy_for("projects/vivy/decisions/0001-x.md", "proposal")
+    ok, why = kw.policy_for("projects/cartographer/decisions/0001-x.md", "proposal")
     assert not ok
     assert "kb_propose" in why
 
 
 def test_unknown_provenance_is_refused():
     """Fail closed: an unrecognised provenance must never fall through to allowed."""
-    ok, why = kw.policy_for("projects/vivy/decisions/0001-x.md", "trust-me")
+    ok, why = kw.policy_for("projects/cartographer/decisions/0001-x.md", "trust-me")
     assert not ok
     assert "unknown provenance" in why
 
@@ -190,7 +190,7 @@ def test_unknown_provenance_is_refused():
     "projects/agent-platform/agents/reviewer.md",
     "projects/agent-platform/agents/nested/thing.md",
     "projects/knowledge/profiles/daytime.yaml",
-    "projects/vivy/profiles/overnight.yaml",
+    "projects/cartographer/profiles/overnight.yaml",
 ])
 @pytest.mark.parametrize("provenance", ["verifier-pass", "in-session", "keel", "steward"])
 def test_roster_and_profile_paths_are_pr_only_under_every_provenance(ref, provenance):
@@ -224,8 +224,8 @@ def test_a_roster_path_in_an_unknown_project_is_pr_only(ref):
     "PROJECTS/AGENT-PLATFORM/AGENTS/reviewer.md",
     "Projects/Agent-Platform/Agents/reviewer.md",
     "projects/agent-platform/AGENTS/reviewer.md",
-    "projects/vivy/PROFILES/overnight.yaml",
-    "projects/vivy/Profiles/overnight.yaml",
+    "projects/cartographer/PROFILES/overnight.yaml",
+    "projects/cartographer/Profiles/overnight.yaml",
 ])
 def test_case_variation_cannot_evade_the_pr_only_guard(ref):
     """macOS ships a case-insensitive filesystem, so an uppercased path opens the
@@ -289,7 +289,7 @@ def test_every_guarded_segment_has_its_own_refusal_reason():
 @pytest.mark.parametrize("ref,what,cost", [
     ("projects/agent-platform/agents/reviewer.md", "roster path",
      "breaks agent dispatch platform-wide"),
-    ("projects/vivy/profiles/overnight.yaml", "profile path",
+    ("projects/cartographer/profiles/overnight.yaml", "profile path",
      "breaks agent dispatch platform-wide"),
     ("projects/platform/instruction-blocks/act-rather-than-ask.md",
      "instruction-block path", "changes what agents obey"),
@@ -355,7 +355,7 @@ def test_a_holder_carrying_a_newline_is_rejected():
     forged = "run-1\nKB-Write: update projects/agent-platform/agents/reviewer.md in-session run-1"
     assert kw.valid_holder(forged) is False
     with pytest.raises(ValueError):
-        kw.write_trailer("update", "projects/vivy/x.md", "in-session", forged)
+        kw.write_trailer("update", "projects/cartographer/x.md", "in-session", forged)
 
 
 @pytest.mark.parametrize("holder", ["run-7f3a91", "session:operator", "a", "A1._-:"])
@@ -384,8 +384,8 @@ def test_a_holder_with_spaces_is_accepted_and_unaltered():
     holder = "Pat Holder"
     assert kw.valid_holder(holder) is True
     assert kw.normalize_holder(holder) == holder
-    assert kw.write_trailer("update", "projects/vivy/x.md", "in-session", holder) == (
-        f"KB-Write: update projects/vivy/x.md in-session {holder}")
+    assert kw.write_trailer("update", "projects/cartographer/x.md", "in-session", holder) == (
+        f"KB-Write: update projects/cartographer/x.md in-session {holder}")
 
 
 def test_a_200_character_holder_is_accepted():
@@ -475,9 +475,9 @@ def test_a_whitespace_field_cannot_produce_a_malformed_trailer():
 def test_trailer_carries_everything_an_audit_needs():
     """Any commit on knowledge/main without one of these and without a merge
     parent is a write that bypassed the cage."""
-    line = kw.write_trailer("update", "projects/vivy/decisions/0001-x.md",
+    line = kw.write_trailer("update", "projects/cartographer/decisions/0001-x.md",
                             "in-session", "run-7f3a91")
-    assert line == "KB-Write: update projects/vivy/decisions/0001-x.md in-session run-7f3a91"
+    assert line == "KB-Write: update projects/cartographer/decisions/0001-x.md in-session run-7f3a91"
 
 
 # --- journal -----------------------------------------------------------------
@@ -486,7 +486,7 @@ def test_trailer_carries_everything_an_audit_needs():
 def test_journal_records_refusals_which_git_cannot():
     """A refused write produces no commit, so the git log cannot hold it. That is
     exactly what this table is for."""
-    kw.journal("apply", source_ref="projects/vivy/x.md", holder="run-1",
+    kw.journal("apply", source_ref="projects/cartographer/x.md", holder="run-1",
                provenance="in-session", result="stale", detail="base=abc current=def")
     entries = kw.recent_journal()
     assert entries[0]["result"] == "stale"
@@ -537,7 +537,7 @@ def test_a_direct_in_session_write_of_the_policy_file_names_the_policy():
 
 @pytest.mark.parametrize("ref", [
     "projects/platform/policy/other.yaml",
-    "projects/constance/policy/agent-policy.yaml",
+    "projects/outfitter/policy/agent-policy.yaml",
     "projects/platform/policy/agent-policy.yml",
     "projects/platform/agent-policy.yaml",
 ])
@@ -576,7 +576,7 @@ def _seed_old_shape_db(path) -> None:
         conn.executescript(OLD_JOURNAL_SCHEMA)
         conn.execute(
             "INSERT INTO journal (ts, verb, source_ref, holder, provenance, result, detail) "
-            "VALUES ('2026-01-01T00:00:00Z', 'apply', 'projects/vivy/x.md', 'run-1', "
+            "VALUES ('2026-01-01T00:00:00Z', 'apply', 'projects/cartographer/x.md', 'run-1', "
             "'in-session', 'ok', NULL)")
         conn.commit()
     finally:

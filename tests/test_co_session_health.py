@@ -49,9 +49,9 @@ def _resolves(csh, monkeypatch, value):
 def test_segment_renders_slot_and_account(csh, cache, monkeypatch):
     account = "operator@example.com"
     _, _, domain = account.partition("@")
-    _resolves(csh, monkeypatch, f"nyh {account}")
+    _resolves(csh, monkeypatch, f"acme {account}")
     seg = csh._sub_segment("sess-1")
-    assert "sub nyh (operator)" in seg
+    assert "sub acme (operator)" in seg
     # Only the local part renders — the line is width-tight, and `_sub_label`
     # does `email.split('@')[0]`. Asserting the DOMAIN absent covers the whole
     # address, since the domain is a substring of it, and also catches a leak
@@ -80,18 +80,18 @@ def test_a_switch_is_reflected_after_the_ttl(csh, cache, monkeypatch):
     monkeypatch.setattr(csh, "SUB_TTL_S", 0)                     # every render re-resolves
     _resolves(csh, monkeypatch, "convivy operator@example.com")
     assert "sub convivy (operator)" in csh._sub_segment("sess-3")
-    _resolves(csh, monkeypatch, "nyh operator@example.com")  # the switch
-    assert "sub nyh (operator)" in csh._sub_segment("sess-3")   # SAME session follows it
+    _resolves(csh, monkeypatch, "acme operator@example.com")  # the switch
+    assert "sub acme (operator)" in csh._sub_segment("sess-3")   # SAME session follows it
 
 
 def test_a_transient_resolve_failure_keeps_the_last_good_value(csh, cache, monkeypatch):
     """A locked Keychain read returns '?' — but a correct display must not flip to
     'sub ?' over a blip. The last good value holds until a resolve succeeds."""
     monkeypatch.setattr(csh, "SUB_TTL_S", 0)
-    _resolves(csh, monkeypatch, "nyh operator@example.com")
-    assert "sub nyh (operator)" in csh._sub_segment("sess-x")
+    _resolves(csh, monkeypatch, "acme operator@example.com")
+    assert "sub acme (operator)" in csh._sub_segment("sess-x")
     _resolves(csh, monkeypatch, "?")                             # transient failure
-    assert "sub nyh (operator)" in csh._sub_segment("sess-x")   # not "?"
+    assert "sub acme (operator)" in csh._sub_segment("sess-x")   # not "?"
 
 
 def test_failed_resolve_is_visible_not_silent(csh, cache, monkeypatch):
@@ -152,7 +152,7 @@ def test_stale_session_sidecars_are_swept_but_live_slot_is_kept(csh, cache, monk
         p = d / name
         p.write_text("x")
         csh.os.utime(p, (old, old))
-    _resolves(csh, monkeypatch, "nyh operator@example.com")
+    _resolves(csh, monkeypatch, "acme operator@example.com")
     csh._sub_segment("sess-live")                                # triggers a resolve + sweep
     names = {p.name for p in d.iterdir()}
     assert "sub-deadsession" not in names and "vitals-deadsession.json" not in names
@@ -466,7 +466,7 @@ def test_stale_rollover_sidecars_are_swept(csh, cache, monkeypatch):
     csh.os.utime(p, (old, old))
 
     def fake_resolve():
-        return "nyh operator@example.com"
+        return "acme operator@example.com"
     monkeypatch.setattr(csh, "_resolve_sub", fake_resolve)
     csh._sub_segment("sess-live")  # triggers a resolve + sweep, same as its sibling test
 
@@ -494,7 +494,7 @@ def test_stale_render_staleness_sidecars_are_swept_but_a_live_pair_is_kept(csh, 
         p.write_text("{}")
 
     def fake_resolve():
-        return "nyh operator@example.com"
+        return "acme operator@example.com"
     monkeypatch.setattr(csh, "_resolve_sub", fake_resolve)
     csh._sub_segment("sess-live")  # triggers a resolve + sweep, same as its sibling test
 

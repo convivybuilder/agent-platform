@@ -8,7 +8,7 @@ item 5b, and it works. Nothing has ever fed it. Measured 2026-07-26, the store
 held exactly ONE such signal: a smoke test from 2026-07-18 whose body is
 `## Test note\\n- delete me (item-5b smoke)`.
 
-Meanwhile vivy cuts releases regularly — five tags between 2026-07-23 and
+Meanwhile one product cuts releases regularly — five tags between 2026-07-23 and
 2026-07-26 — and `scripts/cut_release.sh` drafts a note from the PRs in
 `prev_tag..new_tag` via `claude -p`. So every real release note ever written went
 to a channel the operator stopped reading on 2026-07-21, while the surface built to hold
@@ -20,17 +20,17 @@ sibling; this deliberately mirrors it rather than inventing a second set of
 conventions, and it matches the page's own capture form field for field so a note
 written here and one typed into the form are the same object.
 
-ONE IMPLEMENTATION, NOT ONE PER PRODUCT. Only vivy has a release script today.
-Putting the behaviour here means the next product to grow one calls this instead
-of copying a second copy that then drifts — the ARCH-340 lesson applied before
-the copies exist.
+ONE IMPLEMENTATION, NOT ONE PER PRODUCT. Only one product has a release script
+today. Putting the behaviour here means the next product to grow one calls this
+instead of copying a second copy that then drifts — the ARCH-340 lesson applied
+before the copies exist.
 
 FAIL-SAFE. A signal failure is a non-zero exit the caller sees, because a release
 ceremony must not report success on a note that never landed.
 
 Usage:
-    post-release-note --product vivy --version release-2026-07-26 "…"
-    post-release-note --product vivy --version release-2026-07-26 --file notes.md
+    post-release-note --product acme --version release-2026-07-26 "…"
+    post-release-note --product acme --version release-2026-07-26 --file notes.md
 """
 from __future__ import annotations
 
@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
     # flag in each caller.
     ap = argparse.ArgumentParser(prog="post-release-note", description=__doc__)
     ap.add_argument("message", nargs="?", help="the note text (Markdown)")
-    ap.add_argument("--product", required=True, help="product/repo name, e.g. vivy")
+    ap.add_argument("--product", required=True, help="product/repo name, e.g. acme")
     ap.add_argument("--version", required=True,
                     help="the release tag or version, e.g. release-2026-07-26")
     ap.add_argument("--file", help="read the note from this UTF-8 file instead")

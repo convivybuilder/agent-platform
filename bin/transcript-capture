@@ -11,7 +11,7 @@ turn to the Library as one Archives signal.
 
 **Black-box exclusion is directory-name-only, and happens before this script
 opens a single line inside an excluded directory.** `projects.private_slugs()`
-names the excluded crews (today just `cfo`); for each, this forward-computes
+names the excluded crews (today a small handful); for each, this forward-computes
 the sanitized directory-name fragment its home directory, its `dirs`-registered
 directories (ARCH-426), and its repos' worktree collections would produce, and
 skips any `~/.claude/projects/<dir>` whose name contains one of them at a
@@ -22,11 +22,12 @@ never hardcoded to a slug, since ADR-0043 says more crews will follow.
 registered, non-private project, and every other directory is skipped unopened,
 exactly like a black box.** The black-box exclusion alone is a denylist, and a
 denylist fails open for any session whose cwd no crew's fragment names. Two
-did, until 2026-09-12. Ask's directory is not in the registry at all, so its
-sessions were posted under their raw dirname. Headless `claude -p` jobs that
+did, until 2026-09-12. The walled-off crew's directory is not in the registry
+as `private`, so its sessions were posted under their raw dirname. Headless
+`claude -p` jobs that
 launchd starts with no WorkingDirectory run at `/`, whose dirname is `-`, and
-that is how the EA crew's mailbox and calendar prompts reached the Library
-despite EA being private. An unregistered directory now loses its archive
+that is how one private crew's mailbox and calendar prompts reached the Library
+despite that crew being private. An unregistered directory now loses its archive
 rather than leaking it; a job whose transcripts should be archived runs from a
 registered directory instead of widening this.
 
@@ -39,12 +40,12 @@ outside `<root>` (`/private/tmp/claude-<uid>/<origin-path>-scratchpad-
 leading-prefix-only check can never catch that shape no matter how many
 fragments are enumerated. `dir_matches_prefixes` scans for the fragment at
 any position, delimited by '-' (or a string edge) so that a private home_dir
-of `.../CFO` cannot also swallow an unrelated `.../CFOextra` wherever it
+of `.../ACME` cannot also swallow an unrelated `.../ACMEextra` wherever it
 appears.
 
 **The match is case- and Unicode-normalization-insensitive, on purpose.** This
 machine defaults to case-insensitive APFS, so a session whose cwd was reached
-via different case (`<root-lowercased>/cfo` instead of `<root>/CFO`) sanitizes to a
+via different case (`<root-lowercased>/acme` instead of `<root>/ACME`) sanitizes to a
 differently-cased directory name that still names the SAME on-disk directory —
 a naive case-sensitive prefix comparison misses it. `dir_matches_prefixes`
 NFC-normalizes and casefolds both sides before comparing. This is a directory-
@@ -210,7 +211,7 @@ class _Prefix(NamedTuple):
 
     `boundary=True` means the match must be delimited by '-' (or a string
     edge) on BOTH sides — required for a home_dir/dirs_for fragment, where
-    nothing else disambiguates "CFO" from "CFOextra" wherever in the string
+    nothing else disambiguates "ACME" from "ACMEextra" wherever in the string
     it appears. `boundary=False` means only the LEFT side needs delimiting —
     true for a worktree fragment, whose trailing '.' (from `<repo>.<purpose>`)
     is itself sanitized to a trailing '-' by `_sanitize`, so the fragment
@@ -229,15 +230,15 @@ def _project_prefixes(slug: str, unit: dict) -> list[_Prefix]:
 
     `dirs_for(slug)` leads with `home_path(slug)` itself, so it is only
     consulted for the entries BEYOND home — a repo checkout that is not
-    nested under the project's home directory (the shape `svc` already uses
-    for `convivy-services`). Without this, a private crew registered with a
-    non-empty `dirs` entry gets zero exclusion coverage for that directory
-    tree, even though its own home directory is covered.
+    nested under the project's home directory (a shape a real two-repo crew
+    already uses for its second repo). Without this, a private crew registered
+    with a non-empty `dirs` entry gets zero exclusion coverage for that
+    directory tree, even though its own home directory is covered.
 
     Forward-computed from the registry, never decoded from a transcript
     directory name — that direction is ambiguous, since a repo name can
-    itself contain '-' (`sous-chef`, `convivy-orient`), the same character the
-    sanitizer uses as its separator.
+    itself contain '-' (as several real product repo names do), the same
+    character the sanitizer uses as its separator.
     """
     out: list[_Prefix] = []
     home = projects.home_path(slug)
@@ -275,7 +276,7 @@ def black_box_prefixes(project_index: dict[str, list[_Prefix]],
 
 def _normalize(s: str) -> str:
     """NFC-normalize then casefold, so a comparison built on this is immune to
-    both ASCII case (`CFO` vs `cfo`) and Unicode form differences — the two
+    both ASCII case (`ACME` vs `acme`) and Unicode form differences — the two
     ways APFS's normalization-insensitive, case-insensitive default lets two
     different literal strings name the same on-disk path."""
     return unicodedata.normalize("NFC", s).casefold()
@@ -316,13 +317,13 @@ def dir_matches_prefixes(dirname: str, prefixes: list[_Prefix]) -> bool:
     scratchpad cwd rooted outside <root>
     (`/private/tmp/claude-<uid>/<origin-path>-scratchpad-<name>`) embeds a
     project's sanitized identifier partway through the dirname, e.g.
-    `-private-tmp-claude-501--Users-operator-Convivy-CFO-somehash-
+    `-private-tmp-claude-501--Users-operator-Convivy-ACME-somehash-
     scratchpad-probe`: the private home_dir fragment `-Users-operator-
-    Convivy-CFO` sits after `claude-501-`, never at the front, so a plain
+    Convivy-ACME` sits after `claude-501-`, never at the front, so a plain
     `startswith` can never catch it no matter how many prefixes are
     enumerated (security-reviewer, PR #415, run-3a454557). A `boundary=True`
     prefix requires the delimiter on both sides, so a private home_dir of
-    `.../CFO` does not also swallow an unrelated `.../CFOextra` wherever in
+    `.../ACME` does not also swallow an unrelated `.../ACMEextra` wherever in
     the string it appears; a `boundary=False` (worktree) prefix already
     carries its own trailing '-' (sanitized from `<repo>.`), which is itself
     the right-side delimiter, so only the left side is checked.
@@ -343,7 +344,7 @@ def resolve_product(dirname: str, project_index: dict[str, list[_Prefix]],
 
     This used to fall back to the raw directory name, and that fallback is the
     leak the module docstring describes: every unregistered directory,
-    including `-` and ask's, was captured under its own name.
+    including `-` and the walled-off crew's, was captured under its own name.
 
     `private` is excluded from the candidate pool as a second, independent
     guard alongside the caller's own exclusion check — belt-and-suspenders,
@@ -686,7 +687,7 @@ def main() -> None:
         product = resolve_product(dirpath.name, project_index, projects.private_slugs())
         if product is None:
             # No registered public project owns it: skipped just as unopened.
-            # `-` (cwd `/`) and ask's dir both land here.
+            # `-` (cwd `/`) and the walled-off crew's dir both land here.
             unregistered += 1
             continue
         for f in sorted(dirpath.glob("*.jsonl")):

@@ -32,17 +32,17 @@ def _runs(tmp_path):
 
 def test_one_session_gets_the_same_directory_on_every_call(home):
     runs = _runs(home)
-    first = CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
-    second = CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+    first = CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
+    second = CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     assert first == second
-    assert first == runs / "2026-10-03" / "co-vivy-0914"
-    assert [p.name for p in (runs / "2026-10-03").iterdir()] == ["co-vivy-0914"]
+    assert first == runs / "2026-10-03" / "co-finch-0914"
+    assert [p.name for p in (runs / "2026-10-03").iterdir()] == ["co-finch-0914"]
 
 
 def test_two_sessions_in_the_same_minute_get_separate_directories(home):
     runs = _runs(home)
-    a = CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
-    b = CR.session_handoff_dir("sess-b", "vivy", runs_root=runs, now=NOW)
+    a = CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
+    b = CR.session_handoff_dir("sess-b", "finch", runs_root=runs, now=NOW)
     assert a != b
     assert a.is_dir() and b.is_dir()
 
@@ -51,7 +51,7 @@ def test_a_session_id_that_is_not_a_plain_key_is_refused_and_nothing_is_minted(h
     runs = _runs(home)
     for bad in ("", "../escape", "a/b", ".hidden", "x" * 200):
         with pytest.raises(CR.HandoffDirError, match="not a usable key"):
-            CR.session_handoff_dir(bad, "vivy", runs_root=runs, now=NOW)
+            CR.session_handoff_dir(bad, "finch", runs_root=runs, now=NOW)
     assert list(runs.iterdir()) == []
 
 
@@ -65,14 +65,14 @@ def test_a_product_that_is_not_a_slug_is_refused(home):
 def test_a_session_id_with_a_trailing_newline_is_refused_and_nothing_is_minted(home):
     runs = _runs(home)
     with pytest.raises(CR.HandoffDirError, match="not a usable key"):
-        CR.session_handoff_dir("sess-a\n", "vivy", runs_root=runs, now=NOW)
+        CR.session_handoff_dir("sess-a\n", "finch", runs_root=runs, now=NOW)
     assert list(runs.iterdir()) == []
 
 
 def test_a_product_with_a_trailing_newline_is_refused_and_nothing_is_minted(home):
     runs = _runs(home)
     with pytest.raises(CR.HandoffDirError, match="lowercase slug"):
-        CR.session_handoff_dir("sess-a", "vivy\n", runs_root=runs, now=NOW)
+        CR.session_handoff_dir("sess-a", "finch\n", runs_root=runs, now=NOW)
     assert list(runs.iterdir()) == []
 
 
@@ -84,11 +84,11 @@ def _record(session_id, target):
 
 def test_a_pointer_naming_a_directory_outside_the_runs_root_is_refused(home):
     runs = _runs(home)
-    outside = home / "constance"
+    outside = home / "faraway"
     outside.mkdir()
     _record("sess-a", outside)
     with pytest.raises(CR.HandoffDirError, match="outside the agent-runs root"):
-        CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+        CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     assert list(outside.iterdir()) == []
 
 
@@ -96,12 +96,12 @@ def test_a_symlinked_directory_inside_the_runs_root_that_points_out_is_refused(h
     runs = _runs(home)
     outside = home / "elsewhere"
     outside.mkdir()
-    link = runs / "2026-10-03" / "co-vivy-0914"
+    link = runs / "2026-10-03" / "co-finch-0914"
     link.parent.mkdir()
     link.symlink_to(outside, target_is_directory=True)
     _record("sess-a", link)
     with pytest.raises(CR.HandoffDirError, match="is a symlink"):
-        CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+        CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     assert list(outside.iterdir()) == []
 
 
@@ -113,7 +113,7 @@ def test_a_dangling_pointer_symlink_is_refused_and_nothing_is_minted(home):
     pointer.parent.mkdir(parents=True)
     pointer.symlink_to(home / "nowhere")
     with pytest.raises(CR.HandoffDirError, match="is a dangling symlink"):
-        CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+        CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     assert list(runs.iterdir()) == []
 
 
@@ -122,16 +122,16 @@ def test_a_pointer_that_cannot_be_read_as_a_file_is_refused_and_nothing_is_minte
     pointer = CR.handoff_pointer_root() / "sess-a"
     pointer.mkdir(parents=True)
     with pytest.raises(CR.HandoffDirError, match="cannot be read"):
-        CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+        CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     assert list(runs.iterdir()) == []
 
 
 def test_a_recorded_directory_that_has_gone_is_refused_not_recreated(home):
     runs = _runs(home)
-    d = CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+    d = CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     d.rmdir()
     with pytest.raises(CR.HandoffDirError, match="is missing"):
-        CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+        CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     assert not d.exists()
 
 
@@ -140,7 +140,7 @@ def test_a_caller_that_loses_the_record_race_uses_the_winners_directory(home, mo
     link. This caller must take the winner's directory and remove the empty one it
     minted, not record a second one."""
     runs = _runs(home)
-    winner = runs / "2026-10-03" / "co-vivy-0914-9"
+    winner = runs / "2026-10-03" / "co-finch-0914-9"
     real_link = os.link
 
     def racing_link(src, dst, *a, **k):
@@ -149,9 +149,9 @@ def test_a_caller_that_loses_the_record_race_uses_the_winners_directory(home, mo
         return real_link(src, dst, *a, **k)
 
     monkeypatch.setattr(CR.os, "link", racing_link)
-    got = CR.session_handoff_dir("sess-a", "vivy", runs_root=runs, now=NOW)
+    got = CR.session_handoff_dir("sess-a", "finch", runs_root=runs, now=NOW)
     assert got == winner
-    assert not (runs / "2026-10-03" / "co-vivy-0914").exists()
+    assert not (runs / "2026-10-03" / "co-finch-0914").exists()
 
 
 def test_write_handoff_replaces_the_file_and_leaves_no_temp_behind(tmp_path):

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""queue-sync — rebuild an overnight queue's Completed section from live GitHub state.
+"""queue-sync — rebuild a product queue's Completed section from live GitHub state.
 
 WHERE THE QUEUES LIVE (ARCH-390). `<root>/substrate/queues/<product>.md`, beside
 backlog.md, which is the same kind of object. They were in the provenance-gated KB,
@@ -15,7 +15,7 @@ WHY THIS EXISTS (ARCH-388). The queue doc's own editing contract said:
 
 Per ARCH-020 nothing merges autonomously, so at the moment the orchestrator writes
 that entry the PR is BY DEFINITION not merged. "Completed" was therefore guaranteed
-to accumulate unmerged work, and it did: on 2026-07-21 the constance queue carried
+to accumulate unmerged work, and it did: on 2026-07-21 one product's queue carried
 two entries reading "Landed as #526" and "Landed as #527" when #526 had been closed
 as superseded and #527 was still open. Both sat under Completed, so the next drain
 would have skipped them as finished.
@@ -25,7 +25,7 @@ GitHub's fact, and a doc that restates it as prose is a copy that starts driftin
 the moment it is written. This regenerates the section from the source instead.
 
 RECONCILER, NOT LISTER — the correction that matters. The obvious build ("regenerate
-Completed from merged PRs") is wrong, and testing said so immediately: constance had
+Completed from merged PRs") is wrong, and testing said so immediately: one product had
 83 PRs merged in the window against ~17 queue entries. Completed tracks the QUEUE'S
 items that landed, not everything the repo merged, so a bulk listing would bury the
 queue's own history under unrelated work.
@@ -55,12 +55,33 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import builder_root as BR  # noqa: E402
+import github_app as GA  # noqa: E402
 
 # The queues live in substrate, beside backlog.md, which is the same kind of object
 # (ARCH-390). They were in the provenance-gated KB, which made them un-writable by the
 # only process that maintains them — see the module docstring.
 QUEUE_ROOT = BR.root() / "substrate" / "queues"
 WINDOW_DAYS = 30
+
+# A GitHub remote URL in the HTTPS, `ssh://git@` or `git@host:` form, capturing
+# its `owner/repo` — queue-sync takes the slug straight off `repo_dir`'s own
+# `origin` (company/decisions/0027: `resolve` runs with a `cwd`, not a
+# `--repo` flag, and `repo_dir` need not be a registered project), rather than
+# through `projects.repo_github_slug`.
+_GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https://|ssh://git@|git@)github\.com[:/](?P<slug>[^/]+/[^/]+?)(?:\.git)?/?$",
+    re.IGNORECASE)
+
+
+def origin_github_slug(repo_dir: Path) -> str | None:
+    """`owner/repo` for `repo_dir`'s own `origin` remote, or None when there
+    is no such remote or it isn't a GitHub HTTPS/SSH form this can parse."""
+    r = subprocess.run(["git", "-C", str(repo_dir), "remote", "get-url", "origin"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    m = _GITHUB_REMOTE_RE.match(r.stdout.strip())
+    return m.group("slug") if m else None
 
 HEADING = "## Completed (last 30 days)"
 # A bullet's PR reference, in either the URL form the orchestrator writes or a bare #N.
@@ -77,17 +98,17 @@ PR_HASH_RE = re.compile(r"(?<![\w/])#(\d+)")
 # Bounded to a single line ON PURPOSE. A greedy DOTALL match would swallow the
 # indented sub-bullets that carry an item's follow-up notes.
 #
-# TWO TAIL DIALECTS, because the queues disagree (reviewer, #193). constance writes
-# "Landed as <url>"; vivy writes "→ <url>" and never uses the word at all — 45
-# entries to nil. Matching only the constance form left every rebuilt vivy entry
-# carrying its old PR reference AND an appended new one.
+# TWO TAIL DIALECTS, because the queues disagree (reviewer, #193). One product's
+# queue writes "Landed as <url>"; another's writes "→ <url>" and never uses the
+# word at all — 45 entries to nil. Matching only the "Landed as" form left every
+# rebuilt arrow-dialect entry carrying its old PR reference AND an appended new one.
 #
 # The arrow form is matched ONLY when the arrow is followed by a PR link, because a
 # bare arrow is ordinary prose in these titles ("logType 29 → `lock.code_changed`").
 # Stripping from the first arrow would have eaten the title itself.
 # BOTH DIALECTS REQUIRE A PR LINK, and the verb must sit right against "as".
-# A loose version — "merged" anywhere, "as" anywhere later — matched this real vivy
-# line mid-sentence:
+# A loose version — "merged" anywhere, "as" anywhere later — matched this real
+# line mid-sentence from one queue:
 #
 #     Already in main via PR #992 (merged 2026-07-18) which added the validator …
 #
@@ -95,8 +116,8 @@ PR_HASH_RE = re.compile(r"(?<![\w/])#(\d+)")
 # has a shape: the verb, optionally "ready-to-merge", then "as", then the link.
 _PR_LINK = r"(?:\[[^\]]*\]\()?https://github\.com/[\w-]+/[\w-]+/pull/\d+\)?"
 LANDED_RE = re.compile(
-    rf"\s*[—-]?\s*(?:(?:landed|merged)(?:\s+ready-to-merge)?\s+as\s+{_PR_LINK}"  # constance
-    rf"|→\s*{_PR_LINK})"                                                          # vivy
+    rf"\s*[—-]?\s*(?:(?:landed|merged)(?:\s+ready-to-merge)?\s+as\s+{_PR_LINK}"  # "landed as" dialect
+    rf"|→\s*{_PR_LINK})"                                                          # arrow dialect
     r"[^\n]*",
     re.I)
 
@@ -109,18 +130,22 @@ def sh(cmd: list[str], cwd: Path | None = None) -> str:
     return r.stdout
 
 
-def resolve(repo_dir: Path, number: int) -> dict:
+def resolve(repo_dir: Path, number: int, env: dict) -> dict:
     """Live truth for one PR the doc references.
 
     Structural fields only — state, title, mergedAt, mergeCommit — all computed by
     GitHub. Deliberately NOT comment bodies: those are agent-written prose, and
     treating them as ground truth would launder agent claims into the KB, which is
     the failure the provenance cage exists to prevent (ARCH-388).
+
+    `env` is the one `read`-scoped token's environment minted once for
+    `repo_dir`'s own repo for this whole run (company/decisions/0027), never
+    minted in here.
     """
     r = subprocess.run(
         ["gh", "pr", "view", str(number), "--json",
          "number,state,title,mergedAt,mergeCommit,url"],
-        cwd=str(repo_dir), capture_output=True, text=True)
+        cwd=str(repo_dir), capture_output=True, text=True, env=env)
     if r.returncode != 0:
         return {"number": number, "state": "UNKNOWN"}
     return json.loads(r.stdout)
@@ -181,7 +206,7 @@ def render(pr: dict, prose: str | None) -> str:
     head = (prose or f"- **{day} — {md_escape(pr['title'])}**").rstrip()
     # Re-date a preserved bullet from the MERGE, not from what was written. The
     # authored date is the orchestrator's end-of-run belief and predates the merge:
-    # across the constance queue it was out by up to six days, because the operator merges in
+    # across one product's queue it was out by up to six days, because the operator merges in
     # batches days after the drain produces the PR.
     head = re.sub(r"\*\*\d{4}-\d{2}-\d{2} — ", f"**{day} — ", head, count=1)
     head = head.rstrip(" .—-")
@@ -191,7 +216,7 @@ def render(pr: dict, prose: str | None) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("product", help="product name, e.g. constance")
+    ap.add_argument("product", help="product name, e.g. acme")
     ap.add_argument("--repo", help="repo dir name under the machine's root (defaults to product)")
     ap.add_argument("--write", action="store_true",
                     help="rewrite the doc in place; default is to report only")
@@ -211,6 +236,10 @@ def main() -> int:
     repo_dir = BR.root() / (args.repo or args.product)
     if not repo_dir.is_dir():
         sys.exit(f"queue-sync: repo not found: {repo_dir}")
+    repo_slug = origin_github_slug(repo_dir)
+    if repo_slug is None:
+        sys.exit(f"queue-sync: {repo_dir}'s origin is not a GitHub remote; "
+                 f"cannot mint a GitHub token to scope to.")
     doc = QUEUE_ROOT / f"{args.product}.md"
     if not doc.is_file():
         sys.exit(f"queue-sync: queue not found: {doc}")
@@ -223,81 +252,91 @@ def main() -> int:
     #
     # THREE OUTCOMES, AND THE THIRD IS THE SAFETY PROPERTY. A verdict of MERGED or
     # CLOSED/OPEN is GitHub answering the question. UNKNOWN means the question could
-    # not be asked — the number is an ISSUE rather than a PR (`#424 (triage)` in the
-    # constance queue), the API failed, the ref is from another repo — and an
+    # not be asked — the number is an ISSUE rather than a PR (`#424 (triage)` in
+    # one product's queue), the API failed, the ref is from another repo — and an
     # unverifiable entry must be KEPT VERBATIM, never removed. Treating "could not
     # check" as "did not land" would have this tool silently delete real history,
     # which is a worse failure than the drift it was written to fix.
     kept, in_flight, misfiled, unresolved = [], [], [], []
     passthrough: dict[int, str] = {}
-    for idx, b in enumerate(bullets(body)):
-        nums = [int(n) for n in PR_URL_RE.findall(b)] or [int(n) for n in PR_HASH_RE.findall(b)]
-        if not nums:
-            unresolved.append(("no PR reference", b.strip().splitlines()[0][:88]))
-            passthrough[idx] = b.rstrip()
-            continue
-        pr = resolve(repo_dir, nums[0])
-        if pr["state"] == "MERGED":
-            kept.append((pr, described(b)))
-        elif pr["state"] == "UNKNOWN":
-            unresolved.append((f"#{nums[0]} not readable as a PR", b.strip().splitlines()[0][:88]))
-            passthrough[idx] = b.rstrip()
-        elif pr["state"] == "OPEN":
-            # IN FLIGHT — the work exists and is waiting on a human merge. Earlier this
-            # was lumped with CLOSED and simply deleted, which is the wrong repair: it
-            # removed five real vivy items from the queue entirely, leaving them in
-            # neither Completed nor pending. The queue is how this work is tracked, so
-            # losing the entry is worse than the misfiling it was correcting.
-            #
-            # It does NOT go back to P1/P2/P3 either. The orchestrator would then redo
-            # work that already sits in an open PR and produce a competing one. It stays
-            # in Completed's section, marked for what it is, so a reader sees the item
-            # and its true state at once.
-            in_flight.append((pr, described(b)))
-        else:
-            # CLOSED without merging — the #526 case, and the one that actually loses
-            # work: the item reads as finished forever while nothing landed.
-            misfiled.append((pr, b.strip().splitlines()[0][:88]))
-
-    # Age out anything past the window — the section is titled "last 30 days" and its
-    # contract says to trim monthly. Every dropped entry is NAMED below rather than
-    # counted: a tool that quietly deletes history reads as "nothing to see" at exactly
-    # the moment someone should look. sous-chef's whole section is past the window, so
-    # this is a real deletion, not a hypothetical one.
-    fresh, aged_out = [], []
-    for pr, prose in kept:
-        if datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) >= since:
-            fresh.append((pr, prose))
-        else:
-            aged_out.append(pr)
-    aged = len(aged_out)
-
-    fresh.sort(key=lambda kp: kp[0]["mergedAt"], reverse=True)
-    rendered = [render(pr, prose) for pr, prose in fresh]
-    # Unverifiable entries are carried through untouched, ahead of the regenerated
-    # ones, so nothing this tool could not check is lost or reordered into meaning
-    # it did not have.
-    in_flight.sort(key=lambda kp: kp[0]["number"], reverse=True)
-    flight_entries = [
-        f"{prose.rstrip(' .—-')} — **IN FLIGHT**: {pr['url']} is open, not merged."
-        for pr, prose in in_flight]
-    # In-flight first: an item awaiting a merge is the one a reader needs to act on,
-    # and burying it under finished work is how it got misfiled in the first place.
-    out_entries = ([passthrough[i] for i in sorted(passthrough)]
-                   + flight_entries + rendered)
-    new_body = "\n\n" + "\n\n".join(out_entries) + "\n\n"
-    new_text = before + new_body + after
-
-    # Audit the pending sections. An item still queued whose PR already merged is
-    # work the next drain would redo.
     pending_done = []
-    for line in before.splitlines():
-        if not line.startswith("- "):
-            continue
-        for n in [int(x) for x in PR_URL_RE.findall(line)]:
-            pr = resolve(repo_dir, n)
-            if pr["state"] == "MERGED":
-                pending_done.append((n, line.strip()[:88]))
+    # One `read`-scoped token for this one repo, for this whole pass
+    # (company/decisions/0027): minted once here, reused by every `resolve`
+    # call below — the bullet loop just below AND the pending-section audit
+    # further down — revoked once both finish.
+    try:
+        with GA.read_token_env(repo_slug) as env:
+            for idx, b in enumerate(bullets(body)):
+                nums = ([int(n) for n in PR_URL_RE.findall(b)]
+                        or [int(n) for n in PR_HASH_RE.findall(b)])
+                if not nums:
+                    unresolved.append(("no PR reference", b.strip().splitlines()[0][:88]))
+                    passthrough[idx] = b.rstrip()
+                    continue
+                pr = resolve(repo_dir, nums[0], env)
+                if pr["state"] == "MERGED":
+                    kept.append((pr, described(b)))
+                elif pr["state"] == "UNKNOWN":
+                    unresolved.append((f"#{nums[0]} not readable as a PR",
+                                       b.strip().splitlines()[0][:88]))
+                    passthrough[idx] = b.rstrip()
+                elif pr["state"] == "OPEN":
+                    # IN FLIGHT — the work exists and is waiting on a human merge. Earlier this
+                    # was lumped with CLOSED and simply deleted, which is the wrong repair: it
+                    # removed five real items from one product's queue entirely, leaving them in
+                    # neither Completed nor pending. The queue is how this work is tracked, so
+                    # losing the entry is worse than the misfiling it was correcting.
+                    #
+                    # It does NOT go back to P1/P2/P3 either. The orchestrator would then redo
+                    # work that already sits in an open PR and produce a competing one. It stays
+                    # in Completed's section, marked for what it is, so a reader sees the item
+                    # and its true state at once.
+                    in_flight.append((pr, described(b)))
+                else:
+                    # CLOSED without merging — the #526 case, and the one that actually loses
+                    # work: the item reads as finished forever while nothing landed.
+                    misfiled.append((pr, b.strip().splitlines()[0][:88]))
+
+            # Age out anything past the window — the section is titled "last 30 days" and its
+            # contract says to trim monthly. Every dropped entry is NAMED below rather than
+            # counted: a tool that quietly deletes history reads as "nothing to see" at exactly
+            # the moment someone should look. One product's whole section was once past the
+            # window, so this is a real deletion, not a hypothetical one.
+            fresh, aged_out = [], []
+            for pr, prose in kept:
+                if datetime.fromisoformat(pr["mergedAt"].replace("Z", "+00:00")) >= since:
+                    fresh.append((pr, prose))
+                else:
+                    aged_out.append(pr)
+            aged = len(aged_out)
+
+            fresh.sort(key=lambda kp: kp[0]["mergedAt"], reverse=True)
+            rendered = [render(pr, prose) for pr, prose in fresh]
+            # Unverifiable entries are carried through untouched, ahead of the regenerated
+            # ones, so nothing this tool could not check is lost or reordered into meaning
+            # it did not have.
+            in_flight.sort(key=lambda kp: kp[0]["number"], reverse=True)
+            flight_entries = [
+                f"{prose.rstrip(' .—-')} — **IN FLIGHT**: {pr['url']} is open, not merged."
+                for pr, prose in in_flight]
+            # In-flight first: an item awaiting a merge is the one a reader needs to act on,
+            # and burying it under finished work is how it got misfiled in the first place.
+            out_entries = ([passthrough[i] for i in sorted(passthrough)]
+                           + flight_entries + rendered)
+            new_body = "\n\n" + "\n\n".join(out_entries) + "\n\n"
+            new_text = before + new_body + after
+
+            # Audit the pending sections. An item still queued whose PR already merged is
+            # work the next drain would redo.
+            for line in before.splitlines():
+                if not line.startswith("- "):
+                    continue
+                for n in [int(x) for x in PR_URL_RE.findall(line)]:
+                    pr = resolve(repo_dir, n, env)
+                    if pr["state"] == "MERGED":
+                        pending_done.append((n, line.strip()[:88]))
+    except GA.Unreadable as e:
+        sys.exit(f"queue-sync: cannot mint a GitHub token for {repo_slug} ({e})")
 
     if in_flight:
         print("IN FLIGHT — kept, and marked open rather than completed:", file=sys.stderr)
@@ -360,7 +399,7 @@ def main() -> int:
         # what else is dirty in the tree ("nothing to commit, working tree clean", "no
         # changes added to commit", "nothing added to commit but untracked files
         # present"), and the messages are localizable besides. Matching on one of them
-        # is what made the 06:00 backstop report `constance: FAILED (exit 1)` on an
+        # is what made the 06:00 backstop report one product `FAILED (exit 1)` on an
         # already-current queue on 2026-07-23 — a false alarm in the one log an
         # unattended overnight has to be able to trust. An exit code cannot be reworded.
         #

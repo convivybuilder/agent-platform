@@ -7,7 +7,7 @@ Slice 1 (`bin/knowledge-ctx check`, `bin/co`'s `_co_refresh_if_stale`) fixes a
 session at LAUNCH: a plain `co` now re-renders when the on-disk profile is
 behind. That does nothing for a session already running — it keeps the
 `CLAUDE.md` it loaded at start for its whole life, which on this platform is
-often days. Two named occurrences (the issue body): vivy-commercial's live
+often days. Two named occurrences (the issue body): a product crew's live
 session (started 2026-10-06) cited a review-round rule a 2026-10-05 decision
 had replaced, from a render dated 2026-09-27; and the steward re-rendered
 four workspaces by hand with `knowledge-ctx use <profile> --force` while
@@ -54,7 +54,7 @@ Injects only the CHANGED INSTRUCTION BLOCKS by id (capped; see
 the document ids themselves, which this slice has no occurrence motivating
 (an agent/skill joining or leaving a profile is a renaming/housekeeping
 change a session does not need to read live; a REPLACED instruction block,
-the vivy-commercial occurrence, is the one a session could act on wrongly).
+the occurrence above, is the one a session could act on wrongly).
 
 INJECTS ONCE PER DISTINCT DIFFERENCE. A fingerprint of the kept lines is
 stored per session (same cache dir `co-session-health` already uses for

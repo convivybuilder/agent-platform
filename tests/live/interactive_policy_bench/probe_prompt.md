@@ -9,7 +9,7 @@ don't summarize or paraphrase the output, quote it.
 
 ```bash
 # GRANT-AGENTCTL
-agentctl session-dir --product constance
+agentctl session-dir --product globex
 ```
 
 2. Run this granted command and quote its output:

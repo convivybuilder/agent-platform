@@ -9,7 +9,7 @@ from __future__ import annotations
 
 def test_kind_of(kb_eval):
     assert kb_eval.kind_of("shared/runbooks/foo") == "runbooks"
-    assert kb_eval.kind_of("constance/decisions/0001-x") == "decisions"
+    assert kb_eval.kind_of("globex/decisions/0001-x") == "decisions"
     assert kb_eval.kind_of("nodelim") == "?"
 
 
@@ -52,26 +52,54 @@ def test_score_case_passes_filters_and_limit(kb_eval):
         seen["limit"] = limit
         return []
 
-    case = {"id": "c4", "query": "deploy", "expect": ["constance/decisions/0012-x"],
-            "filters": {"project": "constance"}}
+    case = {"id": "c4", "query": "deploy", "expect": ["globex/decisions/0012-x"],
+            "filters": {"project": "globex"}}
     kb_eval.score_case(case, search, 7)
-    assert seen["project"] == "constance" and seen["limit"] == 7
+    assert seen["project"] == "globex" and seen["limit"] == 7
 
 
-def test_golden_set_is_well_formed(kb_eval):
-    # Guards the hand- and traffic-authored golden file: every case must carry the
+def test_example_golden_set_is_well_formed(kb_eval):
+    # Guards the repository's synthetic example set: every case must carry the
     # keys score_case reads, a non-empty expect list, a known style, and a unique
-    # id. Comment lines (#) are skipped by load_golden. ARCH-149 doubled this file
-    # from real traffic, so a malformed edit is a live risk worth a cheap test.
-    cases = kb_eval.load_golden(kb_eval.GOLDEN_DEFAULT)
-    assert len(cases) >= 40
+    # id, and both query styles must be represented. Comment lines (#) are
+    # skipped by load_golden.
+    cases = kb_eval.load_golden(kb_eval.GOLDEN_EXAMPLE)
+    assert len(cases) >= 6
     ids = [c["id"] for c in cases]
     assert len(ids) == len(set(ids)), "duplicate golden case id"
+    styles = {c.get("style", "keyword") for c in cases}
+    assert styles == {"keyword", "nl"}, "example set must cover both query styles"
     for c in cases:
         assert c["query"].strip(), f"empty query in {c['id']}"
         assert isinstance(c["expect"], list) and c["expect"], f"bad expect in {c['id']}"
         assert all("/" in e for e in c["expect"]), f"expect id not a doc path in {c['id']}"
         assert c.get("style", "keyword") in ("keyword", "nl"), f"bad style in {c['id']}"
+
+
+def test_resolve_golden_prefers_an_explicit_override(kb_eval, tmp_path):
+    explicit = tmp_path / "custom-golden.jsonl"
+    assert kb_eval.resolve_golden(explicit) == explicit
+
+
+def test_default_golden_scores_the_install_set_when_present(kb_eval, tmp_path, monkeypatch, capsys):
+    install_golden = tmp_path / "install" / "kb-golden.jsonl"
+    install_golden.parent.mkdir(parents=True)
+    install_golden.write_text('{"id": "x", "query": "q", "expect": ["a/b"]}\n')
+    monkeypatch.setattr(kb_eval.BR, "root", lambda: tmp_path)
+
+    assert kb_eval.default_golden() == install_golden
+    assert kb_eval.resolve_golden(None) == install_golden
+    assert capsys.readouterr().err == ""
+
+
+def test_default_golden_falls_back_to_the_example_set_when_absent(kb_eval, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(kb_eval.BR, "root", lambda: tmp_path)  # no install/ at all
+
+    assert kb_eval.default_golden() == kb_eval.GOLDEN_EXAMPLE
+    assert kb_eval.resolve_golden(None) == kb_eval.GOLDEN_EXAMPLE
+    err = capsys.readouterr().err
+    assert "synthetic example set" in err
+    assert str(tmp_path / "install" / "kb-golden.jsonl") in err
 
 
 def test_aggregate_by_style_and_overall(kb_eval):

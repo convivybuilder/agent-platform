@@ -67,7 +67,7 @@ echo "== the installer's real staging step and real build (--build-only) produce
 out=$(PATH="$sudo_dir:$PATH" sudo "$INSTALLER" \
     --repo="$REPO_ROOT" --ref="$SHA" --allow-non-main --build-only \
     --bosun-host=stage-check --bosun-address=127.0.0.1:8710 \
-    --root-ca=/dev/null --operator-uid=501 \
+    --root-ca=/dev/null --account=root-test \
     --key-dir="$key_dir" --install-dir="$install_dir" \
     --config-path="$config_path" --launch-daemons-dir="$launchd_dir" \
     --socket-dir="$socket_dir" 2>&1)

@@ -65,7 +65,7 @@ def test_scan_review_records_filters_to_posted_review_class_runs(tmp_path):
     _make_run(tmp_path, "2026-09-10", "run-d", agent="reviewer", repo="agent-platform",
              pr="3", review_sha="d" * 40, review_verdict="APPROVE")
     # crew-prefixed reviewer — included, role normalized to the base
-    _make_run(tmp_path, "2026-09-22", "run-e", agent="hollis-reviewer", repo="hollis",
+    _make_run(tmp_path, "2026-09-22", "run-e", agent="synthcrew-reviewer", repo="synth-crew",
              pr="9", review_sha="e" * 40, review_verdict="REQUEST_CHANGES")
 
     records = REC.scan_review_records(tmp_path, since_date="2026-09-20")
@@ -325,6 +325,11 @@ def test_default_finding_extractor_routes_its_env_through_the_credential_guard(m
     `calls[0]["env"]` is `None` and every assertion below raises)."""
     monkeypatch.setenv("GH_TOKEN", "ghp_secret")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    # DE.dispatch_env()'s own git-identity probe (sixth gap, its docstring) is a
+    # real `subprocess.run` call too — unmocked, it would be counted as a second
+    # call below, against `fake_run`'s own `len(calls) == 1` contract. `True`
+    # matches this test's real environment.
+    monkeypatch.setattr(REC.DE, "_git_identity_resolves", lambda env, cwd: True)
     calls = []
 
     def fake_run(argv, **kwargs):

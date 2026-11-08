@@ -514,6 +514,102 @@ def mark_picked_up(handoff_path, successor_session_id: str, *, now: float | None
     return {**data, "picked_up_this_call": picked_up_this_call}
 
 
+# --- the pickup watch: co records its own successor's pickup ---------------
+#
+# WHY THIS EXISTS. Before this, the only thing that ever ran `co-rollover
+# --picked-up` was the `/handoff-pickup` skill — which depends on the
+# successor's MODEL choosing to run it, and twice it did not (2026-10-01,
+# 2026-10-24), leaving the predecessor's pane fenced and alive until the
+# operator ran the command by hand. `bin/co` now starts this watch, detached,
+# for every rollover-successor launch, right before it `exec`s claude, so the
+# pickup is recorded by the launcher rather than by a model's choice.
+# `bin/co-rollover-pickup-watch` is the thin CLI this backs.
+#
+# THE SESSION ID IS CO'S OWN INVENTION. `_require_session_id` in
+# `bin/co-rollover` needs `CLAUDE_CODE_SESSION_ID` set, but `bin/co` runs
+# BEFORE claude exists — there is no session id yet for it to read. So `bin/
+# co` generates one itself (a uuid) and passes it to `claude --session-id`,
+# making the id real; this watch is handed that same id and sets it in the
+# environment of the `co-rollover --picked-up` call it makes.
+
+
+def wait_for_pickup_ready(handoff_path, claude_pid: int, *, timeout: float = 120.0,
+                           poll_interval: float = 1.0, sleep=time.sleep,
+                           clock=time.monotonic) -> bool:
+    """Block until BOTH are true, or *timeout* seconds have passed:
+
+    - the side channel (`co-rollover-state.json`) exists beside
+      *handoff_path* — `_cmd_spawn`'s `write_side_channel` call can still be
+      running when this watch starts, so a late-appearing file is the normal
+      case, not an error; and
+    - *claude_pid* — `bin/co`'s own pid, which becomes the pid `claude` runs
+      as the instant `bin/co` `exec`s it — is alive and running the `claude`
+      CLI, checked the same way `tmux_transcript.claude_pids_under` checks
+      any other pid (`_is_claude(_command_of(pid))`).
+
+    The second check is the proof the successor actually started: a launch
+    that dies before `exec claude`, or execs something else, must never get
+    a pickup recorded for a session that never existed. Returns whether both
+    held before the deadline.
+    """
+    deadline = clock() + timeout
+    while True:
+        if _side_channel_path(handoff_path).is_file() \
+                and TT._is_claude(TT._command_of(claude_pid)):
+            return True
+        if clock() >= deadline:
+            return False
+        sleep(poll_interval)
+
+
+def run_pickup_watch(handoff_path, claude_pid: int, session_id: str, *,
+                      timeout: float = 120.0, log_dir=None,
+                      picked_up_argv: "list[str] | None" = None,
+                      run=subprocess.run, sleep=time.sleep,
+                      clock=time.monotonic) -> int:
+    """The detached watch `bin/co` starts for a rollover successor, before it
+    `exec`s claude. Waits via `wait_for_pickup_ready`, then runs `co-rollover
+    --picked-up <handoff_path>` with `CLAUDE_CODE_SESSION_ID` set to
+    *session_id* standing in for the successor's own session id (see the
+    module-level comment above this section for why `bin/co` invents one).
+
+    A model that ALSO runs `/handoff-pickup`'s own `co-rollover --picked-up`
+    stays harmless: both calls reach the same idempotent gate
+    (`mark_picked_up`) — whichever runs first records the pickup, the other
+    is a no-op.
+
+    Never raises. A timeout or a non-zero `co-rollover` exit is logged
+    (`_log_close_out_skip`, the same log a forwarding skip already uses —
+    see `log_forwarding_skipped` above) and returned as this call's own exit
+    code: this watch's stdout/stderr are closed by `bin/co` before it `exec`s
+    claude, so that log is the only place either failure can ever be read.
+    """
+    log_dir = log_dir if log_dir is not None else RP.CACHE_DIR
+    if not wait_for_pickup_ready(handoff_path, claude_pid, timeout=timeout,
+                                  sleep=sleep, clock=clock):
+        _log_close_out_skip(
+            log_dir,
+            f"{time.time():.0f} pickup-watch timeout after {timeout:.0f}s: "
+            f"handoff={handoff_path!r} claude_pid={claude_pid!r} — the "
+            "successor's pickup was not recorded automatically; run "
+            f"`co-rollover --picked-up {handoff_path}` by hand if the "
+            "successor is otherwise up\n")
+        return 1
+
+    argv = list(picked_up_argv) if picked_up_argv is not None else ["co-rollover"]
+    argv = [*argv, "--picked-up", str(handoff_path)]
+    env = dict(os.environ)
+    env["CLAUDE_CODE_SESSION_ID"] = session_id
+    done = run(argv, env=env, capture_output=True, text=True)
+    if done.returncode != 0:
+        _log_close_out_skip(
+            log_dir,
+            f"{time.time():.0f} pickup-watch: co-rollover --picked-up "
+            f"{handoff_path} exited {done.returncode}: "
+            f"{(done.stderr or '').strip()}\n")
+    return done.returncode
+
+
 # --- forwarding a late-arriving message to the successor (Slice 7) ---------
 #
 # The operator can still type into the predecessor's pane after it is

@@ -23,7 +23,7 @@ public enum RegisterSocketServerError: Error, CustomStringConvertible {
 
 /// The root daemon's Unix-socket accept loop — thin IO glue around
 /// `RegisterRequestHandler`, which is where every actual decision (the peer
-/// check, the one `register` operation) is made and tested. Serial, not
+/// check, the `register` and `authorize` operations) is made and tested. Serial, not
 /// threaded: this is a low-volume local control socket, and handling one
 /// connection at a time means a slow or stuck registration attempt cannot
 /// starve a concurrent one into a race over the Bosun connection.

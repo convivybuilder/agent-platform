@@ -1,46 +1,52 @@
-"""Register one crew in the project registry (config/projects.json) — the
-site a new crew keeps missing (bin/co's own comment calls it "THE SITE NEW
-CREWS KEEP MISSING"), so the `new-crew` skill can file work items for a crew
-it just created with no hand edit of this file.
+"""Register one crew with the Library — the site a new crew keeps missing
+(bin/co's own comment calls it "THE SITE NEW CREWS KEEP MISSING"), so the
+`new-crew` skill can file work items for a crew it just created with no hand
+edit of a registry file.
 
 issue_01M3YN6857H5J541G73Y9P3KA1, part of E19 (crew creation has one path
 end to end). THE DEFECT this closes: Shipwright's single-account rehearsal
-created a crew — a directory, a tmux session, a bead — with no row here, and
-the work-queue tools refused to file its epics because they resolve
-`product` through this file (the Library's own `projects.py` reads
-`agent-platform/config/projects.json` directly; see this module's
-`default_registry_path`).
+created a crew — a directory, a tmux session, a bead — with no row in the
+registry, and the work-queue tools refused to file its epics because they
+resolve `product` through it.
 
-ONE ROW, WRITTEN ATOMICALLY, REFUSING A CLASH. `register()` never partially
-writes: on any refusal the registry file is untouched, and a successful
-write is a temp file written in the same directory and renamed over the
-target, so a reader never observes a half-written file. A clash is checked
-the way the registry's own resolution checks it — case-insensitively, against
-every existing slug, alias, repo and non-project scope at once
-(`claimed_names`), the same membership `projects.project_for_repo` and the
-Library's `projects._resolution_map` test.
+CQ·564 (the 2026-10-25 amendment to platform/decisions/0098) moved the
+registry itself onto the Library: `register()` sends one row to the
+Library's `POST /registry/crews` (CQ·242, library#334) and writes NO FILE
+anywhere, on any outcome. The outcome is the Library's answer, never a
+guess — see `register()`'s own docstring.
 
-WHAT THIS DOES NOT DO, and why each is left to a different change or a
-different crew, is in this change's PR body rather than here: the two
-dispatch-prefix tuples in bin/agentctl and lib/agent-platform/review_protocol.py
-(a crew's `agent_prefix`, once recorded, still needs a hand edit there), and
+Every check that used to read the shared registry file to decide a
+collision, an unknown product, a bad pre-existing value, or a schema-
+breaking write — this module's own `claimed_names`, `_kb_project_syntax_
+errors`, and a whole-document `projects.validate_registry` call — is now
+the LIBRARY's job: library#334 ported `build_row` and those same checks
+server-side, and reports a clash or an invalid document back as a 400 or a
+409. This module keeps only the checks `build_row` can make from the spec
+alone, with no registry to read.
+
+WHAT THIS DOES NOT DO, and why it is left to a different change or a
+different crew, is in this change's PR body rather than here:
 lib/knowledge/knowledge.py's `ALLOWED_PROJECTS`/`ID_PATTERN` baseline (a new
 crew's `knowledge/projects/<slug>/` directory, once it exists, admits the
 crew through `project_catalogue`'s tree-read fallback with no edit to that
-baseline at all).
+baseline at all). A crew's `agent_prefix`, once recorded here, needs no
+further edit: app_prefixes.py derives bin/agentctl's and
+lib/agent-platform/review_protocol.py's shared prefix tuple straight from the
+registry (ARCH-397 Phase 2).
 """
 from __future__ import annotations
 
-import contextlib
 import json
-import os
 import re
-import tempfile
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import github_app as GA
 import projects
+import vault_plane
 
 # The stored form every `home_dir`/`dirs` entry takes (projects.py's
 # `_ROOT_PREFIX`, not imported directly since it is that module's own
@@ -57,12 +63,41 @@ _ROOT_PREFIX = "<root>/"
 # still avoid digits, to clear that stricter rule when it reaches the KB.
 _SLUG_OK = re.compile(r"^[a-z][a-z0-9-]*$")
 
-_VALID_OVERNIGHT = (True, False, "own-drain")
+# knowledge.py's own KB-project slug rule (`_PROJECT_SLUG`, lib/knowledge/knowledge.py),
+# duplicated rather than imported — that name is a private attribute of a sibling
+# module, and the pattern is a one-line literal neither module's docstring expects
+# the other to change without updating this copy. A `kb_project` this strict rule
+# refuses would otherwise reach `knowledge.id_pattern_for`'s regex alternation
+# unchecked: `crew_registration.build_row` validated `slug` but not `kb_project`,
+# so `agentctl crew register --kb-project <value>` could write a value — an
+# unbalanced paren, say — that made `re.compile()` raise at knowledge.py's
+# import, taking down agentctl, the watcher, the KB server, and kb apply and kb
+# sync (security-reviewer, PR #978 round 2). Checked here, before a byte reaches
+# the registry, rather than only where `id_pattern_for` builds the pattern: a bad
+# value refused at registration never gets the chance to break every later import.
+_KB_PROJECT_SLUG_OK = re.compile(r"^[a-z][a-z-]*$")
+
+# A GitHub account (user or org) login: letters, digits and single hyphens,
+# never a leading or trailing hyphen — GitHub's own login-name rule. Checked
+# here, before any request is made, since an unchecked `--github-owner`
+# would otherwise reach every GitHub URL this crew's reads build (the
+# `.github/workflows` read included) as an unvalidated path segment.
+_GITHUB_OWNER_OK = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$")
+_GITHUB_OWNER_MAX_LEN = 39
 
 
-class RegistrationRefused(ValueError):
-    """Why a row was not written. The registry file named in the attempt is
-    untouched — this is raised before anything is opened for writing."""
+class RegistrationRefused(Exception):
+    """Why `spec` was not registered: nothing is written on any of these.
+
+    Two different sources end up here, and the message says which: a
+    REFUSAL — `build_row`'s own pure checks (a bad slug, an inconsistent
+    `--private` row, …), or the Library's 400/409 (a collision, an unknown
+    product, a document the new row would leave schema-invalid — all now
+    checked server-side, library#334) — names the field or value. A FAILURE
+    — the Library unreachable, a timeout, 401, 403, 503, any other status,
+    or no readable writer-token file — names the status or the path. Either
+    way the caller's contract is the same: nothing was registered, and this
+    is why."""
 
 
 @dataclass(frozen=True)
@@ -71,11 +106,14 @@ class CrewSpec:
     registry row and validates it. Every optional field left at its default
     is OMITTED from the written row (never written as a redundant `false` or
     `null`), matching the registry's own absent-means-the-conservative-answer
-    convention (projects.py's REQUIRED_FIELDS comment) — with two
-    deliberate exceptions, `task_text_public` and `overnight`, which every
-    existing row in config/projects.json writes explicitly even when false,
-    so this module follows that convention rather than the code's own
-    permissive one.
+    convention (projects.py's REQUIRED_FIELDS comment) — with one
+    deliberate exception, `task_text_public`, which every existing row in
+    the registry writes explicitly even when false, so this module follows
+    that convention rather than the code's own permissive one.
+
+    CARRIES NO `ci_workflows`. That field is filled from a live GitHub read
+    at registration time (comment 5947 on CQ·564) — `register()` computes
+    it for every one of `repos`, and a caller cannot override it here.
     """
 
     slug: str
@@ -83,6 +121,10 @@ class CrewSpec:
     repos: list[str]
     crew: str | None = None
     owner: str = "convivy"
+    # The GitHub account owning this crew's repo(s), when it is not convivy
+    # (`projects.repo_github_slug`'s own fallback). `None` omits the field,
+    # matching every other optional field's default-is-absent convention.
+    github_owner: str | None = None
     created_by: str | None = None
     cls: str = "project"
     kb: str = "central"
@@ -94,7 +136,6 @@ class CrewSpec:
     lifecycle: str = "active"
     model_tier: str | None = None
     task_text_public: bool = False
-    overnight: Any = None
     private: bool = False
     data_local: bool = False
     agent_prefix: str | None = None
@@ -107,103 +148,15 @@ class CrewSpec:
     note: str | None = None
 
 
-def default_registry_path() -> Path:
-    """Where a crew is registered when no explicit path is given: calls
-    `projects._registry_path()` itself — the live three-step resolver
-    (`$PROJECTS_JSON`, then the module's own tree, then the operator's
-    checkout) — rather than reading `projects.PROJECTS_JSON`, which is only
-    that resolver's result cached at whichever moment `projects` first
-    imported in this process. The two agree in the ordinary case (one
-    process, one import), but calling the resolver directly is what makes
-    this command honour a `PROJECTS_JSON` set after that first import too —
-    the shape a test process or a long-running wrapper can hit, and the
-    shared contract an adopter install's `PROJECTS_JSON` and the Library's
-    own resolution (platform/decisions, 2026-10-02) both depend on landing on
-    the same file this command does. Covers both shapes this repo deploys
-    in: the symlink farm, where `projects.py` follows the link back to the
-    checkout actually running; and a copy deploy that carries its own
-    `config/`, which an adopter's packaged install preserves across updates
-    as that machine's own state."""
-    return projects._registry_path()
-
-
-def resolved_registry_path(registry_path: Path | str | None = None) -> Path:
-    """The ABSOLUTE registry file a call to `register()` acts on:
-    *registry_path* if given, else `default_registry_path()`. Resolved so an
-    operator reading the command's own success or refusal output sees the
-    real file — not a relative spelling that only means something relative
-    to whatever directory the command happened to run from, and not a
-    symlinked form that reads as a different path than the one `register()`
-    actually opened.
-
-    A caller that needs to report which file was (or would have been)
-    touched before `register()` itself can return it — a refusal raised
-    inside `build_row()`, which never receives a path at all — calls this
-    directly rather than guessing `register()`'s internal resolution over
-    again.
-    """
-    path = Path(registry_path) if registry_path is not None else default_registry_path()
-    return path.resolve()
-
-
-def load_registry(path: Path) -> dict[str, Any]:
-    """The registry at `path`, parsed. Refuses — never raises a bare
-    exception a caller has to know to catch — on a missing or malformed
-    file, since a command run against the wrong path should say so rather
-    than traceback."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except FileNotFoundError as exc:
-        raise RegistrationRefused(
-            f"no registry at {path} — every real install ships one "
-            f"(config/projects.seed.json is the template this repo carries "
-            f"for a fresh one); this command will not invent one from "
-            f"nothing") from exc
-    except json.JSONDecodeError as exc:
-        raise RegistrationRefused(f"{path} is not valid JSON: {exc}") from exc
-    if not isinstance(data, dict):
-        raise RegistrationRefused(f"{path} must hold a JSON object at its top level")
-    return data
-
-
-def claimed_names(data: dict[str, Any]) -> dict[str, str]:
-    """Every name already spoken for in this registry, lowercased, mapped to
-    what claims it — a project slug or a non-project scope — so a refusal
-    can name the clash rather than just report one exists.
-
-    The same membership `projects.project_for_repo` tests (a project's own
-    slug, its `aliases` and its `repos`) UNIONED with every `_scopes` key,
-    the way the Library's `projects._resolution_map` builds its table:
-    ARCH-426 makes the vocabulary uniform across projects and scopes, so a
-    new slug must not shadow either one.
-    """
-    claimed: dict[str, str] = {}
-    scopes = data.get("_scopes", {})
-    if isinstance(scopes, dict):
-        for name in scopes:
-            if isinstance(name, str) and name.strip() and not name.startswith("_"):
-                claimed.setdefault(name.strip().lower(), f"the {name!r} scope")
-    for slug, unit in data.items():
-        if not isinstance(slug, str) or slug.startswith("_") or not slug.strip():
-            continue
-        names = [slug]
-        if isinstance(unit, dict):
-            for key in ("aliases", "repos"):
-                value = unit.get(key)
-                if isinstance(value, list):
-                    names.extend(value)
-        for name in names:
-            if isinstance(name, str) and name.strip():
-                claimed.setdefault(name.strip().lower(), f"project {slug!r}")
-    return claimed
-
-
 def build_row(spec: CrewSpec) -> dict[str, Any]:
-    """`spec` as a registry row, or raises `RegistrationRefused` on anything
-    that would fail `tests/test_projects.py::test_schema_wellformed` (or a
-    narrower rule this module itself enforces, such as a slug shape or a
-    kb/kb_project mismatch) before a single byte is written.
+    """`spec` as a registry row, with no `ci_workflows` key yet (`register`
+    fills that from a live GitHub read) — or raises `RegistrationRefused` on
+    anything `build_row` itself can tell is wrong with no registry to read:
+    a malformed field, or a narrower rule this module enforces (a slug
+    shape, a kb/kb_project mismatch, ADR-0043's private-crew invariant).
+    Every check that needs the EXISTING registry to answer (a clashing
+    slug/alias/repo, an unknown product, a document this row would leave
+    schema-invalid) is the Library's job now — see the module docstring.
     """
     if not _SLUG_OK.match(spec.slug):
         raise RegistrationRefused(
@@ -224,13 +177,33 @@ def build_row(spec: CrewSpec) -> dict[str, Any]:
     if spec.model_tier is not None and spec.model_tier not in projects.MODEL_TIERS:
         raise RegistrationRefused(
             f"model_tier must be one of {projects.MODEL_TIERS}, got {spec.model_tier!r}")
-    if spec.overnight not in (None, *_VALID_OVERNIGHT):
-        raise RegistrationRefused(
-            f"overnight must be true, false or 'own-drain', got {spec.overnight!r}")
     if spec.created_by is not None and not projects.valid_person_id(spec.created_by):
         raise RegistrationRefused(
             f"created_by must be a Library person id (person_<ULID>), got "
             f"{spec.created_by!r}")
+    # Checked before any GitHub or Library request — every GitHub read
+    # `register` makes builds its slug from this value unvalidated
+    # otherwise (`_repo_ci_workflows` via `projects.repo_github_slug`).
+    if spec.github_owner is not None and (
+            not isinstance(spec.github_owner, str)
+            or len(spec.github_owner) > _GITHUB_OWNER_MAX_LEN
+            or not _GITHUB_OWNER_OK.fullmatch(spec.github_owner)):
+        raise RegistrationRefused(
+            f"github_owner must be a GitHub account name — letters, digits "
+            f"and single hyphens, at most {_GITHUB_OWNER_MAX_LEN} "
+            f"characters, no leading or trailing hyphen — got "
+            f"{spec.github_owner!r}")
+    # Same shape `projects.agent_prefixes()` enforces on read, checked here on
+    # write: a bad value refuses before the row is ever written, rather than
+    # landing in the live registry and crashing every later prefix read
+    # (app_prefixes.internal_app_prefixes() degrades that case to `()`, but
+    # only once it exists — the write that would cause it is this one).
+    if spec.agent_prefix is not None and (
+            not isinstance(spec.agent_prefix, str) or not spec.agent_prefix
+            or not spec.agent_prefix.endswith("-")):
+        raise RegistrationRefused(
+            f"agent_prefix must be a non-empty string ending in '-', got "
+            f"{spec.agent_prefix!r}")
 
     kb_project = spec.kb_project
     if spec.kb == "local":
@@ -238,6 +211,11 @@ def build_row(spec: CrewSpec) -> dict[str, Any]:
             raise RegistrationRefused("kb_project must not be set when kb='local'")
     else:
         kb_project = kb_project or spec.slug
+    if kb_project and not _KB_PROJECT_SLUG_OK.fullmatch(kb_project):
+        raise RegistrationRefused(
+            f"kb_project {kb_project!r} is not a valid KB project slug — "
+            f"expected a lowercase letter followed by lowercase letters or "
+            f"hyphens (knowledge.py's `_PROJECT_SLUG` rule), no digits")
 
     crew = spec.slug if spec.crew is None else spec.crew
     home_dir = spec.home_dir or f"{_ROOT_PREFIX}{spec.slug}"
@@ -262,10 +240,11 @@ def build_row(spec: CrewSpec) -> dict[str, Any]:
     })
     if kb_project:
         row["kb_project"] = kb_project
+    if spec.github_owner:
+        row["github_owner"] = spec.github_owner
     # Written explicitly even when false — see CrewSpec's docstring on why
-    # these two break from the rest of this row's omit-the-default shape.
+    # this breaks from the rest of this row's omit-the-default shape.
     row["task_text_public"] = bool(spec.task_text_public)
-    row["overnight"] = False if spec.overnight is None else spec.overnight
     if spec.data_local:
         row["data_local"] = True
     if spec.model_tier:
@@ -290,77 +269,208 @@ def build_row(spec: CrewSpec) -> dict[str, Any]:
     violations = projects.privacy_invariant_errors(row)
     if violations:
         raise RegistrationRefused(
-            f"{spec.slug!r} is --private, which requires kb='local', "
-            f"task_text_public=false and overnight=false (ADR-0043 — a "
-            f"black box crew must not be centrally indexed, publish task "
-            f"text or join the shared overnight drain), but {'; '.join(violations)}. "
-            f"Pass --kb local, drop --task-text-public, and leave --overnight "
-            f"unset or 'false' to clear whichever of these this row violates.")
+            f"{spec.slug!r} is --private, which requires kb='local' and "
+            f"task_text_public=false (ADR-0043 — a black box crew must not "
+            f"be centrally indexed or publish task text), but "
+            f"{'; '.join(violations)}. Pass --kb local and drop "
+            f"--task-text-public to clear whichever of these this row violates.")
     return row
 
 
-def _atomic_write(path: Path, data: dict[str, Any]) -> None:
-    """Write `data` as the registry's own JSON style (2-space indent, real
-    UTF-8 rather than `\\uXXXX` escapes — the two together reproduce the
-    checked-in file byte-for-byte when nothing changed) to a temp file in
-    `path`'s own directory, then `os.replace` it over `path`. The rename is
-    atomic on the same filesystem, which a same-directory temp file
-    guarantees; a reader of `path` therefore never observes a partial write.
+# --- filling ci_workflows from a live GitHub read (comment 5947 on CQ·564) --
+#
+# Several crews were registered with an empty ci_workflows entry though
+# each repo had a ci.yml, so their pull requests were never CI-captured and
+# merge admission had to stay off (CQ·569 corrected those rows). The fix is
+# to stop guessing: every registration fills `ci_workflows` from what
+# GitHub actually lists in each repo's `.github/workflows`, so the field a
+# caller cannot even see can no longer go stale the moment it is written.
+#
+# THE SAME CREDENTIAL agent-platform ALREADY USES FOR A REPO-OWNER
+# INSTALLATION TOKEN: the install's own GitHub App, whose JWT/installation-token
+# plumbing `github_app.py` already shares, scoped per repo through `GA.mint_token`
+# exactly as `bin/agentctl`'s own `_mint_run_github_token` and
+# `bin/ci-result-capture`/`bin/pr-state-capture`/`bin/ci1-heartbeat` already mint
+# it — all resolved through `GA.installed_app()`, never a literal, not a second
+# credential path.
+
+# A workflow file GitHub Actions recognises: directly in `.github/workflows/`
+# (a subdirectory is never a workflow) with a `.yml`/`.yaml` extension —
+# GitHub's own rule for what it treats as a workflow, applied here so a
+# stray non-workflow file (a README, say) in that directory is never written
+# into the row.
+_WORKFLOW_FILE_SUFFIXES = (".yml", ".yaml")
+
+
+def _repo_ci_workflows(repo: str, row: dict[str, Any], *,
+                       opener=urllib.request.urlopen) -> list[str]:
+    """The workflow file names GitHub lists in `repo`'s `.github/workflows`
+    directory, sorted. `[]` on a 404 from GitHub's contents API — which
+    reads identically for "no such directory" and "no such repo", so both
+    come back as "no workflows" here, the same conflation `projects.
+    ci_workflows`'s own default already treats as the safe answer for an
+    absent field. Raises `RegistrationRefused`, naming `repo`, on every
+    other way this can fail: the App key, the installation lookup, the
+    token mint, or a GitHub status other than 200 or 404.
+
+    `opener` defaults to the real `urllib.request.urlopen` and threads
+    through to `GA.mint_token`/`GA.request` exactly as their own `opener`
+    parameters do — a test passes a fake opener (`tests/test_github_mint.py`'s
+    own pattern) rather than reaching the real GitHub API.
     """
-    text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=".projects.json.", suffix=".tmp", dir=str(path.parent))
+    slug = projects.repo_github_slug(repo, unit=row)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(text)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, path)
-    except Exception:
-        with contextlib.suppress(OSError):
-            os.unlink(tmp_name)
-        raise
-
-
-def register(spec: CrewSpec, *, registry_path: Path | str | None = None,
-             dry_run: bool = False) -> tuple[Path, dict[str, Any]]:
-    """Add `spec`'s row to the registry at `registry_path` (default
-    `default_registry_path()`), returning `(path, row)`.
-
-    REFUSES RATHER THAN WRITES on any of: a malformed spec (`build_row`'s
-    checks), a slug/alias/repo already claimed by an existing project or
-    scope (`claimed_names`), or a `--product` naming no entry in the
-    registry's own `_products` block. Every refusal is raised BEFORE the
-    registry is opened for writing, so the file is byte-for-byte unchanged
-    on any of them — including the dry-run path, which never writes at all.
-
-    The returned path is `resolved_registry_path(registry_path)` — absolute —
-    so a caller printing it back to an operator never has to resolve it
-    again itself.
-    """
-    path = resolved_registry_path(registry_path)
-    data = load_registry(path)
-    row = build_row(spec)
-
-    claimed = claimed_names(data)
-    for name in (spec.slug, *row["aliases"], *row["repos"]):
-        key = name.strip().lower()
-        if key in claimed:
-            raise RegistrationRefused(
-                f"{name!r} is already claimed by {claimed[key]}; pick a "
-                f"different slug, alias or repo name")
-
-    products_block = data.get("_products", {})
-    unknown_products = [p for p in row["products"]
-                        if not (isinstance(products_block, dict) and p in products_block)]
-    if unknown_products:
+        app = GA.installed_app()
+        with GA.mint_token(slug, "read", key_path=app.key_path,
+                            app_id=app.app_id,
+                            label="the install's GitHub App", opener=opener) as token:
+            code, payload = GA.request(
+                "GET", f"{GA.API}/repos/{slug}/contents/.github/workflows", token, None,
+                opener=opener)
+    except GA.Unreadable as e:
         raise RegistrationRefused(
-            f"product(s) {unknown_products} are not in the registry's "
-            f"_products block")
+            f"{repo!r}'s .github/workflows could not be read: {e}") from e
+    if code == 404:
+        return []
+    if code != 200 or not isinstance(payload, list):
+        raise RegistrationRefused(
+            f"{repo!r}'s .github/workflows could not be read (HTTP {code})")
+    return sorted(
+        item["name"] for item in payload
+        if isinstance(item, dict) and item.get("type") == "file"
+        and isinstance(item.get("name"), str)
+        and item["name"].endswith(_WORKFLOW_FILE_SUFFIXES))
 
+
+# --- sending the row to the Library (CQ·564) ---------------------------------
+
+# The Library's own route for one crew row (CQ·242, library#334). The
+# written §6.8 contract subsection is not published yet (the Library's own
+# outcome note on that item); this is built to the behaviour it describes.
+_REGISTRY_CREWS_ROUTE = "/registry/crews"
+
+# The ONE capability this credential holds, per the contract: `registry.write`
+# alone — it cannot read `GET /registry` or `GET /roster` (both answer 403).
+# Never the reader token `projects.py` sends on `GET /registry`: that one
+# lacks `registry.write` and the Library would refuse it the same way, the
+# other direction.
+_REGISTRY_WRITER_TOKEN_RELATIVE = Path(".orient-control") / "agent-platform-registry-writer-token"
+
+# Loopback-equivalent; mirrors `projects._REGISTRY_TIMEOUT_S` — a slow or
+# hung Library must not hold a registration open forever.
+_REGISTRY_TIMEOUT_S = 5
+
+
+def _registry_writer_token_file() -> Path:
+    """Where the registry-writer credential lives, resolved from
+    `Path.home()` fresh on every call — mirrors `projects._registry_token_
+    file()`'s own resolution of the reader token, so a test can point
+    `Path.home()` at its own directory and see this resolve under it. Never
+    opened, printed or copied outside `_registry_writer_token` below."""
+    return Path.home() / _REGISTRY_WRITER_TOKEN_RELATIVE
+
+
+def _registry_writer_token() -> str | None:
+    """The registry-writer credential from `_registry_writer_token_file()`,
+    or `None` when it could not be read. Unlike `projects._registry_token`,
+    there is no environment-variable override — the writer credential has
+    exactly one source, the file."""
+    try:
+        return _registry_writer_token_file().read_text().strip() or None
+    except OSError:
+        return None
+
+
+def _post_crew_row(body: dict[str, Any], *,
+                   opener=urllib.request.urlopen) -> dict[str, Any]:
+    """POST `body` to the Library's `POST /registry/crews` and return the
+    stored row (the Library's 201 body, which adds `slug`, `updated_at` and
+    `updated_by`). Raises `RegistrationRefused` on every other outcome: no
+    token; 400 or 409 (named with the Library's own `error`, and `hint` when
+    it gives one); any other status; or a request that could not even be
+    made (unreachable, a timeout, …) — never read as success.
+
+    `opener` defaults to the real `urllib.request.urlopen`; a test passes a
+    fake one (`tests/test_github_mint.py`'s own pattern, which
+    `GA.request` already relies on) rather than reaching a real socket —
+    handling BOTH shapes a fake can answer with: an `HTTPError` raised the
+    way the real `urlopen` raises one for a non-2xx status, or a response
+    object simply carrying that status with no exception at all, the way
+    `GA.request`'s own fakes already do."""
+    slug = body.get("slug")
+    token = _registry_writer_token()
+    if not token:
+        raise RegistrationRefused(
+            f"no registry-writer token: {_registry_writer_token_file()} "
+            f"could not be read; {slug!r} was not registered")
+    req = urllib.request.Request(
+        vault_plane.library_url(_REGISTRY_CREWS_ROUTE), method="POST",
+        data=json.dumps(body).encode("utf-8"),
+        headers=vault_plane.library_headers(token=token, json_body=True))
+    try:
+        with opener(req, timeout=_REGISTRY_TIMEOUT_S) as resp:
+            status, raw = resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        status, raw = e.code, e.read()
+    except Exception as e:
+        raise RegistrationRefused(
+            f"the Library could not be asked to register {slug!r}: "
+            f"{e.__class__.__name__}: {e}") from e
+    try:
+        payload = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw or "{}") \
+            if raw else {}
+    except ValueError:
+        payload = {}
+    if status == 201:
+        return payload
+    message = payload.get("error") or f"HTTP {status}"
+    hint = f" ({payload['hint']})" if payload.get("hint") else ""
+    verb = "refused" if status in (400, 409) else "failed to"
+    raise RegistrationRefused(
+        f"the Library {verb} register {slug!r} (HTTP {status}): {message}{hint}")
+
+
+def register(spec: CrewSpec, *, dry_run: bool = False,
+             opener=urllib.request.urlopen) -> dict[str, Any]:
+    """Register `spec` with the Library's `POST /registry/crews` (CQ·564).
+    Returns the stored row on success. WRITES NO FILE, ANYWHERE, ON ANY
+    OUTCOME.
+
+    `build_row(spec)` runs first and raises `RegistrationRefused` on its own
+    pure checks, with no registry to read. The row's `ci_workflows` is then
+    filled from a live GitHub read, one call per repo in `spec.repos`
+    (`_repo_ci_workflows`) — also before anything is sent, and also a
+    `RegistrationRefused` on a repo whose workflows cannot be read.
+
+    THE OUTCOME IS THE LIBRARY'S ANSWER, NEVER A GUESS. A 201 is registered.
+    A 400 or a 409 is a REFUSAL, naming the field or value the Library's own
+    `error` names. An unreachable Library, a timeout, 401, 403, 503, or any
+    other status is a FAILURE, named by its status — never read as success.
+    A missing or unreadable writer-token file fails the same way, naming the
+    path, before any request is made. All three raise `RegistrationRefused`;
+    see that class's docstring for how to tell them apart from the message.
+
+    `dry_run=True` builds and fills the row — the GitHub read included — and
+    returns it without ever asking the Library, so an operator previewing a
+    registration sees exactly the row that would be sent.
+
+    On a 201, `projects._load_raw`'s cache is cleared, so a caller in THIS
+    SAME PROCESS that reads the registry right after registering (`agentctl
+    crew create`'s next step; the doctor's KB-slug check) sees the new crew
+    rather than whatever `projects.py` had already cached.
+
+    `opener` is passed straight through to BOTH `_repo_ci_workflows`'s own
+    GitHub calls and `_post_crew_row`'s POST, so one fake opener can answer
+    both in a single test — the real `urllib.request.urlopen` by default,
+    for production."""
+    row = build_row(spec)
+    row["ci_workflows"] = {repo: _repo_ci_workflows(repo, row, opener=opener)
+                           for repo in row["repos"]}
+    ci_errors = projects.ci_workflows_errors({"repos": row["repos"], "ci_workflows": row["ci_workflows"]})
+    if ci_errors:
+        raise RegistrationRefused(f"ci_workflows invalid: {'; '.join(ci_errors)}")
     if dry_run:
-        return path, row
-
-    data[spec.slug] = row
-    _atomic_write(path, data)
-    return path, row
+        return row
+    stored = _post_crew_row({**row, "slug": spec.slug}, opener=opener)
+    projects._load_raw.cache_clear()
+    return stored

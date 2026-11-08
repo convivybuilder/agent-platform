@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tests for bin/install-push-gate — the installer that puts the content
 # gate's pre-push hook into each engine clone (agent-platform, library,
-# convivy-orient, convivy-deck).
+# convivy-orient, convivy-deck, write-better).
 #
 # Every clone here is a real, from-scratch git repository under a temp root
 # named with --root-config (company/decisions/0008), never a real clone —
@@ -18,7 +18,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 INSTALLER="$REPO_ROOT/bin/install-push-gate"
 MARKER="managed-by: agent-platform push-gate"
-CLONES="agent-platform library convivy-orient convivy-deck"
+CLONES="agent-platform library convivy-orient convivy-deck write-better"
 
 _git_ident() { # <repo>
     git -C "$1" config user.email t@t
@@ -42,7 +42,7 @@ seed_clone() { # <path>
 }
 
 # setup [<clones to seed>] -> echoes a fake HOME, with $HOME/Convivy/<repo>
-# seeded as a real git repo for each name given (default: all four).
+# seeded as a real git repo for each name given (default: all five).
 setup() {
     local home clones repo
     home=$(mktemp -d)
@@ -71,7 +71,7 @@ run_installer() {
 
 hook_of() { echo "$1/Convivy/$2/.git/hooks/pre-push"; } # <home> <repo>
 
-# --- 1. installs into the four temp clones, each stub carrying its own
+# --- 1. installs into the five temp clones, each stub carrying its own
 #        clone's repository name ---------------------------------------------
 home=$(setup)
 rc=0

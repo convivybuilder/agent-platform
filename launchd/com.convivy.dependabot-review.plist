@@ -8,14 +8,14 @@
     <!-- Reviews the open dependency PRs overnight, so the morning decision is one
          paragraph rather than a dozen tabs.
 
-         Measured 2026-07-30: 73 dependabot PRs merged across vivy, constance and
-         sous-chef in 30 days. The operator's account was that dependabot plus nightly bugs
+         Measured 2026-07-30: 73 dependabot PRs merged across the product repos
+         in 30 days. The operator's account was that dependabot plus nightly bugs
          plus issues consumed roughly the first ten hours of his day.
 
          Grouping (the dependabot.yml rewrites merged the same day) cut how OFTEN
-         the question is asked; within minutes of merging, vivy's next dependabot
-         pass produced two grouped PRs carrying 17 updates in place of 17 separate
-         ones. This job cuts what ANSWERING it costs.
+         the question is asked; within minutes of merging, one product's next
+         dependabot pass produced two grouped PRs carrying 17 updates in place of
+         17 separate ones. This job cuts what ANSWERING it costs.
 
          EVERY THREE HOURS, at :15 past, starting 01:15. A dependabot PR is then
          reviewed within a few hours of opening rather than waiting for the night,

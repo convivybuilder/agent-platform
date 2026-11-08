@@ -24,11 +24,11 @@ def _read(home):
 
 
 def test_no_config_file_creates_one_with_the_entry(tmp_path):
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     data = _read(tmp_path)
-    assert data["projects"]["/srv/convivy/nyh"] == {"hasTrustDialogAccepted": True}
+    assert data["projects"]["/srv/convivy/oak"] == {"hasTrustDialogAccepted": True}
 
 
 # MARK: - An existing file
@@ -44,26 +44,26 @@ def test_existing_file_no_entry_for_the_path_adds_it_others_untouched(tmp_path):
         },
     }))
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     data = _read(tmp_path)
     assert data["numStartups"] == 42
     assert data["projects"]["/srv/convivy/other"] == {
         "hasTrustDialogAccepted": True, "lastSessionId": "abc123"}
-    assert data["projects"]["/srv/convivy/nyh"] == {"hasTrustDialogAccepted": True}
+    assert data["projects"]["/srv/convivy/oak"] == {"hasTrustDialogAccepted": True}
 
 
 def test_existing_entry_with_other_keys_keeps_them(tmp_path):
     config = tmp_path / CT.CONFIG_FILENAME
     config.write_text(json.dumps({"projects": {
-        "/srv/convivy/nyh": {"lastSessionId": "abc123", "allowedTools": ["Bash"]},
+        "/srv/convivy/oak": {"lastSessionId": "abc123", "allowedTools": ["Bash"]},
     }}))
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
-    entry = _read(tmp_path)["projects"]["/srv/convivy/nyh"]
+    entry = _read(tmp_path)["projects"]["/srv/convivy/oak"]
     assert entry == {"lastSessionId": "abc123", "allowedTools": ["Bash"],
                      "hasTrustDialogAccepted": True}
 
@@ -80,7 +80,7 @@ def test_the_config_files_mode_survives_the_write(tmp_path):
     config.write_text(json.dumps({"projects": {}}))
     config.chmod(0o600)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
@@ -90,7 +90,7 @@ def test_a_fresh_files_mode_is_0600_with_no_prior_file_to_preserve(tmp_path):
     """No prior file means no prior mode to carry across — this is
     credential-adjacent config this process is creating, so it gets 0600
     rather than falling through to whatever the umask happens to allow."""
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     config = tmp_path / CT.CONFIG_FILENAME
@@ -125,7 +125,7 @@ def test_the_temp_file_is_created_at_the_target_mode_before_any_write(
 
     monkeypatch.setattr(CT.os, "open", spying_open)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     assert opened, "the PID-scoped temp path was never opened"
@@ -153,11 +153,11 @@ def test_a_stale_temp_file_is_cleaned_up_and_the_write_succeeds(tmp_path):
     tmp = tmp_path / f"{CT.CONFIG_FILENAME}.tmp.{os.getpid()}"
     tmp.write_text("stale leftover from this same PID's crashed prior write")
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     data = _read(tmp_path)
-    assert data["projects"]["/srv/convivy/nyh"] == {"hasTrustDialogAccepted": True}
+    assert data["projects"]["/srv/convivy/oak"] == {"hasTrustDialogAccepted": True}
     assert stat.S_IMODE(config.stat().st_mode) == 0o600
 
 
@@ -180,7 +180,7 @@ def test_a_second_stale_temp_file_still_fails_soft(tmp_path, monkeypatch):
 
     monkeypatch.setattr(CT.os, "open", always_conflicting_open)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert "could not write" in result["reason"]
@@ -202,13 +202,13 @@ def test_a_bare_named_peer_temp_file_is_left_untouched(tmp_path):
     peer_tmp = tmp_path / f"{CT.CONFIG_FILENAME}.tmp"
     peer_tmp.write_text("a peer's in-flight write, not this process's own")
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     assert peer_tmp.exists(), "a peer's temp file must never be unlinked"
     assert peer_tmp.read_text() == "a peer's in-flight write, not this process's own"
     data = _read(tmp_path)
-    assert data["projects"]["/srv/convivy/nyh"] == {"hasTrustDialogAccepted": True}
+    assert data["projects"]["/srv/convivy/oak"] == {"hasTrustDialogAccepted": True}
 
 
 # MARK: - Sweeping stale <config>.tmp.<pid> litter
@@ -225,7 +225,7 @@ def test_an_aged_tmp_leftover_is_removed(tmp_path):
     old = time.time() - CT.STALE_TMP_AGE_SECONDS - 1
     os.utime(stale, (old, old))
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     assert not stale.exists()
@@ -241,7 +241,7 @@ def test_a_fresh_tmp_leftover_is_not_removed(tmp_path):
     fresh = tmp_path / f"{CT.CONFIG_FILENAME}.tmp.99999"
     fresh.write_text("recent, not yet stale")
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     assert fresh.exists()
@@ -259,7 +259,7 @@ def test_the_bare_tmp_name_is_never_swept(tmp_path):
     old = time.time() - CT.STALE_TMP_AGE_SECONDS - 1
     os.utime(peer_tmp, (old, old))
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     assert peer_tmp.exists()
@@ -277,7 +277,7 @@ def test_a_non_digit_tmp_suffix_is_never_swept(tmp_path):
     old = time.time() - CT.STALE_TMP_AGE_SECONDS - 1
     os.utime(foreign, (old, old))
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     assert foreign.exists()
@@ -299,11 +299,11 @@ def test_a_sweep_that_raises_still_lets_pre_trust_succeed(tmp_path, monkeypatch)
         raise OSError("permission denied listing directory")
     monkeypatch.setattr(CT.Path, "iterdir", boom)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": None}
     data = _read(tmp_path)
-    assert data["projects"]["/srv/convivy/nyh"] == {"hasTrustDialogAccepted": True}
+    assert data["projects"]["/srv/convivy/oak"] == {"hasTrustDialogAccepted": True}
 
 
 # MARK: - The mode lookup cannot crash the "never raises" guarantee
@@ -343,12 +343,12 @@ def test_config_deleted_right_before_the_stat_call_does_not_raise(tmp_path, monk
 
     monkeypatch.setattr(CT.os, "stat", deletes_on_second_stat)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is True
     assert result["reason"] is None
     data = _read(tmp_path)
-    assert data["projects"]["/srv/convivy/nyh"] == {"hasTrustDialogAccepted": True}
+    assert data["projects"]["/srv/convivy/oak"] == {"hasTrustDialogAccepted": True}
 
 
 def test_a_stat_failure_other_than_missing_file_fails_soft(tmp_path, monkeypatch):
@@ -367,7 +367,7 @@ def test_a_stat_failure_other_than_missing_file_fails_soft(tmp_path, monkeypatch
 
     monkeypatch.setattr(CT.os, "stat", boom)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert "could not write" in result["reason"]
@@ -377,7 +377,7 @@ def test_a_stat_failure_other_than_missing_file_fails_soft(tmp_path, monkeypatch
 def test_an_already_trusted_entry_is_a_noop(tmp_path, monkeypatch):
     config = tmp_path / CT.CONFIG_FILENAME
     config.write_text(json.dumps({"projects": {
-        "/srv/convivy/nyh": {"hasTrustDialogAccepted": True, "lastSessionId": "abc123"},
+        "/srv/convivy/oak": {"hasTrustDialogAccepted": True, "lastSessionId": "abc123"},
     }}))
     before = config.read_text()
 
@@ -385,7 +385,7 @@ def test_an_already_trusted_entry_is_a_noop(tmp_path, monkeypatch):
         raise AssertionError("must not rewrite an already-trusted entry")
     monkeypatch.setattr(CT.os, "replace", _no_write)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result == {"trusted": True, "reason": "already trusted"}
     assert config.read_text() == before
@@ -400,7 +400,7 @@ def test_unreadable_file_fails_soft_and_is_untouched(tmp_path):
     # permission models, unlike a chmod-based simulation.
     (tmp_path / CT.CONFIG_FILENAME).mkdir()
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert "could not read" in result["reason"]
@@ -411,7 +411,7 @@ def test_malformed_json_fails_soft_and_is_untouched(tmp_path):
     config = tmp_path / CT.CONFIG_FILENAME
     config.write_text("{not json")
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert "not valid JSON" in result["reason"]
@@ -422,7 +422,7 @@ def test_non_object_json_fails_soft(tmp_path):
     config = tmp_path / CT.CONFIG_FILENAME
     config.write_text("[]")
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert "not a JSON object" in result["reason"]
@@ -433,7 +433,7 @@ def test_a_non_object_projects_key_fails_soft(tmp_path):
     config = tmp_path / CT.CONFIG_FILENAME
     config.write_text(json.dumps({"projects": "nope"}))
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert "projects" in result["reason"]
@@ -448,14 +448,14 @@ def test_a_non_object_project_entry_fails_soft(tmp_path):
     silently discarded and replaced."""
     config = tmp_path / CT.CONFIG_FILENAME
     config.write_text(json.dumps({"projects": {
-        "/srv/convivy/nyh": "nope",
+        "/srv/convivy/oak": "nope",
     }}))
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
-    assert "/srv/convivy/nyh" in result["reason"]
-    assert _read(tmp_path) == {"projects": {"/srv/convivy/nyh": "nope"}}
+    assert "/srv/convivy/oak" in result["reason"]
+    assert _read(tmp_path) == {"projects": {"/srv/convivy/oak": "nope"}}
 
 
 def test_a_write_failure_fails_soft(tmp_path, monkeypatch):
@@ -463,7 +463,7 @@ def test_a_write_failure_fails_soft(tmp_path, monkeypatch):
         raise OSError("disk full")
     monkeypatch.setattr(CT.os, "replace", _boom)
 
-    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(tmp_path, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert "could not write" in result["reason"]
@@ -474,7 +474,7 @@ def test_an_unwritable_home_fails_soft(tmp_path):
     earliest possible failure point, degrading the same as every later one."""
     home = tmp_path / "does-not-exist"  # never created
 
-    result = CT.pre_trust_created_directory(home, "/srv/convivy/nyh")
+    result = CT.pre_trust_created_directory(home, "/srv/convivy/oak")
 
     assert result["trusted"] is False
     assert result["reason"]

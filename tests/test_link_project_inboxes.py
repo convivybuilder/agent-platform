@@ -54,7 +54,7 @@ def test_an_inbox_holding_notes_is_REFUSED_and_left_untouched(link_project_inbox
 
 
 def test_a_handled_subdirectory_counts_as_content(link_project_inboxes, pair):
-    """Both svc repos have an `inbox/handled/` with history in it and an empty
+    """Both relay repos have an `inbox/handled/` with history in it and an empty
     top level, so "empty apart from handled/" is the live shape — and it is
     content, not emptiness."""
     link, target, _ = pair

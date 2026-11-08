@@ -1,14 +1,23 @@
 # LiteLLM proxy config for the Convivy agent-platform gateway (Phase C, ARCH-102).
 #
 # MODEL STRINGS (coder notes for the operator's review):
-#   deepseek/deepseek-v4-flash  — DeepSeek's current fast model, explicit id (ARCH-280).
-#       Repointed from the legacy `deepseek-chat` alias, which DeepSeek sunsets
-#       2026-07-24; deepseek-chat had already become V4 Flash's non-thinking mode at
-#       the same price, so this is the same model under its durable name. Pricing is
-#       pinned in model_info below (LiteLLM's map has no v4-flash entry). Keep this,
-#       MODEL_ALIASES, GATEWAY_MODEL_GROUPS, and the model_group_alias in bin/agentctl
-#       (+ bin/metric-alerts' alias map and the test fixtures) in sync —
-#       test_gateway_routing enforces the alias↔deployment match.
+#   deepseek/deepseek-flash  — DeepSeek's current fast model, explicit id.
+#       Repointed from the legacy `deepseek-v4-flash` id: DeepSeek's pricing page
+#       (api-docs.deepseek.com/quick_start/pricing, read 2026-10-20) names
+#       `deepseek-v4-flash` a legacy, still-accepted alias with no stated
+#       retirement date, served by DeepSeek-V4.1-Flash-1017 under the
+#       `deepseek-flash` id — same model, same price, new durable name. Pricing is
+#       pinned in model_info below (LiteLLM's map has no deepseek-flash entry).
+#       Keep this, MODEL_ALIASES, GATEWAY_MODEL_GROUPS, and the model_group_alias
+#       in bin/agentctl (+ bin/metric-alerts' alias map and the test fixtures) in
+#       sync — test_gateway_routing enforces the alias↔deployment match.
+#
+#   deepseek/deepseek-v4-pro  — DeepSeek V4 Pro, the model trial 2 arm (CQ·524).
+#       Pricing is pinned in model_info below — same reason as deepseek-flash
+#       above (LiteLLM's map has no deepseek-v4-pro entry). Keep this,
+#       MODEL_ALIASES, GATEWAY_MODEL_GROUPS, and the model_group_alias in
+#       bin/agentctl (+ bin/metric-alerts' alias map and the test fixtures) in
+#       sync — test_gateway_routing enforces the alias↔deployment match.
 #
 #   moonshot/kimi-k2.6  — Moonshot AI direct (256k context window).
 #       Confirmed available on the existing MOONSHOT_API_KEY (GET /v1/models,
@@ -59,24 +68,50 @@ model_list:
 
   - model_name: deepseek
     litellm_params:
-      model: deepseek/deepseek-v4-flash
+      model: deepseek/deepseek-flash
       api_key: "os.environ/DEEPSEEK_API_KEY"
-    # Repointed from the legacy `deepseek-chat` alias to the explicit
-    # `deepseek-v4-flash` id (ARCH-280): DeepSeek sunsets the `deepseek-chat` /
-    # `deepseek-reasoner` aliases on 2026-07-24 15:59 UTC. deepseek-chat already
-    # routed to V4 Flash (non-thinking) at the same price, so this is the same
-    # model under its durable name — V4 Flash ($0.14/$0.0028/$0.28 per M, 1M
-    # context) is the mechanical-tier model. Pin pricing on the deployment so
-    # cost is correct regardless of what the API echoes: LiteLLM 1.86.2's map
-    # has no v4-flash entry → completion_cost() would error → usd:0 in the spend
-    # log. These model_info costs feed the cache-aware map path
-    # (cache_read_input_token_cost is honored there, unlike the flat
-    # custom_cost_per_token path). Source: api-docs.deepseek.com/quick_start/pricing
-    # (2026-06): input cache-miss $0.14/M, cache-hit $0.0028/M, output $0.28/M.
+    # Repointed from the legacy `deepseek-v4-flash` id to the current
+    # `deepseek-flash` id: DeepSeek's pricing page (api-docs.deepseek.com/
+    # quick_start/pricing, read 2026-10-20) names `deepseek-v4-flash` a legacy,
+    # still-accepted alias with no stated retirement date, served by
+    # DeepSeek-V4.1-Flash-1017 under the `deepseek-flash` id — same model, same
+    # price, so this is a rename rather than a model change. Pin pricing on the
+    # deployment so cost is correct regardless of what the API echoes: LiteLLM
+    # 1.86.2's map has no deepseek-flash entry → completion_cost() would error →
+    # usd:0 in the spend log. These model_info costs feed the cache-aware map
+    # path (cache_read_input_token_cost is honored there, unlike the flat
+    # custom_cost_per_token path).
+    #
+    # DeepSeek's billed PEAK rates for deepseek-flash (CQ·515, steward ruling
+    # 2026-10-19), derived from DeepSeek's per-category billing export for
+    # 2026-10-18/19: off-peak cache-miss $0.15/M, cache-hit $0.003/M, output
+    # $0.60/M; peak (01:00–04:00 and 06:00–10:00 UTC weekdays) doubles each to
+    # $0.30/M, $0.006/M, $1.20/M. The prior pin ($0.14/$0.0028/$0.28/M)
+    # undercounted the real bill by 2 to 4 times. This pins the peak rate, so
+    # the ledger and the model trial's $50-per-arm cap, which reads this
+    # ledger, can overcount a request billed off-peak but never undercount one
+    # billed at peak.
     model_info:
-      input_cost_per_token: 0.00000014
-      cache_read_input_token_cost: 0.0000000028
-      output_cost_per_token: 0.00000028
+      input_cost_per_token: 0.0000003
+      cache_read_input_token_cost: 0.000000006
+      output_cost_per_token: 0.0000012
+
+  - model_name: deepseek-pro
+    litellm_params:
+      model: deepseek/deepseek-v4-pro
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+    # Model trial 2's second arm (CQ·524): DeepSeek V4 Pro. Pin pricing for the
+    # same reason as the deepseek deployment above — LiteLLM 1.86.2's map has
+    # no deepseek-v4-pro entry, so completion_cost() would error and the real
+    # spend would log usd:0, undercounting the trial's $50-per-arm cost cap.
+    #
+    # DeepSeek's billed PEAK rates for deepseek-v4-pro (api-docs.deepseek.com/
+    # quick_start/pricing, read 2026-10-20): input $1.32/M, cache-hit
+    # $0.044/M, output $3.96/M.
+    model_info:
+      input_cost_per_token: 0.00000132
+      cache_read_input_token_cost: 0.000000044
+      output_cost_per_token: 0.00000396
 
   - model_name: kimi
     litellm_params:
@@ -84,7 +119,7 @@ model_list:
       api_key: "os.environ/MOONSHOT_API_KEY"
     # Pin pricing for the same reason as deepseek above: if Moonshot's API
     # echoes a model name absent from the installed LiteLLM map (the
-    # deepseek-v4-flash failure mode), completion_cost() errors → usd:0 in the
+    # deepseek-flash failure mode), completion_cost() errors → usd:0 in the
     # spend log. Source: litellm upstream map 2026-06-11 (matches Azure's
     # kimi-k2.6 listing): input cache-miss $0.95/M, cache-hit $0.16/M,
     # output $4.00/M.
@@ -98,7 +133,7 @@ model_list:
       model: moonshot/kimi-k2.7-code
       api_key: "os.environ/MOONSHOT_API_KEY"
     # Pin pricing — k2.7-code (released 2026-06-12) is too new for the installed
-    # LiteLLM map, so completion_cost() would error → usd:0 (the deepseek-v4-flash
+    # LiteLLM map, so completion_cost() would error → usd:0 (the deepseek-flash
     # failure mode). Source: Moonshot's published k2.7-code rates (platform.kimi.ai,
     # 2026-06): input cache-miss $0.95/M, cache-hit $0.19/M, output $4.00/M. The
     # cache-read tier (added ARCH-181) matters: agent loops are cache-read-dominated
@@ -134,7 +169,7 @@ model_list:
       # /chat/completions instead, which Xiaomi serves (ARCH-210 Fix 1). openai_like
       # is NOT an option here — it's unmapped on the anthropic bridge.
     # Pin pricing — mimo-v2.5-pro is absent from the installed LiteLLM map
-    # (completion_cost() → usd:0, the deepseek-v4-flash failure mode). Source:
+    # (completion_cost() → usd:0, the deepseek-flash failure mode). Source:
     # Xiaomi MiMo open platform pricing (mimo.mi.com, June 2026, after the
     # 2026-05-26 permanent reduction): input cache-miss $0.435/M, output $0.87/M,
     # cache-hit $0.0036/M (a 99% cache-read cut). Cache-read tier pinned for the
@@ -171,7 +206,7 @@ general_settings:
 
 router_settings:
   # Fallbacks only fire for requests that name a model GROUP ("deepseek").
-  # A raw provider string ("deepseek/deepseek-v4-flash") routes fine, but LiteLLM
+  # A raw provider string ("deepseek/deepseek-flash") routes fine, but LiteLLM
   # 1.86.2 treats it as an ad-hoc group where neither the fallbacks lookup nor
   # the fallback hop can resolve ("No deployments available. Passed
   # model=kimi") — and model_group_alias does NOT bridge it: the alias fixes
@@ -179,9 +214,12 @@ router_settings:
   # verified empirically 2026-06-11). agentctl therefore passes the GROUP name
   # to `claude --model` (GATEWAY_MODEL_GROUPS in bin/agentctl — keep in sync).
   # The alias stays as a routing safety net for any straggler caller still
-  # sending the provider string; such calls get no fallback.
+  # sending the provider string; such calls get no fallback. The legacy
+  # `deepseek-v4-flash` entry stays for any straggler still sending that id.
   model_group_alias:
+    "deepseek/deepseek-flash": "deepseek"
     "deepseek/deepseek-v4-flash": "deepseek"
+    "deepseek/deepseek-v4-pro": "deepseek-pro"
   # Fallbacks removed (ARCH-186) — kimi is cut. The `deepseek → kimi` net was
   # added (ARCH-130) for DeepSeek's 2026-06-11 json_schema 400-storm (it disabled
   # response_format json_schema, the shape every Claude-CLI structured-output

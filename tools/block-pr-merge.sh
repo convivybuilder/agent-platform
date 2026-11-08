@@ -7,7 +7,7 @@
 # and even if the operator said "ship it" / "merge it" in the session. Merging is a human
 # action the operator performs themself (the GitHub UI); an agent running the merge is the
 # exact gate ARCH-020 exists to hold, and prompt text alone proved bypassable
-# (a vivy co read "ship it" as merge authorization and squash-merged, 2026-05-31).
+# (a product crew's co read "ship it" as merge authorization and squash-merged, 2026-05-31).
 #
 # MENTION vs INVOCATION: the match is anchored to a command-segment boundary
 # (start-of-string or after a real separator ; & ( ), so a command that merely

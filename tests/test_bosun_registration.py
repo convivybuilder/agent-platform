@@ -1476,11 +1476,23 @@ def test_a_silent_post_handshake_connection_is_closed_after_the_request_timeout(
     nothing re-applied one — a peer presenting any valid machine certificate
     could complete the handshake and then send nothing at all, holding its
     thread and socket forever. Confirmed to fail against 3d7af669, bounded
-    so a regression hangs for at most `silent.settimeout(5)`'s 5 seconds
+    so a regression hangs for at most `silent.settimeout(15)`'s 15 seconds
     rather than hanging the suite.
+
+    The healthy client's own budget (`HEALTHY_REQUEST_BUDGET_S` below) is
+    deliberately not `TLS_REQUEST_TIMEOUT_S` itself: on a loaded CI runner
+    the healthy request alone — thread spawn, TLS handshake, registration —
+    was observed ranging from 0.59 s to 2.25 s, which would fail against a
+    2.0 s `HEALTHY_REQUEST_BUDGET_S` on unrelated PRs with nothing actually
+    blocked on the silent connection. `TLS_REQUEST_TIMEOUT_S` is raised to
+    10 s and `HEALTHY_REQUEST_BUDGET_S` to 8 s so a loaded runner comfortably
+    fits, while a real regression (`ThreadingMixIn` not isolating the silent
+    connection, so the healthy request waits out its deadline) still produces
+    an elapsed time far past `HEALTHY_REQUEST_BUDGET_S`.
     """
+    HEALTHY_REQUEST_BUDGET_S = 8.0
     ca_path, cert_path, key_path, root_key, root_cert = tls_material
-    monkeypatch.setattr(BRG, "TLS_REQUEST_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(BRG, "TLS_REQUEST_TIMEOUT_S", 10.0)
     ctx = BRG.build_server_ssl_context(trust_anchor_path=ca_path,
                                        server_cert_path=str(cert_path),
                                        server_key_path=str(key_path))
@@ -1519,12 +1531,12 @@ def test_a_silent_post_handshake_connection_is_closed_after_the_request_timeout(
             elapsed = time.monotonic() - start
             assert status == 200
             assert payload["session_token"]
-            assert elapsed < BRG.TLS_REQUEST_TIMEOUT_S, (
+            assert elapsed < HEALTHY_REQUEST_BUDGET_S, (
                 "the real client waited on the silent connection's request")
 
             # The silent connection is then closed once its own request
             # deadline elapses, affecting only itself.
-            silent.settimeout(5)
+            silent.settimeout(15)
             assert silent.recv(1) == b""
         finally:
             silent.close()

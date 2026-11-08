@@ -11,7 +11,7 @@ through `fixtures/stub_claude.py` instead of a real `claude` binary — see
 that module's docstring for exactly what a dry run does and doesn't prove.
 
 `fixtures/sample_product_manager.md` stands in for the real individuated
-product-manager agent (`~/Convivy/constance-commercial/.claude/agents/
+product-manager agent (`~/Convivy/globex-commercial/.claude/agents/
 product-manager.md`), a machine-specific path this suite must not depend on.
 """
 from __future__ import annotations
@@ -49,7 +49,7 @@ def test_extract_allow_prefixes_reads_the_real_grants():
 
 @pytest.mark.parametrize("command", [
     "agentctl session-dir",
-    "agentctl session-dir --product constance",
+    "agentctl session-dir --product globex",
     "git rev-parse",
     "git rev-parse HEAD",
 ])
@@ -322,7 +322,7 @@ def test_evaluate_arm_denied_all(tmp_path):
     )
     hook_log = tmp_path / "hook.jsonl"
     _write_hook_log(hook_log, [
-        {"at": 1.0, "decision": "allow", "command": "agentctl session-dir --product constance",
+        {"at": 1.0, "decision": "allow", "command": "agentctl session-dir --product globex",
          "agent_type": "product-manager", "agent_id": None, "duration_ms": 1.0},
         {"at": 2.0, "decision": "allow", "command": "git rev-parse HEAD",
          "agent_type": "product-manager", "agent_id": None, "duration_ms": 1.0},
@@ -406,7 +406,7 @@ def test_running_the_control_first_does_not_pollute_a_later_arms_verdict(tmp_pat
     a_transcript.write_text("### STEP PROBE-DIRECT\ndecision: DENIED\n")
     hook_log = tmp_path / "a-after-c-hook.jsonl"
     _write_hook_log(hook_log, [
-        {"at": 1.0, "decision": "allow", "command": "agentctl session-dir --product constance",
+        {"at": 1.0, "decision": "allow", "command": "agentctl session-dir --product globex",
          "agent_type": "product-manager", "agent_id": None, "duration_ms": 1.0},
         {"at": 2.0, "decision": "allow", "command": "git rev-parse HEAD",
          "agent_type": "product-manager", "agent_id": None, "duration_ms": 1.0},

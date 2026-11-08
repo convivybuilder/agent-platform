@@ -10,16 +10,14 @@
 # the hook that calls it in place.
 #
 # WHAT. Writes a small POSIX sh stub to `<clone>/.git/hooks/pre-push` for
-# each of agent-platform, library, convivy-orient and convivy-deck — the
-# clone's common hooks directory, so every worktree of that clone is gated
-# too. The stub execs the deploy area's pinned interpreter against the
-# deploy area's copy of bin/push-content-gate, passing git's own pre-push
-# arguments and stdin straight through; a missing interpreter or gate file
-# refuses the push rather than letting it through unscanned. A clone that
-# does not exist on this machine is skipped, not an error.
-#
-# write-better is deliberately not in the clone list: its hook waits for a
-# Shipwright change.
+# each of agent-platform, library, convivy-orient, convivy-deck and
+# write-better — the clone's common hooks directory, so every worktree of
+# that clone is gated too. The stub execs the deploy area's pinned
+# interpreter against the deploy area's copy of bin/push-content-gate,
+# passing git's own pre-push arguments and stdin straight through; a
+# missing interpreter or gate file refuses the push rather than letting it
+# through unscanned. A clone that does not exist on this machine is
+# skipped, not an error.
 #
 # UNLIKE THE SIBLING HOOK INSTALLERS (install-knowledge-main-guard,
 # install-agent-platform-primary-guard), a foreign pre-push hook — one
@@ -85,7 +83,7 @@ fi
 DEPLOY="${DEPLOY_DIR_ARG:-$HOME/.local/deploy/agent-platform-shared}"
 
 MARKER="# managed-by: agent-platform push-gate"
-CLONES="agent-platform library convivy-orient convivy-deck"
+CLONES="agent-platform library convivy-orient convivy-deck write-better"
 
 status=0
 for repo in $CLONES; do

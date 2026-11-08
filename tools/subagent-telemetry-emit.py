@@ -44,7 +44,7 @@ except Exception:
 def _resolve_repo(cwd: str) -> str:
     """The real product for a subagent's cwd, even when it ran in a git worktree.
 
-    Dispatched workers (a co's reviewer/coder, a pa-crew agent) run in a worktree
+    Dispatched workers (a co's reviewer/coder, a lab-product crew's agent) run in a worktree
     under `.../worktrees/<name>`, whose basename is a worktree label — `agent-<hex>`
     or `<product>.<agent>-<slug>` — NOT the product. Taking `Path(cwd).name` stamped
     those labels as `repo`, which then surfaced as garbage Product chips and phantom

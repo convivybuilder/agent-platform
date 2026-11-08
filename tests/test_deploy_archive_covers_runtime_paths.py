@@ -8,7 +8,11 @@ with no fallback to the checkout.
 That failed for five days: `bin/kb-eval` reads its golden set from
 `Path(__file__).resolve().parents[1] / "eval" / "kb-golden.jsonl"`, `eval` was
 not in the archive list, and every nightly run raised FileNotFoundError against
-a deploy whose DEPLOYED_COMMIT was current.
+a deploy whose DEPLOYED_COMMIT was current. The golden set has since moved to
+`<builder root>/install/kb-golden.jsonl` (CQ·591), outside this archive, but
+`eval` still has to be here: kb-eval falls back to the tree-relative
+`eval/kb-golden.example.jsonl` whenever the install has no golden set of its
+own.
 
 This holds the list to what the code actually resolves, rather than to whoever
 last remembered to update it.
@@ -100,13 +104,25 @@ def archived_paths():
 # copes with the path being missing; adding one without that being true reopens
 # the hole quietly, so each carries its argument rather than a name alone.
 ABSENT_ON_PURPOSE = {
+    "deck": (
+        "bin/render-co-style's default --theme-committed reads deck/theme.json "
+        "(CQ-590), but only when install.sh invokes it as "
+        "\"$REPO/bin/render-co-style\" against the live checkout — $REPO is "
+        "wherever install.sh itself was run from, and deck/theme.json is a "
+        "tracked file present there whether that checkout is the primary or a "
+        "linked worktree. Nothing invokes the deployed ~/.local/bin copy on "
+        "its own; like bin/pin-claude's etc/ below, nothing schedules it."
+    ),
     "config": (
-        "lib/agent-platform/projects.py reads config/projects.json from its own "
-        "tree, and MUST NOT find a copy there. It is the privacy registry: a "
-        "deployed copy parses fine while being as old as the last install, so a "
-        "project marked private afterwards would read as PUBLIC to run-register-"
-        "api's /runs and /sessions. Its resolution falls through to the "
-        "operator's checkout precisely because this is absent (operator, 2026-09-05)."
+        "config/projects.json is gone (CQ·565): the crew registry lives in the "
+        "Library now, and lib/agent-platform/projects.py reads it from there by "
+        "default (CQ·563) — never from a file in its own tree, deployed copy "
+        "included. The privacy risk a deployed copy of that file once posed (a "
+        "project marked private after the last install reading as PUBLIC to "
+        "run-register-api's /runs and /sessions) no longer applies: there is no "
+        "file left to go stale. config/projects.seed.json, the one file left "
+        "under config/, is read only by Shipwright's own install tooling, never "
+        "by anything in this deploy tree."
     ),
     "etc": (
         "bin/pin-claude only WRITES etc/claude-pin.yaml (platform/decisions/0090), "

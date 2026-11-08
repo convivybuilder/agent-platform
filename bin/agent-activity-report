@@ -30,6 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import cost_join as cj  # noqa: E402
+import projects  # noqa: E402
 
 OUT_DEFAULT = cj.RUNS_ROOT / "activity" / "sessions.json"
 OUTCOMES_DEFAULT = cj.RUNS_ROOT / "activity" / "outcomes.json"
@@ -51,60 +52,35 @@ _SESSION_KEEP = (
     "main_loop_captured", "total_usd", "unpriced_models", "models", "prs_opened",
 )
 
-# Task/label redaction is FAIL-CLOSED. The /activity scan is opt-out — every Convivy
-# product-root session now surfaces (was a PA-only allowlist) — so only products on this
-# engineering allowlist show their free-text task/label on the shared team.convivy.com
-# surface. Every other product — a data-local lab product (hollis, ask,
-# selector, the NYH studios) whose prompts embed personal content (ARCH-243 / ADR-0027),
-# or any new/unrecognized product — has task+label redacted by default (Hollis,
-# formerly personal-assistant, stays data-local this way too) — so broadening the
-# scan can never leak personal content before a product is explicitly cleared. Cost /
-# agent / model / PR / timing metadata is always kept; only the free text is redacted.
-# The engine (cost_join) holds the true text; this producer applies the surfacing policy.
-# Add a product here only once its task prompts are confirmed free of personal content
-# (security review, PR #92, which flipped this from a deny-list to this allow-list).
-# `knowledge` and the `keel` slug JOIN on 2026-08-06, when agent-platform, substrate
-# and knowledge folded into one `keel` project marked `task_text_public: true`
-# (operator). This set is the ACTUAL gate — `_is_data_local` keys on it directly — while
-# the registry field is what `projects.public_task_slugs()` reads, so the two must
-# agree or the registry states an intent the code does not enforce.
+# Task/label redaction is FAIL-CLOSED. The /activity scan is opt-out — every
+# project-root session now surfaces (was a single-product allowlist) — so only
+# a project the registry marks `task_text_public: true` shows its free-text
+# task/label on the shared team.convivy.com surface. Every other project — a
+# data-local product whose prompts embed personal content (ARCH-243 / ADR-0027),
+# or any new/unrecognized product — has task+label redacted by default, so
+# broadening the scan can never leak personal content before a project is
+# explicitly cleared. Cost / agent / model / PR / timing metadata is always
+# kept; only the free text is redacted. The engine (cost_join) holds the true
+# text; this producer applies the surfacing policy.
 #
-# The fold's first draft took `false`, the more restrictive of the three merged
-# values, and that was wrong on inspection: agent-platform and substrate were
-# deliberately cleared by PR #92's security review, while knowledge was registered
-# in ARCH-426 step 2 under what that commit calls "the fail-closed default" and was
-# never separately judged. `false` would have propagated an unexamined default onto
-# two repos that had been examined and passed, and hidden the Keel's own work on
-# /activity while every product stayed legible.
-#
-# `knowledge` clears no personal content: the KB holds company knowledge, and user
-# data stays on-device by design (the KB unification). The `keel` slug is listed
-# beside the three repo names for the reason `svc` is — telemetry tags by repo
-# basename, so the slug form needs naming separately.
-_PUBLIC_TASK_PRODUCTS = {
-    "vivy", "vivy-commercial", "constance", "constance-commercial",
-    "agent-platform", "substrate", "knowledge", "library", "keel",
-    # The crew slugs from the 2026-08-17 split. These clear no new content: the
-    # repos behind them (`agent-platform`, `substrate`) were already cleared by
-    # the PR #92 security review and are listed above. Telemetry tags by repo
-    # basename, so this covers the slug form the registry now uses.
-    "bosun", "steward",
-    "sous-chef", "convivy-app-kit",
-    "convivy-commercial", "write-better",
-    # `svc` is the registry slug for the project whose repos are convivy-app-kit
-    # and convivy-services (ARCH-426). convivy-app-kit was already cleared above,
-    # so this clears no new content — it lets the registry NAME the posture that
-    # already applies. Telemetry tags by repo basename, so the raw string reaching
-    # _is_data_local is normally the repo; this covers the slug form.
-    "svc",
-}
+# This used to be a hand-maintained allowlist, kept in sync with the
+# registry's own `task_text_public` field by a drift test rather than by
+# reading the registry directly. Reading `projects.public_task_slugs()` here
+# retires that second list — a project clearing its task text now needs one
+# registry edit, not a matching code change — at the cost of the allowlist's
+# repo-level and legacy-slug entries (`…-commercial`, `substrate`,
+# `agent-platform`, `knowledge`, `keel`, which aren't top-level registry
+# units): a product string reaching `_is_data_local` in one of those forms now
+# redacts where the old allowlist showed it. See the PR that made this change
+# for exactly which forms that affects.
 _REDACTED = "[redacted — data-local product]"
 
 
 def _is_data_local(product) -> bool:
-    """A product whose free-text task/label must NOT reach the shared surface — anything
-    not on the engineering allowlist (fail-closed: unknown ⇒ redact)."""
-    return product not in _PUBLIC_TASK_PRODUCTS
+    """A product whose free-text task/label must NOT reach the shared surface —
+    anything the registry does not mark `task_text_public: true` (fail-closed:
+    unknown ⇒ redact)."""
+    return product not in projects.public_task_slugs()
 
 
 def _trim_node(n: dict, redact: bool) -> dict:

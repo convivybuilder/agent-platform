@@ -39,6 +39,25 @@ EOF
     chmod +x "$1"
 }
 
+# A minimal lib/agent-platform/projects.py stub, as a sibling of the script's
+# own bin/ directory the way a real deploy area and the checkout both lay it
+# out (bin/ and lib/agent-platform/ under one root; install-agent-platform-
+# shared deploys them together). The script reads
+# projects.shared_coverage_products() and projects.shared_job_host() to build
+# AUDIT_PRODUCTS/SHARED_JOB_HOST; this stub answers with made-up names
+# rather than the real registry's.
+_write_projects_stub() { # <root, i.e. the dir holding bin/>
+    mkdir -p "$1/lib/agent-platform"
+    cat > "$1/lib/agent-platform/projects.py" <<'EOF'
+def shared_coverage_products():
+    return ["acme", "globex"]
+
+
+def shared_job_host():
+    return "globex"
+EOF
+}
+
 # fake agentctl: exits 1 immediately, so every run_agent call in stages 1-3
 # takes the "failed" branch and the pipeline finishes without spawning
 # anything real.
@@ -56,6 +75,7 @@ _write_agentctl_stub "$H"
 cp "$SCRIPT" "$H/deploy/bin/launch-weekly-curation"
 chmod +x "$H/deploy/bin/launch-weekly-curation"
 _write_stub "$H/deploy/bin/worktrees-cleanup" "DEPLOY_STUB_INVOKED" 0
+_write_projects_stub "$H/deploy"
 
 MARKER="$H/marker.log"
 rc=0
@@ -76,6 +96,7 @@ _write_agentctl_stub "$H"
 cp "$SCRIPT" "$H/checkout/bin/launch-weekly-curation"
 chmod +x "$H/checkout/bin/launch-weekly-curation"
 _write_stub "$H/checkout/bin/worktrees-cleanup" "CHECKOUT_STUB_INVOKED" 0
+_write_projects_stub "$H/checkout"
 ln -sf "$H/checkout/bin/launch-weekly-curation" "$H/.local/bin/launch-weekly-curation"
 # Decoy at the OLD hardcoded location — a regression to
 # "$HOME/.local/bin/worktrees-cleanup" would invoke THIS instead.

@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.check-ci-workflow-drift</string>
+
+    <!-- Reports a registered repo whose declared `ci_workflows`
+         (the registry: the Library's `GET /registry`, or the file
+         `PROJECTS_JSON` names) disagree with GitHub's own pull-request
+         workflow list (CQ·570, issue_01M5VPQ9Z92C58R3MPGDNCA7JM): the check
+         that catches the next CQ·569 (five repos found 2026-10-26 declaring
+         `ci_workflows: {repo: []}` though each had a real CI workflow —
+         nothing noticed, so their pull requests were never CI-captured).
+         Authenticates as the convivy-bosun GitHub App, the same App and key
+         `bin/ci-result-capture` already mints a read-only token through. Exits
+         non-zero only when the check itself could not run (an unusable key, a
+         JWT mint failure, an unreadable registry) — a finding is this check's
+         product, never a failure, so it never feeds a merge gate. -->
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of check-ci-workflow-drift, not someone working on it,
+         so this reads a COPY installed from `main` into
+         ~/.local/deploy/agent-platform-shared/ (rules 2, 6, 7) instead of the
+         ~/.local/bin symlink into the checkout — that symlink still exists and
+         still reaches the tree, for the person who re-invokes
+         check-ci-workflow-drift interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH.
+
+         NOT INSTALLED BY THIS CHANGE: this plist is committed so its shape and
+         schedule are reviewable; the orchestrator loads it after merge
+         (`launchctl load`/`kickstart`) rather than this PR touching
+         ~/Library/LaunchAgents or ~/.local. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/check-ci-workflow-drift</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- 09:47 local time, daily — five minutes ahead of kb-guards-check's own
+         09:52 and cli-contract-check's 09:57, so the three morning checks do
+         not compete for the machine, and during the workday so the operator
+         sees any alert promptly. Off-minute to avoid the :00 crowd. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>9</integer>
+        <key>Minute</key><integer>47</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Convivy/agent-runs/check-ci-workflow-drift.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Convivy/agent-runs/check-ci-workflow-drift.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- ~/.local/bin is not load-bearing here (no subprocess call anywhere
+             in this script) but is kept for parity with this repo's other
+             deploy-pinned jobs, same as com.convivy.ci-result-capture.plist. -->
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -8,8 +8,9 @@
   ~30-day window, so this runs every 15 minutes to keep up with it — the same
   interval com.convivy.orient-github-capture.plist uses for the analogous job.
 
-  Black-box crews (projects.private_slugs(), today just cfo) are excluded at
-  the directory-name level before this ever opens a file inside them.
+  Black-box crews (projects.private_slugs(), today a small handful) are
+  excluded at the directory-name level before this ever opens a file inside
+  them.
 
   RunAtLoad is deliberately false, matching the sibling capture jobs: a
   capture that fires on every login/reload is a capture whose timing an

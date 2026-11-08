@@ -17,14 +17,17 @@ Two surfaces, both added at the operator's request:
 
 This is the machine-wide copy, run from agent-platform's primary checkout
 (tools/, like every other hook in ~/.claude/settings.json; that checkout only
-ever sits on main). EA keeps its own at EA/bin/outbound-guard.py for
-detect-plans. Reads the tool call as JSON on stdin; exit 2 blocks the call and
-hands the reason back to the model, exit 0 lets it through.
+ever sits on main). A private lab-product crew keeps its own copy at its own
+bin/outbound-guard.py for its detect-plans surface. Reads the tool call as
+JSON on stdin; exit 2 blocks the call and hands the reason back to the model,
+exit 0 lets it through.
 
-The operator's own addresses are per-machine operator data, read from
-~/.config/convivy/outbound-guard.env (OWN_ADDRESSES=a@x, b@y) off the passwd
-home. A missing or empty file leaves the set empty, so every connector
-recipient counts as outside and the block message names the file.
+The operator's own addresses, and any shared calendars they allow writes to
+without guests or notifications, are per-machine operator data, read from
+~/.config/convivy/outbound-guard.env (OWN_ADDRESSES=a@x, b@y; OWN_CALENDARS
+holds calendar ids the same way) off the passwd home. A missing file, or a
+missing key, leaves that set empty, so every connector recipient, and every
+calendar write, counts as outside and the block message names the file.
 
 It fails CLOSED on a connector call it cannot read, because a guard that errors
 open is the same as no guard. On Bash it fails closed only when the command
@@ -56,17 +59,21 @@ from datetime import datetime, timezone
 # HOME must not be able to point this guard at an address list it wrote.
 _HOME = os.path.realpath(pwd.getpwuid(os.getuid()).pw_dir)
 
-# The operator's own mailboxes, as per-machine data. One key, OWN_ADDRESSES, comma- or
-# space-separated, parsed as DATA and never sourced, the same doctrine
-# session_lifecycle applies to session-agent.env. The shared rental inbox stays
-# OUT of it: guests' mail lands there, so an invite there reaches someone other
-# than the operator, which is how this hook came to exist.
+# The operator's own data, in one file, two keys. OWN_ADDRESSES, their own
+# mailboxes. OWN_CALENDARS, shared calendars they have approved writes to
+# without inviting or notifying anyone else on the share (CALENDAR_WRITES,
+# below). Both comma- or space-separated, parsed as DATA and never sourced,
+# the same doctrine session_lifecycle applies to session-agent.env. The
+# shared rental inbox's address stays OUT of OWN_ADDRESSES: guests' mail
+# lands there, so an invite there reaches someone other than the operator,
+# which is how this hook came to exist.
 OWN_CONFIG = os.path.join(_HOME, ".config", "convivy", "outbound-guard.env")
 _OWN_KEY = "OWN_ADDRESSES"
+_OWN_CALENDARS_KEY = "OWN_CALENDARS"
 
 
-def own_addresses():
-    """The operator's addresses from OWN_CONFIG, lowercased; empty when unset.
+def _own_config_set(target_key):
+    """The address-shaped tokens under `target_key` in OWN_CONFIG, lowercased.
 
     An absent file, an absent key and a value holding no address all read the
     same: the empty set, under which every recipient is outside. Tokens that are
@@ -82,13 +89,24 @@ def own_addresses():
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
-        if key.strip() != _OWN_KEY:
+        if key.strip() != target_key:
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             value = value[1:-1]
         return {tok.lower() for tok in re.split(r"[,\s]+", value) if ADDRESS.fullmatch(tok)}
     return set()
+
+
+def own_addresses():
+    """The operator's addresses from OWN_CONFIG; see _own_config_set."""
+    return _own_config_set(_OWN_KEY)
+
+
+def own_calendars():
+    """The operator's named shared-calendar ids from OWN_CONFIG; see _own_config_set."""
+    return _own_config_set(_OWN_CALENDARS_KEY)
+
 
 # Tools whose whole purpose is to reach another person. Blocked outright, with no
 # recipient check: a reply or an RSVP goes to whoever sent the original, and that
@@ -122,11 +140,23 @@ ADDRESS = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 # A calendar write lands on whichever calendar `calendarId` names, and an event
 # written onto someone else's calendar reaches them as surely as an invite: the
 # shared rental inbox's calendar is one field away from the incident above. So
-# on the two calendar WRITES only, `calendarId` is checked like a recipient.
-# Reads (list_events, get_event) may name any calendar, and "primary" is the
-# operator's own, which holds no address and so passes.
+# on the two calendar WRITES only, `calendarId` is checked like a recipient --
+# UNLESS it names a calendar in OWN_CALENDARS, approved for writes that add no
+# guest and cause no notification (the operator's own shared calendar, visible
+# to someone else but never inviting or mailing them). Reads (list_events,
+# get_event) may name any calendar, and "primary" is the operator's own, which
+# holds no address and so passes.
 CALENDAR_WRITES = {"create_event", "update_event"}
 CALENDAR_TARGET_KEY = re.compile(r"^calendar_?id$", re.I)
+
+# On an OWN_CALENDARS write, these three are what would still reach the other
+# person on the share: a guest added to the event, a field asking Google to
+# notify or email guests, or conference data (creating a conference can email
+# participants). Key names only, same reasoning as RECIPIENT_KEY -- so the
+# next connector's spelling of "notify everyone" is still covered.
+SEND_UPDATES_KEY = re.compile(r"^send_?updates$", re.I)
+SEND_NOTIFICATIONS_KEY = re.compile(r"^send_?notifications$", re.I)
+CONFERENCE_DATA_KEY = re.compile(r"^conference_?data$", re.I)
 
 LOG = os.path.join(_HOME, ".local", "state", "agent-platform", "outbound-guard.log")
 SELF = os.path.realpath(__file__)
@@ -195,6 +225,34 @@ def recipients(node, under_recipient_key=False):
     elif isinstance(node, str) and under_recipient_key:
         found += ADDRESS.findall(node)
     return found
+
+
+def keys_matching(node, pattern):
+    """Every (key, value) pair in `node` whose key matches `pattern`, at any depth."""
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if pattern.match(str(key)):
+                found.append((key, value))
+            found += keys_matching(value, pattern)
+    elif isinstance(node, list):
+        for item in node:
+            found += keys_matching(item, pattern)
+    return found
+
+
+def shared_calendar_notify_reason(args):
+    """Why an OWN_CALENDARS write would still reach the other person on the
+    share, through a notification rather than a guest, or None."""
+    for key, value in keys_matching(args, SEND_UPDATES_KEY):
+        if str(value).strip().lower() != "none":
+            return f"'{key}' is {value!r}, which notifies guests on the calendar"
+    for key, value in keys_matching(args, SEND_NOTIFICATIONS_KEY):
+        if value:
+            return f"'{key}' is set, which notifies guests on the calendar"
+    if keys_matching(args, CONFERENCE_DATA_KEY):
+        return "it would add conference data, which can email participants"
+    return None
 
 
 def tokens(command):
@@ -414,16 +472,33 @@ def main():
     if action not in DRAFTS:
         own = own_addresses()
         found = recipients(args)
+        calendar_ids = []
         if action in CALENDAR_WRITES and isinstance(args, dict):
-            found += [a for k, v in args.items()
-                      if CALENDAR_TARGET_KEY.match(str(k)) and isinstance(v, str)
-                      for a in ADDRESS.findall(v)]
-        outside = sorted({a.lower() for a in found} - own)
-        if outside:
-            if not own:
-                block(tool, f"it would send to {', '.join(outside)}, and no own "
-                            f"addresses are configured in {OWN_CONFIG}")
-            block(tool, f"it would send to {', '.join(outside)}")
+            # Every calendar-id-shaped key, under every spelling and at any depth --
+            # not just the one the connector's own schema names -- because a call
+            # naming an unlisted calendar under one spelling and a listed decoy
+            # under another must not pass on the decoy alone (security review, PR 958).
+            calendar_ids = [a for k, v in keys_matching(args, CALENDAR_TARGET_KEY)
+                            if isinstance(v, str) for a in ADDRESS.findall(v)]
+
+        if calendar_ids and all(a.lower() in own_calendars() for a in calendar_ids):
+            # Approved shared calendar(s): every calendar-id value in the call is
+            # one of the operator's own, so none of them is a recipient -- but a
+            # guest or a notification field on the write would still reach the
+            # other person on the share.
+            if found:
+                block(tool, "it would add a guest to an event on a calendar "
+                            "shared with someone else, who would be invited")
+            reason = shared_calendar_notify_reason(args)
+            if reason:
+                block(tool, reason)
+        else:
+            outside = sorted({a.lower() for a in found + calendar_ids} - own)
+            if outside:
+                if not own:
+                    block(tool, f"it would send to {', '.join(outside)}, and no own "
+                                f"addresses are configured in {OWN_CONFIG}")
+                block(tool, f"it would send to {', '.join(outside)}")
 
     sys.exit(0)
 

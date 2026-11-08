@@ -187,3 +187,41 @@ def test_issues_section_lists_project_cap_refused(agent_summary, tmp_path, monke
     out = agent_summary.issues_section(start, end, runs)
     assert "run-cap-1" in out
     assert "project_cap_refused" in out
+
+
+def test_issues_section_lists_registry_lost_and_token_refused(agent_summary, tmp_path, monkeypatch):
+    # CQ-518: a reaped reservation (`registry_lost`) or a failed post-hold
+    # token re-mint (`token_refused`) must surface in the digest the same way
+    # any other failed-or-never-ran exit_status does.
+    monkeypatch.setattr(agent_summary, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(agent_summary, "STALE_LOG", tmp_path / "stale-runs.jsonl")
+    start = datetime(2026, 5, 31, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 31, 7, tzinfo=timezone.utc)
+    runs = [
+        {"run_id": "run-reg-1", "meta": {"agent": "platform-coder"},
+         "outcome": {"exit_status": "registry_lost"}},
+        {"run_id": "run-tok-1", "meta": {"agent": "platform-coder"},
+         "outcome": {"exit_status": "token_refused"}},
+    ]
+    out = agent_summary.issues_section(start, end, runs)
+    assert "run-reg-1" in out
+    assert "registry_lost" in out
+    assert "run-tok-1" in out
+    assert "token_refused" in out
+
+
+def test_issues_section_lists_registration_refused(agent_summary, tmp_path, monkeypatch):
+    # E12-2 slice S4a, D4: with the root Individuator daemon down, every
+    # dispatch on this machine ends `registration_refused` — the digest must
+    # surface that the same way it surfaces every other failed-or-never-ran
+    # exit_status, or a daemon outage would fail every dispatch closed and
+    # the daily digest would show nothing wrong.
+    monkeypatch.setattr(agent_summary, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(agent_summary, "STALE_LOG", tmp_path / "stale-runs.jsonl")
+    start = datetime(2026, 5, 31, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 5, 31, 7, tzinfo=timezone.utc)
+    runs = [{"run_id": "run-regref-1", "meta": {"agent": "platform-coder"},
+             "outcome": {"exit_status": "registration_refused"}}]
+    out = agent_summary.issues_section(start, end, runs)
+    assert "run-regref-1" in out
+    assert "registration_refused" in out

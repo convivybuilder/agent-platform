@@ -12,6 +12,11 @@ import Darwin
 import Glibc
 #endif
 
+// Nested under `PoolBlockingIntegrationSuites` (round 3, PR 1121) — see
+// that type's own doc comment for why a suite that blocks a pool thread
+// needs to be nested there rather than left as a top-level suite.
+extension PoolBlockingIntegrationSuites {
+
 /// Runs the Swift mutual-TLS client against a REAL
 /// `bosun_registration.RegistrationServer`, over a real TLS 1.3 socket, with
 /// a throwaway test root — the work item's required integration test. The
@@ -53,10 +58,18 @@ import Glibc
 // four of them hit the harness's old 15s PORT deadline at the identical
 // instant and the silent-peer test's 2s client deadline took 15s to
 // surface. `.serialized` runs this suite's tests one at a time, so only
-// one pool thread is ever blocked by this suite's own blocking work; the
-// rest of the pool, and the package's other suites, stay free. `.timeLimit`
-// on a `.serialized` suite still bounds each test individually, not the
-// suite's total, so it does not need to grow by the number of tests.
+// one pool thread is ever blocked by this suite's OWN blocking work.
+// `.timeLimit` on a `.serialized` suite still bounds each test
+// individually, not the suite's total, so it does not need to grow by the
+// number of tests.
+//
+// Round 3's own occurrence (PR 1121, job 125672806699): `.serialized` here
+// says nothing about any OTHER suite in this target that also blocks a
+// pool thread, and by the time this PR added three more such suites, the
+// pool had more blocking suites than it had threads — see
+// `PoolBlockingIntegrationSuites`'s own doc comment. Nesting this suite
+// there is what bounds the rest of the pool; this suite's own `.serialized`
+// still matters underneath it, for the reason above.
 @Suite(.serialized, .timeLimit(.minutes(3)))
 struct BosunRegistrationClientIntegrationTests {
     private static let repoRoot: URL = {
@@ -206,7 +219,7 @@ struct BosunRegistrationClientIntegrationTests {
 
         let config = IndividuatorRootConfig(
             bosunHost: expectedBosunHost, bosunURIName: "convivy://machine/\(expectedBosunHost)",
-            bosunAddress: "127.0.0.1:\(harness.port)", rootCAPath: clientRoot.pemPath(in: dir), operatorUID: 0)
+            bosunAddress: "127.0.0.1:\(harness.port)", rootCAPath: clientRoot.pemPath(in: dir), admittedAccounts: [AdmittedAccount(uid: 0, account: "operator")])
         let client = BosunRegistrationClient(
             config: config, machineKey: resolvedMachineKey, clientCertificatePEM: clientCertPEM)
 
@@ -384,7 +397,7 @@ struct BosunRegistrationClientIntegrationTests {
         try clientRoot.certificatePEM.write(to: clientTrustAnchorURL, atomically: true, encoding: .utf8)
         let config = IndividuatorRootConfig(
             bosunHost: "bosun-test", bosunURIName: "convivy://machine/bosun-test",
-            bosunAddress: "127.0.0.1:\(harness.port)", rootCAPath: clientTrustAnchorURL.path, operatorUID: 0)
+            bosunAddress: "127.0.0.1:\(harness.port)", rootCAPath: clientTrustAnchorURL.path, admittedAccounts: [AdmittedAccount(uid: 0, account: "operator")])
         let client = BosunRegistrationClient(config: config, machineKey: machineKey, clientCertificatePEM: clientCertPEM)
 
         let outcome = client.register(
@@ -450,7 +463,7 @@ struct BosunRegistrationClientIntegrationTests {
 
         let config = IndividuatorRootConfig(
             bosunHost: "bosun-test", bosunURIName: "convivy://machine/bosun-test",
-            bosunAddress: "127.0.0.1:\(port)", rootCAPath: trustAnchorURL.path, operatorUID: 0)
+            bosunAddress: "127.0.0.1:\(port)", rootCAPath: trustAnchorURL.path, admittedAccounts: [AdmittedAccount(uid: 0, account: "operator")])
         let client = BosunRegistrationClient(
             config: config, machineKey: machineKey, clientCertificatePEM: clientLeaf.pem,
             responseTimeoutSeconds: 2)
@@ -471,6 +484,8 @@ struct BosunRegistrationClientIntegrationTests {
         #expect(detail.lowercased().contains("timed out"))
     }
 }
+
+} // extension PoolBlockingIntegrationSuites
 
 /// A `MachineKey` whose `signature(for:)` always fails — the handshake's
 /// own certificate still carries a real, valid public key (`inner`'s), so
@@ -513,7 +528,12 @@ private extension TestCertificateAuthority {
 /// instead (`portTimeout` for `PORT`, `readTimeout` for `SESSIONS` and
 /// `quit()`'s own wait), and `quit()` escalates through terminate then kill
 /// rather than waiting forever.
-private final class PythonBosunHarness {
+/// Not `private`: E12·2 slice S3's own authorization integration tests
+/// (`BosunAuthorizationIntegrationTests.swift`, same target) drive the
+/// identical `bosun_test_harness.py` subprocess, over the same `register`
+/// round trip plus its own `authorize` calls, and reuse this one driver
+/// rather than a second copy of its process-lifecycle handling.
+final class PythonBosunHarness {
     enum HarnessError: Error, CustomStringConvertible {
         case didNotStart(String)
         case timedOut(String)
@@ -707,6 +727,36 @@ private final class PythonBosunHarness {
             return -1
         }
         return Int(line.dropFirst("SESSIONS ".count)) ?? -1
+    }
+
+    /// E12·2 slice S3: the row count in the Bosun's own
+    /// `authorization_audit` table — every call that reached
+    /// `bosun_authz.decide()`, allow or deny alike. Used to confirm a call
+    /// the daemon handler refused before any network call (an unknown
+    /// handle, a uid mismatch) never reached this harness at all.
+    func queryAuthorizationAuditCount() throws -> Int {
+        send("QUERY_AUTHZ_COUNT")
+        guard let line = try Self.readLine(
+            from: stdoutHandle, pending: &pending, timeout: Self.readTimeout, what: "AUTHZ_COUNT"),
+              line.hasPrefix("AUTHZ_COUNT ") else {
+            return -1
+        }
+        return Int(line.dropFirst("AUTHZ_COUNT ".count)) ?? -1
+    }
+
+    /// E12·2 slice S3: ends every live session this harness's Bosun has
+    /// registered for `machine` — the same `revoke_sessions_for_machine`
+    /// an operator's real `agentctl bosun revoke-machine` calls — so a test
+    /// can confirm the very next `authorize` call for that session is
+    /// refused.
+    func revokeMachine(_ machine: String) throws -> Int {
+        send("REVOKE_MACHINE \(machine)")
+        guard let line = try Self.readLine(
+            from: stdoutHandle, pending: &pending, timeout: Self.readTimeout, what: "REVOKED"),
+              line.hasPrefix("REVOKED ") else {
+            return -1
+        }
+        return Int(line.dropFirst("REVOKED ".count)) ?? -1
     }
 
     /// Sends `QUIT` and waits for the process to exit on its own; escalates

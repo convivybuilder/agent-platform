@@ -51,7 +51,7 @@ def test_wb_reviewer_returns_the_role_its_document_declares(tmp_path):
 
 
 def test_a_crew_reviewer_returns_its_declared_role(tmp_path):
-    db = _index(tmp_path, {"selector/agents/sel-reviewer": {"role": "reviewer"},
+    db = _index(tmp_path, {"beacon/agents/sel-reviewer": {"role": "reviewer"},
                            "deck/agents/deck-security-reviewer": {"role": "security-reviewer"}})
     assert AR.role_for("sel-reviewer", db_path=db) == "reviewer"
     assert AR.role_for("deck-security-reviewer", db_path=db) == "security-reviewer"
@@ -68,23 +68,23 @@ def test_a_name_ending_in_a_role_returns_the_role_the_document_declares(tmp_path
 def test_a_missing_document_returns_none_and_never_a_name_derived_role(tmp_path):
     """`sel-reviewer` would have derived `reviewer` from its name. With no
     document the answer is None, meaning bind by name."""
-    db = _index(tmp_path, {"selector/agents/sel-coder": {"role": "coder"}})
+    db = _index(tmp_path, {"beacon/agents/sel-coder": {"role": "coder"}})
     assert AR.role_for("sel-reviewer", db_path=db) is None
-    assert AR.role_for("selector/agents/sel-reviewer", db_path=db) is None
+    assert AR.role_for("beacon/agents/sel-reviewer", db_path=db) is None
 
 
 def test_a_document_with_no_role_returns_none(tmp_path):
-    db = _index(tmp_path, {"selector/agents/sel-reviewer": None,
-                           "selector/agents/sel-coder": {"model": "sonnet"},
-                           "selector/agents/sel-scout": {"role": ""}})
+    db = _index(tmp_path, {"beacon/agents/sel-reviewer": None,
+                           "beacon/agents/sel-coder": {"model": "sonnet"},
+                           "beacon/agents/sel-scout": {"role": ""}})
     assert AR.role_for("sel-reviewer", db_path=db) is None
     assert AR.role_for("sel-coder", db_path=db) is None
     assert AR.role_for("sel-scout", db_path=db) is None
 
 
 def test_a_full_id_and_a_bare_name_resolve_the_same(tmp_path):
-    db = _index(tmp_path, {"selector/agents/sel-reviewer": {"role": "reviewer"}})
-    assert (AR.role_for("selector/agents/sel-reviewer", db_path=db)
+    db = _index(tmp_path, {"beacon/agents/sel-reviewer": {"role": "reviewer"}})
+    assert (AR.role_for("beacon/agents/sel-reviewer", db_path=db)
             == AR.role_for("sel-reviewer", db_path=db) == "reviewer")
 
 
@@ -105,19 +105,19 @@ def _add(db: Path, doc_id: str, source_ref: str, kind: str, fm: dict | str) -> N
 def test_a_skill_under_agents_declares_no_role(tmp_path):
     """Pins the `kind = 'agent'` filter alone: the path is right, the kind is not."""
     db = _index(tmp_path, {})
-    _add(db, "selector/agents/sel-reviewer", "projects/selector/agents/sel-reviewer.md",
+    _add(db, "beacon/agents/sel-reviewer", "projects/beacon/agents/sel-reviewer.md",
          "skill", {"role": "reviewer"})
     assert AR.role_for("sel-reviewer", db_path=db) is None
-    assert AR.role_for("selector/agents/sel-reviewer", db_path=db) is None
+    assert AR.role_for("beacon/agents/sel-reviewer", db_path=db) is None
 
 
 def test_an_agent_kind_outside_agents_declares_no_role(tmp_path):
     """Pins the path filter alone: the kind is right, the path is not."""
     db = _index(tmp_path, {})
-    _add(db, "selector/skills/sel-reviewer", "projects/selector/skills/sel-reviewer.md",
+    _add(db, "beacon/skills/sel-reviewer", "projects/beacon/skills/sel-reviewer.md",
          "agent", {"role": "reviewer"})
     assert AR.role_for("sel-reviewer", db_path=db) is None
-    assert AR.role_for("selector/skills/sel-reviewer", db_path=db) is None
+    assert AR.role_for("beacon/skills/sel-reviewer", db_path=db) is None
 
 
 def test_a_forged_document_at_an_unguarded_path_is_never_a_candidate(tmp_path):
@@ -125,13 +125,13 @@ def test_a_forged_document_at_an_unguarded_path_is_never_a_candidate(tmp_path):
     field. A `kind: agent` file at a decisions/ path is a candidate for neither
     lookup form, whatever `id` it carries, and the real document's answer is
     untouched by its presence."""
-    db = _index(tmp_path, {"selector/agents/sel-reviewer": {"role": "reviewer"}})
-    _add(db, "selector/agents/sel-coder", "projects/platform/decisions/0099-x.md",
+    db = _index(tmp_path, {"beacon/agents/sel-reviewer": {"role": "reviewer"}})
+    _add(db, "beacon/agents/sel-coder", "projects/platform/decisions/0099-x.md",
          "agent", {"role": "coder"})
     assert AR.role_for("sel-reviewer", db_path=db) == "reviewer"
-    assert AR.role_for("selector/agents/sel-reviewer", db_path=db) == "reviewer"
+    assert AR.role_for("beacon/agents/sel-reviewer", db_path=db) == "reviewer"
     assert AR.role_for("sel-coder", db_path=db) is None
-    assert AR.role_for("selector/agents/sel-coder", db_path=db) is None
+    assert AR.role_for("beacon/agents/sel-coder", db_path=db) is None
 
 
 def test_a_forgery_that_took_over_a_real_agents_id_never_supplies_the_role(tmp_path):
@@ -141,9 +141,9 @@ def test_a_forgery_that_took_over_a_real_agents_id_never_supplies_the_role(tmp_p
     `id` (the earlier `role_for`) that row answers `coder`. Read by `source_ref`
     it is not an agent document, so the forged role is never returned."""
     db = _index(tmp_path, {})
-    _add(db, "selector/agents/sel-reviewer", "projects/platform/decisions/0099-x.md",
+    _add(db, "beacon/agents/sel-reviewer", "projects/platform/decisions/0099-x.md",
          "agent", {"role": "coder"})
-    assert AR.role_for("selector/agents/sel-reviewer", db_path=db) is None
+    assert AR.role_for("beacon/agents/sel-reviewer", db_path=db) is None
     assert AR.role_for("sel-reviewer", db_path=db) is None
 
 
@@ -164,20 +164,20 @@ def test_a_bare_name_two_documents_disagree_on_raises_naming_them(tmp_path):
 
 
 def test_a_matched_document_with_unusable_frontmatter_raises_naming_it(tmp_path):
-    db = _index(tmp_path, {"selector/agents/sel-coder": {"role": "coder"}})
-    _add(db, "selector/agents/sel-reviewer", "projects/selector/agents/sel-reviewer.md",
+    db = _index(tmp_path, {"beacon/agents/sel-coder": {"role": "coder"}})
+    _add(db, "beacon/agents/sel-reviewer", "projects/beacon/agents/sel-reviewer.md",
          "agent", "[1, 2]")
-    with pytest.raises(AR.AgentRoleError, match="projects/selector/agents/sel-reviewer.md"):
+    with pytest.raises(AR.AgentRoleError, match="projects/beacon/agents/sel-reviewer.md"):
         AR.role_for("sel-reviewer", db_path=db)
     with pytest.raises(AR.AgentRoleError, match="sel-reviewer.md"):
-        AR.role_for("selector/agents/sel-reviewer", db_path=db)
+        AR.role_for("beacon/agents/sel-reviewer", db_path=db)
 
 
 def test_a_document_with_unusable_frontmatter_is_ignored_when_not_matched(tmp_path):
     """Only matched rows are parsed, so one bad document does not block every
     other agent's lookup."""
-    db = _index(tmp_path, {"selector/agents/sel-coder": {"role": "coder"}})
-    _add(db, "selector/agents/sel-reviewer", "projects/selector/agents/sel-reviewer.md",
+    db = _index(tmp_path, {"beacon/agents/sel-coder": {"role": "coder"}})
+    _add(db, "beacon/agents/sel-reviewer", "projects/beacon/agents/sel-reviewer.md",
          "agent", "[1, 2]")
     assert AR.role_for("sel-coder", db_path=db) == "coder"
 
@@ -190,7 +190,7 @@ def test_a_missing_index_raises_rather_than_reading_as_bind_by_name(tmp_path):
 
 
 def test_the_default_index_follows_kb_index_db(tmp_path, monkeypatch):
-    db = _index(tmp_path, {"selector/agents/sel-reviewer": {"role": "reviewer"}})
+    db = _index(tmp_path, {"beacon/agents/sel-reviewer": {"role": "reviewer"}})
     monkeypatch.setenv("KB_INDEX_DB", str(db))
     assert AR.role_for("sel-reviewer") == "reviewer"
 

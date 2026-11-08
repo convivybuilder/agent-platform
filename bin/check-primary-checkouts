@@ -34,7 +34,7 @@ EXCEPT for a black-box crew — see below. A missing checkout degrades gracefull
 the repo is simply not checked. It never creates a work item (platform/decisions/0073).
 
 A SECOND, INDEPENDENT BREACH: the job itself is not loaded or is disabled.
-`com.convivy.appkit.autoupdate` sat disabled for 26 days before anyone noticed
+A crew's primary-checkout autoupdate job sat disabled for 26 days before anyone noticed
 (engineering-practice/skills/security-review-rubric rule 2) — a branch check can
 never catch this, because a job that never fires also never leaves its checkout
 on the wrong branch. `launchctl bootstrap` reports a disabled service only as an
@@ -88,6 +88,7 @@ import sys
 from typing import Any, NamedTuple
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import builder_root as BR  # noqa: E402
+import projects  # noqa: E402
 
 CONVIVY_ROOT = BR.root()
 
@@ -95,107 +96,57 @@ CONVIVY_ROOT = BR.root()
 # reads it. DECLARED, not discovered: a repo that is merely present must not be
 # policed, and only the deployment mechanism tells the two apart. The `reads` text
 # goes into the alert, so whoever gets paged learns what is actually affected
-# rather than only that a rule was broken.
+# rather than only that a rule was broken. Read from the registry's own
+# `live_checkout_readers` field (projects.live_checkout_readers) rather than a
+# literal dict here, so adding or retiring a live-read repo is a registry edit.
 #
 # `jobs`: the launchd labels, among those already named in `reads` above, whose
-# liveness `check_jobs` also checks. DECLARED here rather than parsed out of the
+# liveness `check_jobs` also checks. DECLARED rather than parsed out of the
 # `reads` prose at runtime, for the same reason the repo list itself is declared
 # and not discovered: a rewording of `reads` that happened to drop a label's exact
 # spelling would silently stop checking it, with nothing to say so. Left empty
-# where `reads` names no single job: `agent-platform`'s "every cron job",
-# `convivy-orient`'s `serve.sh`, and `selector`'s deliberately unenumerated
-# `com.selector.*` family (see the comment at that entry for why).
-_LIVE_CHECKOUTS: dict[str, dict[str, Any]] = {
-    "agent-platform": {
-        "reads": "~/.local/bin and ~/.local/lib symlink into this working tree "
-                 "(ARCH-229), so every cron job and the 01:00 overnight run "
-                 "whatever branch it sits on",
-        "adr": "ARCH-396",
-        "jobs": (),
-    },
-    "knowledge": {
-        "reads": "com.convivy.knowledge-watcher indexes this checkout, so an "
-                 "off-main branch changes what every agent can retrieve",
-        "adr": "ARCH-395",
-        "jobs": ("com.convivy.knowledge-watcher",),
-    },
-    "convivy-orient": {
-        "reads": "serve.sh runs the site from this checkout and the full-tier "
-                 "dashboards render live per request (ARCH-182), so team.convivy.com "
-                 "serves whatever branch it sits on",
-        "adr": "ARCH-182",
-        "jobs": (),
-    },
-    # The four below came out of PR #347's review. The reviewer found
-    # convivy-services; sweeping every launchd plist for the same shape found the
-    # other three, which is the fourth time in two days that a list of "the places
-    # X happens" was short. The audit below is the answer to that pattern.
-    "convivy-services": {
-        "reads": "com.convivy.think-gateway is a PERSISTENT service (KeepAlive) "
-                 "running convivy_services from an EDITABLE install in this "
-                 "checkout's .venv, so uvicorn imports the source tree directly — "
-                 "every /think request the mini serves runs whatever branch this "
-                 "checkout sits on, from the next request onward",
-        "adr": "ARCH-249",
-        "jobs": ("com.convivy.think-gateway",),
-    },
-    # No job COUNTS in these descriptions, deliberately. The first version said
-    # "nine launchd jobs" for selector and the real number was ten; a count in a
-    # paging alert drifts every time a job is added or retired, and being wrong
-    # about the number is worse than not stating one, because it invites the
-    # reader to trust the rest of the sentence (reviewer, #347). The same reason
-    # leaves `jobs` empty here rather than guessing at individual labels: naming
-    # some of a `com.selector.*` family and not the rest would read as complete
-    # coverage while being exactly the gap this comment already warns against.
-    "selector": {
-        "reads": "the com.selector.* jobs — the web server, the poller, the "
-                 "backfills, the sweeps, the deploy — all run from this checkout, "
-                 "and the selector package is an EDITABLE install in its .venv, so "
-                 "the source tree is what they execute",
-        "adr": "ARCH-247",
-        "jobs": (),
-    },
-    "selector-backend": {
-        "reads": "com.selector-backend.api serves the MusicBrainz mirror API from "
-                 "this checkout",
-        "adr": "ARCH-247",
-        "jobs": ("com.selector-backend.api",),
-    },
-    "convivy-app-kit": {
-        "reads": "com.convivy.rails.update runs deploy-rails against this checkout "
-                 "(--kit-checkout) and the package is an EDITABLE install in its "
-                 ".venv, so the source tree is what a rails deploy ships. "
-                 "com.convivy.appkit.autoupdate also names this path but only "
-                 "`git pull --ff-only`s INTO it — it is not a reader, and a pull "
-                 "onto a feature branch is its own quiet problem",
-        "adr": "ARCH-249",
-        # BOTH checked, not just the reader: `com.convivy.appkit.autoupdate` is
-        # the exact job that sat disabled for 26 days unnoticed (module docstring
-        # "A SECOND, INDEPENDENT BREACH" above) — "not a reader" explains why the
-        # branch check above never names it, not why its own liveness wouldn't
-        # matter.
-        "jobs": ("com.convivy.rails.update", "com.convivy.appkit.autoupdate"),
-    },
-    # The two below came out of check-serving-checkouts' own launchd audit
-    # (agent-platform#423/#424) finding two checkouts a plist reads that were in
-    # NEITHER this dict nor _NOT_LIVE — the exact gap this file's completeness
-    # audit exists to surface, closed here by the audit's own next reader.
-    "library": {
-        "reads": "com.convivy.library runs the Library API straight out of this "
-                 "checkout (platform/decisions/0022 made it its own deployable "
-                 "service), so the branch it sits on is the code every request is "
-                 "served from — this is the checkout that served code from 19 "
-                 "hours before library#45 merged (2026-08-20) because nothing here "
-                 "had classified it as live",
-        "adr": "platform/decisions/0022",
-        "jobs": ("com.convivy.library",),
-    },
-    "CFO": {
-        "reads": "com.convivy.cfo-review reads this checkout",
-        "adr": "platform/decisions/0043",
-        "jobs": ("com.convivy.cfo-review",),
-    },
-}
+# where `reads` names no single job: the platform repo's "every cron job", the
+# Orient repo's `serve.sh`, and one repo's deliberately unenumerated job
+# family (see that repo's own `reads` text in the registry for why: naming
+# SOME of a family and not the rest would read as complete coverage
+# while being exactly the gap this file's completeness audit exists to surface).
+#
+# READ AT IMPORT, BUT NEVER LETS THE IMPORT CRASH (round 5, security review of
+# PR#985; broadened round 6). Both plists that run this script leave
+# `PROJECTS_JSON` unset, so a Library outage or a missing registry token raises
+# `projects.RegistryUnavailable` here every time, and a `PROJECTS_JSON` pointed
+# at an unreadable file raises `OSError`/`json.JSONDecodeError` the same way
+# `projects._explicit_project_by_name` already catches. Uncaught, any of those
+# killed `--assert` before it could return `EXIT_ASSERT_BREACH` — the refusal
+# code `primary-checkout-autoupdate` already treats as "do not pull" — so
+# `primary-checkout-autoupdate` read the crash as "the check could not run" and pulled
+# anyway, unchecked, which is the exact hazard this check exists to close. It
+# also killed the monitor before `main()` could log anything, so the outage
+# itself was invisible.
+#
+# ANY FAILURE TO READ OR INTERPRET THE REGISTRY IS RECORDED AND TURNED INTO A
+# REFUSAL (round 6). `live_checkout_readers()` also calls `projects.load()`,
+# which runs `_validate_kb_project_targets()` over the WHOLE registry document
+# — every unit, not just the ones this file reads — and raises a plain
+# `ValueError` when any unit's `kb_project_by_repo` or `kb_scope_exceptions` is
+# invalid; and a `live_checkout_readers` row missing `"reads"` raises
+# `KeyError` while this file's own rows are read. The registry is edited by
+# several PRs at once, so a bad row in a unit this file never looks at still
+# reaches this import. Catching only the three exception types round 5 named
+# let either escape uncaught, same crash as round 5 fixed. `except Exception`
+# (never `BaseException`, so `KeyboardInterrupt`/`SystemExit` still propagate)
+# catches every way the read and row-parsing above can fail, known or not.
+# `_REGISTRY_ERROR` records the exception's type and message; `assert_one` and
+# `main()` below both check it before touching `_LIVE_CHECKOUTS`, which stays
+# `{}` rather than a partial or stale document — "unknown" must never read as
+# "nothing live", the same rule `projects.RegistryUnavailable`'s own docstring
+# states for privacy data.
+try:
+    _LIVE_CHECKOUTS: dict[str, dict[str, Any]] = projects.live_checkout_readers()
+    _REGISTRY_ERROR: Exception | None = None
+except Exception as _registry_exc:
+    _LIVE_CHECKOUTS = {}
+    _REGISTRY_ERROR = _registry_exc
 
 # Checkouts a launchd job references that are NOT branch-sensitive, each with the
 # reason. Empty today, and that is the point: the audit below treats an
@@ -274,15 +225,16 @@ def _is_private_checkout(repo_dir: pathlib.Path) -> bool:
     reimplemented — that file's docstring has the full history (security-reviewer,
     PR #423, run-0d72a1e3): a finding's own EXISTENCE in the shared, multi-reader
     signal store is the leak ADR-0043 forbids, independent of how little it says,
-    so CFO's breach here must never reach `_post_signal` even though this check has
-    always been branch-name-only and never reads file content.
+    so a black-box crew's breach here must never reach `_post_signal` even though
+    this check has always been branch-name-only and never reads file content.
 
     Delegates to `private_crew.private_home_for`, the SAME registry lookup
     `session_state.py`/`tmux_transcript.py`/`check-serving-checkouts` already use
     — not a second implementation that could drift from theirs, and one that
     compares real paths via `os.path.samefile` rather than a slug string, which
-    matters here specifically: CFO's checkout directory is capital-`CFO` on disk
-    while the registry slug is lower-case `cfo`.
+    matters here specifically: a black-box crew's checkout directory does not
+    always match the registry slug's exact case (one registered crew's is
+    capitalized on disk while its slug is lower-case).
 
     Returns `True` — skip logging — both when the checkout genuinely IS private
     and when that cannot be determined at all (the import failed, or
@@ -499,7 +451,7 @@ def _legacy_label_loaded(label: str) -> str | None:
     actually reports loaded. Scoped to `com.convivy.*` labels only (the only
     ones CQ-428 could have renamed) — a bare last-dot-segment match would
     false-match an unrelated job for a multi-dot label like
-    `com.convivy.appkit.autoupdate`.
+    `com.convivy.foo.bar`.
     """
     if not label.startswith(_OWNED_LABEL_PREFIX):
         return None
@@ -576,6 +528,7 @@ def check_jobs(repo: str, cfg: dict[str, Any], convivy_root: pathlib.Path,
 
 
 EXIT_ASSERT_BREACH = 4   # --assert: the named checkout is off main
+EXIT_REGISTRY_UNAVAILABLE = 5   # sweep mode: the registry itself could not be read
 
 
 def assert_one(repo: str, convivy_root: pathlib.Path, *, actor: str) -> int:
@@ -583,7 +536,7 @@ def assert_one(repo: str, convivy_root: pathlib.Path, *, actor: str) -> int:
 
     THE MONITOR BOUNDS HOW LONG a bad state lasts; this stops it being ACTED ON
     (ARCH-441). Both reviewers of PR #347 made the same structural point from
-    different angles: `com.convivy.appkit.autoupdate` pulls INTO a checkout on a
+    different angles: `primary-checkout-autoupdate` pulls INTO a checkout on a
     schedule, and if that checkout is on a feature branch the pull either
     fast-forwards the feature branch to new remote commits or fails outright,
     neither of which anyone intends — and the 15-minute monitor learns about it
@@ -598,7 +551,21 @@ def assert_one(repo: str, convivy_root: pathlib.Path, *, actor: str) -> int:
     within fifteen minutes. A second logger would double-report one incident and
     make the signal count of it wrong. Refusing loudly on stderr, and letting
     the caller decide what a refusal means, is this function's whole job.
+
+    A REGISTRY THAT COULD NOT BE READ IS A REFUSAL TOO (round 5). `_REGISTRY_ERROR`
+    means `_LIVE_CHECKOUTS` is `{}` regardless of whether `repo` is actually
+    declared live-read, so looking it up there would misreport "not in
+    _LIVE_CHECKOUTS" (a declaration gap) when the real cause is "could not
+    confirm it's on main at all". Checked first, and returns the same
+    `EXIT_ASSERT_BREACH` `primary-checkout-autoupdate` already treats as "do not pull" —
+    an unconfirmed checkout must refuse exactly like a confirmed off-main one.
     """
+    if _REGISTRY_ERROR is not None:
+        print(f"REFUSING: cannot read the live-checkout registry ({_REGISTRY_ERROR}), "
+              f"so whether the {repo} primary checkout is on main cannot be confirmed.\n"
+              f"  {actor} was about to act on it; treating this the same as a breach "
+              f"until the registry is readable again.", file=sys.stderr)
+        return EXIT_ASSERT_BREACH
     cfg = _LIVE_CHECKOUTS.get(repo)
     if cfg is None:
         print(f"assert: {repo!r} is not in _LIVE_CHECKOUTS — refusing rather than "
@@ -652,12 +619,38 @@ def main(argv: list[str] | None = None) -> int:
     breaches = 0
     day = _utc_today()
 
+    # THE SWEEP CANNOT RUN AT ALL without the registry (round 5): every repo it
+    # would check, and the completeness audit's own exclusion set, come from
+    # `_LIVE_CHECKOUTS`, which is `{}` here precisely because it could not be
+    # read. Sweeping an empty map would read as "every live checkout passed" —
+    # a false "all clear" for the exact outage window this check exists to
+    # catch. Reported through `_post_signal`, the same alert path a breach
+    # uses below (neither it nor `signal_client` needs the registry, so the
+    # outage this is reporting does not also block reporting it), and a
+    # distinct nonzero exit rather than 0, so launchd's own run history shows
+    # this sweep did not pass — it did not run.
+    if _REGISTRY_ERROR is not None:
+        print(f"check-primary-checkouts: cannot read the live-checkout registry "
+              f"({_REGISTRY_ERROR}) — no checkout was swept this run", file=sys.stderr)
+        res = _post_signal(
+            "agent-platform",
+            "[primary-checkout] the live-checkout registry could not be read",
+            f"**check-primary-checkouts could not read the live-checkout registry: "
+            f"{_REGISTRY_ERROR}.**\n\n"
+            f"No checkout was swept and no launchd job was checked this run, so a "
+            f"branch or job breach during this outage would go undetected. The next "
+            f"run (within fifteen minutes) retries.",
+            dedup_key=f"primary-checkout:registry-unavailable:{day}",
+            severity="high", dry_run=opts.no_report)
+        print(f"[REGISTRY-UNAVAILABLE] → {res.get('status', '?')}", file=sys.stderr)
+        return EXIT_REGISTRY_UNAVAILABLE
+
     # The COMPLETENESS audit, before the branch checks. A repo missing from
     # `_LIVE_CHECKOUTS` is not reported as healthy — it is not reported at all,
     # which is the failure this whole tool is about, one level up. PR #347's
-    # reviewer found `convivy-services` missing; sweeping the plists found three
-    # more, so the gap was not a one-off oversight and a list nobody re-derives
-    # will have another.
+    # reviewer found a private crew's own repository missing; sweeping the
+    # plists found three more, so the gap was not a one-off oversight and a
+    # list nobody re-derives will have another.
     unclassified = sorted(
         launchd_referenced_repos(pathlib.Path(opts.launch_agents), convivy_root)
         - set(_LIVE_CHECKOUTS) - set(_NOT_LIVE))

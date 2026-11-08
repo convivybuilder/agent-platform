@@ -39,9 +39,10 @@ REQUIRED_RUN_FILES = (
     "outcome.json",
 )
 VALID_EXIT_STATUSES = {"completed", "killed", "errored", "budget_refused", "running",
-                       # a wave the resume-watchdog superseded by re-spawning the
-                       # orchestrator after it died mid-drain (ARCH-160) — terminal,
-                       # not an error; the 05:00 healthcheck treats it as fine.
+                       # a wave the (now-retired) resume-watchdog superseded by
+                       # re-spawning the orchestrator after it died mid-drain
+                       # (ARCH-160) — terminal, not an error. Kept as a historical
+                       # value for runs already recorded with it.
                        "superseded",
                        # a worker (coder, bug-fixer) that committed its fix but exited
                        # before the orchestrator called `agentctl publish` — the work
@@ -112,7 +113,36 @@ VALID_EXIT_STATUSES = {"completed", "killed", "errored", "budget_refused", "runn
                        # until revocation exists) before any agent was materialized —
                        # distinct from `budget_refused`, which is agentctl's own
                        # daily scheduled-pool gate against a different ledger.
-                       "project_cap_refused"}
+                       "project_cap_refused",
+                       # `R.attach_pid` raised KeyError because the reservation it
+                       # was filling in was already reaped by another registry
+                       # write (CQ·518 — a reservation aged by its original
+                       # `started_at` could already be past RESERVATION_TIMEOUT_SECONDS
+                       # the moment it was taken, when a multi-hour usage hold sat
+                       # between the two). The dispatcher had already started the
+                       # claude child by then; it kills that child's process group
+                       # and records this instead of leaving it running with no
+                       # registry entry and no outcome.json. The KeyError text
+                       # lands in error_reason.
+                       "registry_lost",
+                       # the per-run convivy-bosun installation token, re-minted right
+                       # after a usage hold returns because the pre-hold mint lasts only
+                       # one hour and the hold can run for several (CQ·518, second half:
+                       # one crew's held reviewers read an expired token as "could not read
+                       # check-runs" and a 401 from `gh pr checks`, 2026-10-19). The
+                       # dispatcher never starts the claude child on this path — no
+                       # process to kill, unlike `registry_lost` above — and never falls
+                       # back to the pre-hold token or the operator's own credential. The
+                       # mint's own refusal reason lands in error_reason.
+                       "token_refused",
+                       # the root Individuator daemon refused (or could not be reached
+                       # for) this run's agent-session registration (E12·2 slice S4a) —
+                       # the daemon absent, the connection refused, a timeout, or a
+                       # named refusal reply. The dispatcher never starts the claude
+                       # child on this path, the same "never happened" shape as
+                       # `capacity_refused`/`token_refused`; the refusal's own reason
+                       # lands in error_reason.
+                       "registration_refused"}
 # Subscription rate-limit states, in SEVERITY ORDER — the list is the ordering,
 # so `RATE_LIMIT_SEVERITY.index()` is what compares two of them and there is no
 # second copy to drift. Values observed across every transcript on the box:
@@ -184,17 +214,23 @@ CLAUDE_PRICING_PER_MTOK = {
     # will not occur; the row previously carried $3/$15 and read 50% high. Do not
     # revert it to $3/$15.
     "claude-sonnet-5":   {"input": 2.0, "output": 10.0, "cache_write": 2.50, "cache_write_1h": 4.0, "cache_read": 0.20},
-    # Sonnet 5.5 had no row at all, so every run on it (the review-model eval's
-    # baseline) priced as unpriced/None. Read from the live pricing page on
-    # 2026-10-07: base input $2, 5-minute cache write $2.50, 1-hour cache write
-    # $4, output $10. The page disagrees with itself on cache reads: the model
-    # table gives $0.20 (the standard 0.1x input, same as claude-sonnet-5), but
-    # the prompt-caching section gives 0.05x ("$0.10 USD on Claude Sonnet 5.5").
-    # This row uses the model table's $0.20 — the same rate every other
-    # non-footnoted row uses — rather than the prompt-caching section's figure.
-    "claude-sonnet-5-5": {"input": 2.0, "output": 10.0, "cache_write": 2.50, "cache_write_1h": 4.0, "cache_read": 0.20},
+    # Sonnet 5.5 read from the live pricing page on 2026-10-20: base input $2,
+    # 5-minute cache write $2.50, 1-hour cache write $4, cache read $0.10
+    # (0.05x input, footnote 2), output $10.
+    "claude-sonnet-5-5": {"input": 2.0, "output": 10.0, "cache_write": 2.50, "cache_write_1h": 4.0, "cache_read": 0.10},
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_write_1h": 6.0, "cache_read": 0.30},
     "claude-haiku-4-5":  {"input": 1.0, "output":  5.0, "cache_write": 1.25, "cache_write_1h": 2.0, "cache_read": 0.10},
+    # Haiku 5.5 (model trial 2's third arm, CQ·525) is priced by prompt length,
+    # read from the live pricing page on 2026-10-20: up to 100,000 prompt tokens
+    # $0.10 input / $0.125 5-minute cache write / $0.20 1-hour cache write /
+    # $0.01 cache read / $0.50 output per Mtok; over 100,000 prompt tokens $0.50 /
+    # $0.625 / $1.00 / $0.05 / $2.50. This table prices a run's per-model totals
+    # and can't tell which requests crossed the threshold, so this row is pinned
+    # to the OVER-100,000 rates — the direction that overcounts rather than
+    # undercounts against the trial's per-arm cost cap, the same rule the
+    # gateway's deepseek pin follows. A coder's requests routinely carry more
+    # than 100,000 prompt tokens.
+    "claude-haiku-5-5":  {"input": 0.50, "output": 2.50, "cache_write": 0.625, "cache_write_1h": 1.0, "cache_read": 0.05},
 }
 
 # OpenAI API list pricing for the models the Codex CLI serves, USD per million
@@ -212,9 +248,12 @@ CODEX_PRICING_PER_MTOK = {
     "gpt-5.5":       {"input":  5.00, "output": 30.00, "cache_write":  5.00, "cache_read": 0.50},
 }
 
-# A run's origin: who initiated the spawn (ARCH-156). `scheduled` = a launchd
-# launcher (overnight, weekly-consulting) set AGENT_RUN_ORIGIN in the env, which
-# propagates through every descendant agentctl spawn; `curation` = the weekly
+# A run's origin: who initiated the spawn (ARCH-156). `scheduled` = today,
+# `agentctl`'s own root-of-inheritance fallback when a named parent's recorded
+# origin is unreadable (the overnight and weekly-consulting launchers that
+# used to set AGENT_RUN_ORIGIN directly are retired, platform/decisions/0102
+# and 0103); the value propagates through every descendant agentctl spawn the
+# same way either source would; `curation` = the weekly
 # curation launcher, split into its own budget pool so a heavy overnight can't
 # starve it (ARCH-320); `interactive` = dispatched from a human `co` session (the
 # env-unset default); `full_monty` = a deliberate subscription-headroom burn
@@ -270,6 +309,18 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def platform_day_for(when: datetime) -> str:
+    """The LOCAL day bucket (see `platform_day`) for a specific instant `when`,
+    rather than the current moment — a run's recorded finish time (`ended_at`),
+    bucketed the same way `platform_day` buckets "now", for a caller resolving
+    a past run's day (e.g. the spend-ledger poster's day-of-finish, or a sweep
+    run well after the fact). `when` must be timezone-aware; `.astimezone()`
+    with no argument converts it to the system's local timezone before taking
+    the date, the same conversion `platform_day` performs on `datetime.now()`.
+    """
+    return when.astimezone().strftime("%Y-%m-%d")
+
+
 def platform_day() -> str:
     """The platform's run-dir + budget day key, in LOCAL time (ARCH-156).
 
@@ -280,9 +331,13 @@ def platform_day() -> str:
     bucket. `agent-summary` already fires on `datetime.now().astimezone().date()`,
     so a local run-dir key also aligns the daily summary with the dirs it reads.
 
-    Timestamps stay UTC (`now_iso`); only the day *bucket* is local.
+    Timestamps stay UTC (`now_iso`); only the day *bucket* is local. Delegates
+    to `platform_day_for` for "now" (`datetime.now(timezone.utc)`), the same
+    real instant `datetime.now().astimezone()` used to compute directly —
+    converting from an aware UTC `now` rather than assuming a naive one is
+    already local reaches the identical wall-clock date.
     """
-    return datetime.now().astimezone().strftime("%Y-%m-%d")
+    return platform_day_for(datetime.now(timezone.utc))
 
 
 def today_dir() -> str:
@@ -299,9 +354,17 @@ def new_run_id() -> str:
     return f"run-{secrets.token_hex(4)}"
 
 
-def run_dir(run_id: str, *, date: str | None = None) -> Path:
-    """Resolve the on-disk directory for a run."""
-    return RUNS_ROOT / (date or today_dir()) / run_id
+def run_dir(run_id: str, *, date: str | None = None, root: "Path | None" = None) -> Path:
+    """Resolve the on-disk directory for a run.
+
+    `root` defaults to the shared `RUNS_ROOT`; a caller routing a black-box
+    crew's run into its own home (ADR-0043's fourth surface,
+    `bin/agentctl`'s `_private_run_root`) passes that crew's own run-corpus
+    root instead. Same `<root>/<date>/<run_id>` shape either way, so every
+    other reader/writer in this module (`write_meta`, `read_cost`, ...) works
+    unchanged against either root — they all take the resolved directory as
+    their own first argument and never read `RUNS_ROOT` themselves."""
+    return (root if root is not None else RUNS_ROOT) / (date or today_dir()) / run_id
 
 
 # --- owner-only write primitives ----------------------------------------------
@@ -345,25 +408,133 @@ def open_owner_only(path: Path, *, append: bool = False) -> IO[bytes]:
 # --- creation -----------------------------------------------------------------
 
 
+class RunRootIsSymlink(OSError):
+    """Raised by `ensure_real_dir` when something already exists at the given
+    path and is not a real, non-symlink directory.
+
+    A private crew's own earlier, sandboxed dispatch can plant a symlink at
+    any path under its own home it knows the name of in advance —
+    `<home>/agent-runs` itself, or that root's date directory — immediately
+    before a LATER, unsandboxed call creates or uses it; following such a
+    link would let that dispatch redirect a later run's entire corpus
+    (transcript, tool calls, task text) outside its own sandbox's write
+    grant. Named so a caller that must tell this apart from an ordinary
+    creation failure can catch exactly this — `agentctl spawn` catches it
+    around its `create_run_dir` call and refuses the dispatch (exit 2)
+    rather than falling back to the shared run root."""
+
+
+def ensure_real_dir(path: "Path | str") -> None:
+    """Make `path` a real, non-symlink directory, or raise `RunRootIsSymlink`.
+
+    Checked by `os.lstat` BEFORE anything else touches `path` — never
+    `path.is_dir()`/`os.stat`, which follow a symlink to answer what it
+    points AT, exactly the question this function must answer NO to for a
+    symlink aimed at a real directory elsewhere. `Path.mkdir(...,
+    exist_ok=True)` alone does not catch this: it treats an existing
+    symlink-to-a-directory as satisfying `exist_ok` and is a silent no-op,
+    which is the gap this function closes for `_ensure_root`/`create_run_dir`
+    (security-reviewer and reviewer, PR #1101 round 3 — round 2's
+    `O_EXCL|O_NOFOLLOW` fix below protected only the `.gitignore` file
+    create, not the directory creation/chmod against the same `root`, or
+    `create_run_dir`'s own date-directory creation under it).
+
+    `path` (and any missing parents) is created when nothing exists there
+    yet. An existing REAL directory is left exactly as it is — this never
+    chmods or otherwise touches it. A caller does not always pin `path`'s
+    own mode afterward: `_ensure_root` chmods the exact path checked here
+    (`root`) to 0700, but `create_run_dir` chmods `d`, one level below the
+    date directory (`d.parent`) checked here — so a date directory's mode
+    is left at whatever `Path.mkdir`'s default/umask produced. Accepts a
+    plain `str` as well as a `Path` — `tools/session-event-log.py` (whose
+    own paths are all `os.path.join` strings) imports and calls this
+    directly rather than keeping a second copy of the same check."""
+    p = Path(path)
+    try:
+        st = os.lstat(p)
+    except OSError:
+        p.mkdir(parents=True, exist_ok=True)
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        raise RunRootIsSymlink(f"{p} exists and is not a real directory")
+
+
+def _ensure_root(root: Path, *, gitignore: bool = False) -> None:
+    """Create `root` if absent and pin it to 0700.
+
+    The SessionStart hook also does this for `RUNS_ROOT`, but autonomous
+    dispatches (scheduled, launchd) never fire that hook. Calling this from
+    `create_run_dir`/`create_accounting_stub` closes the gap: the traversal
+    gate is set on the first run regardless of how the session started —
+    for `RUNS_ROOT` and, for a black-box crew's own run-corpus root
+    (ADR-0043's fourth surface), for that root too.
+
+    `gitignore`, set only for a black-box crew's own run-corpus root (never
+    for RUNS_ROOT, which lives outside any tree `agentctl` dispatches into),
+    also writes a `.gitignore` containing `*` directly inside `root` the
+    first time it is created — not just a convention this time: that root
+    lives inside the crew's own git working tree, so its own `git add -A`
+    could otherwise stage the full, unredacted run corpus (transcripts, tool
+    calls, task text) ADR-0043 exists to keep out of a shared store. The
+    same flag also picks `ensure_real_dir` over a plain `mkdir` for `root`
+    itself, below — RUNS_ROOT needs neither defense, since it lives outside
+    every tree a dispatched run can write to.
+
+    `gitignore=True` runs from `agentctl spawn`'s own dispatching process —
+    not a run `run_sandbox.py` has wrapped in a Seatbelt profile; that
+    profile confines the CHILD this call is about to create a run directory
+    for, not the parent creating it. So a private crew's own earlier,
+    sandboxed dispatch can replace `root` (predictable: `<home>/agent-runs`)
+    with a symlink before a LATER spawn's call here ever runs, and nothing
+    confines this write away from following it. `ensure_real_dir` refuses
+    that (round 3); the `.gitignore` write below separately uses
+    `O_EXCL|O_NOFOLLOW` for its own, narrower reason — round 2 fixed that
+    file create before round 3 fixed the directory create/chmod around it
+    (security-reviewer, PR #1101 rounds 2 and 3 — the identical gap to
+    `session-event-log.py`'s hook-log write, one directory over)."""
+    if gitignore:
+        ensure_real_dir(root)
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+    # Assumes single-user ownership of `root`. On a shared host where it
+    # was created by another user, os.chmod raises PermissionError here —
+    # surfacing the misconfiguration rather than silently continuing.
+    os.chmod(root, 0o700)
+    if gitignore:
+        ignore = root / ".gitignore"
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+        try:
+            fd = os.open(str(ignore), flags, 0o644)
+        except OSError:
+            pass
+        else:
+            try:
+                os.write(fd, b"*\n")
+            finally:
+                os.close(fd)
+
+
 def _ensure_runs_root() -> None:
-    """Create RUNS_ROOT if absent and pin it to 0700.
-
-    The SessionStart hook also does this, but autonomous dispatches (scheduled,
-    launchd) never fire that hook. Calling this from create_run_dir closes the
-    gap: the traversal gate is set on the first run regardless of how the session
-    started.
-    """
-    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
-    # Assumes single-user ownership of RUNS_ROOT. On a shared host where RUNS_ROOT
-    # was created by another user, os.chmod raises PermissionError here — surfacing
-    # the misconfiguration rather than silently continuing.
-    os.chmod(RUNS_ROOT, 0o700)
+    _ensure_root(RUNS_ROOT)
 
 
-def create_run_dir(run_id: str, *, date: str | None = None) -> Path:
-    """Make the run directory + initialize empty append-files and a prompts/ dir."""
-    _ensure_runs_root()
-    d = run_dir(run_id, date=date)
+def create_run_dir(run_id: str, *, date: str | None = None,
+                   root: "Path | None" = None) -> Path:
+    """Make the run directory + initialize empty append-files and a prompts/ dir.
+
+    `root` — see `run_dir`'s own docstring for what it means and defaults to.
+
+    For a private crew's own root (`root` not None), the date directory
+    `d.parent` is exactly as predictable and plantable as `root` itself
+    (`_ensure_root`'s own docstring), so it gets the same `ensure_real_dir`
+    check — raising `RunRootIsSymlink` — before `d` is created under it
+    (ARCH-322 round 3). RUNS_ROOT's own date directories skip the check,
+    for the reason `_ensure_root` gives for `root` itself."""
+    base = root if root is not None else RUNS_ROOT
+    _ensure_root(base, gitignore=root is not None)
+    d = run_dir(run_id, date=date, root=base)
+    if root is not None:
+        ensure_real_dir(d.parent)
     d.mkdir(parents=True, exist_ok=False)
     os.chmod(d, 0o700)
     (d / "prompts").mkdir()
@@ -373,6 +544,26 @@ def create_run_dir(run_id: str, *, date: str | None = None) -> Path:
     # fchmod rather than relying on os.open's umask-masked mode argument.
     for name in ("transcript.jsonl", "tool_calls.jsonl"):
         write_owner_only(d / name, b"")
+    return d
+
+
+def create_accounting_stub(run_id: str, *, date: str | None = None) -> Path:
+    """Make the SHARED-SIDE accounting record for a black-box crew's run
+    (ADR-0043's fourth surface, platform/decisions/0043): a bare, owner-only
+    run directory under the shared `RUNS_ROOT`, at the same `<date>/<run_id>`
+    this run's real (private) directory also uses, holding nothing on
+    creation — no `prompts/`, no `transcript.jsonl`, no `tool_calls.jsonl`.
+
+    A caller writes `meta.json`/`cost.json`/`outcome.json` into the directory
+    this returns the same way it would into any other run directory
+    (`write_meta`, `write_cost`, `write_outcome`) — this function only makes
+    the bare directory shape intentionally SMALLER than `create_run_dir`'s,
+    so there is never a file here for a task string, a transcript line or a
+    tool call to land in, on disk, even by accident."""
+    _ensure_runs_root()
+    d = run_dir(run_id, date=date)
+    d.mkdir(parents=True, exist_ok=False)
+    os.chmod(d, 0o700)
     return d
 
 
@@ -453,8 +644,8 @@ def write_meta(d: Path, **fields: Any) -> None:
         # every meta.json already on disk predates this field and must keep
         # validating. `repo` alone can't say whether a dispatch reached a
         # black-box crew: `--agents-dir` is honoured before `repo` is even
-        # looked at, so `--on constance --agents-dir <root>/CFO/.claude/agents`
-        # writes `repo: "constance"` while loading a CFO agent. This is the
+        # looked at, so `--on acme --agents-dir <root>/acme-private/.claude/agents`
+        # writes `repo: "acme"` while loading a private crew's agent. This is the
         # second signal `projects.dispatch_is_private` needs to catch that,
         # which `session_state._dispatched_by`'s privacy filter reads
         # (agent-platform#465 round 2).
@@ -487,6 +678,16 @@ def write_meta(d: Path, **fields: Any) -> None:
         # materialized (e.g. `_ledger_cap_refuse_and_record`).
         "persona_source": fields.get("persona_source"),
     }
+    # Blind model trial (operator approval 2026-10-18): `agentctl spawn --trial
+    # <name>` records the trial name here, alongside `model`/`model_resolved` above
+    # — both already wrote the real model before this field existed, and still do,
+    # so a trial run's record is never missing which model actually ran. Added to
+    # the payload ONLY when a trial name is present, not as a `fields.get(...)`
+    # default of `None` like the optional fields above it: a non-trial dispatch's
+    # meta.json must stay byte-identical to what `write_meta` wrote before this
+    # parameter existed, and a `"trial": null` key on every run would not.
+    if fields.get("trial"):
+        payload["trial"] = fields["trial"]
     if payload["billing_source"] not in VALID_BILLING_SOURCES:
         raise ValueError(f"invalid billing_source: {payload['billing_source']}")
     if payload["origin"] not in VALID_ORIGINS:

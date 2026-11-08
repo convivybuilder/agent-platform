@@ -102,7 +102,7 @@ def stubs(tmp_path, tmux_sock, monkeypatch):
     s.calls_log = calls_log
     s.root = tmp_path / "Convivy"
     (s.root / "substrate").mkdir(parents=True)
-    (s.root / "vivy").mkdir()
+    (s.root / "finch").mkdir()
     (s.root / "convivy-deck").mkdir()
     s.projects = tmp_path / "projects"
     s.projects.mkdir()
@@ -170,14 +170,14 @@ def restore(stubs, tmux_sock, *, names, dry_run=False, stagger=0.0, sleep=None,
 # --- the window and the marker -------------------------------------------------
 
 def test_window_takes_only_interactive_transcripts_written_in_range(stubs, tmux_sock, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "in-window", cwd=vivy,
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "in-window", cwd=finch,
                      mtime=KILL_TIME)
-    write_transcript(stubs.projects, slug_for(vivy), "too-old", cwd=vivy,
+    write_transcript(stubs.projects, slug_for(finch), "too-old", cwd=finch,
                      mtime=WINDOW_START - 60)
-    write_transcript(stubs.projects, slug_for(vivy), "after-kill", cwd=vivy,
+    write_transcript(stubs.projects, slug_for(finch), "after-kill", cwd=finch,
                      mtime=KILL_TIME + 900)
-    rc = restore(stubs, tmux_sock, names={"in-window": "vivy"}, dry_run=True,
+    rc = restore(stubs, tmux_sock, names={"in-window": "finch"}, dry_run=True,
                  until=KILL_TIME + 60)
     out = capsys.readouterr().out
     assert rc == 0
@@ -191,10 +191,10 @@ def test_dispatched_runs_are_left_out_even_inside_the_window(stubs, tmux_sock, c
     worktree.mkdir(parents=True)
     write_transcript(stubs.projects, slug_for(str(worktree)), "dispatched",
                      cwd=str(worktree), mtime=KILL_TIME, entrypoint="sdk-cli")
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "interactive", cwd=vivy,
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "interactive", cwd=finch,
                      mtime=KILL_TIME)
-    restore(stubs, tmux_sock, names={"dispatched": "x", "interactive": "vivy"}, dry_run=True)
+    restore(stubs, tmux_sock, names={"dispatched": "x", "interactive": "finch"}, dry_run=True)
     out = capsys.readouterr().out
     # Match the session token, not the word: the pytest tmp path contains "dispatched".
     assert "session dispatched" not in out
@@ -216,25 +216,25 @@ def test_marker_is_the_entrypoint_so_an_interactive_session_in_a_worktree_is_kep
 
 def test_launch_directory_comes_from_the_slug_so_a_subdirectory_resumes_from_the_root(
         stubs, tmux_sock):
-    sub = stubs.root / "vivy" / "src" / "deep"
+    sub = stubs.root / "finch" / "src" / "deep"
     sub.mkdir(parents=True)
-    write_transcript(stubs.projects, slug_for(str(stubs.root / "vivy")), "sub-session",
-                     cwd=str(sub), mtime=KILL_TIME, title="vivy")
-    rc = restore(stubs, tmux_sock, names={"sub-session": "vivy"})
+    write_transcript(stubs.projects, slug_for(str(stubs.root / "finch")), "sub-session",
+                     cwd=str(sub), mtime=KILL_TIME, title="finch")
+    rc = restore(stubs, tmux_sock, names={"sub-session": "finch"})
     assert rc == 0
     calls = wait_for_co(stubs, 1)
     assert len(calls) == 1
-    assert os.path.realpath(calls[0]["pwd"]) == os.path.realpath(str(stubs.root / "vivy"))
+    assert os.path.realpath(calls[0]["pwd"]) == os.path.realpath(str(stubs.root / "finch"))
 
 
 def test_a_generic_path_crew_gets_its_agent_as_the_first_argument(stubs, tmux_sock):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "vivy-session", cwd=vivy,
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "finch-session", cwd=finch,
                      mtime=KILL_TIME, agent="planning-orchestrator")
-    rc = restore(stubs, tmux_sock, names={"vivy-session": "vivy"})
+    rc = restore(stubs, tmux_sock, names={"finch-session": "finch"})
     assert rc == 0
     calls = wait_for_co(stubs, 1)
-    assert calls[0]["args"][:4] == ["planning-orchestrator", "--resume", "vivy-session",
+    assert calls[0]["args"][:4] == ["planning-orchestrator", "--resume", "finch-session",
                                     CR.RESUME_PROMPT]
 
 
@@ -249,10 +249,10 @@ def test_a_crew_without_an_agent_gets_no_agent_argument(stubs, tmux_sock):
 
 
 def test_an_agent_setting_that_is_a_flag_is_refused_not_passed_to_co(stubs, tmux_sock, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "flagged", cwd=vivy,
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "flagged", cwd=finch,
                      mtime=KILL_TIME, agent="--model")
-    restore(stubs, tmux_sock, names={"flagged": "vivy"}, dry_run=True)
+    restore(stubs, tmux_sock, names={"flagged": "finch"}, dry_run=True)
     out = capsys.readouterr().out
     assert "is not an agent name" in out
 
@@ -260,32 +260,32 @@ def test_an_agent_setting_that_is_a_flag_is_refused_not_passed_to_co(stubs, tmux
 # --- the live checks -----------------------------------------------------------
 
 def test_a_crew_already_live_at_the_top_is_skipped(stubs, tmux_sock, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
-    subprocess.run(["tmux", "-L", tmux_sock, "new-session", "-d", "-s", "vivy", "sleep 600"],
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
+    subprocess.run(["tmux", "-L", tmux_sock, "new-session", "-d", "-s", "finch", "sleep 600"],
                    check=True)
-    restore(stubs, tmux_sock, names={"v1": "vivy"}, dry_run=True)
-    assert "tmux session vivy is already live" in capsys.readouterr().out
+    restore(stubs, tmux_sock, names={"v1": "finch"}, dry_run=True)
+    assert "tmux session finch is already live" in capsys.readouterr().out
 
 
 def test_liveness_is_checked_immediately_before_each_start_not_once_at_the_top(
         stubs, tmux_sock, capsys):
     # Two crews, both absent at the top. Between the two starts, someone starts the
     # second crew by hand (the 2026-09-27 case). The second start must notice it.
-    vivy = str(stubs.root / "vivy")
+    finch = str(stubs.root / "finch")
     deck = str(stubs.root / "convivy-deck")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     write_transcript(stubs.projects, slug_for(deck), "d1", cwd=deck, mtime=KILL_TIME - 5)
 
     def someone_starts_deck(seconds: float) -> None:
         subprocess.run(["tmux", "-L", tmux_sock, "new-session", "-d", "-s", "deck",
                         "sleep 600"], check=True)
 
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy", "d1": "deck"},
+    rc = restore(stubs, tmux_sock, names={"v1": "finch", "d1": "deck"},
                  sleep=someone_starts_deck)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "sent          vivy" in out
+    assert "sent          finch" in out
     assert "skip          deck: tmux session deck went live before its start" in out
     assert "deck" in live_names(tmux_sock)
     # Only the first crew gets a `co`: the second was skipped, so no resume was typed for it.
@@ -324,10 +324,10 @@ def test_only_one_steward_is_resumed_per_run(stubs, tmux_sock, capsys):
 # --- the ensure-server refusal -------------------------------------------------
 
 def test_ensure_server_is_called_before_any_session_and_sees_none(stubs, tmux_sock):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     stubs.set_session_agent(0, "")
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy"})
+    rc = restore(stubs, tmux_sock, names={"v1": "finch"})
     assert rc == 0
     assert stubs.calls_log.read_text().split() == ["ensure"]
     assert (stubs.log / "ensure-sessions.log").read_text().split() == ["0"]
@@ -335,10 +335,10 @@ def test_ensure_server_is_called_before_any_session_and_sees_none(stubs, tmux_so
 
 def test_an_ensure_server_refusal_stops_the_run_with_its_message_and_no_session(
         stubs, tmux_sock, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     stubs.set_session_agent(1, "tmux server is not GUI-born; kickstart the keeper")
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy"})
+    rc = restore(stubs, tmux_sock, names={"v1": "finch"})
     captured = capsys.readouterr()
     assert rc == 1
     assert "kickstart the keeper" in captured.err
@@ -349,12 +349,12 @@ def test_an_ensure_server_refusal_stops_the_run_with_its_message_and_no_session(
 # --- the stagger and the dry run -----------------------------------------------
 
 def test_the_stagger_is_a_parameter_and_separates_the_starts(stubs, tmux_sock):
-    vivy = str(stubs.root / "vivy")
+    finch = str(stubs.root / "finch")
     deck = str(stubs.root / "convivy-deck")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     write_transcript(stubs.projects, slug_for(deck), "d1", cwd=deck, mtime=KILL_TIME - 5)
     waits: list[float] = []
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy", "d1": "deck"}, stagger=7.5,
+    rc = restore(stubs, tmux_sock, names={"v1": "finch", "d1": "deck"}, stagger=7.5,
                  sleep=waits.append)
     assert rc == 0
     assert waits == [7.5]
@@ -365,13 +365,13 @@ def test_the_default_stagger_is_five_seconds():
 
 
 def test_dry_run_prints_the_plan_and_starts_nothing(stubs, tmux_sock, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     stubs.set_session_agent(0, "")
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy"}, dry_run=True)
+    rc = restore(stubs, tmux_sock, names={"v1": "finch"}, dry_run=True)
     out = capsys.readouterr().out
     assert rc == 0
-    assert "would resume" in out and "vivy" in out
+    assert "would resume" in out and "finch" in out
     assert "dry run: nothing started" in out
     assert live_names(tmux_sock) == []
     assert not stubs.calls_log.exists()
@@ -382,9 +382,9 @@ def test_dry_run_prints_the_plan_and_starts_nothing(stubs, tmux_sock, capsys):
 
 def test_a_transcript_with_no_recorded_tmux_name_is_skipped_and_nothing_is_guessed(
         stubs, tmux_sock, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME,
-                     title="vivy")
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME,
+                     title="finch")
     rc = restore(stubs, tmux_sock, names={})
     assert rc == 0
     out = capsys.readouterr().out
@@ -395,8 +395,8 @@ def test_a_transcript_with_no_recorded_tmux_name_is_skipped_and_nothing_is_guess
 
 
 def test_unknown_tmux_state_refuses_rather_than_starting(stubs, tmux_sock, monkeypatch, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     real_run = subprocess.run
 
     def refusing(argv, **kwargs):
@@ -405,7 +405,7 @@ def test_unknown_tmux_state_refuses_rather_than_starting(stubs, tmux_sock, monke
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(CR.subprocess, "run", refusing)
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy"})
+    rc = restore(stubs, tmux_sock, names={"v1": "finch"})
     assert rc == 1
     assert "cannot read tmux state: permission denied" in capsys.readouterr().err
     assert not stubs.calls_log.exists()
@@ -417,8 +417,8 @@ def test_unknown_tmux_state_refuses_rather_than_starting(stubs, tmux_sock, monke
 ])
 def test_a_socket_failure_that_is_not_no_server_stops_the_run(
         stubs, tmux_sock, monkeypatch, capsys, stderr):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     real_run = subprocess.run
 
     def refusing(argv, **kwargs):
@@ -427,7 +427,7 @@ def test_a_socket_failure_that_is_not_no_server_stops_the_run(
         return real_run(argv, **kwargs)
 
     monkeypatch.setattr(CR.subprocess, "run", refusing)
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy"})
+    rc = restore(stubs, tmux_sock, names={"v1": "finch"})
     assert rc == 1
     assert "cannot read tmux state" in capsys.readouterr().err
     assert live_names(tmux_sock) == []
@@ -500,10 +500,10 @@ def test_the_refusal_lists_every_tmux_process_with_its_command_line(monkeypatch)
 
 def test_a_live_tmux_process_with_a_gone_socket_stops_the_run_before_any_start(
         stubs, tmux_sock, monkeypatch, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     _missing_socket(monkeypatch, [(4242, "tmux new-session -d -s a.b.test")])
-    rc = restore(stubs, tmux_sock, names={"v1": "vivy"})
+    rc = restore(stubs, tmux_sock, names={"v1": "finch"})
     assert rc == 1
     err = capsys.readouterr().err
     assert "pid 4242: tmux new-session -d -s a.b.test" in err and "Nothing was started" in err
@@ -558,14 +558,14 @@ def test_clean_env_drops_the_co_credential_path_so_tmux_never_inherits_it(monkey
     # tmux gives a server's global environment, and every pane made on it, the environment
     # of the process that starts the server. A restore started with the path in its
     # environment would otherwise put it in every later pane (probed 2026-10-06).
-    monkeypatch.setenv("ORIENT_OPS_CO_TOKEN_FILE", "/tmp/co-credential")
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", "/tmp/co-credential")
     env = CR.clean_env()
-    assert "ORIENT_OPS_CO_TOKEN_FILE" not in env
+    assert "ORIENT_OPS_CREW_TOKEN_FILE" not in env
 
 
 def test_a_transcript_whose_slug_names_no_ancestor_of_its_cwd_is_skipped():
     t = CR.Transcript(session_id="orphan", project_dir="-srv-convivy-gone",
-                      mtime=KILL_TIME, entrypoint="cli", cwd="/srv/convivy/ask",
+                      mtime=KILL_TIME, entrypoint="cli", cwd="/srv/convivy/parlor",
                       title="example--tennis", agent=None)
     assert CR.launch_dir(t) is None
     steps = CR.plan([t], {"orphan": "example--tennis"}, set(), "/x/substrate", False)
@@ -575,15 +575,15 @@ def test_a_transcript_whose_slug_names_no_ancestor_of_its_cwd_is_skipped():
 def test_the_newest_transcript_claims_a_name_and_an_older_one_for_the_same_crew_is_skipped(
         tmp_path):
     root = tmp_path / "Convivy"
-    (root / "vivy").mkdir(parents=True)
-    newer = CR.Transcript("new", project_dir=slug_for(str(root / "vivy")), mtime=KILL_TIME,
-                          entrypoint="cli", cwd=str(root / "vivy"), title=None, agent=None)
-    older = CR.Transcript("old", project_dir=slug_for(str(root / "vivy")), mtime=KILL_TIME - 9,
-                          entrypoint="cli", cwd=str(root / "vivy"), title=None, agent=None)
-    steps = CR.plan([newer, older], {"new": "vivy", "old": "vivy"}, set(),
+    (root / "finch").mkdir(parents=True)
+    newer = CR.Transcript("new", project_dir=slug_for(str(root / "finch")), mtime=KILL_TIME,
+                          entrypoint="cli", cwd=str(root / "finch"), title=None, agent=None)
+    older = CR.Transcript("old", project_dir=slug_for(str(root / "finch")), mtime=KILL_TIME - 9,
+                          entrypoint="cli", cwd=str(root / "finch"), title=None, agent=None)
+    steps = CR.plan([newer, older], {"new": "finch", "old": "finch"}, set(),
                     str(root / "substrate"), False)
     assert steps[0].skip is None
-    assert "a newer transcript already resumes tmux session vivy" in steps[1].skip
+    assert "a newer transcript already resumes tmux session finch" in steps[1].skip
 
 
 def test_window_arithmetic_for_since_and_from(tmp_path):
@@ -624,23 +624,23 @@ def run_main(stubs, tmux_sock: str, runs: Path, *extra: str) -> int:
 
 
 def test_the_tmux_name_comes_from_the_co_record_of_the_same_session(stubs, tmux_sock, tmp_path, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     runs = tmp_path / "runs"
-    write_record(runs, "v1", "vivy")
+    write_record(runs, "v1", "finch")
     write_record(runs, "other", "decoy")
     rc = run_main(stubs, tmux_sock, runs, "--dry-run")
     out = capsys.readouterr().out
     assert rc == 0
-    assert any(line.startswith("would resume  vivy  ") and "name from co-* record" in line
+    assert any(line.startswith("would resume  finch  ") and "name from co-* record" in line
                for line in out.splitlines())
     assert "decoy" not in out, "a record for a session with no transcript names nothing"
 
 
 def test_a_record_without_a_tmux_session_leaves_the_crew_skipped_with_the_reason(
         stubs, tmux_sock, tmp_path, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     runs = tmp_path / "runs"
     write_record(runs, "v1")  # pre-dates the field, or the session was not in a pane
     rc = run_main(stubs, tmux_sock, runs, "--dry-run")
@@ -652,38 +652,38 @@ def test_a_record_without_a_tmux_session_leaves_the_crew_skipped_with_the_reason
 
 
 def test_a_session_flag_overrides_the_record_name(stubs, tmux_sock, tmp_path, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     runs = tmp_path / "runs"
-    write_record(runs, "v1", "vivy")
+    write_record(runs, "v1", "finch")
     rc = run_main(stubs, tmux_sock, runs, "--dry-run", "--session", "v1=crewx")
     out = capsys.readouterr().out
     assert rc == 0
     lines = out.splitlines()
     assert any(line.startswith("would resume  crewx  ") and "name from --session" in line
                for line in lines)
-    assert not any(line.startswith("would resume  vivy") for line in lines)
+    assert not any(line.startswith("would resume  finch") for line in lines)
 
 
 def test_a_session_flag_adds_a_session_the_window_missed(stubs, tmux_sock, tmp_path, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy,
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch,
                      mtime=WINDOW_START - 600)  # written before the window opens
     runs = tmp_path / "runs"
     assert run_main(stubs, tmux_sock, runs, "--dry-run") == 0
     assert "would resume" not in capsys.readouterr().out
-    assert run_main(stubs, tmux_sock, runs, "--dry-run", "--session", "v1=vivy") == 0
+    assert run_main(stubs, tmux_sock, runs, "--dry-run", "--session", "v1=finch") == 0
     out = capsys.readouterr().out
-    assert any(line.startswith("would resume  vivy  ") and "picked by --session" in line
+    assert any(line.startswith("would resume  finch  ") and "picked by --session" in line
                for line in out.splitlines())
 
 
 def test_a_session_flag_naming_no_interactive_transcript_is_reported(stubs, tmux_sock, tmp_path, capsys):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "bot", cwd=vivy, mtime=KILL_TIME,
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "bot", cwd=finch, mtime=KILL_TIME,
                      entrypoint="sdk-cli")
     rc = run_main(stubs, tmux_sock, tmp_path / "runs", "--dry-run",
-                  "--session", "bot=vivy", "--session", "ghost=vivy")
+                  "--session", "bot=finch", "--session", "ghost=finch")
     out = capsys.readouterr().out
     assert rc == 0
     assert "skip          session bot: no interactive transcript" in out
@@ -691,7 +691,7 @@ def test_a_session_flag_naming_no_interactive_transcript_is_reported(stubs, tmux
     assert "would resume" not in out
 
 
-@pytest.mark.parametrize("flag", ["v1", "bad name=vivy", "v1=bad name"])
+@pytest.mark.parametrize("flag", ["v1", "bad name=finch", "v1=bad name"])
 def test_a_malformed_session_flag_is_refused_before_anything_runs(flag, tmp_path, capsys):
     with pytest.raises(SystemExit) as refused:
         CR.main(["--from", WINDOW_START_ISO, "--root", str(tmp_path),
@@ -701,16 +701,16 @@ def test_a_malformed_session_flag_is_refused_before_anything_runs(flag, tmp_path
 
 
 def test_a_real_start_resumes_the_crew_under_its_recorded_name(stubs, tmux_sock, tmp_path):
-    vivy = str(stubs.root / "vivy")
-    write_transcript(stubs.projects, slug_for(vivy), "v1", cwd=vivy, mtime=KILL_TIME)
+    finch = str(stubs.root / "finch")
+    write_transcript(stubs.projects, slug_for(finch), "v1", cwd=finch, mtime=KILL_TIME)
     runs = tmp_path / "runs"
-    write_record(runs, "v1", "vivy")
+    write_record(runs, "v1", "finch")
     stubs.set_session_agent(0, "")
     assert run_main(stubs, tmux_sock, runs) == 0
-    assert "vivy" in live_names(tmux_sock)
+    assert "finch" in live_names(tmux_sock)
     calls = wait_for_co(stubs, 1)
     assert len(calls) == 1
-    assert calls[0]["pwd"].endswith("vivy")
+    assert calls[0]["pwd"].endswith("finch")
     assert calls[0]["args"][:2] == ["--resume", "v1"]
 
 
@@ -742,12 +742,12 @@ def test_help_says_the_window_misses_sessions_that_were_idle(capsys):
 
 def test_a_session_flag_with_a_trailing_newline_in_its_session_id_is_refused():
     with pytest.raises(argparse.ArgumentTypeError):
-        CR._session_pair("0a1b\n=vivy")
+        CR._session_pair("0a1b\n=finch")
 
 
 def test_a_session_flag_with_a_trailing_newline_in_its_tmux_name_is_refused():
     with pytest.raises(argparse.ArgumentTypeError):
-        CR._session_pair("0a1b=vivy\n")
+        CR._session_pair("0a1b=finch\n")
 
 
 def test_a_since_duration_with_a_trailing_newline_is_refused():
@@ -756,20 +756,20 @@ def test_a_since_duration_with_a_trailing_newline_is_refused():
 
 
 def test_an_agent_setting_with_a_trailing_newline_is_skipped_not_resumed(tmp_path):
-    vivy = tmp_path / "vivy"
-    vivy.mkdir()
-    t = CR.Transcript(session_id="v1", project_dir=CR.project_slug(str(vivy)), mtime=KILL_TIME,
-                      entrypoint="cli", cwd=str(vivy), title=None, agent="coder\n")
-    (step,) = CR.plan([t], {"v1": "vivy"}, set(), str(tmp_path / "substrate"), False)
+    finch = tmp_path / "finch"
+    finch.mkdir()
+    t = CR.Transcript(session_id="v1", project_dir=CR.project_slug(str(finch)), mtime=KILL_TIME,
+                      entrypoint="cli", cwd=str(finch), title=None, agent="coder\n")
+    (step,) = CR.plan([t], {"v1": "finch"}, set(), str(tmp_path / "substrate"), False)
     assert step.argv == ()
     assert "is not an agent name" in step.skip
 
 
 def test_a_session_id_with_a_trailing_newline_is_skipped_not_resumed(tmp_path):
-    vivy = tmp_path / "vivy"
-    vivy.mkdir()
-    t = CR.Transcript(session_id="v1\n", project_dir=CR.project_slug(str(vivy)), mtime=KILL_TIME,
-                      entrypoint="cli", cwd=str(vivy), title=None, agent=None)
-    (step,) = CR.plan([t], {"v1\n": "vivy"}, set(), str(tmp_path / "substrate"), False)
+    finch = tmp_path / "finch"
+    finch.mkdir()
+    t = CR.Transcript(session_id="v1\n", project_dir=CR.project_slug(str(finch)), mtime=KILL_TIME,
+                      entrypoint="cli", cwd=str(finch), title=None, agent=None)
+    (step,) = CR.plan([t], {"v1\n": "finch"}, set(), str(tmp_path / "substrate"), False)
     assert step.argv == ()
     assert "transcript name is not a session id" in step.skip

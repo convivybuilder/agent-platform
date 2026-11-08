@@ -8,7 +8,18 @@ issue whose PR was abandoned rather than merged.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
+
+
+@contextmanager
+def _fake_read_token_pool(**kw):
+    """Stands in for `GA.read_token_pool` in a test that drives `main()` end
+    to end and stubs `pr_state` itself: yields an `env_for` that answers
+    every repo with a plain dict rather than reaching the install's GitHub
+    App."""
+    yield lambda repo_slug: {}
 
 
 @pytest.fixture
@@ -16,7 +27,7 @@ def rec(issue_pr_reconcile):
     return issue_pr_reconcile
 
 
-def _issue(iid="issue_1", product="selector", **kw):
+def _issue(iid="issue_1", product="beacon", **kw):
     out = {"id": iid, "product": product, "title": "a title"}
     out.update(kw)
     return out
@@ -27,14 +38,14 @@ def _issue(iid="issue_1", product="selector", **kw):
 def test_prefers_server_derived_pr_repo(rec):
     """`pr_repo` is org-pinned by the server; `pr_url` is stored as supplied. When
     both are present the derived one wins, so a crafted url cannot redirect the check."""
-    ref = rec.pr_ref(_issue(pr_repo="convivy/selector-backend", pr=13,
-                            pr_url="https://github.com/convivy/selector/pull/13"))
-    assert ref == ("convivy/selector-backend", "13")
+    ref = rec.pr_ref(_issue(pr_repo="convivy/beacon-backend", pr=13,
+                            pr_url="https://github.com/convivy/beacon/pull/13"))
+    assert ref == ("convivy/beacon-backend", "13")
 
 
 def test_falls_back_to_pr_url_when_repo_absent(rec):
-    assert rec.pr_ref(_issue(pr_url="https://github.com/convivy/vivy/pull/1095")) == \
-        ("convivy/vivy", "1095")
+    assert rec.pr_ref(_issue(pr_url="https://github.com/convivy/widget/pull/1095")) == \
+        ("convivy/widget", "1095")
 
 
 def test_reads_the_loopback_refs_shape(rec):
@@ -42,14 +53,14 @@ def test_reads_the_loopback_refs_shape(rec):
     flattens the same values to the top level. Reading only the flattened shape made
     every real issue look unresolvable while the sweep reported a clean pass — a
     silent no-op that no test using the flattened shape could catch."""
-    issue = _issue(refs={"url": "https://github.com/convivy/sous-chef/pull/417",
-                         "pr": "417", "repo": "convivy/sous-chef"})
-    assert rec.pr_ref(issue) == ("convivy/sous-chef", "417")
+    issue = _issue(refs={"url": "https://github.com/convivy/globex/pull/417",
+                         "pr": "417", "repo": "convivy/globex"})
+    assert rec.pr_ref(issue) == ("convivy/globex", "417")
 
 
 def test_refs_url_alone_resolves(rec):
-    assert rec.pr_ref(_issue(refs={"url": "https://github.com/convivy/vivy/pull/9"})) == \
-        ("convivy/vivy", "9")
+    assert rec.pr_ref(_issue(refs={"url": "https://github.com/convivy/widget/pull/9"})) == \
+        ("convivy/widget", "9")
 
 
 def test_refs_repo_is_still_org_pinned(rec):
@@ -62,19 +73,19 @@ def test_a_non_dict_refs_does_not_crash_the_sweep(rec):
 
 
 def test_never_derives_repo_from_product(rec):
-    """The failure this tool must not have. `selector` spans convivy/selector AND
-    convivy/selector-backend, so product+pr resolves to the wrong repo and would mark
+    """The failure this tool must not have. `beacon` spans convivy/beacon AND
+    convivy/beacon-backend, so product+pr resolves to the wrong repo and would mark
     live work fixed against a coincidentally-numbered PR. Absent both references, the
     answer is None — not a guess from `product`."""
-    assert rec.pr_ref(_issue(product="selector", pr=13)) is None
-    assert rec.pr_ref(_issue(product="selector")) is None
+    assert rec.pr_ref(_issue(product="beacon", pr=13)) is None
+    assert rec.pr_ref(_issue(product="beacon")) is None
 
 
 @pytest.mark.parametrize("url", [
-    "https://github.com/evil/selector/pull/1",       # out of org
-    "https://github.com/convivy/selector/pull/abc",  # not a number
-    "https://github.com/convivy/selector/issues/1",  # not a PR
-    "http://github.com/convivy/selector/pull/1",     # not https
+    "https://github.com/evil/beacon/pull/1",       # out of org
+    "https://github.com/convivy/beacon/pull/abc",  # not a number
+    "https://github.com/convivy/beacon/issues/1",  # not a PR
+    "http://github.com/convivy/beacon/pull/1",     # not https
     "https://github.com.evil.test/convivy/x/pull/1",  # host suffix
     "",
 ])
@@ -83,10 +94,10 @@ def test_rejects_a_pr_url_that_is_not_a_convivy_pr(rec, url):
 
 
 def test_rejects_an_out_of_org_pr_repo(rec):
-    assert rec.pr_ref(_issue(pr_repo="evil/selector", pr=1)) is None
+    assert rec.pr_ref(_issue(pr_repo="evil/beacon", pr=1)) is None
 
 
-@pytest.mark.parametrize("repo", ["convivy/-selector", "convivy/-", "convivy/"])
+@pytest.mark.parametrize("repo", ["convivy/-beacon", "convivy/-", "convivy/"])
 def test_rejects_a_repo_name_that_could_read_as_a_flag(rec, repo):
     """A repo name starting with a hyphen has no business being built into an argv,
     whether or not any current caller could produce one."""
@@ -103,7 +114,7 @@ def test_gh_failure_reads_as_unknown_not_as_unmerged(rec, monkeypatch):
         returncode = 1
         stdout = ""
     monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: _R())
-    assert rec.pr_state("convivy/vivy", "1") is None
+    assert rec.pr_state("convivy/widget", "1", {}) is None
 
 
 def test_unparseable_gh_output_reads_as_unknown(rec, monkeypatch):
@@ -111,14 +122,81 @@ def test_unparseable_gh_output_reads_as_unknown(rec, monkeypatch):
         returncode = 0
         stdout = "not json"
     monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: _R())
-    assert rec.pr_state("convivy/vivy", "1") is None
+    assert rec.pr_state("convivy/widget", "1", {}) is None
 
 
 def test_gh_timeout_reads_as_unknown(rec, monkeypatch):
     def _boom(*a, **k):
         raise OSError("gh missing")
     monkeypatch.setattr(rec.subprocess, "run", _boom)
-    assert rec.pr_state("convivy/vivy", "1") is None
+    assert rec.pr_state("convivy/widget", "1", {}) is None
+
+
+# --- the GitHub credential seam (company/decisions/0027): every `gh` call
+# runs on a token minted from the install's own GitHub App, never the
+# operator's `gh` login ------------------------------------------------------
+
+def test_main_threads_the_minted_tokens_env_into_pr_state(rec, monkeypatch):
+    """Drives `main`'s real `GA.read_token_pool` (only `GA.installed_app`
+    and `GA.mint_token` are stubbed — `GA.gh_env` runs for real): the minted
+    token lands in `GH_TOKEN`, and `GH_CONFIG_DIR` is an empty, throwaway
+    directory, on the `gh pr view` call `pr_state` makes."""
+    from pathlib import Path
+
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1095)]
+    monkeypatch.setattr(rec.ic, "list_issues_by_state", lambda *a, **k: issues)
+    monkeypatch.setattr(
+        rec.GA, "installed_app",
+        lambda: rec.GA.InstalledApp(app_id="1", key_path=Path("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(rec.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = Path(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        return type("P", (), {"returncode": 0, "stdout": '{"state": "MERGED"}', "stderr": ""})()
+
+    monkeypatch.setattr(rec.subprocess, "run", fake_run)
+    monkeypatch.setattr(rec.ic, "resolve_issue", lambda *a, **k: {"status": "ok"})
+    monkeypatch.setattr(rec.sys, "argv", ["issue-pr-reconcile"])
+
+    assert rec.main() == 0
+    assert captured, "gh must have been called with the minted token's environment"
+
+
+def test_a_mint_failure_runs_no_gh_process_and_is_counted_as_unreachable(rec, monkeypatch):
+    """A repo whose token cannot be minted takes the same path a failed `gh
+    pr view` already takes (unreachable, not resolved) — and, unlike that
+    path, no `gh` process ever runs."""
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1095)]
+    monkeypatch.setattr(rec.ic, "list_issues_by_state", lambda *a, **k: issues)
+
+    @contextmanager
+    def failing_pool(**kw):
+        def env_for(repo_slug):
+            raise rec.GA.Unreadable("no App key configured at .../app.pem")
+        yield env_for
+
+    monkeypatch.setattr(rec.GA, "read_token_pool", failing_pool)
+    calls = []
+    monkeypatch.setattr(rec.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(rec.sys, "argv", ["issue-pr-reconcile"])
+
+    assert rec.main() == 0
+    assert calls == [], "a mint failure must never fall back to running gh"
 
 
 def test_gh_is_resolved_absolutely_for_launchd(rec):
@@ -217,7 +295,8 @@ def _run(rec, monkeypatch, issues, states, argv=("issue-pr-reconcile",),
     reconciled = []
     alerts = []
     monkeypatch.setattr(rec.ic, "list_issues_by_state", lambda *a, **k: issues)
-    monkeypatch.setattr(rec, "pr_state", lambda repo, num: states.get(f"{repo}#{num}"))
+    monkeypatch.setattr(rec.GA, "read_token_pool", _fake_read_token_pool)
+    monkeypatch.setattr(rec, "pr_state", lambda repo, num, env: states.get(f"{repo}#{num}"))
     monkeypatch.setattr(rec.ic, "resolve_issue",
                         lambda iid, res, **kw: resolved.append((iid, res, kw)) or {"status": "ok"})
     monkeypatch.setattr(rec.ic, "reconcile_pr",
@@ -231,28 +310,30 @@ def _run(rec, monkeypatch, issues, states, argv=("issue-pr-reconcile",),
 
 
 def test_merged_pr_resolves_its_issue_fixed(rec, monkeypatch):
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1095)]
-    rc, resolved, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/vivy#1095": "MERGED"})
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1095)]
+    rc, resolved, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/widget#1095": "MERGED"})
     assert rc == 0
     assert len(resolved) == 1
     iid, resolution, kw = resolved[0]
     assert (iid, resolution) == ("issue_1", "fixed")
-    assert kw["fix_pr"] == "https://github.com/convivy/vivy/pull/1095"
+    assert kw["fix_pr"] == "https://github.com/convivy/widget/pull/1095"
     assert reconciled == [], (
         "a plain merged PR resolves through issue_resolve, not reconcile-pr — that "
         "route is for the three cases this sweep used to only report")
 
 
-def test_open_pr_calls_reconcile_pr_abandoned_and_moves_nothing(rec, monkeypatch):
-    """An open PR is indistinguishable from one still being worked, so the sweep must
-    not move the item itself. It reports the new Library route
-    (convivy/library#116) instead, which sets `needs: operator` and nothing else —
-    this test pins that the SWEEP still resolves and alerts nothing on its own."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1)]
-    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "OPEN"})
+def test_open_pr_calls_no_reconcile_pr_and_counts_as_still_open(rec, monkeypatch, capsys):
+    """An open PR is indistinguishable from one still being worked, so the sweep makes
+    no judgment about it at all: no resolve, no reconcile-pr call (that would be the
+    sweep deciding the PR was abandoned on no evidence), no alert. It only shows up in
+    the run's still-open tally."""
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1)]
+    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "OPEN"})
     assert resolved == []
     assert alerts == []
-    assert reconciled == [("issue_1", "abandoned", {})]
+    assert reconciled == []
+    out = capsys.readouterr().out
+    assert "1 PR still open" in out
 
 
 def test_abandoned_pr_is_reported_never_resolved(rec, monkeypatch):
@@ -260,8 +341,8 @@ def test_abandoned_pr_is_reported_never_resolved(rec, monkeypatch):
     work again. Closing it would bury real work; reopening it would guess at why it
     was abandoned. It alerts instead, and calls reconcile-pr("closed") so the Library
     returns the item to `open` rather than leaving it stuck in `pr-open` forever."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1)]
-    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "CLOSED"})
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1)]
+    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "CLOSED"})
     assert resolved == []
     assert len(alerts) == 1
     assert "closed without merging" in alerts[0][0]
@@ -349,8 +430,8 @@ def test_an_exception_state_alert_is_not_deduped(rec, monkeypatch):
     An abandoned PR or a failed write is an exception nobody has dealt with yet;
     those repeat deliberately until someone does.
     """
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1)]
-    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "CLOSED"})
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1)]
+    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "CLOSED"})
     assert len(alerts) == 1
     assert alerts[0][1] is None, "the exception alert must carry no dedup key"
 
@@ -361,8 +442,8 @@ def test_an_epic_whose_pr_did_not_merge_takes_the_ordinary_path(
     """The hold is reachable only after MERGED, and this pins that against a refactor
     moving the check earlier. An epic with an open PR is simply still in flight; an
     epic whose PR was closed unmerged is abandoned work and must still be reported."""
-    issues = [_issue("issue_epic", pr_repo="convivy/vivy", pr=1, type="epic")]
-    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": state})
+    issues = [_issue("issue_epic", pr_repo="convivy/widget", pr=1, type="epic")]
+    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": state})
     assert resolved == []
     assert bool(alerts) is expect_alert
     if expect_alert:
@@ -372,8 +453,8 @@ def test_an_epic_whose_pr_did_not_merge_takes_the_ordinary_path(
             "report the same way")
         assert reconciled == [("issue_epic", "closed", {})]
     else:
-        assert reconciled == [("issue_epic", "abandoned", {})], (
-            "an epic type must not change which outcome an OPEN PR reports")
+        assert reconciled == [], (
+            "an epic type must not change that an OPEN PR calls no reconcile-pr")
 
 
 # --- a blocked item's merged PR must not resolve it -----------------------------
@@ -409,9 +490,9 @@ def test_a_blocked_merged_items_prerequisite_text_is_sanitised(rec, monkeypatch)
     """`prerequisites[].text` is free text an agent or human authored, not a
     platform-derived value, so it gets the same treatment as a title."""
     hostile = "fix it\x1b[31mRED\x1b[0m sk-abcdefghijklmnop"
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, blocked=True,
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, blocked=True,
                      prerequisites=[{"text": hostile}])]
-    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "MERGED"})
+    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "MERGED"})
     assert len(alerts) == 1
     assert "\x1b" not in alerts[0][0]
     assert "sk-abcdefghijklmnop" not in alerts[0][0]
@@ -419,9 +500,9 @@ def test_a_blocked_merged_items_prerequisite_text_is_sanitised(rec, monkeypatch)
 
 
 def test_a_blocked_merged_item_with_an_item_prerequisite_names_it(rec, monkeypatch):
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, blocked=True,
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, blocked=True,
                      prerequisites=[{"item": "issue_other"}])]
-    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "MERGED"})
+    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "MERGED"})
     assert len(alerts) == 1
     assert "issue_other" in alerts[0][0]
 
@@ -435,9 +516,9 @@ def test_a_blocked_merged_items_item_prerequisite_is_sanitised_and_capped(
     # credential-redaction threshold — it must be the 70-char cap, not
     # `_redact_long_run`, that truncates it.
     hostile = "fix it\x1b[31mRED\x1b[0m sk-abcdefghijklmnop " + "lorem " * 20
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, blocked=True,
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, blocked=True,
                      prerequisites=[{"item": hostile}])]
-    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "MERGED"})
+    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "MERGED"})
     out = capsys.readouterr().out
     assert len(alerts) == 1
     for text in (alerts[0][0], out):
@@ -452,8 +533,8 @@ def test_a_blocked_merged_item_with_no_prerequisites_recorded_says_so(rec, monke
     """`blocked` can be true with an empty or absent `prerequisites` list (an older
     Library deploy, or a race on the write) — the report must say so rather than
     rendering an empty string that reads as though nothing is wrong."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, blocked=True)]
-    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "MERGED"})
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, blocked=True)]
+    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "MERGED"})
     assert len(alerts) == 1
     assert "(none recorded)" in alerts[0][0]
 
@@ -473,14 +554,14 @@ def test_an_epic_that_is_also_blocked_takes_the_epic_path(rec, monkeypatch):
 
 
 def test_a_blocked_merged_alert_is_deduped_on_the_item_and_its_pr(rec, monkeypatch):
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, blocked=True,
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, blocked=True,
                      prerequisites=[{"text": "x"}])]
-    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "MERGED"})
-    assert alerts[0][1] == "reconcile-blocked-merged-held:issue_1:convivy/vivy#1"
+    _, _, _, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "MERGED"})
+    assert alerts[0][1] == "reconcile-blocked-merged-held:issue_1:convivy/widget#1"
 
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=2, blocked=True,
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=2, blocked=True,
                      prerequisites=[{"text": "x"}])]
-    _, _, _, alerts2 = _run(rec, monkeypatch, issues, {"convivy/vivy#2": "MERGED"})
+    _, _, _, alerts2 = _run(rec, monkeypatch, issues, {"convivy/widget#2": "MERGED"})
     assert alerts2[0][1] != alerts[0][1], "a new merged PR is a new transition"
 
 
@@ -488,16 +569,16 @@ def test_an_unblocked_item_with_a_merged_pr_still_resolves(rec, monkeypatch):
     """The hold is scoped to `blocked` items — an ordinary item, with `blocked`
     false or absent, keeps closing on its merged PR exactly as before."""
     for blocked_value in (False, None):
-        issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=7, blocked=blocked_value)]
-        _, resolved, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/vivy#7": "MERGED"})
+        issues = [_issue("issue_1", pr_repo="convivy/widget", pr=7, blocked=blocked_value)]
+        _, resolved, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/widget#7": "MERGED"})
         assert len(resolved) == 1, f"blocked={blocked_value!r} must still resolve"
         assert reconciled == [], f"blocked={blocked_value!r} must not call reconcile-pr"
 
 
 def test_dry_run_writes_nothing_for_the_blocked_case(rec, monkeypatch):
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, blocked=True,
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, blocked=True,
                      prerequisites=[{"text": "x"}])]
-    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "MERGED"},
+    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "MERGED"},
                                            argv=("issue-pr-reconcile", "--dry-run"))
     assert resolved == []
     assert reconciled == []
@@ -509,14 +590,14 @@ def test_a_non_epic_with_a_merged_pr_still_resolves(rec, monkeypatch):
     that is the whole job, and a guard that quietly stopped doing it would recreate
     the 39-stale-issues backlog this tool was written to end."""
     for kind in ("bug", "task", "improvement", "feature", "nit", None):
-        issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=7, type=kind)]
-        _, resolved, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/vivy#7": "MERGED"})
+        issues = [_issue("issue_1", pr_repo="convivy/widget", pr=7, type=kind)]
+        _, resolved, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/widget#7": "MERGED"})
         assert len(resolved) == 1, f"type={kind!r} must still resolve"
         assert reconciled == [], f"type={kind!r} must not call reconcile-pr"
 
 
 def test_unresolvable_reference_is_skipped_and_alerted(rec, monkeypatch):
-    issues = [_issue("issue_1", product="selector", pr=13)]  # no repo, no url
+    issues = [_issue("issue_1", product="beacon", pr=13)]  # no repo, no url
     _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {})
     assert resolved == []
     assert reconciled == []
@@ -531,7 +612,7 @@ def test_a_hostile_title_is_sanitised_before_it_reaches_any_output(
     escape or credential in a title must not survive to the console rows or the
     alert."""
     title = "close\x1b[31mRED\x1b[0m sk-abcdefghijklmnop"
-    issues = [_issue("issue_1", product="selector", title=title)]  # no ref → unresolvable
+    issues = [_issue("issue_1", product="beacon", title=title)]  # no ref → unresolvable
     _, resolved, _, alerts = _run(rec, monkeypatch, issues, {})
     assert resolved == []
     assert len(alerts) == 1
@@ -554,7 +635,7 @@ def test_a_truncate_first_order_cannot_bisect_a_credential(rec, monkeypatch, cap
     # sk- sits at index 63, so a 70-char truncate-first cut leaves only "zzzz"
     # of the value, which both redaction regexes miss.
     title = "-" * 62 + " sk-" + "z" * 40
-    issues = [_issue("issue_1", product="selector", title=title)]  # no ref → unresolvable
+    issues = [_issue("issue_1", product="beacon", title=title)]  # no ref → unresolvable
     _, resolved, _, alerts = _run(rec, monkeypatch, issues, {})
     assert resolved == []
     assert len(alerts) == 1
@@ -570,18 +651,18 @@ def test_a_truncate_first_order_cannot_bisect_a_credential(rec, monkeypatch, cap
 def test_a_routine_sweep_stays_quiet(rec, monkeypatch):
     """Every night resolving merged PRs is the normal path. Alerting on it would train
     the alerts page to be ignored, which costs the alerts that do matter."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1),
-              _issue("issue_2", pr_repo="convivy/vivy", pr=2)]
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1),
+              _issue("issue_2", pr_repo="convivy/widget", pr=2)]
     _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues,
-                                           {"convivy/vivy#1": "MERGED", "convivy/vivy#2": "OPEN"})
+                                           {"convivy/widget#1": "MERGED", "convivy/widget#2": "OPEN"})
     assert len(resolved) == 1
     assert alerts == []
-    assert reconciled == [("issue_2", "abandoned", {})]
+    assert reconciled == [], "an OPEN PR calls no reconcile-pr, abandoned or otherwise"
 
 
 def test_dry_run_writes_nothing(rec, monkeypatch):
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1)]
-    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": "MERGED"},
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1)]
+    _, resolved, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": "MERGED"},
                                            argv=("issue-pr-reconcile", "--dry-run"))
     assert resolved == []
     assert reconciled == []
@@ -589,22 +670,21 @@ def test_dry_run_writes_nothing(rec, monkeypatch):
 
 
 @pytest.mark.parametrize("state,issue_type,expected_outcome", [
-    ("OPEN", None, "abandoned"),
     ("CLOSED", None, "closed"),
     ("MERGED", "epic", "merged"),
 ])
 def test_dry_run_never_calls_reconcile_pr(rec, monkeypatch, state, issue_type, expected_outcome):
-    """The three new reconcile-pr call sites must respect --dry-run exactly like the
-    ordinary resolve write does — this pins each of them individually rather than
-    trusting one MERGED/non-epic case to stand in for all four branches."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, type=issue_type)]
-    _, _, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/vivy#1": state},
+    """These reconcile-pr call sites must respect --dry-run exactly like the ordinary
+    resolve write does — this pins each of them individually rather than trusting one
+    MERGED/non-epic case to stand in for the rest. (An OPEN PR calls reconcile-pr
+    neither here nor outside --dry-run; that is pinned in its own test.)"""
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, type=issue_type)]
+    _, _, reconciled, _ = _run(rec, monkeypatch, issues, {"convivy/widget#1": state},
                                argv=("issue-pr-reconcile", "--dry-run"))
     assert reconciled == [], f"outcome={expected_outcome!r} must not write during --dry-run"
 
 
 @pytest.mark.parametrize("state,issue_type,expected_outcome", [
-    ("OPEN", None, "abandoned"),
     ("CLOSED", None, "closed"),
     ("MERGED", "epic", "merged"),
 ])
@@ -614,8 +694,8 @@ def test_a_failed_reconcile_write_is_reported_not_swallowed(
     contract `write_failed` already holds for a failed `resolve_issue` call — a
     write that silently failed leaves the queue knowably wrong with nothing saying
     so."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1, type=issue_type)]
-    _, _, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/vivy#1": state},
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1, type=issue_type)]
+    _, _, reconciled, alerts = _run(rec, monkeypatch, issues, {"convivy/widget#1": state},
                                     reconcile_status="error:500")
     assert reconciled == [("issue_1", expected_outcome, {})]
     reconcile_alerts = [a for a in alerts if "reconcile-pr write failed" in a[0]]
@@ -635,10 +715,11 @@ def test_unreadable_queue_exits_nonzero(rec, monkeypatch):
 def test_a_failed_resolve_does_not_count_as_resolved(rec, monkeypatch):
     """A write that failed must not be reported as a close, or the summary asserts a
     queue state that never happened."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1)]
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1)]
     alerts = []
     monkeypatch.setattr(rec.ic, "list_issues_by_state", lambda *a, **k: issues)
-    monkeypatch.setattr(rec, "pr_state", lambda repo, num: "MERGED")
+    monkeypatch.setattr(rec.GA, "read_token_pool", _fake_read_token_pool)
+    monkeypatch.setattr(rec, "pr_state", lambda repo, num, env: "MERGED")
     monkeypatch.setattr(rec.ic, "resolve_issue", lambda *a, **k: {"status": "error:500"})
     monkeypatch.setattr(rec, "post_alert",
                         lambda stream, body, **kw: alerts.append((body, kw.get("dedup_key"))))
@@ -652,10 +733,11 @@ def test_a_write_failure_alerts_but_a_gh_failure_does_not(rec, monkeypatch):
     """The two are kept apart on purpose. A gh failure is transient and self-healing.
     A write that failed after GitHub CONFIRMED the merge leaves the queue knowably
     wrong, with only a log file saying so."""
-    issues = [_issue("issue_1", pr_repo="convivy/vivy", pr=1)]
+    issues = [_issue("issue_1", pr_repo="convivy/widget", pr=1)]
     alerts = []
     monkeypatch.setattr(rec.ic, "list_issues_by_state", lambda *a, **k: issues)
-    monkeypatch.setattr(rec, "pr_state", lambda repo, num: None)  # gh could not answer
+    monkeypatch.setattr(rec.GA, "read_token_pool", _fake_read_token_pool)
+    monkeypatch.setattr(rec, "pr_state", lambda repo, num, env: None)  # gh could not answer
     monkeypatch.setattr(rec.ic, "resolve_issue", lambda *a, **k: {"status": "ok"})
     monkeypatch.setattr(rec, "post_alert",
                         lambda stream, body, **kw: alerts.append((body, kw.get("dedup_key"))))

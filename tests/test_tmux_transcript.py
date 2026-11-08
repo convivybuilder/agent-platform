@@ -179,8 +179,9 @@ def test_a_prefix_of_a_real_session_raises_rather_than_leaking_its_transcript(
 
 def test_a_window_name_that_matches_no_session_is_not_captured(TT, monkeypatch):
     """NOT A PROVEN BYPASS — checked live and does not reproduce. A window can
-    carry the same name as an unrelated session (`ask--audio` has a window
-    literally named `ask` on this machine today), which looks like it could
+    carry the same name as an unrelated session (the walled-off crew's own
+    `<crew>--<topic>` sub-session naming convention has a window literally
+    named for the bare crew on this machine today), which looks like it could
     be a second, independent way for a bare name to resolve into the wrong
     session. It isn't: a colon-less `-t` on `list-panes` resolves purely by
     target-SESSION rules (id, exact name, then prefix), with no fallback to a
@@ -197,15 +198,15 @@ def test_a_window_name_that_matches_no_session_is_not_captured(TT, monkeypatch):
     """
     def fake_run(argv, stdin=None):
         if argv[:2] == ["tmux", "list-sessions"]:
-            return "$19 ask--audio"  # the window "ask" lives inside this
+            return "$19 parlor--audio"  # the window "parlor" lives inside this
         if argv[:2] == ["tmux", "list-panes"] and "-t" in argv:
             pytest.fail(f"list-panes called with an unresolved target: {argv}")
         return None
 
     monkeypatch.setattr(TT, "_run", fake_run)
 
-    assert TT.pane_pids("ask") == []
-    assert TT.panes("ask") == []
+    assert TT.pane_pids("parlor") == []
+    assert TT.panes("parlor") == []
 
 
 def test_pane_pids_sees_every_window_not_only_the_active_one(TT, monkeypatch):
@@ -227,6 +228,117 @@ def test_pane_pids_sees_every_window_not_only_the_active_one(TT, monkeypatch):
     monkeypatch.setattr(TT, "_run", fake_run)
     assert TT.pane_pids("twowin") == [111, 222]
     assert TT.panes("twowin") == [("%1", 111), ("%2", 222)]
+
+
+# MARK: - client_table: one `list-clients` for the whole batch (CQ·521)
+
+
+def test_client_table_groups_clients_by_session(TT, monkeypatch):
+    def fake(argv, stdin=None):
+        if argv[:2] == ["tmux", "list-sessions"]:
+            return "$1 deck\n$2 galley"
+        if argv[:2] == ["tmux", "list-clients"]:
+            return "deck|501\ndeck|601\ngalley|701\n"
+        return None
+    monkeypatch.setattr(TT, "_run", fake)
+    got = TT.client_table()
+    assert got == {
+        "deck": [{"pid": 501}, {"pid": 601}],
+        "galley": [{"pid": 701}],
+    }
+
+
+def test_client_table_only_requests_session_and_pid(TT, monkeypatch):
+    """CQ·521 security finding: every other `list-clients` field is free text
+    a connecting client sets itself (`#{client_termname}` reflects the
+    client's own `TERM`), and `tmux`'s `-F` output has no per-field escaping
+    — so the fix is to never ask for a field this module does not read, not
+    to try to sanitise one after the fact."""
+    seen = []
+
+    def fake(argv, stdin=None):
+        seen.append(argv)
+        return ""
+    monkeypatch.setattr(TT, "_run", fake)
+    TT.client_table()
+    [list_clients_argv] = [a for a in seen if a[:2] == ["tmux", "list-clients"]]
+    assert list_clients_argv == ["tmux", "list-clients", "-F", "#{client_session}|#{client_pid}"]
+
+
+def test_client_table_is_empty_dict_for_a_successful_read_with_nobody_attached(TT, monkeypatch):
+    """Distinct from the unreadable case below: tmux ran fine and simply has
+    no clients anywhere, which is a positive, known answer."""
+    monkeypatch.setattr(TT, "_run", lambda argv, stdin=None: "")
+    assert TT.client_table() == {}
+
+
+def test_client_table_is_none_when_the_tmux_call_itself_fails(TT, monkeypatch):
+    monkeypatch.setattr(TT, "_run", lambda argv, stdin=None: None)
+    assert TT.client_table() is None
+
+
+def test_client_table_skips_a_malformed_line(TT, monkeypatch):
+    """One unreadable or rejected row must not cost the caller the rest of
+    the table — the same per-record degradation `_children` applies to a
+    malformed `ps` line. Covers a short record, a non-digit pid, and a pid
+    of `0` (digit-shaped but not a positive pid)."""
+    monkeypatch.setattr(TT, "_run", lambda argv, stdin=None: (
+        "deck|501\n"
+        "not-enough-fields\n"
+        "deck|not-a-pid\n"
+        "deck|0\n"
+    ))
+    got = TT.client_table(valid_sessions={"deck"})
+    assert got == {"deck": [{"pid": 501}]}
+
+
+def test_client_table_rejects_a_record_for_a_session_tmux_never_reported_live(TT, monkeypatch):
+    """The security finding this closes (PR #956 review round 1). A tmux
+    client field a connecting process controls — `#{client_termname}`
+    reflects the client's own `TERM`, which an ssh client sets directly in
+    its `pty-req` request independent of `AcceptEnv` — carrying an embedded
+    newline followed by `<victim-session>|<pid>` would, before this fix,
+    split `list-clients`'s output into an extra line that satisfied the
+    field-count check and forged a client record under any session name,
+    with an arbitrary pid, because nothing cross-checked the parsed session
+    name against a session tmux actually reported. Dropping every free-text
+    field from the query (the test above) closes the vector itself; this
+    pins the second layer, so a stray or forged line naming a session tmux
+    never reported live is discarded regardless of how it arrived — rather
+    than reproducing the newline mechanics of a field this module no longer
+    requests at all."""
+    monkeypatch.setattr(TT, "_run", lambda argv, stdin=None: "real|501\nvictim|666\n")
+    got = TT.client_table(valid_sessions={"real"})
+    assert got == {"real": [{"pid": 501}]}
+    assert "victim" not in got
+
+
+# MARK: - local_machine_name: this machine's own name (CQ·521)
+
+
+def test_local_machine_name_reads_scutil_computed_name(TT, monkeypatch):
+    monkeypatch.setattr(TT, "_run", lambda argv, stdin=None: (
+        "a-test-machine" if argv == ["scutil", "--get", "ComputedName"] else None))
+    assert TT.local_machine_name() == "a-test-machine"
+
+
+def test_local_machine_name_falls_back_to_hostname_short_form(TT, monkeypatch):
+    """`scutil` failing (an empty or absent `ComputedName`) falls back to
+    `socket.gethostname()`, truncated to the part before the first dot — the
+    short name a person recognises, not the `<host>.<domain>` form a
+    networked mac's hostname carries."""
+    monkeypatch.setattr(TT, "_run", lambda argv, stdin=None: None)
+    monkeypatch.setattr(TT.socket, "gethostname", lambda: "a-test-machine.local")
+    assert TT.local_machine_name() == "a-test-machine"
+
+
+def test_local_machine_name_is_none_when_both_reads_fail(TT, monkeypatch):
+    monkeypatch.setattr(TT, "_run", lambda argv, stdin=None: None)
+
+    def _raise():
+        raise OSError("no hostname")
+    monkeypatch.setattr(TT.socket, "gethostname", _raise)
+    assert TT.local_machine_name() is None
 
 
 # MARK: - Reading the process tree
@@ -332,8 +444,8 @@ def test_a_detached_fork_in_the_same_cwd_is_not_chosen(TT, monkeypatch, runs, pr
 
 def test_a_sibling_session_in_another_pane_does_not_leak_in(TT, monkeypatch, runs, projects):
     day = _today(TT)
-    mine = projects("-Users-operator-hollis", "aaaaaaaa-1111")
-    theirs = projects("-Users-operator-hollis", "cccccccc-3333")
+    mine = projects("-Users-operator-galley", "aaaaaaaa-1111")
+    theirs = projects("-Users-operator-galley", "cccccccc-3333")
     runs(day, "aaaaaaaa-1111", ppid=201, transcript=mine)
     runs(day, "cccccccc-3333", ppid=301, transcript=theirs)
 
@@ -341,7 +453,7 @@ def test_a_sibling_session_in_another_pane_does_not_leak_in(TT, monkeypatch, run
           commands={201: "claude", 301: "claude"})
     monkeypatch.setattr(TT, "pane_pids", lambda name: [101])
 
-    assert TT.transcript_for_tmux_session("hollis") == mine
+    assert TT.transcript_for_tmux_session("galley") == mine
 
 
 # MARK: - Containment of the recorded path
@@ -439,7 +551,7 @@ def test_a_session_older_than_the_fixed_window_is_still_found(TT, runs, monkeypa
     and a co session runs until someone stops it — so a fixed "last N days"
     window loses a session precisely BECAUSE it has been up a long time.
 
-    Observed 2026-07-23: sous-chef and vivy, alive since 2026-07-20, both read
+    Observed 2026-07-23: initech and widget, alive since 2026-07-20, both read
     `state: unknown` in Deck's pane with their records one day outside the
     three-day window.
     """
@@ -496,7 +608,7 @@ def test_the_search_does_not_read_days_before_the_process_existed(TT, runs, monk
 # own root too, not just the shared one.
 
 
-def _private_home(tmp_path, TT, monkeypatch, slug="cfo"):
+def _private_home(tmp_path, TT, monkeypatch, slug="ledger"):
     """A fake private crew home, wired so TT.PC.private_homes() returns it."""
     home = tmp_path / slug
     home.mkdir()
@@ -864,7 +976,7 @@ def test_record_predates_process_is_not_fooled_by_a_later_utc_clock_reading(
 
 def test_a_stale_record_from_an_earlier_process_holding_the_same_pid_is_skipped(
         TT, runs, monkeypatch):
-    """THE LIVE CASE (2026-09-30, issue_01M3TBR04B10F04Q9HGJWKS8HG). selector's
+    """THE LIVE CASE (2026-09-30, issue_01M3TBR04B10F04Q9HGJWKS8HG). beacon's
     own `co` session, pid 49951, started today; its own record's `started_at`
     landed a few seconds later. A second record for the same pid, filed the
     day before by an EARLIER process that had held it, carried a different

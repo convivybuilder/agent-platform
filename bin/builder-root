@@ -13,8 +13,13 @@ from it), so it never reads BUILDER_ROOT or any other environment variable.
 `--config FILE` points it at another session-agent.env instead of the machine's.
 That is how a test isolates root() (the steward's call, 2026-09-11), and because
 it is an argument on the command line, nothing a process inherits can supply it.
-`--config` without `--root` is refused: data_root() takes its override from
-BUILDER_ROOT alone.
+`--home DIR` carries root()'s own `home=` the same way: the account whose `~`
+expansion, default root and "too wide" guard apply. Without it, root() reads
+the calling process's own PASSWD home, which is the one a caller resolving
+some OTHER account's root (install-individuator under sudo, for SUDO_USER) must
+override — `--config` alone moves which file is read, not whose home `~` and
+the fallback resolve against. `--config` and `--home` without `--root` are each
+refused: data_root() takes its override from BUILDER_ROOT alone.
 
 `lib/` is found from this file's REAL path, so the copy in the repo, the
 `~/.local/bin` link, and the deploy area each read the `builder_root.py` beside
@@ -38,9 +43,15 @@ def main(argv=None) -> int:
     ap.add_argument("--config", type=Path, default=None,
                     help="with --root: read CREWS_ROOT from this file instead of the machine's "
                          "session-agent.env (how tests isolate root())")
+    ap.add_argument("--home", type=Path, default=None,
+                    help="with --root: resolve '~', the default root and the \"too wide\" "
+                         "guard against this account's home instead of the calling process's "
+                         "own (how a caller resolves another account's root, e.g. under sudo)")
     args = ap.parse_args(argv)
     if args.config is not None and not args.root:
         ap.error("--config applies only to --root; data_root() is overridden by BUILDER_ROOT alone")
+    if args.home is not None and not args.root:
+        ap.error("--home applies only to --root; data_root() is overridden by BUILDER_ROOT alone")
     if not args.root:
         # The shell launchers' run-record directory comes from here, so this is
         # their data root's report-only marker check, on stderr where stdout stays
@@ -50,7 +61,20 @@ def main(argv=None) -> int:
         print(data)
         return 0
     if args.config is None:
-        print(builder_root.root())
+        if args.home is None:
+            print(builder_root.root())
+            return 0
+        # --home alone: resolve as root() would for an account whose own
+        # passwd home is --home, not the calling process's — its own
+        # session-agent.env (config_for), its own default root when
+        # unconfigured (fallback_for), ordinary (non-refusing) root()
+        # semantics throughout. Leaving config/fallback at their own None
+        # defaults would still read the CALLING process's account (root()'s
+        # module-level CONFIG/FALLBACK are themselves built from
+        # real_account_home()), so both must be given explicitly here.
+        print(builder_root.root(config=builder_root.config_for(args.home),
+                                fallback=builder_root.fallback_for(args.home),
+                                home=args.home))
         return 0
     # A --config that names no root is refused rather than answered with the
     # machine's real root. root() never raises: a missing file, a missing or
@@ -59,7 +83,7 @@ def main(argv=None) -> int:
     # the root, so a test whose config is wrong must stop, not read and write the
     # real tree (agent-platform#545 rounds 1-3 found this in session-event-log).
     unhonoured = object()
-    found = builder_root.root(config=args.config, fallback=unhonoured)
+    found = builder_root.root(config=args.config, fallback=unhonoured, home=args.home)
     if found is unhonoured:
         print(f"builder-root: {args.config} names no root this machine will take",
               file=sys.stderr)

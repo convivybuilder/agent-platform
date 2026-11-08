@@ -44,7 +44,7 @@ unset AGENTCTL_RUN_ID
 assert_eq deny  "$(decision "$SPAWN")"                    "un-backgrounded dispatch denied"
 assert_eq deny  "$(decision "cd /tmp && $SPAWN")"         "denied after && too"
 assert_eq deny  "$(decision "$SPAWN; echo done")"         "denied when first in a chain"
-assert_eq deny  "$(decision "$HOME/.local/bin/agentctl spawn coder --on vivy")" \
+assert_eq deny  "$(decision "$HOME/.local/bin/agentctl spawn coder --on cartographer")" \
                                                           "full-path agentctl denied"
 
 # --- backgrounded -> allowed, with --wait added ------------------------------
@@ -55,17 +55,17 @@ assert_eq 'agentctl spawn --wait reviewer --on agent-platform --pr 155 --task "r
 # THE BUG THIS PINS. --wait used to be appended to the END of the whole command,
 # so a piped dispatch handed the flag to the wrong program. Piping a dispatch to
 # pull its run-id out is a common shape, so this was reachable, not theoretical.
-assert_eq 'agentctl spawn --wait reviewer --on vivy | tail -3' \
-                "$(rewritten 'agentctl spawn reviewer --on vivy | tail -3')" \
+assert_eq 'agentctl spawn --wait reviewer --on cartographer | tail -3' \
+                "$(rewritten 'agentctl spawn reviewer --on cartographer | tail -3')" \
                                                           "pipe: flag goes to spawn, not tail"
-assert_eq 'cd /tmp && agentctl spawn --wait coder --on vivy' \
-                "$(rewritten 'cd /tmp && agentctl spawn coder --on vivy')" \
+assert_eq 'cd /tmp && agentctl spawn --wait coder --on cartographer' \
+                "$(rewritten 'cd /tmp && agentctl spawn coder --on cartographer')" \
                                                           "prefix compound rewrites correctly"
-assert_eq 'agentctl spawn --wait coder --on vivy; echo done' \
-                "$(rewritten 'agentctl spawn coder --on vivy; echo done')" \
+assert_eq 'agentctl spawn --wait coder --on cartographer; echo done' \
+                "$(rewritten 'agentctl spawn coder --on cartographer; echo done')" \
                                                           "trailing segment untouched"
-assert_eq "$HOME/.local/bin/agentctl spawn --wait coder --on vivy" \
-                "$(rewritten "$HOME/.local/bin/agentctl spawn coder --on vivy")" \
+assert_eq "$HOME/.local/bin/agentctl spawn --wait coder --on cartographer" \
+                "$(rewritten "$HOME/.local/bin/agentctl spawn coder --on cartographer")" \
                                                           "full-path invocation rewrites correctly"
 
 # --- backgrounded and already correct -> untouched ---------------------------
@@ -106,7 +106,7 @@ assert_eq pass  "$(decision 'gh pr view 155')"                    "gh passes"
 # when backgrounded — --wait spliced into the heredoc body, mangling whatever
 # file or message it wrote. Writing a doc that quotes a dispatch is routine.
 HEREDOC='cat >> notes.md <<EOF
-agentctl spawn reviewer --on vivy
+agentctl spawn reviewer --on cartographer
 EOF'
 assert_eq pass  "$(decision "$HEREDOC")"                  "heredoc body not denied"
 assert_eq pass  "$(decision "$HEREDOC" true)"             "heredoc body not rewritten"

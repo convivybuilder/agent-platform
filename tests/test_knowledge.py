@@ -140,7 +140,7 @@ def test_platform_crew_audience_in_roster():
 def test_id_pattern_enforced():
     errs = knowledge.validate_frontmatter(_ok_doc(id="Shared/Agents/Coder"))
     assert any("invalid id format" in e for e in errs)
-    assert knowledge.validate_frontmatter(_ok_doc(id="vivy/runbooks/deploy-web")) == []
+    assert knowledge.validate_frontmatter(_ok_doc(id="finch/runbooks/deploy-web")) == []
     # agent-platform is a valid id prefix despite the embedded hyphen (ARCH-099)
     assert knowledge.validate_frontmatter(
         _ok_doc(id="agent-platform/runbooks/deploy", project="agent-platform")
@@ -175,7 +175,7 @@ def test_overnight_stage_agents_in_roster():
 
 def test_retired_agent_names_still_index_their_documents():
     """issue_01M2GDVPR81Z0X991Z7XD3VR0M step 5 (the operator's 2026-09-14 ruling) retired
-    overnight-orchestrator, hollis-overnight-orchestrator, knowledge-scribe and
+    overnight-orchestrator, galley-overnight-orchestrator, knowledge-scribe and
     kb-sync-verifier from dispatch, but 100 documents on knowledge/main (74 of
     them decision records)
     already name one of these four in `audience`, and the Library will not
@@ -185,7 +185,7 @@ def test_retired_agent_names_still_index_their_documents():
     dropped all four from ALLOWED_AUDIENCE), green once they're restored."""
     for name in (
         "overnight-orchestrator",
-        "hollis-overnight-orchestrator",
+        "galley-overnight-orchestrator",
         "knowledge-scribe",
         "kb-sync-verifier",
     ):
@@ -219,9 +219,8 @@ def test_allowed_projects_matches_the_kb_validator():
     from either side before both halves have merged — PR C's reviewer used it for
     exactly that.
 
-    Two related guards DO run in CI (`test_deck_project_accepted`,
-    `test_id_pattern_projects_match_allowed_projects`), so specific projects are
-    protected there; only the general cross-repo invariant needs the KB.
+    A related guard DOES run in CI (`test_deck_project_accepted`), so that one
+    project is protected there; only the general cross-repo invariant needs the KB.
     """
     import re
 
@@ -274,40 +273,30 @@ def test_deck_project_accepted():
     assert knowledge.validate_frontmatter(doc) == []
 
 
-def test_placard_project_accepted():
-    """Pins placard the way test_deck_project_accepted pins deck, and for the same
-    reason: the cross-repo test above is `needs_kb`-marked and skips in this
-    repo's CI, so without this a revert of the two placard lines is caught by
-    nothing CI can see until the daily cron hours later.
-
-    Placard reached this file the long way. Its bead merged to knowledge main and
-    then never indexed, because registering with the KB validator
-    (convivy/knowledge#347) left the indexer's own copy of the list still
-    rejecting it — the failure the constance-landing note in ALLOWED_PROJECTS
-    already warns about."""
+def test_a_second_registered_project_is_accepted():
+    """Pins a second registered project the way test_deck_project_accepted pins
+    deck, and for the same reason: the cross-repo test above is `needs_kb`-marked
+    and skips in this repo's CI, so this catches the indexer's own copy of the
+    list drifting from the KB validator's without waiting for the daily cron."""
     doc = {
-        "id": "placard/bead/placard",
+        "id": "cartographer/bead/cartographer",
         "kind": "bead",
-        "project": "placard",
-        "title": "Placard — the bead: where this product is going",
+        "project": "cartographer",
+        "title": "Cartographer — the bead: where this product is going",
         "status": "current",
     }
     assert knowledge.validate_frontmatter(doc) == []
 
 
-def test_shipwright_project_accepted():
-    """Pins shipwright as test_placard_project_accepted pins placard: the
-    cross-repo test is `needs_kb`-marked and skips in CI, so a revert of the two
-    shipwright lines would otherwise be caught by nothing CI can see.
-
-    Shipwright's slug landed in the KB validator (convivy/knowledge#356) the
-    evening of 2026-09-06; this mirror followed the same evening, before its
-    first document existed, so the profile and runbooks index on arrival."""
+def test_a_third_registered_project_is_accepted():
+    """Pins a third registered project as test_a_second_registered_project_is_
+    accepted pins its own: the cross-repo test is `needs_kb`-marked and skips in
+    CI, so this catches the same class of drift on a different project."""
     doc = {
-        "id": "shipwright/runbooks/release-signing",
+        "id": "telemetry/runbooks/release-signing",
         "kind": "runbook",
-        "project": "shipwright",
-        "title": "Signing and notarizing a Builder release",
+        "project": "telemetry",
+        "title": "Signing and notarizing a release",
         "status": "current",
     }
     assert knowledge.validate_frontmatter(doc) == []
@@ -334,19 +323,7 @@ def test_the_non_project_scopes_are_legal_in_the_reference_room():
             f"rejects it — a doc scoped {scope!r} would validate nowhere")
 
 
-def test_every_registered_scope_is_in_allowed_projects():
-    """The registry is the source; the two validator copies mirror it. A scope
-    added to `_scopes` but not to ALLOWED_PROJECTS is the silent failure — the
-    scope reads as legal everywhere the registry is consulted, and every document
-    carrying it is dropped by the indexer without a word."""
-    import projects
-
-    missing = set(projects.scopes()) - knowledge.ALLOWED_PROJECTS
-    assert not missing, (
-        f"scopes registered in projects.json but absent from "
-        f"knowledge.ALLOWED_PROJECTS: {sorted(missing)}")
-
-
+@pytest.mark.rich_registry
 def test_all_scopes_is_projects_plus_the_non_project_scopes():
     """The set a `product`/`project` field should be validated against. Checking
     against `load()` alone is what returned 400 for three legal values."""
@@ -360,32 +337,11 @@ def test_all_scopes_is_projects_plus_the_non_project_scopes():
             f"must not appear as a registry unit with a home dir and a crew")
 
 
-def test_id_pattern_projects_match_allowed_projects():
-    """The project list appears FOUR times across two repos — ALLOWED_PROJECTS and
-    ID_PATTERN, in this file and in the knowledge repo's validate.py — and all four
-    must carry the same names.
-
-    Adding a project to a set but not the matching pattern is the sharper trap of
-    the two: the project check passes and then every doc fails on its `id`, which
-    reads like a malformed-id bug rather than a missing registration. This was
-    found by the deck bootstrap (ARCH-374) hitting it in BOTH files in sequence.
-    """
-    import re
-
-    pattern_projects = set(
-        re.match(r"\^\((.*?)\)/", knowledge.ID_PATTERN.pattern).group(1).split("|")
-    )
-    assert pattern_projects == knowledge.ALLOWED_PROJECTS, (
-        "ID_PATTERN and ALLOWED_PROJECTS disagree. "
-        f"only in ID_PATTERN: {sorted(pattern_projects - knowledge.ALLOWED_PROJECTS)}; "
-        f"only in ALLOWED_PROJECTS: {sorted(knowledge.ALLOWED_PROJECTS - pattern_projects)}"
-    )
-
-
 
 @pytest.mark.needs_kb
 def test_schema_constants_agree_with_the_kb_validator():
-    """`knowledge.py` and the KB's `scripts/validate.py` must hold the same schema.
+    """`knowledge.py` and the KB's `scripts/validate.py` must hold the same schema
+    for kinds, projects and statuses.
 
     The watcher validates with this module and CI validates with that script, so a
     value legal in one and not the other splits the two readings of "is this
@@ -398,6 +354,10 @@ def test_schema_constants_agree_with_the_kb_validator():
     disagree three times before `test_product_maps_agree` was written (`knowledge`
     in July, then substrate and write-better, then convivy-lab). Step 5 edits both
     lists, so it adds the assertion rather than a fourth comment.
+
+    The audience roster is no longer one of the three: it is the Library's, served
+    live from `GET /roster` and checked against that endpoint by admission and the
+    indexer (E7·19), so this test does not pin a copy of it in either file.
 
     `needs_kb` carries the skip and honours KNOWLEDGE_REPO, so a paired
     cross-repo change is verifiable from either side and `bin/check-kb-guards`
@@ -437,36 +397,11 @@ def test_schema_constants_agree_with_the_kb_validator():
         body = re.sub(r"#.*", "", text[start:end])
         return set(re.findall(r'"([A-Za-z0-9._-]+)"', body))
 
-    # ALLOWED_AUDIENCE is pinned too, and its asymmetry makes it the WORST of the
-    # four rather than the most forgiving. validate.py treats an unknown audience as
-    # a WARNING and knowledge.py treats it as an ERROR, so the natural way to hit
-    # the gap is to add a new agent slug to validate.py because CI is complaining,
-    # and stop there: every document carrying that audience then passes CI, merges,
-    # and is silently dropped by the watcher. The deliberately-lenient one is the
-    # one most likely to be edited alone (reviewer, #343).
-    # NON_AGENT_AUDIENCE is the other half of the roster the agent policy reads: ALLOWED_AGENTS
-    # is ALLOWED_AUDIENCE minus it, so a person added to one list alone changes which names may
-    # be bound. Both files hold it, and a test pins it like the rest.
-    #
-    # The operator marker is configured per-operator here (CQ·428, steward ruling) and
-    # still hardcoded in the KB validator — "the knowledge repo's frontmatter keeps its
-    # current value, so the Library's contract is untouched". It is a member of BOTH
-    # ALLOWED_AUDIENCE and NON_AGENT_AUDIENCE on each side, so it is excluded from both
-    # sides of both comparisons, DERIVED rather than named (their marker is whatever
-    # their own NON_AGENT_AUDIENCE carries beyond the three fixed human-group markers),
-    # so a synthetic test-session marker never reads as the drift this check exists to
-    # catch.
-    their_marker = literal_set("NON_AGENT_AUDIENCE") - {"consultant", "team", "contractor"}
     for name, ours in (("ALLOWED_KINDS", knowledge.ALLOWED_KINDS),
                        ("ALLOWED_PROJECTS", knowledge.ALLOWED_PROJECTS),
-                       ("ALLOWED_STATUSES", knowledge.ALLOWED_STATUSES),
-                       ("ALLOWED_AUDIENCE", knowledge.ALLOWED_AUDIENCE),
-                       ("NON_AGENT_AUDIENCE", knowledge.NON_AGENT_AUDIENCE)):
+                       ("ALLOWED_STATUSES", knowledge.ALLOWED_STATUSES)):
         theirs = literal_set(name)
         ours_set = set(ours)
-        if name in ("ALLOWED_AUDIENCE", "NON_AGENT_AUDIENCE"):
-            ours_set -= {knowledge.OPERATOR_MARKER}
-            theirs -= their_marker
         only_here = sorted(ours_set - theirs)
         only_there = sorted(theirs - ours_set)
         assert not only_here, (
@@ -494,7 +429,12 @@ def _block(**overrides):
         "title": "Example rule",
         "status": "current",
         "scope": "crew",
-        "binds_crews": ["library"],
+        # A crew from the small default registry (tests/conftest.py's
+        # `_synthetic_projects_registry_path`): `instruction_block_errors`
+        # now checks `binds_crews` against the LIVE registry, which for a
+        # non-`rich_registry` test is this one, not the rich fixture
+        # knowledge.py saw at its own import.
+        "binds_crews": ["widget-crew"],
     }
     fm.update(overrides)
     return fm
@@ -563,12 +503,12 @@ def test_fleet_must_not_carry_a_session_selector():
 def test_unknown_crew_fails_and_known_crew_passes():
     errs = knowledge.instruction_block_errors(_block(binds_crews=["not-a-real-crew"]), "A rule.")
     assert any("unknown crew" in e for e in errs)
-    assert knowledge.instruction_block_errors(_block(binds_crews=["library"]), "A rule.") == []
+    assert knowledge.instruction_block_errors(_block(binds_crews=["widget-crew"]), "A rule.") == []
 
 
 def test_names_that_are_not_registry_crews_fail():
     """Four names the first knowledge-side set accepted, each binding no session."""
-    for name in ("orient", "www", "constance-landing", "nyh-studio"):
+    for name in ("orient", "www", "globex-landing", "oak-studio"):
         errs = knowledge.instruction_block_errors(_block(binds_crews=[name]), "A rule.")
         assert any("unknown crew" in e for e in errs), name
 
@@ -588,6 +528,14 @@ def test_binds_agents_refuses_a_person_or_a_group():
         assert any("person or a group" in e for e in errs), who
 
 
+def test_binds_agents_accepts_the_consultant_agent():
+    """consultant is a dispatchable agent (agent-platform/agents/consultant), not a
+    person or group (CQ·154). Red on origin/main, where NON_AGENT_AUDIENCE still
+    held "consultant" and this block was refused with "names a person or a group"."""
+    assert knowledge.instruction_block_errors(
+        _block(scope="agent", binds_crews=[], binds_agents=["consultant"]), "A rule.") == []
+
+
 def test_unknown_or_missing_scope_fails():
     assert any("scope" in e for e in knowledge.instruction_block_errors(_block(scope="galaxy"), "A rule."))
     fm = _block()
@@ -597,7 +545,7 @@ def test_unknown_or_missing_scope_fails():
 
 def test_every_scope_passes_with_the_selector_it_needs():
     for scope in knowledge.INSTRUCTION_BLOCK_SCOPES:
-        crews = [] if scope == "fleet" else ["library"]
+        crews = [] if scope == "fleet" else ["widget-crew"]
         assert knowledge.instruction_block_errors(_block(scope=scope, binds_crews=crews), "A rule.") == [], scope
 
 
@@ -694,7 +642,7 @@ def test_body_budget_is_enforced_at_the_boundary():
 # is a person. If it is, add it to NON_AGENT_AUDIENCE too; otherwise it becomes a
 # valid `binds_agents` value, a defect for a human. The roster lives in the Library,
 # so this pins the seed the stub serves here, which is the same set the loader reads.
-EXPECTED_AUDIENCE_ROSTER_SIZE = 58
+EXPECTED_AUDIENCE_ROSTER_SIZE = 62
 
 
 def test_every_audience_value_is_classified():

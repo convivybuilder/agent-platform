@@ -118,14 +118,45 @@ esac
 # HOME does not move it. A test moves it with --root-config, and builder-root
 # refuses a config that names no root rather than printing the real one.
 _self_path="${BASH_SOURCE[0]}"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
+_bin_dir="$(dirname "$_self_path")"
 _root_args=(--root)
 [[ -n "$ROOT_CONFIG" ]] && _root_args+=(--config "$ROOT_CONFIG")
-ROOT="$("$(dirname "$_self_path")/builder-root" "${_root_args[@]}")" && [[ -n "$ROOT" ]] || {
+ROOT="$("$_bin_dir/builder-root" "${_root_args[@]}")" && [[ -n "$ROOT" ]] || {
     echo "$SCRIPT: cannot resolve the machine's root (bin/builder-root --root)" >&2
     exit 1
 }
 TARGET="$ROOT/$APP_NAME"
 DATE=$(date +%Y-%m-%d)
+
+# The shared app-kit library every lab app depends on for its `think()` seam:
+# the one registry unit that declares a `kit_repo` field
+# (lib/agent-platform/projects.py's `kit_repo()`), read through python3 the
+# same way bin/bug-sweep and bin/arch-review read their own registry fields
+# from bash. No unit declaring it is treated the same as the registry being
+# unreadable — this scaffold has named the kit's `think()` seam as a hard
+# dependency since ARCH-249, so a missing answer refuses rather than quietly
+# generating a charter with nothing wired to it.
+LIB_DIR="$_bin_dir/../lib/agent-platform"
+KIT_REPO=$(PYTHONPATH="$LIB_DIR" python3 -c '
+import sys
+import projects
+try:
+    repo = projects.kit_repo()
+except Exception as exc:
+    print(str(exc), file=sys.stderr)
+    sys.exit(1)
+if not repo:
+    sys.exit(1)
+print(repo)
+') && [[ -n "$KIT_REPO" ]] || {
+    echo "$SCRIPT: cannot read the kit repository from the registry (no unit declares kit_repo)" >&2
+    exit 1
+}
+KIT_SLUG=$(PYTHONPATH="$LIB_DIR" python3 -c '
+import sys
+import projects
+print(projects.repo_github_slug(sys.argv[1]))
+' "$KIT_REPO")
 
 if [[ -d "$TARGET" ]]; then
     echo "$SCRIPT: $TARGET already exists; refusing to overwrite." >&2
@@ -177,9 +208,9 @@ ${APP_NAME} is a personal system-of-record lab product in the Convivy suite (ARC
 
 ## The build crew
 
-Within a \`co\` session, the Task tool resolves the \`${PREFIX}-\` crew straight from the \`.claude/agents/\` files below. \`agentctl spawn\` (the steward-or-overnight cross-repo dispatch path) resolves the same names through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA. See the post-creation checklist for what that path still needs.
+Within a \`co\` session, the Task tool resolves the \`${PREFIX}-\` crew straight from the \`.claude/agents/\` files below. \`agentctl spawn\` (the steward's or the crew's own \`co\` session's cross-repo dispatch path) resolves the same names through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the registered privacy crews. See the post-creation checklist for what that path still needs.
 
-\`${PREFIX}-architect\` · \`${PREFIX}-planner\` · \`${PREFIX}-coder\` · \`${PREFIX}-reviewer\` · \`${PREFIX}-security-reviewer\` · \`${PREFIX}-overnight-orchestrator\`
+\`${PREFIX}-architect\` · \`${PREFIX}-planner\` · \`${PREFIX}-coder\` · \`${PREFIX}-reviewer\` · \`${PREFIX}-security-reviewer\`
 EOF
 
 # ---------------------------------------------------------------------------
@@ -195,7 +226,7 @@ ${APP_NAME} is a **lab product** (ARCH-243): a first-class agentic deployment wi
 
 ## What ${APP_NAME} is
 
-[TODO: describe what ${APP_NAME} owns — what system-of-record data it holds, what the user does with it, how it fits alongside PA / Selector / Sous Chef.]
+[TODO: describe what ${APP_NAME} owns — what system-of-record data it holds, what the user does with it, how it fits alongside the fleet's other lab products.]
 
 ## The seam to other apps
 
@@ -204,21 +235,20 @@ ${APP_NAME} is a **lab product** (ARCH-243): a first-class agentic deployment wi
 ## Invariants (hold these in every design and change)
 
 - **The seam is a real trust boundary.** If ${APP_NAME} connects to other suite apps, the cross-app API is the redaction layer between two private KBs; design no shared store to over-reach into (ARCH-248, shared ADR 0006).
-- **All model calls go through \`convivy-app-kit\`'s \`think()\` seam.** No feature imports a provider SDK directly; the seam is also the BYO-LLM swap point (Phase-C).
+- **All model calls go through \`${KIT_REPO}\`'s \`think()\` seam.** No feature imports a provider SDK directly; the seam is also the BYO-LLM swap point (Phase-C).
 - **Privacy:** content KB (\`data/\`) stays on the mini, gitignored, and never reaches the remote, the substrate index, or any shared service. Secrets (tokens, API keys) stay out of git (chmod-600 / Keychain). Code + engineering docs go to a private GitHub remote.
 - **Human merge gate:** designs and code land as ready-to-merge PRs that the operator merges. No agent merges, ever (ARCH-020).
 
 ## The crew
 
-${APP_NAME} has its own crew, committed in \`.claude/agents/\` (the \`${PREFIX}-\` prefix). A Task-tool dispatch in this \`co\` session reads those files directly. \`agentctl spawn\` (the steward-or-overnight cross-repo path) resolves the same names through the shared Library-served index every non-black-box crew uses, once the post-creation checklist's registration step is done; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA:
+${APP_NAME} has its own crew, committed in \`.claude/agents/\` (the \`${PREFIX}-\` prefix). A Task-tool dispatch in this \`co\` session reads those files directly. \`agentctl spawn\` (the steward's or the crew's own \`co\` session's cross-repo path) resolves the same names through the shared Library-served index every non-black-box crew uses, once the post-creation checklist's registration step is done; \`LOCAL_AGENT_REPOS\` is reserved for the registered privacy crews:
 
 - **\`${PREFIX}-architect\`** — design forks, new subsystems, and ADRs. Produces fleshed-out proposals with options + tradeoffs + recommendation.
 - **\`${PREFIX}-planner\`** — turns an approved design into a build plan: small, independently reviewable PRs with crisp specs.
 - **\`${PREFIX}-coder\`** — implements against the plan, produces a ready-to-merge PR.
 - **\`${PREFIX}-reviewer\`** / **\`${PREFIX}-security-reviewer\`** — the review cycle (security owns auth, secrets, seam privacy, and data-flow surfaces).
-- **\`${PREFIX}-overnight-orchestrator\`** — the autonomous overnight drain (gated on 🚀-marked features), once the app has a real backlog.
 
-Dispatch from a \`co\` session here with the **Task tool** (\`subagent_type: ${PREFIX}-coder\`, etc.). (\`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME} …\` is the alternative path for steward or overnight cross-repo dispatch.)
+Dispatch from a \`co\` session here with the **Task tool** (\`subagent_type: ${PREFIX}-coder\`, etc.). (\`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME} …\` is the alternative path for the steward's or the crew's own \`co\` session's cross-repo dispatch.)
 
 ## Driving the crew — say "go"
 
@@ -312,9 +342,9 @@ ${APP_NAME} is a new lab product in the Convivy personal-apps suite (ARCH-243). 
 
 - **Repo:** \`${TARGET}/\` (private GitHub remote — see the post-creation checklist in \`bin/create-lab-app\`)
 - **Crew prefix:** \`${PREFIX}-\`
-- **Crew agents:** architect, planner, coder, reviewer, security-reviewer, overnight-orchestrator
+- **Crew agents:** architect, planner, coder, reviewer, security-reviewer
 - **KB:** local, gitignored \`data/\` directory on the mini
-- **Dispatch:** \`agentctl spawn\` resolves the \`${PREFIX}-\` crew through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA
+- **Dispatch:** \`agentctl spawn\` resolves the \`${PREFIX}-\` crew through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the registered privacy crews
 
 The lab-product pattern this repo follows is documented in \`docs/lab-product-template.md\` and \`bin/create-lab-app\` in the \`agent-platform\` repo (ARCH-249). The data-locality and trust-boundary invariant is the suite-wide canonical statement at \`knowledge/projects/shared/decisions/0006-suite-data-locality-trust-boundary-invariant.md\` (ARCH-248).
 
@@ -322,7 +352,7 @@ The lab-product pattern this repo follows is documented in \`docs/lab-product-te
 
 - Engineering docs go to the shared knowledge base (\`knowledge/projects/${APP_NAME}/\`) once wired (ARCH-248 / shared ADR 0006). Content KB stays local.
 - The crew is dispatchable from any steward \`co\` session via \`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME}\`.
-- All model calls in the app must go through \`convivy-app-kit\`'s \`think()\` seam.
+- All model calls in the app must go through \`${KIT_REPO}\`'s \`think()\` seam.
 EOF
 
 # ---------------------------------------------------------------------------
@@ -355,7 +385,7 @@ write_file "$TARGET/.claude/settings.local.json" << 'EOF'
 EOF
 
 # ---------------------------------------------------------------------------
-# .claude/agents/ — 6 generic crew agent templates
+# .claude/agents/ — 5 generic crew agent templates
 # ---------------------------------------------------------------------------
 
 write_file "$TARGET/.claude/agents/${PREFIX}-architect.md" << EOF
@@ -372,7 +402,7 @@ Your job: turn a feature or problem into a concrete, buildable design. Go deep �
 
 Hold these invariants:
 - **The seam is a real trust boundary.** If ${APP_NAME} connects to other suite apps, the cross-app API is the redaction layer between two private KBs; design no shared store to over-reach into (ARCH-248). The projecting side decides what it exposes; the consuming side holds no upstream credentials.
-- **All model calls go through \`convivy-app-kit\`'s \`think()\` seam.** Never design a feature that calls a provider SDK directly from feature code. The seam is also the BYO-LLM swap point.
+- **All model calls go through \`${KIT_REPO}\`'s \`think()\` seam.** Never design a feature that calls a provider SDK directly from feature code. The seam is also the BYO-LLM swap point.
 - **Privacy:** content KB stays in the gitignored \`data/\` on the mini; never design it onto a remote or into the substrate knowledge index.
 - **Human merge gate:** designs land as ready-to-merge PRs that the operator merges. No autonomous merge (ARCH-020).
 
@@ -416,7 +446,7 @@ You implement code for ${APP_NAME} — a personal system-of-record lab product (
 
 Hard rules (do NOT violate):
 - **The seam is a trust boundary.** If ${APP_NAME} connects to other suite apps, the cross-app API must expose only an explicit projection; never pass raw KB content across it without a projection contract.
-- **All model calls go through \`convivy-app-kit\`'s \`think()\` seam.** Never import or call a provider SDK directly from feature code.
+- **All model calls go through \`${KIT_REPO}\`'s \`think()\` seam.** Never import or call a provider SDK directly from feature code.
 - **Secrets stay out of git** — credentials and API keys via chmod-600 files or Keychain; honor \`.gitignore\`. Never commit or echo a credential.
 - **Personal data stays local** — content KB lives in the gitignored \`data/\`; never add it to git, never send it to a remote or to \`${ROOT}/knowledge/\`.
 - **Tests-as-touched:** cover the risky logic you change (\`pytest\`); run \`ruff check\`. Report a test pass ONLY on a real exit-0 run with a summary — never claim a pass on an errored command.
@@ -479,61 +509,10 @@ On any change to auth, secrets, the seam, data handling, or the served surface, 
 Default to flagging when uncertain. Report precisely (file:line, the risk, the fix); you do **not** edit code and you do **not** merge. **Your final message is your verdict to the orchestrator: lead with \`VERDICT: APPROVE\` or \`VERDICT: REQUEST-CHANGES\`, then the findings.** Post that same review on the PR with \`gh pr comment <#>\` — the PR is the durable record. Write Better prose.
 EOF
 
-write_file "$TARGET/.claude/agents/${PREFIX}-overnight-orchestrator.md" << EOF
----
-name: ${PREFIX}-overnight-orchestrator
-description: Autonomous overnight drain for ${APP_NAME}. Wakes on a schedule, drains unclaimed feature items from the in-box queue, dispatches the ${PREFIX}- crew to ready-to-merge PRs, leaves a morning digest. Never modifies code itself; never merges.
-model: sonnet
-tools: Read, Grep, Glob, Write, Bash(git:*), Bash(gh pr list:*), Bash(gh pr view:*), Bash(gh pr checks:*), Bash(gh run view:*), Bash(agentctl spawn:*), Bash(agentctl wait:*), Bash(agentctl budget:*), Bash(agentctl kill:*), Bash(agentctl publish:*), Bash(agentctl pr-open:*), Bash(agentctl review-status:*), Bash(overnight-manifest:*)
----
-
-> **Write Better.** Every prose artifact you produce (PR notes, digests) says it once, precisely; each clause adds a fact, constraint, or real disambiguation.
-
-You are the **self-contained overnight drain for \`${APP_NAME}\`** — a personal system-of-record lab product (ARCH-243). You wake on a schedule, drain unclaimed feature items from the in-box queue, dispatch the crew to ready-to-merge PRs, and leave the operator a digest. You run as \`claude -p\` with no human in the loop, so you never ask clarifying questions — you either proceed or skip-and-defer. **You do not modify code yourself, and you never merge a PR (ARCH-020).**
-
-\`${APP_NAME}\` is a lab product (ARCH-243). \`agentctl spawn\` resolves the \`${PREFIX}-\` crew through the shared Library-served index every non-black-box crew uses; \`LOCAL_AGENT_REPOS\` is reserved for the two privacy crews, CFO and EA. **You dispatch \`${APP_NAME}\`'s own crew** via \`agentctl spawn ${PREFIX}-<agent> --on ${APP_NAME}\`.
-
-## What you drain — unclaimed feature items from the in-box queue
-
-Enumerate items once: call \`mcp__ops__issue_list(state="open", type="feature")\`. If that returns an error, **skip the drain with a digest line** so the failure surfaces rather than silently draining nothing.
-
-Write the worklist to \`<your-run-dir>/features-worklist.md\`, one \`[ ]\` line per item.
-
-**Per feature — claim, triage, route:**
-1. Claim: use the ops-plane claim action to take ownership (prevents a concurrent run re-draining it).
-2. Triage:
-   - **Build-ready** (clear scope, known pattern, no cross-cutting design call) → dispatch \`${PREFIX}-coder\` and drive the full review cycle (below). On clean reviews + green CI + \`review-status\` PASS: resolve the in-box item. Ready-to-merge only — **never merge**.
-   - **Needs design** (ambiguous, architectural, multi-component, or a product/UX call only the operator can make) → dispatch \`${PREFIX}-architect\` to write a proposal, and surface it in the digest as "feature needs your design call." Leave the item claimed. Do NOT build it this run.
-   - **Too vague to triage** → leave it claimed and surface it in the digest as "feature needs your framing."
-
-## The dispatch + review cycle (do not shortcut)
-
-**Dispatch.** Dispatch every worker as a **detached \`agentctl spawn ${PREFIX}-coder --on ${APP_NAME} --task "<brief>" --parent "\$AGENTCTL_RUN_ID"\`** — never an in-process Task/Agent tool. Capture the printed \`<run-id>\`. Never do a worker's job inline.
-
-**Wait discipline.** A detached spawn returns immediately. Wait with **\`agentctl wait <run-id>\`** in the **foreground** inside your own turn — it blocks until the run writes \`outcome.json\`. **Never yield your turn to wait, never sleep-loop:** you run as \`claude -p\`, so ending your turn ends the session.
-
-**Branch on the wait's exit code; a non-zero exit is not one situation.** \`0\` = finished and succeeded. \`4\` = it finished and the run FAILED (errored, killed, or refused) — the work did not happen, so re-dispatch it; do NOT kill (it is already dead) and do NOT read a stamp or a queue entry as this run's result. \`2\` = timeout, the run is STILL RUNNING — kill and retry once; if that also fails, \`agentctl kill --final <run-id>\` and skip-and-defer. \`3\` = the waiter itself was killed and the run is unaffected — re-attach with another \`agentctl wait\`, never re-dispatch.
-
-**The PR + review gates (all mandatory):**
-1. **Publish** — before any reviewer, and on every auto-cycle round: \`agentctl publish --repo ${APP_NAME} --purpose <purpose> --run <worker-run-id>\`. Capture the \`published-sha:\`.
-2. **PR open** — \`agentctl pr-open --repo ${APP_NAME} --purpose <purpose> --run <worker-run-id> --title "<title>"\`. Open once after the first publish; re-publish on cycle rounds but do NOT re-open.
-3. **Reviews** — dispatch \`${PREFIX}-reviewer\` + \`${PREFIX}-security-reviewer\` in parallel. They post verdicts to the PR via \`agentctl review-post\`; you do NOT synthesize onto the PR.
-4. **Auto-cycle** — on ANY finding or red CI, re-dispatch \`${PREFIX}-coder\` with the concrete finding, re-publish, re-dispatch the reviewer(s), within the review-round cap (for a pull request that changes code or any file an agent is instructed to act on, the cap is \`review_rounds_code\` in the platform's agent policy file, or eleven rounds when that file has no \`review_rounds_code\` line; for one that changes only documents, the cap is \`review_rounds_per_role\` in that file). A pull request that changes code or any file an agent is instructed to act on runs rounds past the document cap only while no finding in the latest round repeats one an earlier round raised; a repeat in a round past the document cap stops the cycle as the cap does. Nothing runs past the cap. At the cap → skip-and-defer the item to the digest, since there is no operator here to ask.
-5. **CI gate** — after reviews go clean, \`gh pr checks <N> --watch --fail-fast\` in the foreground. Green → proceed; red → treat as a blocking finding and run another cycle round.
-6. **Review-status gate** — final: \`agentctl review-status --pr <N>\`. PASS → ready-to-merge (the operator merges). FAIL → re-cycle within the review-round cap above; at the cap → skip-and-defer.
-
-## Morning digest
-
-After draining the queue, write your digest to the path provided in your launch task:
-- Built this run: one line per feature + PR link.
-- Deferred: one line per feature + the reason.
-- Needs the operator's attention: blocked features and any design proposals your architect pass wrote this run.
-EOF
-
 # ---------------------------------------------------------------------------
 # .claude/skills/ — handoff continuity (ARCH-266 follow-up)
 # Every lab product gets /handoff-leave + /handoff-pickup so a co session can
-# span days (the established per-repo pattern PA already had). Written literally
+# span days (the established per-repo pattern an earlier product already had). Written literally
 # (quoted heredoc) — the skills resolve <product> at runtime from git toplevel,
 # so no scaffold-time substitution.
 # ---------------------------------------------------------------------------
@@ -722,7 +701,7 @@ bead from this stub, and carry these rules regardless:
    failure the bead exists to prevent.
 4. **Only a co session files.** A co session decides which not-built entries become
    work items and files them (`issue_create`). **Every other session files nothing:**
-   a dispatched run, a headless run such as the overnight orchestrator, and a session
+   a dispatched run, a headless run such as a scheduled one-shot task, and a session
    with no co. Such a session lists each not-built entry in its final report for a co
    to decide on. This rule overrides the method's instructions to file. Phase 2
    renders the accounting from the Chart House and never from this prose. On a new
@@ -742,7 +721,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
     echo "  (git init)"
 else
     git -C "$TARGET" init --quiet
-    echo "Done. ${TARGET}/ created with ${PREFIX}- crew (6 agents) + handoff and write-bead skills."
+    echo "Done. ${TARGET}/ created with ${PREFIX}- crew (5 agents) + handoff and write-bead skills."
 fi
 
 # ---------------------------------------------------------------------------
@@ -761,22 +740,25 @@ These steps touch shared or external systems; the script does not auto-do them.
      git -C ${TARGET} push -u origin main
 
 2. Register the ${PREFIX}- crew for the shared dispatch path every
-   non-black-box crew uses (LOCAL_AGENT_REPOS is reserved for the two
-   privacy crews, CFO and EA):
+   non-black-box crew uses (LOCAL_AGENT_REPOS is reserved for the registered
+   privacy crews):
 
-   - Add '${PREFIX}-' to _INTERNAL_APP_PREFIXES in bin/agentctl and to
-     INTERNAL_APP_PREFIXES in lib/agent-platform/review_protocol.py, in the
-     same commit (test_agentctl_and_review_protocol_prefixes_match holds
-     the two equal). Without it, agentctl spawn refuses
-     ${PREFIX}-architect, ${PREFIX}-coder, ${PREFIX}-reviewer and
-     ${PREFIX}-security-reviewer rather than giving them a worktree.
+   - Give the ${PREFIX}- crew's unit an 'agent_prefix' field in the project
+     registry: pass --agent-prefix '${PREFIX}-' to agentctl crew register
+     when registering it, or add the field to an already-registered unit
+     through the Library. projects.all_agent_prefixes() reads it
+     from the registry the moment that edit lands, with no change to
+     bin/agentctl or lib/agent-platform/review_protocol.py. Without it,
+     agentctl spawn refuses ${PREFIX}-architect, ${PREFIX}-coder,
+     ${PREFIX}-reviewer and ${PREFIX}-security-reviewer rather than giving
+     them a worktree.
    - Propose the agent files under .claude/agents/ into the knowledge repo
      as knowledge/projects/${APP_NAME}/agents/${PREFIX}-<role>.md
      (kind: agent), the Reference Room location agentctl spawn's
      Library-served resolution reads an agent's definition from.
 
 3. Add a bin/co tab styling entry for ${APP_NAME} — pick a hex accent and add
-   an _apply_co_style block in bin/co, following the selector block (~line 355).
+   an _apply_co_style block in bin/co, following an existing crew's block.
    Deploy the matching iTerm DynamicProfile co-${APP_NAME}.json laptop-side (ARCH-078).
 
 4. Wire telemetry: add a CI_WORKFLOW['${APP_NAME}'] entry to the scorecard and
@@ -786,9 +768,9 @@ These steps touch shared or external systems; the script does not auto-do them.
    add '${APP_NAME}' to knowledge/scripts/validate.py ALLOWED_PROJECTS and
    the id-regex pattern so validate.py accepts docs under projects/${APP_NAME}/.
 
-6. Wire convivy-app-kit as a dependency for the think() seam, cost guard,
+6. Wire ${KIT_REPO} as a dependency for the think() seam, cost guard,
    and (if applicable) trust-boundary framework (ARCH-249):
-     pip install git+ssh://git@github.com/convivy/convivy-app-kit@vN
+     pip install git+ssh://git@github.com/${KIT_SLUG}@vN
 
 7. Hold the standard review cycle and human merge gate (ARCH-020): every PR
    the crew opens runs reviewer + security-reviewer + revise-and-re-review;

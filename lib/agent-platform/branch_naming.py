@@ -3,11 +3,12 @@ into a branch-safe slug (CQ·354).
 
 Factored out of `bin/agentctl`'s `_slug`, byte-for-byte, so that anything
 needing to predict or recognize a fragment of a branch name a dispatched
-worker will get — `issue_gate.py`'s unlinked-branch scan, today — calls the
-SAME transform `agentctl` itself applies when it builds `derive_purpose`'s
-`agent/<purpose>` branch names, rather than a second implementation that can
-silently drift from it. `bin/agentctl` imports `slugify` back as its own
-`_slug` rather than keeping a local copy.
+worker will get calls the SAME transform `agentctl` itself applies when it
+builds `derive_purpose`'s `agent/<purpose>` branch names, rather than a
+second implementation that can silently drift from it — originally
+`issue_gate.py`'s unlinked-branch scan, since deleted; `bin/agentctl` is the
+only caller today. `bin/agentctl` imports `slugify` back as its own `_slug`
+rather than keeping a local copy.
 """
 from __future__ import annotations
 

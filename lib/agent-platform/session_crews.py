@@ -4,7 +4,7 @@ WHY THIS EXISTS. Crew creation has one path (the operator, 2026-09-03): the stew
 `new-crew` skill makes the directory and the tmux session and writes a spec per
 crew to `~/.config/convivy/deck/crews.d/<id>.json`. Deck reads its own config
 on the laptop, so nothing read those files — a crew created through the only
-sanctioned path got a rail row and no cockpit (placard, 2026-09-05). Deck
+sanctioned path got a rail row and no cockpit (a product crew, 2026-09-05). Deck
 already opens an ssh connection to this host every poll, so this verb is the
 read side: the specs, as `{"crews": [...]}`, shaped like `sessions` so Deck's
 decode discipline applies (a row it cannot parse is skipped; only a malformed
@@ -29,9 +29,10 @@ reader can tell a choice from a default.
 A PRIVATE CREW'S ROW IS NOT SERVED, and that is ADR-0043's posture rather
 than a choice made here. `bin/run-register-api` drops a black-box crew's row
 whole from `/runs` and `/sessions`; this verb is the same class of surface
-(unauthenticated the way every session-agent verb is), and `ea.json` was on
-the host with its real directory and `project: ea` the day this shipped
-(security-reviewer, knowledge#362). A row is dropped when its `project` names
+(unauthenticated the way every session-agent verb is), and a private crew's
+spec file was on the host with its real directory and its private `project`
+the day this shipped (security-reviewer, knowledge#362). A row is dropped
+when its `project` names
 a private slug, when its `workingDirectory` lies under a private crew's home
 by inode (a symlink into one included), or when the question cannot be
 answered — no usable `workingDirectory`, or a registry this host cannot read,

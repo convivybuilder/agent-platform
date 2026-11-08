@@ -30,6 +30,7 @@ import urllib.request
 from pathlib import Path
 
 import github_app as GA
+import worktrees as WT
 
 _CHANGELOG_BODY_CLIP = 4000
 
@@ -86,6 +87,28 @@ def _pr_number_from_url(url: str) -> int | None:
         return None
 
 
+def _repo_basename(repo: str) -> str:
+    """`owner/repo` -> `repo`. Every signal's `product` and `stream` carry
+    this bare form, matching every other signal writer and both of Orient's
+    readers (steward's ruling, CQ·605) — `dedup_key` keeps the full
+    `owner/repo` form unchanged, since every stored row already carries it
+    there and the Library's backfill of existing rows leaves `dedup_key`
+    untouched."""
+    return repo.rsplit("/", 1)[-1]
+
+
+def is_safe_basename(repo: str) -> bool:
+    """Whether `_repo_basename(repo)` is safe to carry as `product`/`stream`
+    and, downstream (`bin/changelog-drain`), as a path segment and an
+    `agentctl spawn --on` argument. `repo` comes from the GitHub App's
+    installation listing, not the reviewed project registry, so a basename
+    of `.` or `..` is reachable here the way it already is for
+    `worktrees.is_dispatch_target`'s own segments — reusing its
+    `_is_safe_segment` guard rather than a second copy of the same pattern
+    (security review round 1, CQ·605)."""
+    return WT._is_safe_segment(_repo_basename(repo))
+
+
 def signal_from_review(repo: str, pr_number: int, review: dict) -> dict | None:
     """A review VERDICT event. Empty-body COMMENTED reviews are shells wrapping
     inline comments (captured separately) — skip those; keep APPROVED /
@@ -96,11 +119,12 @@ def signal_from_review(repo: str, pr_number: int, review: dict) -> dict | None:
         return None
     if not state:
         return None
+    basename = _repo_basename(repo)
     return {
         "source": "github_review",
         "kind": "review_verdict",
-        "product": repo,
-        "stream": f"{repo}#{pr_number}",
+        "product": basename,
+        "stream": f"{basename}#{pr_number}",
         "actor": (review.get("user") or {}).get("login") or "unknown",
         "body": body,
         "refs": {"pr": pr_number, "url": review.get("html_url") or ""},
@@ -126,12 +150,13 @@ def signal_from_merge(repo: str, pr: dict) -> dict | None:
     body = f"{title}\n\n{description}" if description else title
     if len(body) > _CHANGELOG_BODY_CLIP:
         body = body[:_CHANGELOG_BODY_CLIP].rstrip() + " …"
+    basename = _repo_basename(repo)
     return {
         "source": "github",
         "kind": "changelog",
-        "stream": repo,
+        "stream": basename,
         "actor": author,
-        "product": repo,
+        "product": basename,
         "body": body,
         "refs": {"pr": number, "url": pr.get("html_url") or "",
                  "merged_at": merged_at, "author": author},
@@ -150,11 +175,12 @@ def signal_from_review_comment(repo: str, rc: dict) -> dict | None:
     refs = {"pr": pr_number, "url": rc.get("html_url") or ""}
     if rc.get("path"):
         refs["path"] = rc["path"]
+    basename = _repo_basename(repo)
     return {
         "source": "github_review",
         "kind": "review_comment",
-        "product": repo,
-        "stream": f"{repo}#{pr_number}",
+        "product": basename,
+        "stream": f"{basename}#{pr_number}",
         "actor": (rc.get("user") or {}).get("login") or "unknown",
         "body": body,
         "refs": refs,
@@ -173,11 +199,12 @@ def signal_from_issue_comment(repo: str, ic: dict) -> dict | None:
         return None
     if "/pull/" not in (ic.get("html_url") or ""):
         return None
+    basename = _repo_basename(repo)
     return {
         "source": "github_review",
         "kind": "pr_comment",
-        "product": repo,
-        "stream": f"{repo}#{pr_number}",
+        "product": basename,
+        "stream": f"{basename}#{pr_number}",
         "actor": (ic.get("user") or {}).get("login") or "unknown",
         "body": body,
         "refs": {"pr": pr_number, "url": ic.get("html_url") or ""},

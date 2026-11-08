@@ -4,8 +4,8 @@
 WHAT HAPPENED, measured 2026-08-12. `session-agent state <name> --follow` never
 exited when its reader (a Deck pane) went away — `BrokenPipeError` only raises on
 a write, so a follower watching a stable session sat forever. 101 followers were
-live on the mini against roughly 8 legitimate ones: `svc` had 28, `constance` 25,
-`sous-chef` 24, `ask` 21, all orphaned (`ppid == 1`), the oldest running 2 days 23
+live on the mini against roughly 8 legitimate ones: one crew had 28, another 25,
+another 24, another 21, all orphaned (`ppid == 1`), the oldest running 2 days 23
 hours. Load average hit 209 on ten cores, the self-hosted CI runner starved into
 failing three unrelated PRs, and the ops control plane took 9.5s to answer a
 health check. It ran undetected for at least three days because nothing was
@@ -121,7 +121,7 @@ def follower_session(command: str) -> str | None:
 # Flags on `session-agent state` that CONSUME THE NEXT TOKEN. `--follow` is a
 # store_true and takes none; `--interval` takes a float. The distinction has to
 # be made, because "the first token that does not start with a dash" reads the
-# 5 in `state --interval 5 sous-chef --follow` as the session name.
+# 5 in `state --interval 5 acme --follow` as the session name.
 #
 # This duplicates the CLI's own spec, which is how it would rot. Pinned by
 # `test_the_value_taking_flag_list_matches_session_agent`, which reads the real

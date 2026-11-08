@@ -142,7 +142,7 @@ def test_spawn_refuses_an_unpriced_codex_slug(agentctl, monkeypatch, capsys):
                         lambda name, repo=None, agents_dir=None: {"model_alias": "gpt-reserve"})
     monkeypatch.setattr(agentctl.R, "can_spawn", lambda *a, **kw: (_ for _ in ()).throw(
         AssertionError("must be refused before R.can_spawn")))
-    args = types.SimpleNamespace(agent="reviewer", task="t", on="agent-platform", profile=None,
+    args = types.SimpleNamespace(agent="reviewer", task="t", on="widget-crew", profile=None,
                                  agents_dir=None, parent=None, pr=None, review_sha=None,
                                  model=None, reason=None)
     assert agentctl.cmd_spawn(args) == 2

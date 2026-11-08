@@ -99,11 +99,11 @@ def test_install_sh_activation_list_names_the_recovered_job():
     )
 
 
-def test_install_sh_activation_list_drops_the_nonexistent_pa_job():
+def test_install_sh_activation_list_drops_the_nonexistent_aide_job():
     install_sh = (REPO / "install.sh").read_text()
     activation_line = _curated_activation_line(install_sh)
-    assert "com.convivy.model-scorecard-pa" not in activation_line, (
-        "com.convivy.model-scorecard-pa is neither a file in launchd/ nor a job loaded "
+    assert "com.convivy.model-scorecard-aide" not in activation_line, (
+        "com.convivy.model-scorecard-aide is neither a file in launchd/ nor a job loaded "
         "on this machine — a name in the activation list that resolves to nothing"
     )
-    assert not (REPO / "launchd" / "com.convivy.model-scorecard-pa.plist").exists()
+    assert not (REPO / "launchd" / "com.convivy.model-scorecard-aide.plist").exists()

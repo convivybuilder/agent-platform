@@ -24,7 +24,7 @@ Two shapes, two scopes:
 
 and each comes from either the user's `~/.claude` or the project's
 `<cwd>/.claude`. In practice the weight is entirely on skills: across
-agent-platform, vivy, sous-chef and knowledge there were 19 to 24 skills each
+agent-platform and three product repos there were 19 to 24 skills each
 and zero project commands, with two user commands total. A version of this that
 only read `commands/` would have reported almost nothing and looked broken.
 """

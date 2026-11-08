@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+import projects
+
 REPO = Path(__file__).resolve().parent.parent
 FIXTURE = REPO / "tests" / "fixtures" / "ci1_heartbeat" / "tailscale-status.json"
 NOW = datetime(2026, 10, 5, 2, 0, tzinfo=timezone.utc)
@@ -89,7 +91,7 @@ def _run(run_id: int) -> dict:
 def _job(name: str, *, status: str = "queued", labels=("convivy-linux",), minutes_old: float = 20) -> dict:
     created = _iso(NOW - timedelta(minutes=minutes_old))
     return {"id": 1, "name": name, "status": status, "labels": list(labels), "created_at": created,
-            "html_url": "https://github.com/convivy/vivy/actions/runs/1/job/1"}
+            "html_url": "https://github.com/convivy/widget/actions/runs/1/job/1"}
 
 
 class FakeActions:
@@ -123,8 +125,8 @@ class FakeActions:
         return 200, {key: items[lo:lo + 100]}
 
 
-REPOS = ["convivy/vivy", "convivy/library", "convivy/agent-platform", "convivy/shipwright",
-        "convivy/selector", "convivy/selector-backend", "convivy/knowledge",
+REPOS = ["convivy/widget", "convivy/library", "convivy/agent-platform", "convivy/shipwright",
+        "convivy/beacon", "convivy/beacon-backend", "convivy/knowledge",
         "convivy/ci1-runner-scratch"]
 
 
@@ -303,44 +305,44 @@ def test_tailscale_is_called_with_a_bounded_timeout(hb):
 
 def test_old_queued_convivy_linux_job_fires_with_its_created_at_as_the_start(hb):
     job = _job("build", minutes_old=20)
-    get = FakeActions(runs={("convivy/vivy", "queued"): [_run(1)]},
-                      jobs={("convivy/vivy", 1): [job]})
+    get = FakeActions(runs={("convivy/widget", "queued"): [_run(1)]},
+                      jobs={("convivy/widget", 1): [job]})
     v = _queue(hb, get)
     assert v.kind == "fired"
     assert v.since == datetime.fromisoformat(job["created_at"])
-    assert "convivy/vivy" in v.detail and "`build`" in v.detail
+    assert "convivy/widget" in v.detail and "`build`" in v.detail
 
 
 def test_young_queued_convivy_linux_job_is_clear(hb):
-    get = FakeActions(runs={("convivy/vivy", "queued"): [_run(1)]},
-                      jobs={("convivy/vivy", 1): [_job("build", minutes_old=10)]})
+    get = FakeActions(runs={("convivy/widget", "queued"): [_run(1)]},
+                      jobs={("convivy/widget", 1): [_job("build", minutes_old=10)]})
     assert _queue(hb, get).kind == "clear"
 
 
 def test_queued_job_at_exactly_fifteen_minutes_fires(hb):
-    get = FakeActions(runs={("convivy/vivy", "queued"): [_run(1)]},
-                      jobs={("convivy/vivy", 1): [_job("build", minutes_old=15)]})
+    get = FakeActions(runs={("convivy/widget", "queued"): [_run(1)]},
+                      jobs={("convivy/widget", 1): [_job("build", minutes_old=15)]})
     assert _queue(hb, get).kind == "fired"
 
 
 def test_old_job_not_targeting_convivy_linux_is_clear(hb):
-    get = FakeActions(runs={("convivy/vivy", "queued"): [_run(1)]},
-                      jobs={("convivy/vivy", 1): [_job("lint", labels=("ubuntu-latest",),
+    get = FakeActions(runs={("convivy/widget", "queued"): [_run(1)]},
+                      jobs={("convivy/widget", 1): [_job("lint", labels=("ubuntu-latest",),
                                                        minutes_old=90)]})
     assert _queue(hb, get).kind == "clear"
 
 
 def test_old_job_already_in_progress_is_clear(hb):
-    get = FakeActions(runs={("convivy/vivy", "in_progress"): [_run(1)]},
-                      jobs={("convivy/vivy", 1): [_job("build", status="in_progress",
+    get = FakeActions(runs={("convivy/widget", "in_progress"): [_run(1)]},
+                      jobs={("convivy/widget", 1): [_job("build", status="in_progress",
                                                        minutes_old=90)]})
     assert _queue(hb, get).kind == "clear"
 
 
 def test_queued_job_inside_an_in_progress_run_is_found(hb):
     # A multi-job run queues its later jobs while the run itself is in progress.
-    get = FakeActions(runs={("convivy/vivy", "in_progress"): [_run(7)]},
-                      jobs={("convivy/vivy", 7): [_job("deploy-check", minutes_old=30)]})
+    get = FakeActions(runs={("convivy/widget", "in_progress"): [_run(7)]},
+                      jobs={("convivy/widget", 7): [_job("deploy-check", minutes_old=30)]})
     assert _queue(hb, get).kind == "fired"
 
 
@@ -354,8 +356,8 @@ def test_every_listed_repository_is_read_for_both_run_statuses(hb):
 
 def test_the_oldest_job_across_repositories_is_the_one_reported(hb):
     get = FakeActions(
-        runs={("convivy/vivy", "queued"): [_run(1)], ("convivy/library", "queued"): [_run(2)]},
-        jobs={("convivy/vivy", 1): [_job("a", minutes_old=20)],
+        runs={("convivy/widget", "queued"): [_run(1)], ("convivy/library", "queued"): [_run(2)]},
+        jobs={("convivy/widget", 1): [_job("a", minutes_old=20)],
               ("convivy/library", 2): [_job("b", minutes_old=40)]})
     v = _queue(hb, get)
     assert "convivy/library" in v.detail and "`b`" in v.detail
@@ -368,50 +370,60 @@ def test_refused_repository_read_is_a_check_failure(hb):
 
 
 def test_runs_past_the_page_cap_are_a_check_failure_not_a_partial_read(hb):
-    get = FakeActions(runs={("convivy/vivy", "queued"): [_run(i) for i in range(1100)]})
+    get = FakeActions(runs={("convivy/widget", "queued"): [_run(i) for i in range(1100)]})
     with pytest.raises(hb.CheckFailed, match="past 10 pages"):
-        _queue(hb, get, repos=["convivy/vivy"])
+        _queue(hb, get, repos=["convivy/widget"])
 
 
 def test_the_second_page_is_read(hb):
     # 101 queued runs: the old job's run is the only one on page two.
     runs = [_run(i) for i in range(100)] + [_run(999)]
-    get = FakeActions(runs={("convivy/vivy", "queued"): runs},
-                      jobs={("convivy/vivy", 999): [_job("late", minutes_old=30)]})
-    assert _queue(hb, get, repos=["convivy/vivy"]).kind == "fired"
+    get = FakeActions(runs={("convivy/widget", "queued"): runs},
+                      jobs={("convivy/widget", 999): [_job("late", minutes_old=30)]})
+    assert _queue(hb, get, repos=["convivy/widget"]).kind == "fired"
 
 
-def test_repository_list_is_the_checked_in_file(hb):
+def _registry_with_ci1_repos(tmp_path: Path, repos: list[str]) -> Path:
+    path = tmp_path / "projects.json"
+    path.write_text(json.dumps({"_ci1_heartbeat_repos": repos}))
+    return path
+
+
+def test_repository_list_comes_from_the_registry(hb, monkeypatch, tmp_path):
+    # CQ·586: the list moved from a checked-in file to the project registry's
+    # `_ci1_heartbeat_repos` key (`projects.ci1_heartbeat_repos()`); which
+    # repos belong there is now the Library's data to keep current, not a
+    # fixed list this test can pin.
+    registry = _registry_with_ci1_repos(tmp_path, REPOS)
+    monkeypatch.setattr(projects, "PROJECTS_JSON", registry)
+    projects._load_raw.cache_clear()
     assert hb.load_repos() == REPOS
 
 
-def test_repository_list_names_every_runner_group_member(hb):
-    # The convivy-linux runner group holds vivy, library, agent-platform, shipwright, selector
-    # and selector-backend (added 2026-10-05), knowledge (added 2026-10-07) and
-    # ci1-runner-scratch (never added to the group, but its workflows use runs-on:
-    # convivy-linux); a removal of any of them from the file must fail this test, not just
-    # surface in a reduced REPOS.
-    repos = hb.load_repos()
-    for repo in ("convivy/vivy", "convivy/library", "convivy/agent-platform",
-                 "convivy/shipwright", "convivy/selector", "convivy/selector-backend",
-                 "convivy/knowledge", "convivy/ci1-runner-scratch"):
-        assert repo in repos
-
-
-def test_repository_list_skips_comments_and_blank_lines(hb, tmp_path):
-    f = tmp_path / "repos.txt"
-    f.write_text("# a note\n\n  convivy/vivy  \n# convivy/old\n")
-    assert hb.load_repos(f) == ["convivy/vivy"]
-
-
-def test_unreadable_repository_list_is_a_check_failure(hb, tmp_path):
+def test_an_unreadable_registry_is_a_check_failure(hb, monkeypatch, tmp_path):
+    monkeypatch.setattr(projects, "PROJECTS_JSON", tmp_path / "missing.json")
+    projects._load_raw.cache_clear()
     with pytest.raises(hb.CheckFailed, match="repository list"):
-        hb.load_repos(tmp_path / "missing.txt")
+        hb.load_repos()
 
 
 def test_a_missing_app_key_is_a_check_failure_before_any_network(hb, tmp_path):
     with pytest.raises(hb.CheckFailed, match="no App key"):
-        hb.github_getter(key_path=tmp_path / "absent.pem")
+        hb.github_getter(key_path=tmp_path / "absent.pem", app_id="1234567")
+
+
+def test_a_missing_installed_app_is_a_check_failure_before_any_network(hb, monkeypatch):
+    """With neither override given, `github_getter` resolves both through
+    `GA.installed_app()` — a fresh install with no App set up yet is a clean
+    `CheckFailed`, not an uncaught `GA.Unreadable`."""
+    import github_app as GA
+
+    def refuse():
+        raise GA.Unreadable("no App id at .../app-id")
+
+    monkeypatch.setattr(GA, "installed_app", refuse)
+    with pytest.raises(hb.CheckFailed, match="no App id"):
+        hb.github_getter()
 
 
 def test_an_app_token_refused_is_a_check_failure(hb, monkeypatch, tmp_path):
@@ -425,7 +437,7 @@ def test_an_app_token_refused_is_a_check_failure(hb, monkeypatch, tmp_path):
 
     monkeypatch.setattr(GA, "app_jwt", refuse)
     with pytest.raises(hb.CheckFailed, match="refused an installation token"):
-        hb.github_getter(key_path=key)
+        hb.github_getter(key_path=key, app_id="1234567")
 
 
 def test_github_getter_resolves_its_own_installation_with_two_installed(
@@ -459,7 +471,7 @@ def test_github_getter_resolves_its_own_installation_with_two_installed(
 
     monkeypatch.setattr(GA, "request", fake_request)
 
-    hb.github_getter(key_path=key)  # must not raise CheckFailed
+    hb.github_getter(key_path=key, app_id="1234567")  # must not raise CheckFailed
 
     assert any(u.endswith("/orgs/convivy/installation") for u in seen)
     assert not any("/app/installations" in u for u in seen), (
@@ -499,7 +511,7 @@ def _ci1_fires():
 def _queue_fires():
     since = NOW - timedelta(minutes=30)
     return lambda now: HB.Verdict("fired", since, "a convivy-linux job queued",
-                                  f"convivy/vivy: job 'build' queued since {_iso(since)}")
+                                  f"convivy/widget: job 'build' queued since {_iso(since)}")
 
 
 def _clear_ci1():
@@ -861,13 +873,14 @@ def test_a_queued_job_fires_its_own_incident(hb, tmp_path):
 
 def test_a_queued_job_in_knowledge_logs_its_own_signal(hb, tmp_path):
     # knowledge#813, 2026-10-07: convivy/knowledge's jobs sat queued for over 30 minutes while
-    # knowledge was in neither the runner group nor this file, and nothing was logged. Reads the
-    # shipped file through load_repos(), not the REPOS test constant, so a dropped
-    # convivy/knowledge entry in the real file fails this test.
+    # knowledge was in neither the runner group nor the (then checked-in) repository list, and
+    # nothing was logged. Named explicitly here, rather than through load_repos(), since the
+    # repository list is now the Library's registry data (CQ·586), not something this test
+    # can read back.
     get = FakeActions(runs={("convivy/knowledge", "queued"): [_run(1)]},
                       jobs={("convivy/knowledge", 1): [_job("validate", minutes_old=30)]})
     rc, calls = _call(hb, tmp_path / STATE_NAME, ci1=_clear_ci1(),
-                      queue=lambda now: hb.queue_verdict(get, hb.load_repos(), now))
+                      queue=lambda now: hb.queue_verdict(get, ["convivy/knowledge"], now))
     assert rc == 0
     assert len(calls["post"]) == 1
     assert calls["post"][0]["edge"] == "opened"
@@ -1040,9 +1053,9 @@ def test_tailscale_last_seen_shapes_are_read_on_the_script_python(hb, seen):
 def test_github_created_at_shapes_are_read_on_the_script_python(hb, created):
     job = _job("build")
     job["created_at"] = created
-    get = FakeActions(runs={("convivy/vivy", "queued"): [_run(1)]},
-                      jobs={("convivy/vivy", 1): [job]})
-    assert _queue(hb, get, repos=["convivy/vivy"]).kind == "fired"
+    get = FakeActions(runs={("convivy/widget", "queued"): [_run(1)]},
+                      jobs={("convivy/widget", 1): [job]})
+    assert _queue(hb, get, repos=["convivy/widget"]).kind == "fired"
 
 
 def test_a_malformed_down_since_stops_the_run_before_any_signal(hb, tmp_path):
@@ -1061,7 +1074,7 @@ def test_a_github_failure_does_not_drop_a_fired_ci1_offline(hb, tmp_path, error)
         raise error
 
     def queue(now):
-        return hb.queue_check(now, github=lambda: get)
+        return hb.queue_check(now, load_repos=lambda: REPOS, github=lambda: get)
 
     rc, calls = _call(hb, tmp_path / STATE_NAME, ci1=_ci1_fires(), queue=queue)
     assert rc == 1

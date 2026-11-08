@@ -78,7 +78,7 @@ run_co_r() {
     ( cd "$home/Convivy/library" && \
       HOME="$home" PATH="$home/stubbin:$PATH" KCTX_LOG="$kctx" \
       AGENTCTL_STUB_GIT="$REAL_GIT" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" -r >/dev/null 2>"$err" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" -r >/dev/null 2>"$err" )
     RC=$?
     STDERR=$(cat "$err")
     FLOOR_CALLS=$(grep '^floor' "$kctx" || true)

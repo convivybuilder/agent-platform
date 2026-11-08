@@ -45,6 +45,21 @@ def test_no_config_means_the_fallback(BR, tmp_path, home):
     assert BR.root(tmp_path / "absent.env", BR.fallback_for(home), home) == home / "builder"
 
 
+def test_configured_raw_reads_another_key_on_request(BR, tmp_path):
+    """`vault_plane.SESSIONS_ONLY` reads this same file under its own key
+    (E12-2 slice S5c), passed explicitly rather than hardcoded as this
+    module's own KEY — `configured_raw` stays the one place that reads the
+    file's bytes."""
+    config = _config(tmp_path, "CREWS_ROOT=/srv/convivy/Convivy\nSESSIONS_ONLY=1\n")
+    assert BR.configured_raw(config, key="SESSIONS_ONLY") == "1"
+    assert BR.configured_raw(config) == "/srv/convivy/Convivy"  # the default key, unchanged
+
+
+def test_configured_raw_an_absent_other_key_is_none(BR, tmp_path):
+    config = _config(tmp_path, "CREWS_ROOT=/srv/convivy/Convivy\n")
+    assert BR.configured_raw(config, key="SESSIONS_ONLY") is None
+
+
 @pytest.mark.parametrize("text", ["", "OTHER=/x\n", "# CREWS_ROOT=/x\n", "CREWS_ROOT=\n",
                                   "CREWS_ROOT=relative/path\n"])
 def test_an_unusable_value_falls_back(BR, tmp_path, home, text):

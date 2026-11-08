@@ -101,7 +101,7 @@ run_co() {
     ( cd "$home/$dir" && \
       HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$claude_log" KCTX_SPY_LOG="$spy_log" KCTX_RC="${KCTX_RC:-0}" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "$@" >/dev/null 2>"$stderr_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" "$@" >/dev/null 2>"$stderr_log" )
     RC=$?
     STDERR=$(cat "$stderr_log")
     KCTX_CALLS=$(cat "$spy_log")

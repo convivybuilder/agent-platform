@@ -25,16 +25,28 @@ private func makeSocketPair() -> (Int32, Int32) {
     @Test func acceptsTheActualPeerUID() throws {
         let (a, b) = makeSocketPair()
         defer { close(a); close(b) }
-        try PeerUIDGate.check(fileDescriptor: a, requiredUID: getuid())
+        let found = try PeerUIDGate.check(fileDescriptor: a, admittedUIDs: [getuid()])
+        #expect(found == getuid())
     }
 
-    @Test func refusesAnyOtherConfiguredUID() {
+    /// Two admitted uids: the connecting peer is one of them, and the gate
+    /// returns that one rather than refusing just because the set has more
+    /// than one member (E12·2 — a second admitted account must not narrow
+    /// what the first account could already do).
+    @Test func acceptsThePeerUIDWhenItIsOneOfSeveralAdmittedUIDs() throws {
+        let (a, b) = makeSocketPair()
+        defer { close(a); close(b) }
+        let found = try PeerUIDGate.check(fileDescriptor: a, admittedUIDs: [getuid(), getuid() + 1, getuid() + 2])
+        #expect(found == getuid())
+    }
+
+    @Test func refusesAnUnlistedUID() {
         let (a, b) = makeSocketPair()
         defer { close(a); close(b) }
         let wrongUID = getuid() + 1
 
-        #expect(throws: PeerUIDGateError.uidMismatch(expected: wrongUID, found: getuid())) {
-            try PeerUIDGate.check(fileDescriptor: a, requiredUID: wrongUID)
+        #expect(throws: PeerUIDGateError.uidNotAdmitted(found: getuid())) {
+            try PeerUIDGate.check(fileDescriptor: a, admittedUIDs: [wrongUID])
         }
     }
 }

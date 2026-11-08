@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""budget-watchdog — periodic budget tripwire for overnight runs (ARCH-065).
+"""budget-watchdog — periodic budget tripwire for a wave of dispatched runs (ARCH-065).
 
 The spawn gate (`agentctl spawn`) only evaluates the budget at the moment a
 new worker is spawned. That misses two cases: (a) a long-lived orchestrator
 that keeps burning between spawns, and (b) a run that goes quiet/stuck and
-stops spawning entirely (the 2026-05-26 vivy failure — $9 on one run, no
+stops spawning entirely (a 2026-05-26 production-crew failure — $9 on one run, no
 spawns, no alert). This watchdog closes both by re-evaluating the *live*
 budget (`budget.status()` = exact completed cost + in-flight estimate) on a
 timer, independent of any spawn.
@@ -16,9 +16,9 @@ It does not kill anything: the hard cap's *enforcement* remains the spawn
 gate refusing new spawns once `status()` reports hard_crossed. The watchdog's
 job is timely notification + marker-setting.
 
-Launched detached by `launch-overnight` after it spawns the orchestrators;
-self-terminates once the overnight runs have all finished (or at a safety
-ceiling). Env overrides:
+Launched detached alongside a session that spawns a wave of workers;
+self-terminates once those runs have all finished (or at a safety ceiling).
+Env overrides:
   BUDGET_WATCHDOG_POLL_SECONDS   (default 180)
   BUDGET_WATCHDOG_MAX_RUNTIME_MIN (default 480)
   BUDGET_WATCHDOG_STARTUP_GRACE_MIN (default 15)

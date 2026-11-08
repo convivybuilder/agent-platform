@@ -42,6 +42,7 @@ import glob
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 
@@ -63,8 +64,9 @@ _TMUX_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 # crew's private content landing in the shared run root, outside every layer
 # ADR-0043 defines: its transport wall stops the session reaching the vaults, and
 # none of it touches a writer that runs beside the session rather than inside it.
-# Measured 2026-08-18 before the fix: 14 CFO sessions holding 147,005 characters of
-# verbatim prompt and assistant text, and 27 for ask.
+# Measured 2026-08-18 before the fix: 14 sessions for one black-box crew holding
+# 147,005 characters of verbatim prompt and assistant text, and 27 for the
+# walled-off crew.
 #
 # WHERE IT GOES INSTEAD, rather than being dropped: the operator's ledger-split rule says a
 # black box crew's detailed record belongs inside the crew's own directory. So the
@@ -79,7 +81,7 @@ _TMUX_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 #
 # `_private_home_for`/`_UNKNOWN` used to be defined here directly; a reader
 # (`session_state.py`) needed the identical answer and had no copy at all,
-# which is how CFO's hook log went unreadable for three days
+# which is how a black-box crew's hook log went unreadable for three days
 # (agent-platform#421 / issue_01M0GVMBXCX10F0R3ZAGHGEKFZ) — the shared root
 # this reader used to write to moved and nothing told it. Both sides now import
 # `lib/agent-platform/private_crew.py`, so there is one place this logic can be
@@ -118,6 +120,20 @@ try:
     LOG_ROOT = os.path.join(RUNS_ROOT, "hook-log")
 except BaseException:
     RUNS_ROOT = LOG_ROOT = None
+
+# `telemetry.ensure_real_dir`/`RunRootIsSymlink`: the same lstat-before-mkdir
+# check `_ensure_root`/`create_run_dir` use for a private crew's own
+# `agent-runs` root, reused here rather than a second copy of the identical
+# logic (ARCH-322 round 3) — `telemetry.py` makes the SAME `builder_root`
+# call this module already makes directly above, so importing it is no
+# riskier than that existing import, and is wrapped the same defensive way.
+# On failure, `_ensure_dir_or_bail` below falls back to this module's own
+# `_is_real_dir` + `os.makedirs`.
+try:
+    from telemetry import ensure_real_dir as _ensure_real_dir, RunRootIsSymlink as _RunRootIsSymlink
+except BaseException:
+    _ensure_real_dir = None
+    _RunRootIsSymlink = OSError
 
 
 # The payload fields that carry what a person or the model actually said. Stripped
@@ -166,6 +182,170 @@ def _safe_name(value, fallback):
     return "".join(keep)[:64] or fallback
 
 
+# --- symlink-safe write primitives (ARCH-322 round 3: a private crew's own
+# sandboxed dispatch can replace a predictable path under its own home —
+# `hook-log`, a day directory, `agent-runs` — with a symlink to anywhere the
+# real OS user can write, and this hook runs UNSANDBOXED (registered in
+# `~/.claude/settings.json`; see `run_sandbox.py`'s "Edit and Write tools run
+# outside the sandbox" comment, which applies equally to a hook process).
+# `os.makedirs(..., exist_ok=True)` and a plain `open(path, "w")` both follow
+# such a symlink silently, laundering a write the crew's own sandboxed Bash
+# tool could not make directly. These two primitives are the fix: a
+# directory check that refuses a symlink outright, and file opens that
+# refuse to follow one at the final path component. ----------------------
+
+
+def _is_real_dir(path):
+    """True iff `path` exists and is a directory that is NOT a symlink.
+
+    `os.lstat`, never `os.stat`: `stat` follows a symlink to check what it
+    points at, which is exactly the question this function must answer NO
+    to for a symlink pointing at a real directory elsewhere."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode)
+
+
+def _is_safe_co_meta_path(meta_path):
+    """True iff both the day directory and the `co-<sid>` directory naming
+    `meta_path` are real, non-symlink directories — the same pair of
+    predictable, plantable path components SessionStart checks (each via
+    `_ensure_dir_or_bail`) before creating anything under them. Stop does
+    not create either directory, but must refuse to read or write through
+    one that was replaced with a symlink exactly as SessionStart refuses to
+    create under one (ARCH-322 round 3)."""
+    co_dir = os.path.dirname(meta_path)
+    day_dir = os.path.dirname(co_dir)
+    return _is_real_dir(day_dir) and _is_real_dir(co_dir)
+
+
+def _ensure_dir_or_bail(path):
+    """Make `path` a real, non-symlink directory, creating it if absent;
+    True on success, False when it must be refused (something else already
+    sits there, or creation failed).
+
+    Uses the shared `telemetry.ensure_real_dir` when it imported cleanly —
+    the SAME lstat-before-mkdir check `_ensure_root`/`create_run_dir` use
+    for this exact family of path (ARCH-322 round 3), rather than a second
+    copy of it here — translating its raised `RunRootIsSymlink`/`OSError`
+    into this module's own never-raise idiom. Falls back to this module's
+    own `_is_real_dir` + `os.makedirs` only if that import failed."""
+    if _ensure_real_dir is not None:
+        try:
+            _ensure_real_dir(path)
+        except (_RunRootIsSymlink, OSError):
+            return False
+        return True
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        return False
+    return _is_real_dir(path)
+
+
+def _open_create_only(path, mode=0o644):
+    """Create `path` and return its fd, or None if it already exists (file,
+    directory, or symlink — dangling or not) or cannot be created.
+
+    `O_EXCL` with `O_CREAT` refuses to follow a symlink at all: the open
+    fails if anything already sits at `path`, even a broken link, so this
+    never writes through one. Used for a file that is written once, only
+    when absent (`.gitignore`, the Spotlight marker)."""
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW
+    try:
+        return os.open(path, flags, mode)
+    except OSError:
+        return None
+
+
+def _open_write_nofollow(path, mode=0o600, *, append=False):
+    """Open `path` for writing (creating it if absent) and return its fd, or
+    None. Refuses to follow a symlink at the final path component.
+
+    Unlike `_open_create_only`, this overwrites (or appends to) an existing
+    REAL file — the day's `.jsonl`, a co-session's `meta.json` — which a
+    plain `O_EXCL` cannot do since the file is meant to exist across calls."""
+    flags = os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_TRUNC)
+    try:
+        return os.open(path, flags, mode)
+    except OSError:
+        return None
+
+
+def _write_json_record(path, record, *, is_private):
+    """Write `record` to `path` as indented JSON, overwriting any prior
+    content — `meta.json`'s own shape, used at both SessionStart (fresh) and
+    Stop (heartbeat refresh).
+
+    `is_private` picks `_open_write_nofollow` over a plain `open(path, "w")`:
+    same O_NOFOLLOW reasoning as `_ensure_hook_log_gitignore`, for the one
+    write this module makes under a private crew's own `agent-runs` tree
+    rather than `hook-log`."""
+    data = json.dumps(record, indent=2, default=str).encode("utf-8")
+    if not is_private:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(data.decode("utf-8"))
+        return
+    fd = _open_write_nofollow(path)
+    if fd is None:
+        return
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+
+
+def _read_json_record(path, *, is_private):
+    """Read `path` as a JSON object, or None on any failure (missing,
+    unreadable, not JSON, not an object) — `meta.json`'s own shape, read
+    back by Stop to refresh the heartbeat without rewriting identity.
+
+    `is_private` opens with `O_NOFOLLOW`: the symlink this guards against is
+    the same one `_write_json_record`'s own write-back already refuses to
+    follow at this exact path, so a read with no such guard would still let
+    the file's CONTENT (not just the write) be read through a symlink
+    planted at the final component."""
+    try:
+        if is_private:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fh = os.fdopen(fd, "r", encoding="utf-8")
+        else:
+            fh = open(path, encoding="utf-8")
+        with fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _ensure_hook_log_gitignore(path):
+    """Write `<path>/.gitignore` containing `*`, so a black-box crew's own
+    `git add -A` cannot stage the hook log `main()` is about to write into
+    (the same gap telemetry._ensure_root closes for `<crew home>/agent-runs`,
+    one directory over). Runs on every hook event, so it has to be cheap
+    once the file exists (a single failing `O_EXCL` open attempt) and must
+    never raise: a failed write here must not fail the hook (see the
+    module's "ALWAYS exit 0" contract above).
+
+    Written unconditionally rather than only at `os.makedirs`'s creation,
+    since `hook-log/` can already exist from before this fix shipped.
+
+    `_open_create_only`, not `exists()` + `open(path, "w")`: the caller has
+    already confirmed `path` itself is a real directory (`_ensure_dir_or_bail`),
+    but `.gitignore` under it could itself be a symlink the crew's own
+    sandboxed dispatch planted — `O_EXCL|O_NOFOLLOW` refuses to follow it,
+    dangling or not, rather than writing `*\\n` through it."""
+    fd = _open_create_only(os.path.join(path, ".gitignore"))
+    if fd is None:
+        return
+    try:
+        os.write(fd, b"*\n")
+    finally:
+        os.close(fd)
+
+
 def _tmux_session_name(pane):
     """The tmux session that owns `pane`, or None when it cannot be named.
 
@@ -181,7 +361,7 @@ def _tmux_session_name(pane):
     return name if _TMUX_NAME_RE.fullmatch(name) else None
 
 
-def _co_record(payload, event, now, runs_root, redact=False):
+def _co_record(payload, event, now, runs_root, redact=False, is_private=False):
     """Write a co-session identity record (Deck WS1.2).
 
     `<runs_root>/<local-day>/co-<session-uuid>/meta.json` — cwd, product, model,
@@ -208,6 +388,23 @@ def _co_record(payload, event, now, runs_root, redact=False):
     (registry read fine, genuinely not a private crew) — that record's identity
     fields are legitimately shared-root content.
 
+    `is_private` is `True` only on that same redirected-to-the-crew's-own-directory
+    path — i.e. `runs_root` is `<crew home>/agent-runs`, a name that crew's own
+    sandboxed dispatch could already have replaced with a symlink before this
+    unsandboxed hook ever ran (same reasoning as `main()`'s hook-log write,
+    above). On that path every directory this function touches is confirmed a
+    real, non-symlink directory before anything is written under it OR read
+    through it: SessionStart creates-or-refuses `runs_root`, the day
+    directory and `d` (`_ensure_dir_or_bail`); Stop creates neither, but
+    refuses to use the day/`co-<sid>` directories naming its own meta.json
+    guess, or any glob-fallback candidate, when either is a symlink rather
+    than a real directory (`_is_safe_co_meta_path`) — the day directory is
+    exactly as predictable as `runs_root` itself, and the midnight-bug glob
+    below has no filter of its own. `meta.json` itself is both read and
+    written with `O_NOFOLLOW` (`_read_json_record`/`_open_write_nofollow`)
+    rather than a plain `open(path, ...)`. A failed check skips the write
+    (or the read); it never falls back to `RUNS_ROOT` (ARCH-322 round 3).
+
     IDENTITY AND LIVENESS ONLY. Cost stays computed on demand from the transcript
     by `cost_join.co_main_loop_node()`. Two representations of one session's spend
     would be a reconciliation problem nobody asked for.
@@ -231,6 +428,18 @@ def _co_record(payload, event, now, runs_root, redact=False):
     meta_path = os.path.join(d, "meta.json")
 
     if event != "SessionStart":
+        # A Stop whose own home has already been replaced with a symlink (the
+        # same crew's own earlier, sandboxed dispatch) must not search or read
+        # through it — same posture as SessionStart's own check below.
+        if is_private and not _is_real_dir(runs_root):
+            return
+        # The direct guess's day directory is exactly as predictable as
+        # `runs_root` itself (today's local date) — SessionStart already
+        # refuses to create under a symlinked one, so Stop refuses to read
+        # or write through one too, rather than silently falling through to
+        # the glob below (ARCH-322 round 3).
+        if is_private and os.path.exists(meta_path) and not _is_safe_co_meta_path(meta_path):
+            return
         # THE MIDNIGHT BUG THIS AVOIDS. Computing the day at Stop time points at
         # TODAY's tree, but a session that began yesterday has its record filed
         # under yesterday — so the lookup missed, returned silently, and the
@@ -240,6 +449,11 @@ def _co_record(payload, event, now, runs_root, redact=False):
         # Find the record instead of predicting where it is.
         if not os.path.exists(meta_path):
             found = sorted(glob.glob(os.path.join(runs_root, "*", f"co-{sid}", "meta.json")))
+            if is_private:
+                # The glob has no idea which matched day segment is real and
+                # which is a symlink a crew's own earlier dispatch planted —
+                # filter exactly as the direct-path check above refuses one.
+                found = [p for p in found if _is_safe_co_meta_path(p)]
             if not found:
                 return
             meta_path = found[-1]
@@ -252,16 +466,41 @@ def _co_record(payload, event, now, runs_root, redact=False):
         # applies here. Also pin 0700 explicitly: the tree is owner-only today
         # only because this script happened to create it under the umask, which
         # makes the invariant depend on creation order rather than intent.
-        os.makedirs(runs_root, exist_ok=True)
+        if is_private:
+            if not _ensure_dir_or_bail(runs_root):
+                return
+        else:
+            try:
+                os.makedirs(runs_root, exist_ok=True)
+            except OSError:
+                return
         try:
             os.chmod(runs_root, 0o700)
         except OSError:
             pass
         runs_marker = os.path.join(runs_root, ".metadata_never_index")
         if not os.path.exists(runs_marker):
-            open(runs_marker, "a").close()
+            if is_private:
+                marker_fd = _open_create_only(runs_marker)
+                if marker_fd is not None:
+                    os.close(marker_fd)
+            else:
+                open(runs_marker, "a").close()
 
-        os.makedirs(d, exist_ok=True)
+        if is_private:
+            # `d` is `runs_root/day/co-sid`; the day component is as
+            # predictable and plantable as `runs_root` itself, so it gets
+            # the same real-directory check before `d` is created under it.
+            day_dir = os.path.join(runs_root, day)
+            if not _ensure_dir_or_bail(day_dir):
+                return
+            if not _ensure_dir_or_bail(d):
+                return
+        else:
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                return
         if redact:
             cwd_val = "[redacted: crew privacy could not be determined]"
             product_val = "[redacted: crew privacy could not be determined]"
@@ -290,23 +529,85 @@ def _co_record(payload, event, now, runs_root, redact=False):
                 tmux_val = _tmux_session_name(pane)
                 if tmux_val is not None:
                     meta["tmux_session"] = tmux_val
-        with open(meta_path, "w", encoding="utf-8") as fh:
-            json.dump(meta, fh, indent=2, default=str)
+        _write_json_record(meta_path, meta, is_private=is_private)
         return
 
     # Stop: refresh liveness without rewriting identity. A Stop for a session that
     # started before this emitter existed has no record to update, and creating a
     # partial one from a Stop payload would invent a start time it does not know.
-    try:
-        with open(meta_path, encoding="utf-8") as fh:
-            meta = json.load(fh)
-        if not isinstance(meta, dict):
-            return
-    except Exception:
+    meta = _read_json_record(meta_path, is_private=is_private)
+    if meta is None:
         return
     meta["heartbeat_at"] = now.isoformat()
-    with open(meta_path, "w", encoding="utf-8") as fh:
-        json.dump(meta, fh, indent=2, default=str)
+    _write_json_record(meta_path, meta, is_private=is_private)
+
+
+def _write_hook_log(root, is_private, day, session_id, line):
+    """Create `<root>/<day>/<session_id>.jsonl` and append `line`, writing
+    `<root>/.gitignore` and the Spotlight-exclusion marker along the way.
+
+    For a private crew's own hook-log (`is_private`), `root` and the day
+    directory are each confirmed real, non-symlink directories
+    (`_ensure_dir_or_bail`) before anything is written under them, and the
+    `.gitignore`/jsonl writes refuse to follow a symlink at the final path
+    component (`_open_create_only`/`_open_write_nofollow`). This hook runs
+    UNSANDBOXED (module docstring, "black box crews"), so a symlink a
+    dispatched run of the SAME crew planted — within its own sandboxed
+    write grant, since this tree lives inside that crew's own worktree —
+    at either directory, or at one of these files, would otherwise be
+    followed, landing this crew's content wherever the symlink points. A
+    failed check skips the write outright: it never falls back to the
+    shared log root, which would land a black-box crew's content in
+    exactly the place ADR-0043 keeps it out of.
+
+    The shared-root path (`is_private=False`) is unchanged from before this
+    hardening: `LOG_ROOT` sits outside every tree a dispatch can write to,
+    so nothing here can plant a symlink under it."""
+    if is_private:
+        if not _ensure_dir_or_bail(root):
+            return
+        _ensure_hook_log_gitignore(root)
+    else:
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError:
+            return
+
+    # Spotlight indexes as root regardless of the 0600 file mode, which would copy
+    # prompt text into an index outside the protection. Written into whichever root
+    # this record landed in, since a private crew's own directory needs it at least
+    # as much as the shared one.
+    marker = os.path.join(root, ".metadata_never_index")
+    if not os.path.exists(marker):
+        if is_private:
+            marker_fd = _open_create_only(marker)
+            if marker_fd is not None:
+                os.close(marker_fd)
+        else:
+            open(marker, "a").close()
+
+    log_dir = os.path.join(root, day)
+    if is_private:
+        if not _ensure_dir_or_bail(log_dir):
+            return
+    else:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+        except OSError:
+            return
+
+    jsonl_path = os.path.join(log_dir, f"{session_id}.jsonl")
+    if is_private:
+        fd = _open_write_nofollow(jsonl_path, append=True)
+        if fd is None:
+            return
+        try:
+            os.write(fd, (line + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    else:
+        with open(jsonl_path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 
 def main():
@@ -414,25 +715,15 @@ def main():
         if len(line) > MAX_LINE:
             line = line[:MAX_LINE] + '"}'
         root = LOG_ROOT
+        is_private_hook_log = False
     elif private_home:
         root = os.path.join(private_home, "hook-log")
+        is_private_hook_log = True
     else:
         root = LOG_ROOT
+        is_private_hook_log = False
 
-    os.makedirs(root, exist_ok=True)
-    # Spotlight indexes as root regardless of the 0600 file mode, which would copy
-    # prompt text into an index outside the protection. Written into whichever root
-    # this record landed in, since a private crew's own directory needs it at least
-    # as much as the shared one.
-    marker = os.path.join(root, ".metadata_never_index")
-    if not os.path.exists(marker):
-        open(marker, "a").close()
-
-    log_dir = os.path.join(root, day)
-    os.makedirs(log_dir, exist_ok=True)
-
-    with open(os.path.join(log_dir, f"{session_id}.jsonl"), "a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    _write_hook_log(root, is_private_hook_log, day, session_id, line)
 
     # Last, and guarded separately: the spool append is the emitter's primary job
     # and must not be lost to a failure in the identity record.
@@ -457,7 +748,8 @@ def main():
             else RUNS_ROOT
         )
         try:
-            _co_record(payload, event, now, co_runs_root, redact=is_unknown)
+            _co_record(payload, event, now, co_runs_root, redact=is_unknown,
+                      is_private=bool(private_home and not is_unknown))
         except Exception:
             pass
 

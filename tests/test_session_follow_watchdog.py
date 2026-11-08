@@ -24,13 +24,13 @@ def _follower_cmd(name: str, *, interpreter: str | None = None,
 
 def test_follower_session_matches_direct_invocation(session_follow_watchdog):
     w = session_follow_watchdog
-    assert w.follower_session(_follower_cmd("svc")) == "svc"
+    assert w.follower_session(_follower_cmd("harbor")) == "harbor"
 
 
 def test_follower_session_matches_with_interpreter_prefix(session_follow_watchdog):
     w = session_follow_watchdog
-    cmd = _follower_cmd("constance", interpreter="python3.11")
-    assert w.follower_session(cmd) == "constance"
+    cmd = _follower_cmd("atlas", interpreter="python3.11")
+    assert w.follower_session(cmd) == "atlas"
 
 
 def test_follower_session_matches_bare_path(session_follow_watchdog):
@@ -51,13 +51,13 @@ def test_follower_session_reads_the_name_with_the_flag_first(session_follow_watc
     into one bogus duplicate bucket, and hiding a real duplicate under its own
     name."""
     w = session_follow_watchdog
-    cmd = "/srv/convivy/.local/bin/session-agent state --follow sous-chef"
-    assert w.follower_session(cmd) == "sous-chef"
+    cmd = "/srv/convivy/.local/bin/session-agent state --follow galley"
+    assert w.follower_session(cmd) == "galley"
 
 
 def test_follower_session_still_needs_the_follow_flag(session_follow_watchdog):
     w = session_follow_watchdog
-    assert w.follower_session("/path/session-agent state sous-chef") is None
+    assert w.follower_session("/path/session-agent state galley") is None
 
 
 def test_follower_session_steps_over_a_value_taking_flag(session_follow_watchdog):
@@ -65,14 +65,14 @@ def test_follower_session_steps_over_a_value_taking_flag(session_follow_watchdog
     its VALUE looking like the session name. Every session invoked this way
     would then collide under one bogus bucket."""
     w = session_follow_watchdog
-    cmd = "/path/session-agent state --interval 5 sous-chef --follow"
-    assert w.follower_session(cmd) == "sous-chef"
+    cmd = "/path/session-agent state --interval 5 galley --follow"
+    assert w.follower_session(cmd) == "galley"
 
 
 def test_follower_session_handles_the_joined_flag_form(session_follow_watchdog):
     w = session_follow_watchdog
-    cmd = "/path/session-agent state --interval=5 sous-chef --follow"
-    assert w.follower_session(cmd) == "sous-chef"
+    cmd = "/path/session-agent state --interval=5 galley --follow"
+    assert w.follower_session(cmd) == "galley"
 
 
 def test_follower_session_reads_a_name_that_begins_with_a_dash(session_follow_watchdog):
@@ -116,7 +116,7 @@ def test_follower_session_sanitises_the_name_it_read_from_ps(session_follow_watc
     author — and it reaches an alert body and meta, so it must be sanitised
     before it leaves this process. Escape sequences are the ones that render."""
     w = session_follow_watchdog
-    assert w.follower_session(_follower_cmd("\x1b[31msvc\x1b[0m")) == "svc"
+    assert w.follower_session(_follower_cmd("\x1b[31mharbor\x1b[0m")) == "harbor"
 
 
 def test_follower_session_bounds_a_pathological_name(session_follow_watchdog):
@@ -129,10 +129,10 @@ def test_follower_session_ignores_non_follow_session_agent_calls(session_follow_
     w = session_follow_watchdog
     # `state` without `--follow` (a one-shot poll) must not count as a follower.
     assert w.follower_session(
-        "/srv/convivy/.local/bin/session-agent state svc") is None
+        "/srv/convivy/.local/bin/session-agent state harbor") is None
     # a different verb entirely
     assert w.follower_session(
-        "/srv/convivy/.local/bin/session-agent send svc --text -") is None
+        "/srv/convivy/.local/bin/session-agent send harbor --text -") is None
 
 
 # --- parse_ps_output: raw ps text -> structured procs -------------------------
@@ -142,12 +142,12 @@ def test_parse_ps_output_reads_pid_ppid_command(session_follow_watchdog):
     w = session_follow_watchdog
     text = "\n".join([
         _ps_line(1, 0, "/sbin/launchd"),
-        _ps_line(501, 1, _follower_cmd("svc")),
+        _ps_line(501, 1, _follower_cmd("harbor")),
     ])
     procs = w.parse_ps_output(text)
     assert procs == [
         {"pid": 1, "ppid": 0, "command": "/sbin/launchd"},
-        {"pid": 501, "ppid": 1, "command": _follower_cmd("svc")},
+        {"pid": 501, "ppid": 1, "command": _follower_cmd("harbor")},
     ]
 
 
@@ -164,8 +164,8 @@ def test_parse_ps_output_skips_unparseable_lines(session_follow_watchdog):
 def test_one_follower_per_session_is_clean(session_follow_watchdog):
     w = session_follow_watchdog
     procs = [
-        {"pid": 100, "ppid": 500, "command": _follower_cmd("svc")},
-        {"pid": 101, "ppid": 500, "command": _follower_cmd("constance")},
+        {"pid": 100, "ppid": 500, "command": _follower_cmd("harbor")},
+        {"pid": 101, "ppid": 500, "command": _follower_cmd("atlas")},
         {"pid": 102, "ppid": 500, "command": _follower_cmd("ask")},
     ]
     followed = w.followers(procs)
@@ -176,24 +176,24 @@ def test_one_follower_per_session_is_clean(session_follow_watchdog):
 def test_two_followers_for_one_session_is_flagged(session_follow_watchdog):
     w = session_follow_watchdog
     procs = [
-        {"pid": 100, "ppid": 500, "command": _follower_cmd("svc")},
-        {"pid": 101, "ppid": 1, "command": _follower_cmd("svc")},
-        {"pid": 102, "ppid": 500, "command": _follower_cmd("constance")},
+        {"pid": 100, "ppid": 500, "command": _follower_cmd("harbor")},
+        {"pid": 101, "ppid": 1, "command": _follower_cmd("harbor")},
+        {"pid": 102, "ppid": 500, "command": _follower_cmd("atlas")},
     ]
     followed = w.followers(procs)
     dups = w.duplicate_sessions(followed)
-    assert set(dups) == {"svc"}
-    assert len(dups["svc"]) == 2
-    assert {p["pid"] for p in dups["svc"]} == {100, 101}
+    assert set(dups) == {"harbor"}
+    assert len(dups["harbor"]) == 2
+    assert {p["pid"] for p in dups["harbor"]} == {100, 101}
 
 
 def test_the_20260812_shape_several_sessions_each_over_20(session_follow_watchdog):
-    """The measured incident: svc=28, constance=25, sous-chef=24, ask=21, every
+    """The measured incident: harbor=28, atlas=25, galley=24, parlor=21, every
     duplicate follower orphaned (ppid=1), plus a handful of clean sessions."""
     w = session_follow_watchdog
     procs = []
     pid = 1000
-    for name, n in (("svc", 28), ("constance", 25), ("sous-chef", 24), ("ask", 21)):
+    for name, n in (("harbor", 28), ("atlas", 25), ("galley", 24), ("parlor", 21)):
         for _ in range(n):
             procs.append({"pid": pid, "ppid": 1, "command": _follower_cmd(name)})
             pid += 1
@@ -204,19 +204,19 @@ def test_the_20260812_shape_several_sessions_each_over_20(session_follow_watchdo
     followed = w.followers(procs)
     dups = w.duplicate_sessions(followed)
 
-    assert set(dups) == {"svc", "constance", "sous-chef", "ask"}
-    assert len(dups["svc"]) == 28
-    assert len(dups["constance"]) == 25
-    assert len(dups["sous-chef"]) == 24
-    assert len(dups["ask"]) == 21
+    assert set(dups) == {"harbor", "atlas", "galley", "parlor"}
+    assert len(dups["harbor"]) == 28
+    assert len(dups["atlas"]) == 25
+    assert len(dups["galley"]) == 24
+    assert len(dups["parlor"]) == 21
     assert w.orphan_count(followed) == 28 + 25 + 24 + 21
 
 
 def test_ppid_one_counts_as_orphan(session_follow_watchdog):
     w = session_follow_watchdog
     followed = [
-        {"pid": 1, "ppid": 1, "session": "svc"},
-        {"pid": 2, "ppid": 500, "session": "svc"},
+        {"pid": 1, "ppid": 1, "session": "harbor"},
+        {"pid": 2, "ppid": 500, "session": "harbor"},
     ]
     assert w.orphan_count(followed) == 1
 
@@ -246,8 +246,8 @@ def test_main_dry_run_leak_returns_one_and_posts_nothing(session_follow_watchdog
                                                           monkeypatch):
     w = session_follow_watchdog
     text = "\n".join([
-        _ps_line(100, 500, _follower_cmd("svc")),
-        _ps_line(101, 1, _follower_cmd("svc")),
+        _ps_line(100, 500, _follower_cmd("harbor")),
+        _ps_line(101, 1, _follower_cmd("harbor")),
     ])
     monkeypatch.setattr(w, "run_ps", lambda: text)
     posted = []
@@ -261,8 +261,8 @@ def test_main_dry_run_leak_returns_one_and_posts_nothing(session_follow_watchdog
 def test_main_posts_alert_on_a_real_leak(session_follow_watchdog, monkeypatch):
     w = session_follow_watchdog
     text = "\n".join([
-        _ps_line(100, 500, _follower_cmd("svc")),
-        _ps_line(101, 1, _follower_cmd("svc")),
+        _ps_line(100, 500, _follower_cmd("harbor")),
+        _ps_line(101, 1, _follower_cmd("harbor")),
     ])
     monkeypatch.setattr(w, "run_ps", lambda: text)
     posted = []
@@ -273,8 +273,8 @@ def test_main_posts_alert_on_a_real_leak(session_follow_watchdog, monkeypatch):
     assert len(posted) == 1
     stream, body, kw = posted[0]
     assert stream == w.ALERT_STREAM
-    assert "svc" in body
-    assert kw["meta"]["duplicate_sessions"] == {"svc": 2}
+    assert "harbor" in body
+    assert kw["meta"]["duplicate_sessions"] == {"harbor": 2}
     assert kw["meta"]["orphan_count"] == 1
     assert kw["meta"]["follower_count"] == 2
 

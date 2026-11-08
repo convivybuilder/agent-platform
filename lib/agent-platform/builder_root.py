@@ -53,19 +53,26 @@ FALLBACK = fallback_for(real_account_home())
 # never arrive; a file read at call time has no such gap.
 CONFIG = config_for(real_account_home())
 
-# The only key CONFIG may set. Parsed as DATA, never sourced or executed: the
-# file is operator-editable, and a bad line in it must never do more than leave
-# the setting unset.
+# This module's own key — the default `configured_raw`/`root` read from
+# CONFIG. Parsed as DATA, never sourced or executed: the file is
+# operator-editable, and a bad line in it must never do more than leave the
+# setting unset. CONFIG holds other settings too, each read by passing its
+# own key to `configured_raw`.
 KEY = "CREWS_ROOT"
 
 
-def configured_raw(config: Path | None = None) -> str | None:
-    """The raw `CREWS_ROOT` value from `config` (default CONFIG), or None when
-    nothing is set.
+def configured_raw(config: Path | None = None, *, key: str = KEY) -> str | None:
+    """The raw value of `key` (default this module's own KEY, `CREWS_ROOT`)
+    from `config` (default CONFIG), or None when nothing is set.
 
     An absent file, an absent key, and a line this cannot parse all read the
     same. Any other key in the file is ignored. Surrounding quotes are
     tolerated, for a hand-edited value.
+
+    `key` lets another reader of this same per-machine file — one that owns
+    a different setting, such as `vault_plane.SESSIONS_ONLY` — reuse this
+    parsing rather than duplicating it; this module stays the only place
+    that reads the file's bytes.
     """
     try:
         text = (CONFIG if config is None else config).read_text()
@@ -75,8 +82,8 @@ def configured_raw(config: Path | None = None) -> str | None:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
-        key, _, value = line.partition("=")
-        if key.strip() != KEY:
+        line_key, _, value = line.partition("=")
+        if line_key.strip() != key:
             continue
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":

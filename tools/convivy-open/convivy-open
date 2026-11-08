@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""convivy-open: terminal companion to the Convivy open-server.
+"""convivy-open: resolve and act on a Convivy file reference from the terminal.
 
 Resolve a Convivy file reference against *this* machine's Convivy base, then act
 on it in the terminal. The reference can be any of:
@@ -14,11 +14,10 @@ Actions:
   convivy-open -e <ref>     open in $EDITOR (default: vim)
   convivy-open -d <ref>     print its containing dir  ->  cd "$(convivy-open -d X)"
   convivy-open -l <ref>     page it with $PAGER (default: less)
-  convivy-open -o <ref>     GUI open, same as clicking the Slack link
+  convivy-open -o <ref>     GUI open
 
 Base is CONVIVY_OPEN_BASE (default: this machine's own resolved root, never a
-hardcoded path — see _default_base()), with the same /Volumes/<user>-N SMB
-fallback the server uses.
+hardcoded path — see _default_base()), with a /Volumes/<user>-N SMB fallback.
 """
 
 import argparse
@@ -145,7 +144,7 @@ def main():
     g.add_argument("-e", "--edit", action="store_true", help="open in $EDITOR")
     g.add_argument("-d", "--dir", action="store_true", help="print containing directory")
     g.add_argument("-l", "--less", action="store_true", help="page with $PAGER")
-    g.add_argument("-o", "--open", action="store_true", help="GUI open (like clicking)")
+    g.add_argument("-o", "--open", action="store_true", help="GUI open")
     ap.add_argument("ref", help="relative path, absolute path, or localhost link")
     args = ap.parse_args()
 

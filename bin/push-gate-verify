@@ -1,0 +1,495 @@
+#!/usr/bin/env python3.11
+"""push-gate-verify — proves, against the real engine clones on this machine,
+that the push content gate (`bin/push-content-gate`, installed as a pre-push
+hook by `bin/install-push-gate`) refuses a forbidden name and passes a clean
+commit.
+
+WHY A SEPARATE PROGRAM, RUN BY HAND. `tests/test_push_content_gate.py` and
+`tests/test_publish_scan.py` already cover the gate's logic end to end, but
+only against a fake engine — CI must never read the operator's own private
+names, so it cannot be the thing that proves the REAL engine, with the REAL
+private-names file, actually refuses a push naming one of them in every clone
+where the hook is installed. Only the operator can run this: it is the only
+reader of that file, and it is never dispatched or scheduled.
+
+WHAT IT DOES. For each clone install-push-gate knows about
+(agent-platform, library, convivy-orient, convivy-deck, write-better) that
+carries the installer's marker in `.git/hooks/pre-push`, this prints "<repo>:
+probing...", then builds two throwaway commits — one holding a name from the
+operator's private-names file, one holding fixed harmless text — and pushes
+each to its own fresh temp bare repository, so the clone's OWN installed
+hook runs exactly as it would on a real `git push`. The forbidden commit
+must be refused (non-zero exit, with its probe path named in the output);
+the clean commit is the positive control and must succeed (without it,
+"refused" could mean the gate refuses everything). A clone without the
+marker is reported as not installed and fails the run.
+
+EACH PROBE COMMIT IS BUILT ON THE CLONE'S OWN HEAD, SO ITS PARENT IS A REAL
+COMMIT. A parentless probe's one parent is git's empty-tree sha
+(`4b825dc6...`), not a commit, and publish-engine refuses to export a
+non-commit — `_scan_added_findings` then reads that as "could not run" and
+refuses the probe for a scan that could not run, never for the probe's own
+content, so the forbidden probe can never come back refused and the
+verifier can never pass (2026-10-26, every installed clone). Parenting each
+probe on the clone's HEAD is what gives publish-engine a real commit to
+export when it scans the probe's parent.
+
+EACH THROWAWAY BARE REPO IS SEEDED WITH THAT SAME HEAD FIRST, WITHOUT RUNNING
+THE HOOK. `_seed_bare_with_head` pushes the clone's HEAD to the bare repo's
+`refs/heads/probe` with `--no-verify`, so the clone's own installed hook
+never runs for that one push; only the probe commit, pushed to that same ref
+right after, fires it. Without this seeding, the probe's bare repo would
+have no ref at all when the probe is pushed, and `bin/push-content-gate`'s
+own already-known-commits lookup (`publish_scan.commits_new_to_remote`)
+would read EVERY commit reachable from the probe — HEAD, and everything
+before it — as new to the remote, oldest first, judging the probe not on
+its own content but on the clone's entire history, including a commit that
+can predate the gate and already carry a finding, the way agent-platform's,
+library's and convivy-orient's each did when this was first run (the bug
+`test_an_older_refused_commit_in_the_clones_history_is_not_scanned` guards
+against). With the bare repo already at HEAD before the probe is pushed,
+`git rev-list <probe> --not <head>` names the probe alone.
+
+NEITHER PROBE TOUCHES THE CLONE'S HEAD, INDEX OR WORKING TREE. Each commit is
+built with `GIT_INDEX_FILE` pointed at a throwaway temp file that is never
+seeded from the clone's own index or HEAD, so the clone's real index is never
+read or written; the probe commit itself is created with `git commit-tree
+-p <head>`, holding only its own one path, and never attached to any ref in
+the clone itself — only, briefly, to `refs/heads/probe` in the throwaway
+bare repo it is pushed to. Both probe commits land in the clone's object
+store too (git writes an object it is asked to create regardless of what
+references it), unreferenced there and reachable only by their own sha, and
+stay there until that clone's own `git gc` collects them — they never leave
+this machine, since the only remote either is ever pushed to is a temp bare
+repository this program creates and deletes before it exits, including when
+a probe push times out (below).
+
+A PROBE PUSH THAT HANGS IS REPORTED, NOT WAITED ON FOREVER. Each push to the
+temp bare repository is given 300 seconds; a probe that has not finished by
+then is reported as not finishing, and the run moves on to the next clone.
+Before this, a probe that misbehaved by scanning a clone's entire history
+could also take long enough on that history to look, from the operator's
+terminal, indistinguishable from having hung for good.
+
+NEVER PRINTS THE PRIVATE NAME. The name taken from the private-names file is
+used only as file content inside a probe commit object; it is never put in
+any message, exception or line this program prints. Diagnostic output is
+filtered to lines naming the probe's own path, the gate's "push refused" /
+"nothing was sent" lines, publish-engine's own "publish-engine: ..." report
+lines, and lines shaped like one of its findings (leading whitespace, then
+`<path>:<line>: <description>`) — never the full output, which could
+otherwise carry a crashed publish-engine's own Python traceback unchanged
+(`lib/agent-platform/publish_scan.py`'s `_scan_one` puts its stdout and
+stderr straight into the refusal message on the "could not run" branch) or
+anything else more than this program means to show — and even those are
+scrubbed for the name as a second safeguard.
+
+A publish-engine report's finding lines carry everything a reader needs on
+their own; its indented section headers are left out of what gets kept for
+exactly that reason. A hand scan of agent-platform's oldest commit shows the
+shape (no value is printed; this is the report's own text, not a probe's
+output):
+
+    publish-engine: agent-platform at <sha> (<short>) would be refused by a
+    release. No value is printed; open each file to judge it.
+      content scan (66):
+        README.md:44: a launchd label outside the product's namespace
+        README.md:44: a person's name
+
+Each finding line already names its own path, line and description; the
+header above it adds only the category's name and a count, neither of which
+a reader needs to make sense of the finding beneath it.
+
+`--root-config FILE` is the test seam the sibling installers share
+(company/decisions/0008): it names a `session-agent.env` holding `CREWS_ROOT`
+for `bin/builder-root --root` to read instead of this machine's real one.
+`--bare-repo-dir DIR` is a second, narrower test seam: it names a directory
+this program creates its throwaway bare repositories under instead of the
+system temp directory, so a test can make one clone's bare-repo creation
+fail without touching the others. `--probe-timeout SECONDS` is a third test
+seam: it shortens the 300-second limit each probe push is given, so a test
+can make a probe time out without waiting 300 real seconds for it. The
+operator calls this program without any of the three; install.sh never calls
+this program at all, only `bin/install-push-gate`.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import publish_scan as PS  # noqa: E402
+
+# bin/install-push-gate is these two values' source of truth (it is POSIX sh,
+# not something this Python program can import); keep this list and marker in
+# sync with its CLONES and MARKER by hand if either ever changes there.
+CLONES = ("agent-platform", "library", "convivy-orient", "convivy-deck", "write-better")
+MARKER = "# managed-by: agent-platform push-gate"
+
+FORBIDDEN_PROBE_PATH = "push-gate-probe/forbidden.txt"
+CLEAN_PROBE_PATH = "push-gate-probe/clean.txt"
+CLEAN_PROBE_CONTENT = b"push-gate-verify: harmless probe content\n"
+
+# How long a single probe push is given before it is reported as not having
+# finished rather than waited on forever — see the module docstring's "A
+# PROBE PUSH THAT HANGS" paragraph. `--probe-timeout` (tests only) overrides
+# this with a value short enough that a test does not wait 300 real seconds.
+DEFAULT_PROBE_TIMEOUT_SECONDS = 300
+
+_REDACTED = "[REDACTED]"
+
+
+class CloneCheckFailed(Exception):
+    """One clone's forbidden or clean probe did not behave as required. The
+    message is already filtered and scrubbed and is safe to print."""
+
+
+def _resolve_root(root_config: str | None) -> Path | None:
+    builder_root = Path(__file__).resolve().parent / "builder-root"
+    cmd = [str(builder_root), "--root"]
+    if root_config:
+        cmd += ["--config", root_config]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    return Path(root) if root else None
+
+
+def _first_private_name() -> str:
+    """The first non-empty, non-comment line of the operator's private-names
+    file — `publish_scan.private_names_file()`'s own resolution, never a
+    path this program picks itself. NEVER returned to a caller that might
+    print it; used only as probe commit content."""
+    path = PS.private_names_file()
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise RuntimeError(f"cannot read the private names file ({path}): {exc}") from exc
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#"):
+            return stripped
+    raise RuntimeError(f"{path} has no non-comment line to use as a forbidden probe")
+
+
+def _run_git(clone: Path, args: list[str], *, env: dict[str, str] | None = None,
+             input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git", "-C", str(clone), *args], env=env, input=input_bytes, capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git {' '.join(args)} failed in {clone}: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+    return result
+
+
+def _build_probe_commit(clone: Path, probe_rel_path: str, content: bytes,
+                         parent_sha: str) -> str:
+    """A commit parented on `parent_sha` — the clone's own HEAD, so
+    publish-engine can scan a real commit when it scans this probe's parent
+    (see the module docstring's "EACH PROBE COMMIT IS BUILT ON THE CLONE'S
+    OWN HEAD" paragraph) — whose tree holds exactly one blob, `content` at
+    `probe_rel_path`. Built through a throwaway `GIT_INDEX_FILE` that is
+    never seeded from `clone`'s own index or HEAD (so `clone`'s real index,
+    HEAD and working tree are all untouched) and never attached to any ref
+    in `clone` itself."""
+    with tempfile.TemporaryDirectory(prefix="push-gate-verify-index-") as tmp_dir:
+        index_path = Path(tmp_dir) / "index"
+        env = {**os.environ, "GIT_INDEX_FILE": str(index_path)}
+        blob_sha = _run_git(
+            clone, ["hash-object", "-w", "--stdin"], env=env, input_bytes=content,
+        ).stdout.decode().strip()
+        _run_git(clone, ["update-index", "--add", "--cacheinfo",
+                          f"100644,{blob_sha},{probe_rel_path}"], env=env)
+        tree_sha = _run_git(clone, ["write-tree"], env=env).stdout.decode().strip()
+        commit_env = {
+            **env,
+            "GIT_AUTHOR_NAME": "push-gate-verify", "GIT_AUTHOR_EMAIL": "push-gate-verify@localhost",
+            "GIT_COMMITTER_NAME": "push-gate-verify", "GIT_COMMITTER_EMAIL": "push-gate-verify@localhost",
+        }
+        commit_sha = _run_git(
+            clone, ["commit-tree", tree_sha, "-p", parent_sha, "-m", "push-gate probe"],
+            env=commit_env,
+        ).stdout.decode().strip()
+    return commit_sha
+
+
+def _seed_bare_with_head(clone: Path, head_sha: str, bare: Path,
+                          timeout_seconds: float) -> None:
+    """Push `head_sha` into `bare`'s `refs/heads/probe`, from `clone` itself,
+    with `--no-verify` so `clone`'s own installed pre-push hook never runs
+    for this push — only the probe commit pushed to that same ref right
+    after is meant to fire it. See the module docstring's "EACH THROWAWAY
+    BARE REPO IS SEEDED" paragraph for why skipping this would make the
+    probe judged on the clone's entire history instead of on itself.
+
+    Raises `RuntimeError` on a non-zero exit or a push that does not finish
+    within `timeout_seconds`, exactly like every other git failure in this
+    file (`_run_git`, `_init_bare`) — seeding is this program's own
+    infrastructure, never something `_verify_clone`'s forbidden/clean
+    reporting should explain."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(clone), "push", "--no-verify", f"file://{bare}",
+             f"{head_sha}:refs/heads/probe"],
+            capture_output=True, text=True, timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"git push --no-verify to seed {bare} with {head_sha[:9]} did not "
+            f"finish within {timeout_seconds:g} s"
+        ) from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git push --no-verify to seed {bare} with {head_sha[:9]} failed: "
+            f"{result.stderr.strip()}"
+        )
+
+
+def _init_bare(path: Path) -> None:
+    """`git init --bare` at `path`, raising `RuntimeError` on failure like
+    every other git failure in this file — never `CalledProcessError`, so
+    `main()`'s per-clone handling reports it and moves on to the next
+    clone instead of the whole run dying on one clone's bare-repo
+    creation. `path` need not exist yet: git creates it."""
+    result = subprocess.run(
+        ["git", "init", "-q", "--bare", "-b", "main", str(path)], capture_output=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"git init --bare failed for {path}: "
+            f"{result.stderr.decode(errors='replace').strip()}"
+        )
+
+
+def _push_probe(clone: Path, commit_sha: str, bare: Path,
+                 timeout_seconds: float) -> subprocess.CompletedProcess | None:
+    """Push `commit_sha` to a fresh ref on `bare`, from `clone` itself —
+    so `clone`'s own installed `pre-push` hook is the thing that runs,
+    exactly as it would on an ordinary `git push` from that clone.
+
+    Returns `None`, rather than waiting any longer, if the push has not
+    finished within `timeout_seconds` — see the module docstring's "A PROBE
+    PUSH THAT HANGS" paragraph. The pushed-to `bare` repository is still
+    removed by `_verify_clone`'s `finally` block in that case; killing the
+    timed-out `git push` process is `subprocess.run`'s own behavior on
+    `TimeoutExpired`, not something this function does itself."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(clone), "push", f"file://{bare}", f"{commit_sha}:refs/heads/probe"],
+            capture_output=True, text=True, timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+
+
+# A publish-engine finding line's own shape: leading whitespace, then
+# `<path>:<line>: ` (the path can hold no whitespace), then a description —
+# e.g. "    README.md:44: a launchd label outside the product's namespace".
+# Matched by shape alone, never by content, so it catches a finding line
+# from any clone's engine report without naming any category in advance;
+# that same looseness is exactly why it must NOT match a crashed engine's
+# indented traceback lines (a "  File ..." line, or the source line below
+# it), which carry no `<path>:<line>:` of their own.
+_FINDING_LINE = re.compile(r"^\s+\S+:\d+:\s\S")
+
+
+def _relevant_lines(output: str, probe_path: str) -> list[str]:
+    """Only the lines worth printing: ones naming the probe's own path, the
+    gate's own "push refused" / "nothing was sent" lines, publish-engine's
+    own "publish-engine: ..." report lines, and lines shaped like one of its
+    findings (`_FINDING_LINE`) — never the full output, which could
+    otherwise carry a crashed engine's own Python traceback unchanged, or
+    anything else more than this program means to show.
+
+    Publish-engine's own indented section headers (e.g. "  content scan
+    (66):") are deliberately left out: every finding beneath one already
+    names its own path, line and description, so the header's category
+    label and count are never needed to read a finding, and a hand scan of
+    a real report (this file's module docstring) shows none besides."""
+    keep = []
+    for line in output.splitlines():
+        lowered = line.lower()
+        if (
+            probe_path in line
+            or "push refused" in lowered
+            or "nothing was sent" in lowered
+            or line.lstrip().startswith("publish-engine:")
+            or _FINDING_LINE.match(line)
+        ):
+            keep.append(line)
+    return keep
+
+
+def _scrub(text: str, private_name: str) -> str:
+    """A second safeguard against the private name ever reaching output:
+    even though nothing in this program's own messages should carry it, any
+    occurrence of it in text taken from a subprocess's output is replaced
+    before that text is printed."""
+    return text.replace(private_name, _REDACTED) if private_name else text
+
+
+def _verify_clone(repo: str, clone: Path, private_name: str,
+                   bare_repo_dir: Path | None = None,
+                   probe_timeout: float = DEFAULT_PROBE_TIMEOUT_SECONDS) -> None:
+    """Raises `CloneCheckFailed` with an already-filtered, already-scrubbed
+    message on any failure, and `RuntimeError` if either bare repo cannot
+    be created or seeded with the clone's HEAD; returns normally when both
+    probes behaved.
+
+    `bare_repo_dir`, when given (the `--bare-repo-dir` test seam), is used
+    literally as the parent of this clone's two bare repos rather than a
+    fresh directory under the system temp directory, so a test can make
+    one clone's bare-repo creation fail without disturbing the others.
+    `probe_timeout` (the `--probe-timeout` test seam) is how long each probe
+    push is given before it is reported as not finished; see `_push_probe`."""
+    if bare_repo_dir is not None:
+        forbidden_bare = bare_repo_dir / f"{repo}-forbidden"
+        clean_bare = bare_repo_dir / f"{repo}-clean"
+    else:
+        forbidden_bare = Path(tempfile.mkdtemp(prefix="push-gate-verify-forbidden-"))
+        clean_bare = Path(tempfile.mkdtemp(prefix="push-gate-verify-clean-"))
+    try:
+        _init_bare(forbidden_bare)
+        _init_bare(clean_bare)
+
+        head_sha = _run_git(clone, ["rev-parse", "HEAD"]).stdout.decode().strip()
+        _seed_bare_with_head(clone, head_sha, forbidden_bare, probe_timeout)
+        _seed_bare_with_head(clone, head_sha, clean_bare, probe_timeout)
+
+        forbidden_content = f"push-gate-verify forbidden probe: {private_name}\n".encode()
+        forbidden_sha = _build_probe_commit(
+            clone, FORBIDDEN_PROBE_PATH, forbidden_content, head_sha,
+        )
+        forbidden_result = _push_probe(clone, forbidden_sha, forbidden_bare, probe_timeout)
+        forbidden_timed_out = forbidden_result is None
+        forbidden_output = (
+            "" if forbidden_timed_out else forbidden_result.stdout + forbidden_result.stderr
+        )
+        forbidden_ok = (
+            not forbidden_timed_out
+            and forbidden_result.returncode != 0
+            and FORBIDDEN_PROBE_PATH in forbidden_output
+        )
+
+        clean_sha = _build_probe_commit(
+            clone, CLEAN_PROBE_PATH, CLEAN_PROBE_CONTENT, head_sha,
+        )
+        clean_result = _push_probe(clone, clean_sha, clean_bare, probe_timeout)
+        clean_timed_out = clean_result is None
+        clean_output = "" if clean_timed_out else clean_result.stdout + clean_result.stderr
+        clean_ok = not clean_timed_out and clean_result.returncode == 0
+
+        if forbidden_ok and clean_ok:
+            return
+
+        details = []
+        if not forbidden_ok:
+            if forbidden_timed_out:
+                details.append(
+                    f"forbidden probe push did not finish within {probe_timeout:g} s"
+                )
+            else:
+                lines = _relevant_lines(forbidden_output, FORBIDDEN_PROBE_PATH)
+                shown = "; ".join(lines) if lines else "(no relevant output)"
+                details.append(
+                    f"forbidden probe NOT refused (exit {forbidden_result.returncode}): "
+                    f"{_scrub(shown, private_name)}"
+                )
+        if not clean_ok:
+            if clean_timed_out:
+                details.append(
+                    f"clean probe push did not finish within {probe_timeout:g} s"
+                )
+            else:
+                lines = _relevant_lines(clean_output, CLEAN_PROBE_PATH)
+                shown = "; ".join(lines) if lines else "(no relevant output)"
+                details.append(
+                    f"clean probe failed (exit {clean_result.returncode}): "
+                    f"{_scrub(shown, private_name)}"
+                )
+        raise CloneCheckFailed("; ".join(details))
+    finally:
+        shutil.rmtree(forbidden_bare, ignore_errors=True)
+        shutil.rmtree(clean_bare, ignore_errors=True)
+
+
+def main(argv: list[str]) -> int:
+    ap = argparse.ArgumentParser(
+        prog="push-gate-verify",
+        description="Prove the push content gate refuses a forbidden name and "
+                    "passes a clean commit in every installed clone.",
+    )
+    ap.add_argument("--root-config", default=None,
+                    help="read the machine's root from this session-agent.env "
+                         "instead of the real one (tests only)")
+    ap.add_argument("--bare-repo-dir", default=None,
+                    help="create each clone's throwaway bare repos under this "
+                         "directory instead of the system temp directory "
+                         "(tests only)")
+    ap.add_argument("--probe-timeout", type=float, default=DEFAULT_PROBE_TIMEOUT_SECONDS,
+                    help="give each probe push this many seconds instead of "
+                         f"{DEFAULT_PROBE_TIMEOUT_SECONDS:g} before reporting it as "
+                         "not finished (tests only)")
+    args = ap.parse_args(argv[1:])
+    bare_repo_dir = Path(args.bare_repo_dir) if args.bare_repo_dir else None
+
+    root = _resolve_root(args.root_config)
+    if root is None:
+        print("push-gate-verify: cannot resolve the machine's root "
+              "(bin/builder-root --root)", file=sys.stderr)
+        return 1
+
+    try:
+        private_name = _first_private_name()
+    except (RuntimeError, PS.OC.OperatorConfigError) as exc:
+        print(f"push-gate-verify: {exc}", file=sys.stderr)
+        return 1
+
+    overall_ok = True
+    for repo in CLONES:
+        clone = root / repo
+        hook = clone / ".git" / "hooks" / "pre-push"
+        if not clone.is_dir() or not hook.is_file():
+            print(f"{repo}: not installed (no pre-push hook)")
+            overall_ok = False
+            continue
+        try:
+            marker_present = MARKER in hook.read_text(errors="replace")
+        except OSError as exc:
+            print(f"{repo}: cannot read its pre-push hook: {exc}")
+            overall_ok = False
+            continue
+        if not marker_present:
+            print(f"{repo}: not installed (pre-push hook carries no push-gate marker)")
+            overall_ok = False
+            continue
+
+        print(f"{repo}: probing...", flush=True)
+        try:
+            _verify_clone(repo, clone, private_name, bare_repo_dir, args.probe_timeout)
+        except CloneCheckFailed as exc:
+            print(f"{repo}: {exc}")
+            overall_ok = False
+            continue
+        except RuntimeError as exc:
+            print(f"{repo}: {_scrub(str(exc), private_name)}")
+            overall_ok = False
+            continue
+        print(f"{repo}: refused forbidden probe, passed clean probe")
+
+    return 0 if overall_ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -7,10 +7,16 @@ Breaks results down by query style (keyword vs natural-language) and target doc
 kind, and lists the misses. Writes a JSON summary the convivy-orient /kb dashboard
 reads.
 
-The golden set (eval/kb-golden.jsonl) is hand-authored to start; augment it from
-real kb-queries.jsonl traffic as it accrues. A case is one query + the doc id(s)
-that should be retrieved; recall@k counts a hit if ANY expected id lands in the
-top k, MRR uses the rank of the first expected id.
+The golden set is this install's own (`<builder root>/install/kb-golden.jsonl`),
+hand-authored to start and augmented from real kb-queries.jsonl traffic as it
+accrues — it expects real document ids from this install's knowledge index, so
+it lives outside the repository rather than inside it. When the install has none
+yet, kb-eval scores the repository's synthetic example set instead
+(eval/kb-golden.example.jsonl) and says so on stderr: that score is a smoke test
+of the scoring code, not a measurement of this install's index. `--golden PATH`
+overrides either default. A case is one query + the doc id(s) that should be
+retrieved; recall@k counts a hit if ANY expected id lands in the top k, MRR uses
+the rank of the first expected id.
 
 Usage:
   kb-eval [--golden PATH] [--k N] [--out PATH] [--json] [--no-write]
@@ -26,7 +32,7 @@ from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-GOLDEN_DEFAULT = REPO / "eval" / "kb-golden.jsonl"
+GOLDEN_EXAMPLE = REPO / "eval" / "kb-golden.example.jsonl"
 sys.path.insert(0, str(REPO / "lib" / "agent-platform"))
 import venv_bootstrap  # noqa: E402
 if __name__ == "__main__":
@@ -45,6 +51,29 @@ def load_kb_search():
     mod.kb_telemetry = None  # eval queries are synthetic — keep them out of the live log
     fn = mod.kb_search
     return getattr(fn, "fn", fn)  # FastMCP FunctionTool exposes the raw callable as .fn
+
+
+def default_golden() -> Path:
+    """The golden set to score when `--golden` names none: this install's own set
+    at `<builder root>/install/kb-golden.jsonl`, or, when that is absent, the
+    repository's synthetic example set — with a note on stderr that the example
+    set's score says nothing about this install's knowledge index."""
+    installed = BR.root() / "install" / "kb-golden.jsonl"
+    if installed.is_file():
+        return installed
+    print(
+        f"kb-eval: no golden set at {installed}; scoring the repository's "
+        f"synthetic example set ({GOLDEN_EXAMPLE}) instead — its score says "
+        f"nothing about this install's knowledge index.",
+        file=sys.stderr,
+    )
+    return GOLDEN_EXAMPLE
+
+
+def resolve_golden(explicit: Path | None) -> Path:
+    """The golden path to score: `explicit` when `--golden` named one, else
+    `default_golden()`."""
+    return explicit if explicit is not None else default_golden()
 
 
 def load_golden(path: Path) -> list[dict]:
@@ -108,15 +137,18 @@ def aggregate(scored: list[dict], k: int) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(prog="kb-eval")
-    ap.add_argument("--golden", type=Path, default=GOLDEN_DEFAULT)
+    ap.add_argument("--golden", type=Path, default=None,
+                     help="override the golden set path (default: this install's own "
+                          "set, else the repository's synthetic example)")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--out", type=Path, default=OUT_DEFAULT)
     ap.add_argument("--json", action="store_true", help="print the JSON summary instead of the report")
     ap.add_argument("--no-write", action="store_true", help="don't write the dashboard JSON")
     args = ap.parse_args()
+    golden = resolve_golden(args.golden)
 
     search = load_kb_search()
-    cases = load_golden(args.golden)
+    cases = load_golden(golden)
     scored = [score_case(c, search, args.k) for c in cases]
     agg = aggregate(scored, args.k)
     misses = [
@@ -127,7 +159,7 @@ def main() -> int:
 
     summary = {
         "generated": datetime.now(timezone.utc).isoformat(),
-        "golden_path": str(args.golden),
+        "golden_path": str(golden),
         "k": args.k,
         "cases": len(cases),
         **agg,

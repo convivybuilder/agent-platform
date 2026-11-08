@@ -1,0 +1,345 @@
+#!/usr/bin/env python3.11
+"""tools/merge-refusal-rehearsal — the merge-refusal rehearsal (E10 S11,
+platform/specs/github-credential-seam, "The rehearsal", amended by
+knowledge#1113).
+
+For each `<owner>/builder-merge-rehearsal` this install's operator config
+names (`rehearsal_repository_owners`), this mints ONE installation token for
+the install's own GitHub App (`github_app.installed_app()`) through
+`github_app.mint_token`'s `rehearsal` verb — so the mint log records it, and
+so it is revoked the moment this finishes or fails for that repository — and
+then:
+
+  1. reads the rules in force on `main` and every ruleset's bypass list,
+     best-effort, and records whether the install's own App is on any of them;
+  2. as the POSITIVE CONTROL, pushes a new branch carrying one new commit
+     and opens a pull request against `main` with that same token. Both
+     must succeed, or this stops for that repository and reports that the
+     rule was never tested;
+  3. tries `PUT /pulls/{n}/merge` with the same token, and records the
+     status and body;
+  4. pushes the pull request's head straight to `main` with the same
+     token, and records git's reply;
+  5. reads `main`'s sha before step 3 and after step 4, and the pull
+     request's `merged` field;
+  6. prints that the operator should now merge the pull request in the
+     browser, waits for the operator to press Enter, then reads the pull
+     request's `merged` field and `main`'s sha again.
+
+A 401, a 404, or a 403 "Resource not accessible by integration" on the merge
+or the push is a PERMISSION refusal — the token could not act, so the rule
+was never asked — and is reported as NOT TESTED, never as proof the rule
+refused the App. If step 3 or step 4 instead SUCCEEDS, this stops the whole
+run at once, revokes the token, and prints MERGE ADMITTED where nobody can
+miss it, rather than moving on to the next repository.
+
+RUN FROM A PERSON'S OWN SESSION, NOT A DISPATCHED RUN. Step 6 blocks on the
+operator pressing Enter after merging in the browser, and `run_sandbox.py`
+denies a dispatched run the App key this reads.
+
+Pushes carry the token only in the push process's own environment
+(`github_app.push_env`, E10 S2's guarantee, reused rather than reimplemented
+here) — never in a URL, a git config file, or a credential helper — and
+every captured git error is passed through `github_app.scrub` before it is
+printed or written to the transcript, so the token cannot reach either one
+even by way of a trace line forwarded from GitHub's own remote-helper
+output.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import github_app as GA            # noqa: E402
+import operator_config             # noqa: E402
+
+# GitHub's own wording for a token that lacks a permission, as distinct from
+# one a repository rule refused (the "What proves the ruleset refuses the
+# App" list in "The rehearsal") — matched case-insensitively since this
+# travels through both a REST JSON `message` and a `git push` remote-helper
+# error line.
+_PERMISSION_REFUSAL = "resource not accessible by integration"
+
+# A three-digit HTTP status GitHub's remote helper sometimes names directly
+# in a failed `git push`'s stderr (e.g. "The requested URL returned error:
+# 403"), read as a fallback when the push gave no clearer signal.
+_STATUS_IN_GIT_STDERR = re.compile(r"\b(40[0-9]|50[0-9])\b")
+
+
+class MergeAdmitted(Exception):
+    """Step 3 or step 4 succeeded: proof the ruleset did NOT refuse the App.
+    Carries the result recorded so far for the repository this happened on,
+    so `main` can still write the transcript before the whole run stops."""
+
+    def __init__(self, result: dict):
+        super().__init__(f"merge admitted for {result.get('repo')!r}")
+        self.result = result
+
+
+def rehearsal_owners() -> list[str]:
+    """The install-specific owners this probe runs against
+    (`rehearsal_repository_owners`) — never a literal here, the same reason
+    `github_app.mint`'s own refusal of the `rehearsal` verb reads the same
+    operator-config key rather than trusting an argument."""
+    return list(operator_config.get_optional("rehearsal_repository_owners") or [])
+
+
+def classify_attempt(status: int, message: str) -> str:
+    """One write attempt against the branch rule — step 3's `PUT .../merge` —
+    bucketed into "admitted" (GitHub did it), "not-tested" (the token could
+    not act, so the rule was never asked), or "refused-by-rule" (anything
+    else GitHub refused with — the only bucket "The rehearsal" treats as
+    proof)."""
+    if status in (200, 201):
+        return "admitted"
+    if status in (401, 404):
+        return "not-tested"
+    if status == 403 and _PERMISSION_REFUSAL in message.lower():
+        return "not-tested"
+    return "refused-by-rule"
+
+
+def classify_push_reply(returncode: int, stderr: str) -> str:
+    """The same three buckets as `classify_attempt`, for step 4's `git push`
+    reply, which carries no status code of its own: a clean exit is
+    "admitted"; GitHub's own permission wording forwarded through `remote: `
+    is "not-tested"; an HTTP status git's remote helper named directly in
+    the error text is read the same way `classify_attempt` would read it;
+    anything else is "refused-by-rule"."""
+    if returncode == 0:
+        return "admitted"
+    lower = stderr.lower()
+    if _PERMISSION_REFUSAL in lower:
+        return "not-tested"
+    m = _STATUS_IN_GIT_STDERR.search(stderr)
+    if m:
+        return classify_attempt(int(m.group(1)), stderr)
+    return "refused-by-rule"
+
+
+def verdict_for(result: dict) -> str:
+    """REFUSED-BY-RULE only when every condition "The rehearsal" names holds
+    for this repository; otherwise, the precise way it falls short, so a
+    partial result is never read as a pass. Never called once step 3 or
+    step 4 has been admitted — `run_repository` raises `MergeAdmitted`
+    before this runs, and sets that result's verdict itself."""
+    if result.get("positive_control_failed"):
+        return "NOT TESTED — the positive control failed, so the rule was never tested"
+    merge_v = (result.get("merge_attempt") or {}).get("verdict")
+    push_v = (result.get("push_attempt") or {}).get("verdict")
+    if merge_v == "not-tested" or push_v == "not-tested":
+        return "NOT TESTED"
+    if merge_v != "refused-by-rule" or push_v != "refused-by-rule":
+        return "INCONCLUSIVE"
+    if result.get("main_moved"):
+        return "INCONCLUSIVE — main moved"
+    if not result.get("operator_merge_admitted"):
+        return "INCONCLUSIVE — the operator's merge was not recorded as admitted"
+    return "REFUSED-BY-RULE"
+
+
+def _read_rules(token: str, slug: str, app_id: str, opener) -> dict:
+    """Best-effort: the rules in force on `main` and whether the install's own
+    App is on any ruleset's bypass list (step 1). Never raises — this is
+    informational, recorded in the transcript, and never gates the verdict,
+    which rests on steps 2 through 6 alone."""
+    try:
+        code, payload = GA.request(
+            "GET", f"{GA.API}/repos/{slug}/rulesets?includes_parents=true",
+            token, None, opener=opener)
+    except OSError as e:
+        return {"readable": False, "error": str(e)}
+    if code != 200 or not isinstance(payload, list):
+        return {"readable": False, "status": code}
+    bypass_actors: list = []
+    for entry in payload:
+        rid = entry.get("id") if isinstance(entry, dict) else None
+        if rid is None:
+            continue
+        rcode, ruleset = GA.request(
+            "GET", f"{GA.API}/repos/{slug}/rulesets/{rid}", token, None, opener=opener)
+        if rcode == 200 and isinstance(ruleset, dict):
+            bypass_actors.extend(ruleset.get("bypass_actors") or [])
+    bosun_in_bypass = any(
+        isinstance(a, dict) and a.get("actor_type") == "Integration"
+        and str(a.get("actor_id")) == app_id
+        for a in bypass_actors)
+    return {"readable": True, "bypass_actors": bypass_actors, "bosun_in_bypass": bosun_in_bypass}
+
+
+def _main_sha(token: str, slug: str, opener) -> str | None:
+    code, payload = GA.request(
+        "GET", f"{GA.API}/repos/{slug}/git/ref/heads/main", token, None, opener=opener)
+    if code != 200 or not isinstance(payload, dict):
+        return None
+    return (payload.get("object") or {}).get("sha")
+
+
+def _pr_merged(token: str, slug: str, pr_number: int, opener) -> bool | None:
+    code, payload = GA.request(
+        "GET", f"{GA.API}/repos/{slug}/pulls/{pr_number}", token, None, opener=opener)
+    if code != 200 or not isinstance(payload, dict):
+        return None
+    return bool(payload.get("merged"))
+
+
+def run_repository(owner: str, *, key_path: Path, app_id: str, opener, run_git,
+                    wait_for_operator, workdir: Path, out=sys.stdout) -> dict:
+    """The probe, run once against `<owner>/builder-merge-rehearsal`
+    ("The rehearsal", platform/specs/github-credential-seam). `run_git` is
+    `subprocess.run` in production and a stub in tests; `wait_for_operator`
+    is a zero-argument callable step 6 calls once, after printing the pull
+    request's URL, and is expected to block until the operator has merged
+    it in the browser.
+
+    Raises `MergeAdmitted` the instant step 3 or step 4 succeeds — see that
+    exception's own docstring."""
+    slug = f"{owner}/{GA.REHEARSAL_REPOSITORY_NAME}"
+    with GA.mint_token(slug, "rehearsal", key_path=key_path, app_id=app_id,
+                       opener=opener) as token:
+
+        def _scrub(text: str | None) -> str:
+            return GA.scrub(text or "", token)
+
+        result: dict = {"repo": slug, "rules": _read_rules(token, slug, app_id, opener)}
+        push_url = f"https://github.com/{slug}.git"
+        git_env = GA.push_env(token, push_url)
+        clone_dir = workdir / owner.replace("/", "_")
+
+        def _refuse_positive_control(step: str, detail: str) -> dict:
+            result["positive_control_failed"] = True
+            result["positive_control_error"] = f"{step}: {_scrub(detail)}"
+            result["verdict"] = verdict_for(result)
+            return result
+
+        clone = run_git(["clone", "--depth", "1", push_url, str(clone_dir)], env=git_env)
+        if clone.returncode != 0:
+            return _refuse_positive_control("clone", clone.stderr)
+
+        branch = f"rehearsal-{int(time.time())}"
+        checkout = run_git(["-C", str(clone_dir), "checkout", "-b", branch])
+        if checkout.returncode != 0:
+            return _refuse_positive_control("checkout", checkout.stderr)
+
+        (clone_dir / "REHEARSAL.md").write_text(
+            f"merge-refusal-rehearsal probe — {branch}\n")
+        run_git(["-C", str(clone_dir), "add", "REHEARSAL.md"])
+        commit = run_git(
+            ["-C", str(clone_dir), "-c", "user.name=merge-refusal-rehearsal",
+             "-c", "user.email=rehearsal@invalid", "commit", "-m",
+             f"merge-refusal-rehearsal probe ({branch})"])
+        if commit.returncode != 0:
+            return _refuse_positive_control("commit", commit.stderr)
+
+        push_branch = run_git(
+            ["-C", str(clone_dir), "push", push_url, f"HEAD:refs/heads/{branch}"],
+            env=git_env)
+        if push_branch.returncode != 0:
+            return _refuse_positive_control("push-branch", push_branch.stderr)
+
+        code, pr = GA.request(
+            "POST", f"{GA.API}/repos/{slug}/pulls", token,
+            {"title": f"merge-refusal-rehearsal ({branch})", "head": branch, "base": "main"},
+            opener=opener)
+        pr_number = (pr or {}).get("number") if isinstance(pr, dict) else None
+        if code not in (200, 201) or pr_number is None:
+            return _refuse_positive_control(
+                "open-pr", f"{code}: {(pr or {}).get('message', pr)}")
+
+        result["branch"] = branch
+        result["pr_number"] = pr_number
+        result["main_sha_before"] = _main_sha(token, slug, opener)
+
+        code, body = GA.request(
+            "PUT", f"{GA.API}/repos/{slug}/pulls/{pr_number}/merge", token, {}, opener=opener)
+        message = str((body or {}).get("message", "")) if isinstance(body, dict) else ""
+        merge_verdict = classify_attempt(code, message)
+        result["merge_attempt"] = {"status": code, "body": body, "verdict": merge_verdict}
+        if merge_verdict == "admitted":
+            result["verdict"] = "MERGE ADMITTED"
+            raise MergeAdmitted(result)
+
+        push_main = run_git(
+            ["-C", str(clone_dir), "push", push_url, f"{branch}:refs/heads/main"],
+            env=git_env)
+        push_stderr = _scrub(push_main.stderr)
+        push_verdict = classify_push_reply(push_main.returncode, push_stderr)
+        result["push_attempt"] = {"returncode": push_main.returncode,
+                                  "stderr": push_stderr, "verdict": push_verdict}
+        if push_verdict == "admitted":
+            result["verdict"] = "MERGE ADMITTED"
+            raise MergeAdmitted(result)
+
+        result["main_sha_after"] = _main_sha(token, slug, opener)
+        result["main_moved"] = bool(
+            result["main_sha_before"] and result["main_sha_after"]
+            and result["main_sha_before"] != result["main_sha_after"])
+        result["pr_merged_before_operator"] = _pr_merged(token, slug, pr_number, opener)
+
+        print(f"merge-refusal-rehearsal: {slug}: now merge pull request #{pr_number} "
+              f"in the browser — https://github.com/{slug}/pull/{pr_number}", file=out)
+        wait_for_operator()
+
+        result["operator_merge_admitted"] = bool(_pr_merged(token, slug, pr_number, opener))
+        result["main_sha_final"] = _main_sha(token, slug, opener)
+        result["verdict"] = verdict_for(result)
+        return result
+
+
+def _write_transcript(out_path: Path, results: list[dict]) -> None:
+    out_path.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--out", required=True, type=Path,
+                        help="where the JSON transcript is written")
+    args = parser.parse_args(argv)
+
+    owners = rehearsal_owners()
+    if not owners:
+        print("merge-refusal-rehearsal: rehearsal_repository_owners is missing or "
+              "empty in the operator config; nothing to probe.", file=sys.stderr)
+        return 1
+
+    try:
+        app = GA.installed_app()
+    except GA.Unreadable as e:
+        print(f"merge-refusal-rehearsal: {e}", file=sys.stderr)
+        return 1
+
+    results: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="merge-refusal-rehearsal-") as workdir:
+        for owner in owners:
+            try:
+                result = run_repository(
+                    owner, key_path=app.key_path, app_id=app.app_id,
+                    opener=urllib.request.urlopen, run_git=subprocess.run,
+                    wait_for_operator=lambda: input(
+                        "merge-refusal-rehearsal: press Enter once merged... "),
+                    workdir=Path(workdir))
+            except MergeAdmitted as e:
+                results.append(e.result)
+                _write_transcript(args.out, results)
+                print("\n" + "!" * 70 + "\nMERGE ADMITTED — the App was NOT refused. "
+                      "Stop. Do not remove any credential.\n" + "!" * 70 + "\n",
+                      file=sys.stderr)
+                return 3
+            results.append(result)
+            print(f"merge-refusal-rehearsal: {result['repo']}: {result['verdict']}")
+
+    _write_transcript(args.out, results)
+    return 0 if all(r["verdict"] == "REFUSED-BY-RULE" for r in results) else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

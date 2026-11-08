@@ -6,7 +6,7 @@ higher global ceiling (raw-resource limit). If any of the three checks is off, o
 dead-PID run isn't reaped before the count, the platform either over-spawns (blows
 the budget / over-coordinates a team / swaps the mini) or unjustly blocks a
 legitimate spawn. The supervisor cap specifically guards the 2026-07-29 starvation:
-nine orchestrators held nine of sixteen slots all night and constance PR #555 was
+nine orchestrators held nine of sixteen slots all night and globex PR #555 was
 refused a reviewer nine times, which under draft-gated CI made it unmergeable. Required-field + duplicate validation guard
 malformed registry entries that crash later readers.
 """
@@ -18,16 +18,19 @@ import pytest
 import registry
 
 
-def _entry(run_id, *, pid=None, parent=None, agent="coder"):
+def _entry(run_id, *, pid=None, parent=None, agent="coder",
+           dispatcher_pid=None, dispatcher_pid_started_at=None):
     return {
         "run_id": run_id,
         "agent": agent,
         "task": "t",
         "started_at": "2026-05-31T00:00:00Z",
-        "repo": "constance",
+        "repo": "globex",
         "worktree": "/tmp/wt",
         "pid": pid if pid is not None else os.getpid(),  # default: alive
         "parent_run": parent,  # None = top-level (orchestrator/ad-hoc); else a team worker
+        "dispatcher_pid": dispatcher_pid,
+        "dispatcher_pid_started_at": dispatcher_pid_started_at,
     }
 
 
@@ -181,6 +184,97 @@ def test_is_alive_probe():
     assert registry._is_alive(-1) is False
 
 
+# --- CQ·523: a dead child survives while its dispatcher is still finalizing --
+
+
+def test_entry_survives_reap_while_dispatcher_alive_and_corroborated(runs_root, monkeypatch):
+    """The false-death race: the claude CHILD exits well before `_finalize_run`,
+    running inside the DISPATCHER, writes outcome.json. A reap_stale while the
+    dispatcher is still alive and start-time-corroborated must not drop the
+    entry — dropping it is exactly what sent `_died_without_finalizing` into
+    its pre-fix, unregistered-run branch and reported a run dead that was
+    still finalizing.
+
+    This must fail against the unfixed code: the old `_reap_in_place` reaps
+    on `_is_alive(pid)` alone, and `pid` here is dead by construction."""
+    monkeypatch.setattr(registry, "_pid_start_time",
+                        lambda pid: "Tue Jan  2 00:00:00 2024")
+    registry.add_run(_entry("run-finalizing", pid=999999,
+                            dispatcher_pid=os.getpid(),
+                            dispatcher_pid_started_at="Tue Jan  2 00:00:00 2024"))
+
+    reaped = registry.reap_stale()
+
+    assert reaped == [], "a dispatcher alive and corroborated must not be reaped"
+    assert registry.get_run("run-finalizing") is not None
+    # list_runs and add_run both reap first — the entry must survive those too.
+    assert any(r["run_id"] == "run-finalizing" for r in registry.list_runs())
+    registry.add_run(_entry("run-other"))
+    assert registry.get_run("run-finalizing") is not None
+
+
+def test_entry_reaped_once_both_child_and_dispatcher_are_gone(runs_root):
+    """Requiring the dispatcher pid too must not disable death detection: a run
+    whose child AND whose registered dispatcher are both gone is reaped, same
+    as before this fix."""
+    registry.add_run(_entry("run-bothgone", pid=999999,
+                            dispatcher_pid=999998))  # a pid nothing owns either
+
+    reaped = registry.reap_stale()
+
+    assert any(r["run_id"] == "run-bothgone" for r in reaped)
+    assert registry.get_run("run-bothgone") is None
+
+
+def test_entry_reaped_when_dispatcher_pid_alive_but_start_time_mismatches(runs_root, monkeypatch):
+    """A live dispatcher pid whose current start time doesn't match what was
+    recorded at spawn is a recycled pid (the OS reused it) or a decoy, not the
+    original dispatcher — gone either way, the same corroboration
+    `_died_without_finalizing` applies to this exact pair of fields."""
+    monkeypatch.setattr(registry, "_pid_start_time",
+                        lambda pid: "Tue Jan  2 00:00:00 2024")
+    registry.add_run(_entry("run-recycled", pid=999999,
+                            dispatcher_pid=os.getpid(),
+                            dispatcher_pid_started_at="Mon Jan  1 00:00:00 2024"))  # wrong
+
+    reaped = registry.reap_stale()
+
+    assert any(r["run_id"] == "run-recycled" for r in reaped)
+    assert registry.get_run("run-recycled") is None
+
+
+def test_entry_with_no_dispatcher_pid_keeps_the_child_only_rule(runs_root):
+    """An entry written before `dispatcher_pid` existed (or whose registry
+    entry has none for any other reason) has no second pid to corroborate
+    against, so a dead child pid alone reaps it exactly as it did before this
+    fix — the dispatcher check adds a survival path, not a new way to leak a
+    slot."""
+    registry.add_run(_entry("run-legacy", pid=999999))
+    assert registry.get_run("run-legacy").get("dispatcher_pid") is None
+
+    reaped = registry.reap_stale()
+
+    assert any(r["run_id"] == "run-legacy" for r in reaped)
+    assert registry.get_run("run-legacy") is None
+
+
+def test_dispatcher_still_finalizing_unknown_start_time_is_not_reaped(runs_root, monkeypatch):
+    """Unknown is not dead: a dispatcher pid alive with no recorded start time
+    to corroborate against, or a current start time `ps` can't read, must not
+    be reaped on a check this function cannot actually perform."""
+    registry.add_run(_entry("run-no-recorded", pid=999999,
+                            dispatcher_pid=os.getpid()))  # no started_at recorded
+    assert registry._dispatcher_still_finalizing(
+        registry.get_run("run-no-recorded")) is True
+
+    monkeypatch.setattr(registry, "_pid_start_time", lambda pid: None)
+    registry.add_run(_entry("run-unreadable", pid=999999,
+                            dispatcher_pid=os.getpid(),
+                            dispatcher_pid_started_at="Mon Jan  1 00:00:00 2024"))
+    assert registry._dispatcher_still_finalizing(
+        registry.get_run("run-unreadable")) is True
+
+
 # --- two-phase add (reserve_slot / attach_pid) --------------------------------
 
 
@@ -237,17 +331,69 @@ def test_reserve_slot_not_reaped_within_timeout(runs_root):
 
 
 def test_reserve_slot_reaped_after_timeout(runs_root, monkeypatch):
-    """A reservation whose started_at is older than RESERVATION_TIMEOUT_SECONDS
-    is treated as orphaned (the spawning process crashed before attach_pid) and
-    reaped so it doesn't block future runs permanently."""
-    expired_ts = "2020-01-01T00:00:00Z"
+    """A reservation whose reserved_at is older than RESERVATION_TIMEOUT_SECONDS
+    is treated as orphaned (the spawning process crashed between reserve_slot
+    and attach_pid) and reaped so it doesn't block future runs permanently.
+
+    Aged by reserved_at, not started_at (CQ·518) — a stale started_at alone
+    (e.g. a run held for hours by the usage hold before reserve_slot was ever
+    called) must NOT age the reservation; see
+    test_reservation_aged_by_reserved_at_survives_stale_started_at below."""
     entry = _reservation("run-old")
-    entry["started_at"] = expired_ts
     registry.reserve_slot(entry)
+    # Backdate reserved_at directly, as a real crash between the two calls
+    # would leave it, rather than passing an already-expired started_at.
+    import json
+    reg = json.loads(registry.ACTIVE_PATH.read_text())
+    for r in reg["runs"]:
+        if r["run_id"] == "run-old":
+            r["reserved_at"] = "2020-01-01T00:00:00Z"
+    registry.ACTIVE_PATH.write_text(json.dumps(reg))
     # The reaper must drop the orphaned reservation.
     reaped = registry.reap_stale()
     assert any(r["run_id"] == "run-old" for r in reaped)
     assert registry.get_run("run-old") is None
+
+
+def test_reservation_aged_by_reserved_at_survives_stale_started_at(runs_root):
+    """CQ·518: a run whose `started_at` is from hours ago (a usage hold sat
+    between dispatch and the reservation) must NOT be reaped just because
+    `started_at` alone would read as expired — the reservation is aged by
+    `reserved_at` (set to now by reserve_slot), not `started_at`. A
+    `reserve_slot` by a second, unrelated run triggers the reap that used to
+    catch the first one."""
+    stale_started = "2020-01-01T00:00:00Z"
+    registry.reserve_slot(_reservation("run-held", started_at=stale_started))
+    entry = registry.get_run("run-held")
+    assert entry["started_at"] == stale_started
+    assert entry["reserved_at"] is not None and entry["reserved_at"] != stale_started
+
+    # Another process's reserve_slot call reaps stale entries before admitting.
+    registry.reserve_slot(_reservation("run-other"))
+
+    assert registry.get_run("run-held") is not None, (
+        "a reservation reserved just now must survive a reap even though its "
+        "started_at (pre-dating a usage hold) is long past the timeout")
+
+
+def test_reservation_with_no_reserved_at_falls_back_to_started_at(runs_root):
+    """A reservation written by an older agentctl (no `reserved_at` field) keeps
+    today's behaviour: aged by `started_at`, so it still reaps rather than
+    leaking forever just because the new field is absent."""
+    import json
+    expired_ts = "2020-01-01T00:00:00Z"
+    entry = _reservation("run-legacy")
+    entry["started_at"] = expired_ts
+    registry.reserve_slot(entry)
+    reg = json.loads(registry.ACTIVE_PATH.read_text())
+    for r in reg["runs"]:
+        if r["run_id"] == "run-legacy":
+            del r["reserved_at"]
+    registry.ACTIVE_PATH.write_text(json.dumps(reg))
+
+    reaped = registry.reap_stale()
+    assert any(r["run_id"] == "run-legacy" for r in reaped)
+    assert registry.get_run("run-legacy") is None
 
 
 def test_reserve_slot_missing_field_raises(runs_root):
@@ -322,6 +468,25 @@ def test_project_cap_refused_exit_status_is_valid():
     assert "project_cap_refused" != "budget_refused"
 
 
+def test_registry_lost_exit_status_is_valid():
+    """registry_lost (CQ·518) must be a recognised exit_status so write_outcome
+    doesn't raise when `R.attach_pid` raises KeyError because the reservation
+    was already reaped before the dispatcher could fill in the real pid."""
+    import telemetry as T
+    assert "registry_lost" in T.VALID_EXIT_STATUSES
+
+
+def test_token_refused_exit_status_is_valid():
+    """token_refused (CQ·518, second half) must be a recognised exit_status so
+    write_outcome doesn't raise when `_run_session`'s post-hold re-mint of the
+    run's own GitHub credential fails and the dispatcher never starts the
+    claude child — distinct from registry_lost, which kills a child already
+    started."""
+    import telemetry as T
+    assert "token_refused" in T.VALID_EXIT_STATUSES
+    assert "token_refused" != "registry_lost"
+
+
 def test_write_outcome_records_error_reason(tmp_path):
     """write_outcome persists error_reason in outcome.json when provided."""
     import json
@@ -348,8 +513,8 @@ def test_supervisor_predicate_matches_roles_and_app_prefixes():
     negative silently re-opens the starvation for that role."""
     for name in ("planning-orchestrator", "overnight-orchestrator", "overnight-triage",
                  "overnight-fix-drain", "overnight-verify",
-                 "hollis-overnight-orchestrator", "sel-planning-orchestrator",
-                 "hollis-overnight-verify"):
+                 "galley-overnight-orchestrator", "sel-planning-orchestrator",
+                 "galley-overnight-verify"):
         assert registry.is_supervisor(name) is True, name
     for name in ("coder", "reviewer", "security-reviewer", "bug-fixer", "architect",
                  None, ""):

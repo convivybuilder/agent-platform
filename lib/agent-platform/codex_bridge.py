@@ -36,6 +36,7 @@ import tomllib
 from pathlib import Path
 
 import builder_root as BR
+import run_sandbox as RS
 
 SHIM = "codex-hook-shim.py"
 GUARDS = ("block-pr-merge.sh", "block-pkill-option-order.sh", "outbound-guard.py")
@@ -57,8 +58,7 @@ def default_tools_dir() -> Path:
     """The OPERATOR'S checkout's tools/, the one ~/.claude/settings.json points
     its own hooks at. Not this module's tree: both deploys are COPIES that carry
     no tools/ (bin/install-agent-platform-shared archives an explicit list), so
-    a deployed agentctl would find nothing there and refuse every Codex dispatch.
-    Same resolution projects.py uses for config/projects.json, for the same reason."""
+    a deployed agentctl would find nothing there and refuse every Codex dispatch."""
     return BR.root() / "agent-platform" / "tools"
 
 
@@ -153,6 +153,49 @@ def verify(home: Path, tools: Path | None = None) -> list[str]:
                         "[hooks.state] entry with a trusted_hash for this hooks.json; review "
                         "the hook in Codex (/hooks) before dispatching")
     return problems
+
+
+def trusted_project_refusal(worktree: Path, home: Path) -> str | None:
+    """Why a Codex launch in `worktree` must be refused, or None.
+
+    The hand probe (platform/specs/codex-coder-lane, 2026-10-19) found that a
+    project folder Codex's own config.toml trusts can supply its OWN
+    `.codex/config.toml` from inside the worktree — an MCP server, a hook, or
+    `sandbox_mode`/`approval_policy`/`permissions` keys that could widen or
+    remove the read-confinement profile this slice relies on — and that NO
+    launch flag disables this (`--ignore-user-config` only drops CODEX_HOME's
+    own config, not a project's; `--ignore-rules` covers only exec-policy
+    files). It also found that a LINKED worktree inherits its main checkout's
+    trust, so both the worktree itself and its main checkout (if it is a linked
+    worktree of one) are checked against `home`'s own `config.toml` `[projects]`
+    table. A `--pr` dispatch checks out a branch whose content the PR's author
+    controls, the same hazard agent-platform#793 closed for Claude's `.mcp.json`
+    — here closed by refusing the launch outright, since no flag can strip a
+    trusted folder's own configuration back out."""
+    try:
+        config = tomllib.loads((home / "config.toml").read_text())
+    except (OSError, ValueError):
+        return None
+    projects = config.get("projects")
+    if not isinstance(projects, dict):
+        return None
+    candidates = {str(Path(worktree)), str(Path(worktree).resolve())}
+    common = RS.git_common_dir(worktree)
+    if common is not None:
+        candidates.add(str(common.parent))
+        candidates.add(str(common.parent.resolve()))
+    for path, entry in projects.items():
+        if not (isinstance(entry, dict) and entry.get("trust_level") == "trusted"):
+            continue
+        # Both spellings: whether Codex's own config.toml records a resolved or an
+        # as-given path for a reviewed project is unconfirmed, and `/tmp` vs
+        # `/private/tmp` alone (a real symlink on macOS) is enough to miss a match
+        # on one spelling but not the other — checked live for exactly this gap.
+        if path in candidates or str(Path(path).resolve()) in candidates:
+            return (f"{path!r} is a trusted Codex project; a launch in {worktree} could "
+                    f"load its own .codex/config.toml (MCP servers, hooks, exec "
+                    f"policies) that no launch flag can strip back out — refused")
+    return None
 
 
 def _trusted(home: Path) -> bool:

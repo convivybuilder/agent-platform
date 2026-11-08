@@ -16,20 +16,21 @@ TWO CONDITIONS, EACH A FACT READ THIS RUN:
                unparseable, has no usable start: the outage starts at the first run that saw ci1
                down. STATE_FILE holds that time as down_since until a run sees ci1 online, so the
                start stays the same across runs.
-  queued-job   a job in a repository listed in lib/agent-platform/ci1_heartbeat_repos.txt has
-               status "queued", a label "convivy-linux", and created_at at least 15 minutes old.
-               Runs in status "queued" and "in_progress" are both read, since a multi-job run
-               queues its later jobs while it is in progress.
+  queued-job   a job in a repository named by the project registry's `_ci1_heartbeat_repos`
+               key (`projects.ci1_heartbeat_repos()`, CQ·586) has status "queued", a label
+               "convivy-linux", and created_at at least 15 minutes old. Runs in status
+               "queued" and "in_progress" are both read, since a multi-job run queues its
+               later jobs while it is in progress.
 
 Fifteen minutes covers the 03:30 MST unattended-upgrade reboot plus VM boot and runner
 registration (platform/runbooks/standing-up-the-linux-ci-box, "Unattended recovery").
 
-GITHUB AUTHENTICATION is the convivy-bosun App through lib/agent-platform/github_app.py, never
-`gh` and never a personal token (platform/decisions/0051). The installation token is narrowed to
+GITHUB AUTHENTICATION is the install's own GitHub App through lib/agent-platform/github_app.py,
+never `gh` and never a personal token (platform/decisions/0051). The installation token is narrowed to
 `actions: read` and `metadata: read`, so code here that tried to write would be refused by GitHub.
-The App cannot list the runner group's repositories (403), so the repository list is the file
-above. Job names and URLs come from GitHub, so they reach the signal body as bounded inline code,
-and the whole body passes through signal_client.sanitise_body.
+The App cannot list the runner group's repositories (403), so the repository list is the
+registry key above. Job names and URLs come from GitHub, so they reach the signal body as
+bounded inline code, and the whole body passes through signal_client.sanitise_body.
 
 ONE INCIDENT PER CONDITION. Each condition opens its own incident, with its own opened signal. STATE_FILE
 records each open incident's dedup_key under its condition's name, so while `ci1-offline` is open a
@@ -80,13 +81,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-p
 
 import builder_root as BR  # noqa: E402
 import github_app as GA  # noqa: E402
+import projects as PR  # noqa: E402
 import signal_client as SC  # noqa: E402
 
-# The convivy-bosun App, as bin/pr-state-capture reads it. Its installation is derived and
-# checked on every run, never stored.
-APP_ID = "4666673"
+# The install's own GitHub App, as bin/pr-state-capture reads it (`GA.installed_app()`,
+# resolved fresh on every run, never a literal). Its installation is derived and checked
+# on every run, never stored.
 OWNER = "convivy"
-KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
 _READ_PERMISSIONS = {"actions": "read", "metadata": "read"}
 
 TAILSCALE = "/usr/local/bin/tailscale"
@@ -94,7 +95,6 @@ TAILSCALE_TIMEOUT = 30
 CI_NODE = "ci1"
 RUNNER_LABEL = "convivy-linux"
 THRESHOLD = timedelta(minutes=15)
-REPOS_FILE = Path(__file__).resolve().parent.parent / "lib" / "agent-platform" / "ci1_heartbeat_repos.txt"
 
 _PER_PAGE = 100
 _PAGE_CAP = 10
@@ -213,27 +213,38 @@ def ci1_verdict(status: dict, now: datetime, down_since: datetime | None = None)
 
 # --- condition 2: convivy-linux jobs queued in GitHub Actions ---------------------
 
-def load_repos(path: Path = REPOS_FILE) -> list[str]:
+def load_repos() -> list[str]:
     try:
-        lines = path.read_text().splitlines()
-    except OSError as e:
-        raise CheckFailed(f"cannot read the repository list {path}: {e}")
-    return [ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")]
+        return PR.ci1_heartbeat_repos()
+    except (OSError, json.JSONDecodeError, PR.RegistryUnavailable) as e:
+        raise CheckFailed(f"cannot read the repository list from the registry: {e}")
 
 
-def github_getter(*, key_path: Path = KEY_PATH) -> Callable[[str], tuple[int, dict]]:
-    problem = GA.key_problem(key_path, label="the convivy-bosun App")
+def github_getter(*, key_path: Path | None = None,
+                  app_id: str | None = None) -> Callable[[str], tuple[int, dict]]:
+    """A GitHub reader authenticated as the install's own GitHub App. `key_path`
+    and `app_id` default to `GA.installed_app()`, resolved here rather than at
+    import time, so importing this module on an install with no App set up yet
+    does not raise — only calling this function does."""
+    if key_path is None or app_id is None:
+        try:
+            app = GA.installed_app()
+        except GA.Unreadable as e:
+            raise CheckFailed(str(e))
+        key_path = app.key_path if key_path is None else key_path
+        app_id = app.app_id if app_id is None else app_id
+    problem = GA.key_problem(key_path, label="the install's GitHub App")
     if problem:
         raise CheckFailed(problem)
     try:
-        jwt = GA.app_jwt(key_path, APP_ID)
-        inst = GA.installation_for_owner(jwt, OWNER, label="the convivy-bosun App")
+        jwt = GA.app_jwt(key_path, app_id)
+        inst = GA.installation_for_owner(jwt, OWNER, label="the install's GitHub App")
         inst_id = str(inst.get("id") or "")
         if not inst_id:
             raise GA.Unreadable("the installation carries no id")
         token = GA.installation_token(jwt, inst_id, permissions=_READ_PERMISSIONS)
     except (GA.Unreadable, OSError, ValueError) as e:
-        raise CheckFailed(f"the convivy-bosun App token: {e}")
+        raise CheckFailed(f"the install's GitHub App token: {e}")
     return lambda path: GA.request("GET", GA.API + path, token, None)
 
 
@@ -277,9 +288,9 @@ def queue_verdict(get: Callable, repos: list[str], now: datetime) -> Verdict:
                    detail=f"{repo}: job {_inert(name)} queued since {_stamp(oldest)} ({_inert(url)})")
 
 
-def queue_check(now: datetime, *, repos_file: Path = REPOS_FILE,
+def queue_check(now: datetime, *, load_repos: Callable[[], list[str]] = load_repos,
                 github: Callable = github_getter) -> Verdict:
-    repos = load_repos(repos_file)
+    repos = load_repos()
     return queue_verdict(github(), repos, now)
 
 

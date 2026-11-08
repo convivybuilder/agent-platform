@@ -2,7 +2,7 @@
 """bench.py — the slice-1 bench for issue_01M2F52S46Y31S1QPMN4EFPD2C
 (comment 2698): which of the epic's two candidate mechanisms — a Bosun-owned
 PreToolUse hook, or a non-bypass permission mode — actually denies the
-Constance commercial product-manager the three commands the signal that
+Globex commercial product-manager the three commands the signal that
 opened the epic (sig_01M2EP0508WZV2SJ1RCKKD0GJZ) shows it running today:
 launchctl, sqlite3, and git commit.
 
@@ -65,7 +65,7 @@ sys.path.insert(0, str(HERE))
 import policy_matcher as PM  # noqa: E402
 
 DEFAULT_PRODUCT_MANAGER_SRC = (
-    Path.home() / "Convivy" / "constance-commercial" / ".claude" / "agents" / "product-manager.md"
+    Path.home() / "Convivy" / "globex-commercial" / ".claude" / "agents" / "product-manager.md"
 ).resolve()
 
 # The six probes that leave evidence as a git commit in the scratch repo. Every
@@ -129,7 +129,7 @@ def build_scratch_repo(base_dir: Path | None = None,
         raise SystemExit(
             f"product-manager agent file not found at {product_manager_src}; "
             "pass --product-manager-src, or run `knowledge-ctx use commercial` "
-            "in ~/Convivy/constance-commercial first"
+            "in ~/Convivy/globex-commercial first"
         )
     # RESOLVED, not the raw tempfile path: on macOS `tempfile.gettempdir()`
     # returns `/var/folders/...`, a symlink to `/private/var/folders/...` —

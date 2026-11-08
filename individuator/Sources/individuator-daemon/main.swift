@@ -31,13 +31,6 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
-func accountName(for uid: uid_t) -> String {
-    guard let pw = getpwuid(uid) else {
-        fail("individuator-daemon: no password-database entry for operator uid \(uid)")
-    }
-    return String(cString: pw.pointee.pw_name)
-}
-
 func option(_ args: [String], _ name: String) -> String? {
     guard let idx = args.firstIndex(of: name), idx + 1 < args.count else { return nil }
     return args[idx + 1]
@@ -47,6 +40,7 @@ let args = Array(CommandLine.arguments.dropFirst())
 let configPath = option(args, "--config").map { URL(fileURLWithPath: $0) } ?? IndividuatorPaths.defaultRootConfigPath
 let keyDir = option(args, "--key-dir").map { URL(fileURLWithPath: $0) } ?? IndividuatorPaths.defaultKeyDirectory
 let socketPath = option(args, "--socket") ?? IndividuatorPaths.defaultDaemonSocketPath.path
+let forwardingSocketPath = option(args, "--forwarding-socket") ?? IndividuatorPaths.defaultForwardingSocketPath.path
 
 let config: IndividuatorRootConfig
 do {
@@ -82,9 +76,47 @@ print(keyStartup.logLine)
 // own named reason, until a certificate has been adopted.
 let transport = CertificateGatedRegistrationTransport(
     config: config, machineKey: keyStartup.key, certificateStore: certStore)
-let account = accountName(for: config.operatorUID)
-let handler = RegisterRequestHandler(requiredUID: config.operatorUID, transport: transport, account: account)
+let authorizationTransport = CertificateGatedAuthorizationTransport(
+    config: config, machineKey: keyStartup.key, certificateStore: certStore)
+// `IndividuatorRootConfig.load` already refuses a repeated uid, but this
+// builds the dictionary with a loop that assigns each entry by its uid key
+// rather than `Dictionary(uniqueKeysWithValues:)`, so a duplicate slipping
+// past that check — a config built directly rather than through `load` —
+// keeps the last entry instead of trapping the daemon at startup.
+var admittedAccounts: [uid_t: String] = [:]
+for entry in config.admittedAccounts {
+    admittedAccounts[entry.uid] = entry.account
+}
+let handler = RegisterRequestHandler(
+    admittedAccounts: admittedAccounts, transport: transport, authorizationTransport: authorizationTransport,
+    sessions: SessionTable())
 let server = RegisterSocketServer(socketPath: socketPath, handler: handler)
+
+// The forwarding socket (E12·2 slice S5b; 0092 "The Individuator carries a
+// sessions-only host's clients to the Keel") is served only when the
+// root-owned config names a Library destination — see
+// `ForwardingServingDecision`'s own doc comment for why that one field is
+// the switch. Run on its own thread: `RegisterSocketServer.run()` below
+// never returns, and the two sockets' accept loops are independent of
+// each other.
+if ForwardingServingDecision.shouldServeForwarding(config: config) {
+    let forwardingTransport = CertificateGatedForwardingTransport(
+        config: config, machineKey: keyStartup.key, certificateStore: certStore)
+    let forwardingHandler = ForwardingConnectionHandler(
+        admittedUIDs: Set(admittedAccounts.keys), allowlist: ForwardingAllowlist.entries,
+        libraryAddress: config.libraryAddress, bosunAddress: config.bosunAddress, upstream: forwardingTransport)
+    let forwardingServer = ForwardingSocketServer(socketPath: forwardingSocketPath, handler: forwardingHandler)
+    Thread.detachNewThread {
+        do {
+            try forwardingServer.run()
+        } catch {
+            FileHandle.standardError.write("individuator-daemon: forwarding socket: \(error)\n".data(using: .utf8)!)
+        }
+    }
+    print("individuator-daemon: serving the forwarding socket at \(forwardingSocketPath)")
+} else {
+    print("individuator-daemon: no library_address configured; the forwarding socket is not served")
+}
 
 do {
     try server.run()

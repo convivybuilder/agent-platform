@@ -20,7 +20,8 @@ import run_sandbox as RS
 pytestmark = pytest.mark.usefixtures("_tool_session_scratch_dir_off_the_real_account_home")
 
 
-def _spawn(agentctl, tmp_path, monkeypatch, *, user_prompt="u", repo="constance", **session_kwargs):
+def _spawn(agentctl, tmp_path, monkeypatch, *, user_prompt="u", repo="widget-crew",
+          agent_name="reviewer", **session_kwargs):
     """Drive `_run_session` (the path foreground, detached and reviewer runs all
     share) with a stub claude; return the argv and the env the stub received.
 
@@ -30,7 +31,14 @@ def _spawn(agentctl, tmp_path, monkeypatch, *, user_prompt="u", repo="constance"
     `activate_profile`'s outcome on a real dispatch. `exist_ok=True` on the
     worktree mkdir: a caller that wants `_fleet_blocks_confirmed_in_claude_md`
     to confirm delivery pre-populates `tmp_path / "wt" / ".claude" / CLAUDE.md`
-    before calling this."""
+    before calling this.
+
+    `agent_name` (args.agent — never the resolved agent dict `_run_session`'s own
+    `agent=` parameter takes) defaults to `"reviewer"`, matching every call site
+    before this parameter existed; a caller testing something `_is_review_agent`
+    would change the answer to
+    (platform/specs/reviewers-run-under-their-allow-list) passes a build-class
+    agent such as `"coder"` instead."""
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     worktree = tmp_path / "wt"
@@ -55,7 +63,7 @@ def _spawn(agentctl, tmp_path, monkeypatch, *, user_prompt="u", repo="constance"
     monkeypatch.setattr(agentctl.R, "reserve_slot", lambda entry: None)
     monkeypatch.setattr(agentctl.R, "attach_pid", lambda run_id, pid, pid_started_at=None, **_kw: None)
     monkeypatch.setattr(agentctl.R, "remove_run", lambda rid: True)
-    args = types.SimpleNamespace(agent="reviewer", task="t", parent=None,
+    args = types.SimpleNamespace(agent=agent_name, task="t", parent=None,
                                  dry_run=False, label=None, model=None, review_sha=None)
     agentctl._run_session(
         args=args, agent={"body": "sys", "model_alias": "sonnet"},
@@ -70,6 +78,19 @@ def _spawn(agentctl, tmp_path, monkeypatch, *, user_prompt="u", repo="constance"
 def _settings(argv):
     assert argv.count("--settings") == 1, "exactly one --settings: spawn's own"
     return json.loads(argv[argv.index("--settings") + 1])
+
+
+def _tools_arg(argv):
+    """The values passed after `--tools`, up to the next flag — mirrors
+    `tests/test_agentctl.py`'s own helper of the same name."""
+    if "--tools" not in argv:
+        return None
+    i = argv.index("--tools") + 1
+    out = []
+    while i < len(argv) and not argv[i].startswith("--"):
+        out.append(argv[i])
+        i += 1
+    return out
 
 
 # A `scope: fleet` instruction-block row shaped exactly like the validated rows
@@ -117,6 +138,52 @@ def test_every_run_is_launched_under_the_sandbox_and_the_grant_is_denied(
         assert argv.index("--settings") < argv.index("--disallowedTools")
 
 
+def test_the_codex_login_credential_is_denied_for_a_coder_and_a_reviewer_dispatch(
+        agentctl, tmp_path_factory, monkeypatch):
+    # The Codex CLI's own login credential (holds the operator's ChatGPT subscription
+    # grant since the CLI logged in on this machine, 2026-10-17); see run_sandbox.py's
+    # DENIED_HOME_FILES comment. Codex is launched by the dispatcher, outside a run's
+    # sandbox, so no dispatched run — build-class or review-class — ever needs it.
+    for agent_name in ("coder", "reviewer"):
+        tmp_path = tmp_path_factory.mktemp(agent_name)
+        caller_home = tmp_path / "caller-home"
+        monkeypatch.setenv("HOME", str(caller_home))
+        argv, _ = _spawn(agentctl, tmp_path, monkeypatch, agent_name=agent_name)
+
+        settings = _settings(argv)
+        deny = settings["permissions"]["deny"]
+        deny_read = settings["sandbox"]["filesystem"]["denyRead"]
+        for home in (RS.passwd_home(), caller_home):
+            auth = home / ".codex" / "auth.json"
+            assert f"Read(//{str(auth).lstrip('/')})" in deny, \
+                f"{agent_name}: no Read(...) deny rule for {auth}"
+            assert str(auth) in deny_read, \
+                f"{agent_name}: {auth} missing from sandbox.filesystem.denyRead"
+
+
+def test_the_claude_sign_in_credential_is_denied_for_a_coder_and_a_reviewer_dispatch(
+        agentctl, tmp_path_factory, monkeypatch):
+    # Claude Code's own sign-in file; see run_sandbox.py's DENIED_HOME_FILES comment.
+    # A dispatched coder read it into its run log on 2026-10-07. Claude Code is
+    # launched by the dispatcher, outside a run's sandbox, so no dispatched run —
+    # build-class or review-class — ever needs it.
+    for agent_name in ("coder", "reviewer"):
+        tmp_path = tmp_path_factory.mktemp(agent_name)
+        caller_home = tmp_path / "caller-home"
+        monkeypatch.setenv("HOME", str(caller_home))
+        argv, _ = _spawn(agentctl, tmp_path, monkeypatch, agent_name=agent_name)
+
+        settings = _settings(argv)
+        deny = settings["permissions"]["deny"]
+        deny_read = settings["sandbox"]["filesystem"]["denyRead"]
+        for home in (RS.passwd_home(), caller_home):
+            creds = home / ".claude" / ".credentials.json"
+            assert f"Read(//{str(creds).lstrip('/')})" in deny, \
+                f"{agent_name}: no Read(...) deny rule for {creds}"
+            assert str(creds) in deny_read, \
+                f"{agent_name}: {creds} missing from sandbox.filesystem.denyRead"
+
+
 def test_a_full_successful_render_excludes_the_runs_own_user_claude_md(
         agentctl, tmp_path, monkeypatch):
     # Context trim phase 2 (issue_01M4D32KA2F99QGKABZ8HV2RG5): a dispatched run's
@@ -147,7 +214,7 @@ def test_a_full_successful_render_excludes_the_runs_own_user_claude_md(
 
 
 @pytest.mark.parametrize("docs_unavailable_reason, render_skipped", [
-    # An is_local agent (CFO/EA): `cmd_spawn` never calls `activate_profile`.
+    # An is_local agent (LEDGER/SATCHEL): `cmd_spawn` never calls `activate_profile`.
     ("render skipped for local/private dispatch", None),
     # A private crew's dispatch kept on the primary checkout: same skip, the other
     # dispatch class that shares it.
@@ -207,13 +274,15 @@ def test_a_rendered_claude_md_missing_one_fleet_block_keeps_loading_the_user_cla
     assert _settings(argv)["claudeMdExcludes"] == []
 
 
-def test_a_vivy_dispatch_gets_the_agent_postgres_socket_and_pghost(agentctl, tmp_path, monkeypatch):
-    # Round-1 revise on PR #817: a vivy coder's test suite needs
+def test_a_flagged_repo_dispatch_gets_the_agent_postgres_socket_and_pghost(
+        agentctl, tmp_path, monkeypatch):
+    # Round-1 revise on PR #817: a product coder's test suite needs
     # the AGENT cluster's unix socket, never the operator's own cluster's — see RS's
-    # POSTGRES_SOCKET_REPOS comment for why. PGHOST/PGPORT point its client at that
+    # postgres_socket_repos() comment for why. PGHOST/PGPORT point its client at that
     # socket; PGUSER picks the one non-superuser role that cluster trusts there. The
     # sandbox grant is the only thing that actually lets the connection through.
-    argv, env = _spawn(agentctl, tmp_path, monkeypatch, repo="vivy")
+    monkeypatch.setattr(RS, "postgres_socket_repos", lambda: ("widget-crew",))
+    argv, env = _spawn(agentctl, tmp_path, monkeypatch, repo="widget-crew")
     net = _settings(argv)["sandbox"]["network"]
     expected_socket = RS.agent_postgres_socket_path(RS.passwd_home())
     assert net["allowUnixSockets"] == [expected_socket]
@@ -226,7 +295,7 @@ def test_a_vivy_dispatch_gets_the_agent_postgres_socket_and_pghost(agentctl, tmp
 
 def test_a_non_postgres_repo_dispatch_gets_neither_the_socket_nor_pghost(
         agentctl, tmp_path, monkeypatch):
-    argv, env = _spawn(agentctl, tmp_path, monkeypatch, repo="constance")
+    argv, env = _spawn(agentctl, tmp_path, monkeypatch, repo="widget-crew")
     assert "allowUnixSockets" not in _settings(argv)["sandbox"]["network"]
     assert "PGHOST" not in env
     assert "PGPORT" not in env
@@ -236,11 +305,118 @@ def test_a_non_postgres_repo_dispatch_gets_neither_the_socket_nor_pghost(
 def test_every_run_is_dontask_so_its_file_tools_are_confined(agentctl, tmp_path, monkeypatch):
     # bypassPermissions allows every write and no deny list can carve the worktree out
     # of that, so the file-write scope binds only under dontAsk, enforced or not.
-    argv, _ = _spawn(agentctl, tmp_path, monkeypatch)
+    # A build-class agent: `/tmp` is the review-class carve-out's own grant, which
+    # this file's reviewer-specific test below checks instead
+    # (platform/specs/reviewers-run-under-their-allow-list).
+    argv, _ = _spawn(agentctl, tmp_path, monkeypatch, agent_name="coder")
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     assert "bypassPermissions" not in argv
     # The allow list the file tools need travels in the same settings.
     assert "Edit(//tmp/**)" in _settings(argv)["permissions"]["allow"]
+
+
+def test_a_reviewer_dispatch_gets_the_review_allow_list_not_tool_allow(
+        agentctl, tmp_path, monkeypatch):
+    """platform/specs/reviewers-run-under-their-allow-list: the default agent every
+    other test in this file drives (`_spawn`'s own default) is `reviewer`, and its
+    settings must carry its OWN resolved policy as the whole permission base — no
+    bare `Bash`, no `/tmp` — with `Write` reaching its own draft directory instead.
+
+    Calibration (2026-10-17, platform/decisions/0926 proposed): the allow-list alone
+    does not bind — left unset, `sandbox.autoAllowBashIfSandboxed` auto-allows any
+    Bash command the sandbox can run no matter what `permissions` says, which let
+    `python3 -c`, `launchctl print` and `ruff check --isolated --fix` all run under
+    the printed review-class settings. This dispatch's settings must also carry that
+    key set to `false`."""
+    argv, _ = _spawn(agentctl, tmp_path, monkeypatch)
+    settings = _settings(argv)
+    allow = settings["permissions"]["allow"]
+    assert "Bash" not in allow
+    assert "mcp__ops" not in allow
+    assert "mcp__kb" not in allow
+    assert "Edit(//tmp/**)" not in allow
+    assert "Read" in allow
+    assert "Bash(git diff:*)" in allow
+    assert "ToolSearch" in allow
+    fs = settings["sandbox"]["filesystem"]
+    assert "/tmp" not in fs["allowWrite"]
+    draft_rule = [r for r in allow if r.startswith("Edit(") and "review-drafts" in r]
+    assert draft_rule, f"no draft-directory Edit(...) rule in {allow}"
+    # `--tools` carries `Write` even though no bare `Write` rule is in `allow` —
+    # `tool_policy._WRITE_SCOPE_CAVEAT`'s own reason: Write is scoped by the
+    # Edit(...) rule above, never a bare allow-list entry.
+    assert "Write" in _tools_arg(argv)
+    assert settings["sandbox"]["autoAllowBashIfSandboxed"] is False
+
+
+def test_a_security_reviewer_dispatch_also_turns_off_bash_auto_allow(
+        agentctl, tmp_path, monkeypatch):
+    """The other `_is_review_agent` member gets the same key — this is not
+    `reviewer`-specific. Calibration (2026-10-17, platform/decisions/0926 proposed):
+    a security-reviewer's `python3 - <<'EOF'` booted out seven live launchd jobs on
+    2026-10-16 (run-4a2b213d) because this key was unset, not because the allow-list
+    omitted a rule for it."""
+    argv, _ = _spawn(agentctl, tmp_path, monkeypatch, agent_name="security-reviewer")
+    settings = _settings(argv)
+    assert settings["sandbox"]["autoAllowBashIfSandboxed"] is False
+
+
+def test_a_build_class_dispatch_never_gets_the_bash_auto_allow_key(
+        agentctl, tmp_path_factory, monkeypatch):
+    """coder/scout/planner keep today's sandbox settings byte-identical
+    (`test_without_review_allowed_settings_are_byte_identical_to_before` in
+    tests/test_run_sandbox.py) — this key is added only on the `_is_review_agent`
+    branch, so it must be absent, not merely `True`, for every other agent."""
+    for agent_name in ("coder", "scout", "planner"):
+        argv, _ = _spawn(agentctl, tmp_path_factory.mktemp(agent_name), monkeypatch,
+                         agent_name=agent_name)
+        settings = _settings(argv)
+        assert "autoAllowBashIfSandboxed" not in settings["sandbox"], \
+            f"{agent_name} must not carry the review-only auto-allow-off key"
+
+
+def test_a_reviewer_dispatchs_policy_json_is_enforced_without_the_env_var(
+        agentctl, tmp_path, monkeypatch):
+    """platform/specs/reviewers-run-under-their-allow-list: `enforcement_active`
+    must read True for a reviewer dispatch even with `AGENTCTL_ENFORCE_TOOL_POLICY`
+    unset — the whole point of removing the switch for this role."""
+    monkeypatch.delenv("AGENTCTL_ENFORCE_TOOL_POLICY", raising=False)
+    _spawn(agentctl, tmp_path, monkeypatch)
+    rec = json.loads((tmp_path / "run" / "policy.json").read_text())
+    assert rec["enforced"] is True
+    assert rec["enforcement_active"] is True
+
+
+def test_a_coder_dispatchs_policy_json_still_needs_the_env_var(
+        agentctl, tmp_path, monkeypatch):
+    """The other side of the same fact: a build-class agent's `enforced` is False
+    regardless, so `enforcement_active` stays False too — untouched by this
+    change."""
+    monkeypatch.delenv("AGENTCTL_ENFORCE_TOOL_POLICY", raising=False)
+    _spawn(agentctl, tmp_path, monkeypatch, agent_name="coder")
+    rec = json.loads((tmp_path / "run" / "policy.json").read_text())
+    assert rec["enforced"] is False
+    assert rec["enforcement_active"] is False
+
+
+def test_a_planner_dispatchs_enforcement_still_needs_the_env_var(
+        agentctl, tmp_path_factory, monkeypatch):
+    """A non-review ENFORCEABLE_AGENTS member (`policy.enforced` True) keeps the
+    switch: `enforcement_active` is False with the env var unset, True once it
+    is — the condition this change did NOT remove for anyone but the two review
+    roles."""
+    monkeypatch.delenv("AGENTCTL_ENFORCE_TOOL_POLICY", raising=False)
+    off_dir = tmp_path_factory.mktemp("planner-off")
+    _spawn(agentctl, off_dir, monkeypatch, agent_name="planner")
+    rec = json.loads((off_dir / "run" / "policy.json").read_text())
+    assert rec["enforced"] is True
+    assert rec["enforcement_active"] is False
+
+    monkeypatch.setenv("AGENTCTL_ENFORCE_TOOL_POLICY", "1")
+    on_dir = tmp_path_factory.mktemp("planner-on")
+    _spawn(agentctl, on_dir, monkeypatch, agent_name="planner")
+    rec = json.loads((on_dir / "run" / "policy.json").read_text())
+    assert rec["enforcement_active"] is True
 
 
 def test_a_task_that_starts_with_a_flag_cannot_replace_the_settings(

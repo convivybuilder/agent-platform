@@ -4,7 +4,7 @@
 # Idempotent. Safe to re-run. Two phases:
 #
 #   1. venv + deps    — creates ~/.local/lib/knowledge/.venv if missing,
-#                        installs/upgrades requirements.txt.
+#                        installs requirements.lock.txt with hashes required.
 #   2. symlinks       — replaces ~/.local/bin/<binary> and
 #                        ~/.local/lib/{agent-platform,knowledge}/* with symlinks
 #                        back into this repo, so future edits land here and
@@ -99,7 +99,16 @@ done
 # literal here either; it is discovered at runtime from what `launchctl
 # list` actually reports loaded. SYSTEM_DAEMON_PLISTS (phase 4, below) were
 # already com.convivy.* and are not part of this list.
-MIGRATED_JOBS="agent-activity-report agent-cost-report-refresh agent-cost-report agent-platform-autopull agent-postgres agent-summary arch129-remeasure changelog-drain check-deploy-pinned-jobs ci1-heartbeat cli-contract-check dependabot-review hook-log-prune issue-pr-reconcile kb-guards-check knowledge-autopull knowledge-watcher limit-resume memory-archive metric-alerts model-scorecard-hollis model-scorecard-weekly model-scorecard orchestrator-tokens-record pr-state-capture primary-checkout-check run-observer run-register-api run-retention security-scorecard serving-checkout-check session-follow-watchdog tcc-prompt-watchdog transcript-capture velocity-report vivy-main-suite warrant-scorecard weekly-consulting weekly-kb-audit worktrees-cleanup"
+# main-suite (renamed by CQ-589 from a single-product name already inside
+# the com.convivy.* namespace) carries no entry here: this list exists to
+# migrate a job OFF a pre-CQ-428 personal-namespace label, discovered by
+# `legacy_label_for` from what `launchctl list` reports loaded, never from a
+# hardcoded old->new map — and that job was already migrated onto its
+# previous com.convivy.* label, under its previous name, before this rename.
+# Its own com.convivy.* -> com.convivy.* rename is a different kind of change
+# this mechanism was never built for: the operator retires the pre-rename
+# label by hand (`launchctl bootout`) after installing this change.
+MIGRATED_JOBS="agent-activity-report agent-cost-report-refresh agent-cost-report agent-platform-autopull agent-postgres agent-summary arch129-remeasure changelog-drain check-deploy-pinned-jobs ci1-heartbeat cli-contract-check dependabot-review hook-log-prune issue-pr-reconcile kb-guards-check knowledge-autopull knowledge-watcher limit-resume memory-archive metric-alerts model-scorecard-weekly model-scorecard orchestrator-tokens-record pr-state-capture primary-checkout-check run-observer run-register-api run-retention security-scorecard serving-checkout-check session-follow-watchdog tcc-prompt-watchdog transcript-capture velocity-report warrant-scorecard weekly-kb-audit worktrees-cleanup"
 
 # Renders launchd/<name>.plist ($1) to a destination path ($2), substituting
 # $HOME for the __HOME__ placeholder the template carries in git.
@@ -261,8 +270,7 @@ if [[ ! -d "$KNOWLEDGE_VENV" ]]; then
   say "Creating $KNOWLEDGE_VENV (python3.11)"
   python3.11 -m venv "$KNOWLEDGE_VENV"
 fi
-"$KNOWLEDGE_VENV/bin/pip" install --quiet --upgrade pip
-"$KNOWLEDGE_VENV/bin/pip" install --quiet -r "$REPO/requirements.txt"
+"$KNOWLEDGE_VENV/bin/pip" install --quiet --require-hashes --only-binary :all: -r "$REPO/requirements.lock.txt"
 say "venv ready: $("$KNOWLEDGE_VENV/bin/python3" --version)"
 
 # --- phase 2: symlinks ------------------------------------------------------
@@ -387,11 +395,12 @@ SYSTEM_DAEMON_PLISTS="com.convivy.ip-forwarding.plist com.convivy.sshd-watchdog.
 #
 # This phase renders over the operator's live launchd config. On 2026-07-13 the live
 # com.convivy.overnight-orchestrator.plist carried four env flags that existed nowhere in
-# git — the sous-chef phase-split canary and the digest assembler, both set by hand
+# git — a product crew's phase-split canary and the digest assembler, both set by hand
 # with PlistBuddy. Running this installer would have reverted them: fragment mode off,
-# the consolidated digest re-broken, silently, with an exit code of 0. The flags have
-# since moved to ~/.config/convivy/overnight.env so they cannot drift again — but the
-# installer must not be a loaded gun for the NEXT thing someone tunes live.
+# the consolidated digest re-broken, silently, with an exit code of 0. The flags moved
+# to ~/.config/convivy/overnight.env so they could not drift again; both the plist and
+# that env file are since retired (platform/decisions/0102) — but the installer must
+# not be a loaded gun for the NEXT thing someone tunes live.
 #
 # So: a live plist that differs from what this install would render is REFUSED, with
 # the diff, and the run continues. --force overwrites (the "I know, my template is
@@ -455,8 +464,6 @@ if [ "$plist_drift" -gt 0 ]; then
   say ""
   say "  $plist_drift live plist(s) differ from their template and were NOT overwritten."
   say "  Reconcile them, or re-run with --force to replace the live copies."
-  say "  Tunable overnight flags belong in ~/.config/convivy/overnight.env, not a plist"
-  say "  (launchd/overnight.env.example) — that is what keeps this from drifting."
 fi
 
 # --- phase 4b: decision-record → #*-explanations hooks (ARCH-170 piece B) ----
@@ -477,17 +484,34 @@ sh "$REPO/bin/install-rollover-policy" || say "  rollover policy seed skipped (n
 say "Phase 4c: project inbox links"
 python3 "$REPO/bin/link-project-inboxes" || say "  some project inboxes need attention (non-fatal) — re-run bin/link-project-inboxes after merging them"
 
-# --- phase 5: iTerm2 DynamicProfiles — DELIBERATELY NOT HERE ----------------
-# Per-product co styling (ARCH-077) needs the DynamicProfiles JSON installed
-# where iTerm2 actually runs — the operator's LAPTOP — not the mini. This install.sh
-# runs on the mini, which is headless (no iTerm2.app), so deploying profiles
-# here is a no-op that only litters the mini's filesystem. That was the
-# ARCH-077 bug (ARCH-078): the prior session symlinked profiles into the
-# mini's iTerm support dir, iTerm never saw them, and SetProfile silently
-# no-opped. The co wrapper (which runs on the mini) still emits the OSC-1337
-# SetProfile escape — it travels up the ssh/tmux pipe to the laptop's iTerm.
-# The profiles themselves are deployed laptop-side by:
-#     the operator's own ssh-alias installer, run on the LAPTOP
+# --- phase 5: render iTerm DynamicProfiles + Deck theme seed (CQ-590) ------
+# INSTALLING the DynamicProfiles JSON is DELIBERATELY NOT HERE. Per-crew co
+# styling (ARCH-077) needs the profiles where iTerm2 actually runs — the
+# operator's LAPTOP — not here: this install.sh runs on the crew machine,
+# which is headless (no iTerm2.app), so installing profiles here is a no-op
+# that only litters this machine's filesystem. That was the ARCH-077 bug
+# (ARCH-078): the prior session symlinked profiles into this machine's iTerm
+# support dir, iTerm never saw them, and SetProfile silently no-opped. The co
+# wrapper (which runs here) still emits the OSC-1337 SetProfile escape — it
+# travels up the ssh/tmux pipe to the laptop's iTerm.
+#
+# RENDERING them is here, though: the registry replaces the per-crew
+# iTerm/Deck files the Builder release name scan refuses (CQ-590), so this
+# machine renders both from the registry's `co_*` fields into a generated
+# directory outside any repository. tools/install-crew-ssh-config.sh, run on
+# the LAPTOP, reads that directory over the SMB mount of this account's home
+# and installs from it — profiles overwritten every run, the Deck seed merged
+# key-by-key the same way it always was.
+say "Phase 5: render iTerm profiles + Deck theme seed"
+python3 "$REPO/bin/render-co-style" || say "  co styling render skipped (non-fatal) — re-run bin/render-co-style"
+
+# Same generated directory, same reader: the ssh host blocks and mosh
+# launcher table tools/install-crew-ssh-config.sh installs on the LAPTOP,
+# rendered from the registry's own `crew`/`home_dir` fields plus this
+# machine's own crew host, standby host and ssh user (CQ-603, E36 slice 6) —
+# never a literal crew, host or user name in this repository's code.
+say "Phase 5b: render ssh host blocks + mosh launcher table"
+python3 "$REPO/bin/render-ssh-config" || say "  ssh config render skipped (non-fatal) — re-run bin/render-ssh-config"
 
 # NEWLY INSTALLED PLISTS, NAMED SEPARATELY AND FIRST. These have never been
 # bootstrapped on this machine — they were copied into LaunchAgents moments ago and
@@ -520,18 +544,19 @@ cat <<EOF
 
 Install complete. To activate launchd jobs (idempotent — re-bootstrap is safe):
 
-  for label in com.convivy.knowledge-watcher com.convivy.agent-summary com.convivy.knowledge-autopull com.convivy.model-scorecard com.convivy.model-scorecard-weekly com.convivy.security-scorecard com.convivy.warrant-scorecard com.convivy.metric-alerts com.convivy.agent-cost-report com.convivy.agent-cost-report-refresh com.convivy.velocity-report com.convivy.sshd-watchdog-notify com.convivy.appkit.autoupdate; do
+  for label in com.convivy.knowledge-watcher com.convivy.agent-summary com.convivy.knowledge-autopull com.convivy.model-scorecard com.convivy.model-scorecard-weekly com.convivy.security-scorecard com.convivy.warrant-scorecard com.convivy.metric-alerts com.convivy.agent-cost-report com.convivy.agent-cost-report-refresh com.convivy.velocity-report com.convivy.sshd-watchdog-notify com.convivy.primary-checkout-autoupdate; do
     launchctl bootout "gui/\$(id -u)/\$label" 2>/dev/null || true
     launchctl bootstrap "gui/\$(id -u)" "$LAUNCH_AGENTS/\$label.plist"
   done
 
-The appkit autoupdate plist CHANGED in ARCH-441 — it used to invoke /usr/bin/git
-directly and now runs bin/appkit-autoupdate, which asserts the checkout is on main
-first. The drift check refuses to overwrite an existing live plist, so on a machine
-that already has the old one, deploying it takes:
+The autoupdate plist was RENAMED from com.convivy.appkit.autoupdate by CQ-602,
+which also made the job read every repo it fast-forwards from the project
+registry instead of naming one. install.sh has no mechanism to retire a
+renamed job's old label (same gap the main-suite rename hit) — on a machine
+that already has the old one loaded, boot it out by hand after this install:
   bash $REPO/install.sh --force
   launchctl bootout "gui/\$(id -u)/com.convivy.appkit.autoupdate" 2>/dev/null || true
-  launchctl bootstrap "gui/\$(id -u)" "$LAUNCH_AGENTS/com.convivy.appkit.autoupdate.plist"
+  launchctl bootstrap "gui/\$(id -u)" "$LAUNCH_AGENTS/com.convivy.primary-checkout-autoupdate.plist"
 
 To deploy a GATEWAY change (after merging it to main):
   git -C $REPO checkout main && git -C $REPO pull   # get the reviewed code

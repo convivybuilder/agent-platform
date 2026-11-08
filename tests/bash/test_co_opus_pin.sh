@@ -1,12 +1,12 @@
 #!/bin/bash
 # Tests for bin/co's main-loop model: Opus unless `_co_sonnet_crews` names the
 # crew (operator, 2026-09-16). The default was once Sonnet, reached Opus only through
-# three lists, and let placard, shipwright and Signals each launch on Sonnet
+# three lists, and let signpost, outfitter and Signals each launch on Sonnet
 # unnoticed; the first case below is that Signals directory.
 #
 # The remaining cases are the directories that used to need a special path to
 # reach Opus (a bare directory with no git toplevel, a -commercial repo, the
-# capital-CFO directory, a private crew's subfolder), the listed Sonnet crews,
+# capital-LEDGER directory, a private crew's subfolder), the listed Sonnet crews,
 # and the two overrides.
 #
 # `co` is zsh (excluded from the ARCH-082 bash-3.2 contract by lint.sh's
@@ -20,7 +20,7 @@ CO="$REPO_ROOT/bin/co"
 OPUS='claude-opus-5-5[1m]'
 SONNET='claude-sonnet-5[1m]'
 
-# A fake HOME holding all six targets, each git-initialized (except `ask`,
+# A fake HOME holding all six targets, each git-initialized (except `parlor`,
 # deliberately not a repo) and individuated with a dummy agent so a
 # non-individuated generic-tail fallthrough can't be confused with the pin
 # actually taking effect. Echoes the fake HOME.
@@ -29,28 +29,34 @@ setup() { # -> echoes fake HOME
     home=$(mktemp -d)
     mkdir -p "$home/stubbin"
 
-    for d in Convivy/library Convivy/agent-platform Convivy/convivy-orient \
-             Convivy/CFO; do
+    for d in Convivy/library Convivy/agent-platform Convivy/northwind-orient \
+             Convivy/LEDGER; do
         mkdir -p "$home/$d/.claude/agents"
         : > "$home/$d/.claude/agents/scout.md"
         ( cd "$home/$d" && git init -q . )
     done
-    # convivy-commercial hardcodes agent=positioning-strategist (bin/co ~line 679).
-    mkdir -p "$home/Convivy/convivy-commercial/.claude/agents"
-    : > "$home/Convivy/convivy-commercial/.claude/agents/positioning-strategist.md"
-    ( cd "$home/Convivy/convivy-commercial" && git init -q . )
-    # `ask` is deliberately NOT a git repo — that absence is the case this
-    # file exists to cover. `EA` is the same shape and is here for the same
+    # northwind-commercial hardcodes agent=positioning-strategist (bin/co ~line 679).
+    mkdir -p "$home/Convivy/northwind-commercial/.claude/agents"
+    : > "$home/Convivy/northwind-commercial/.claude/agents/positioning-strategist.md"
+    ( cd "$home/Convivy/northwind-commercial" && git init -q . )
+    # `parlor` is deliberately NOT a git repo — that absence is the case this
+    # file exists to cover. `SATCHEL` is the same shape and is here for the same
     # reason: it is a bare directory on disk, so an entry in `_co_crew_dirs`
     # would be unreachable code and the pin would silently not apply.
-    mkdir -p "$home/Convivy/ask"
-    mkdir -p "$home/Convivy/EA"
+    mkdir -p "$home/Convivy/parlor"
+    mkdir -p "$home/Convivy/SATCHEL"
     # The operator's own private crew IS a git repo, as it is on disk (synthesized
     # here as "private-a" against a fixture registry, below), so the `$PWD` pin
     # must win over a toplevel whose basename the brand `case` does not list.
     mkdir -p "$home/Convivy/private-a"
     ( cd "$home/Convivy/private-a" && git init -q . )
     write_private_registry "$home/synthetic-private-registry.json" private-a private-a.example
+    # `parlor` needs its own registry row too: unlike the old directory-literal
+    # ask check, the walled-off gate (platform/decisions/0100) now reads the
+    # registry, so a bare, unregistered "parlor" directory is an ordinary
+    # unregistered repo rather than the walled-off crew's own no-individuation
+    # launch path — the shape this one case exists to pin.
+    write_walled_off_registry "$home/walled-registry.json" parlor Parlor
 
     cat > "$home/stubbin/claude" <<'EOF'
 #!/bin/bash
@@ -86,7 +92,7 @@ run_co_in() {
     if [ -n "${REGISTRY_OVERRIDE:-}" ]; then
         root_config=$(co_root_config "$home" "$REGISTRY_OVERRIDE")
     else
-        root_config=$(co_root_config "$home")
+        root_config=$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")
     fi
     ( cd "$home/$rel" && unset CO_DEFAULT_MODEL && HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$call_log" /bin/zsh "$CO" --root-config "$root_config" >/dev/null 2>&1 )
@@ -127,38 +133,40 @@ assert_opus "sig-signals (unregistered, unlisted)" "Convivy/sig-signals" "$H"
 echo "== directories that once needed their own path to Opus still get it =="
 assert_opus "library"            "Convivy/library"            "$H"
 assert_opus "agent-platform"     "Convivy/agent-platform"     "$H"
-assert_opus "convivy-orient"     "Convivy/convivy-orient"     "$H"
-assert_opus "ask (no git toplevel)" "Convivy/ask"             "$H"
-assert_opus "EA (no git toplevel)"  "Convivy/EA"              "$H"
-assert_opus "convivy-commercial" "Convivy/convivy-commercial" "$H"
-assert_opus "CFO"                "Convivy/CFO"                "$H"
+assert_opus "northwind-orient"     "Convivy/northwind-orient"     "$H"
+REGISTRY_OVERRIDE="$H/walled-registry.json"
+assert_opus "parlor (no git toplevel, walled-off)" "Convivy/parlor" "$H"
+unset REGISTRY_OVERRIDE
+assert_opus "SATCHEL (no git toplevel)"  "Convivy/SATCHEL"              "$H"
+assert_opus "northwind-commercial" "Convivy/northwind-commercial" "$H"
+assert_opus "LEDGER"                "Convivy/LEDGER"                "$H"
 REGISTRY_OVERRIDE="$H/synthetic-private-registry.json"
 assert_opus "private-a"          "Convivy/private-a"          "$H"
-mkdir -p "$H/Convivy/private-a/Back" "$H/Convivy/EA/2026"
+mkdir -p "$H/Convivy/private-a/Back" "$H/Convivy/SATCHEL/2026"
 ( cd "$H/Convivy/private-a/Back" && git init -q . )
 assert_opus "private-a/Back (private subfolder)" "Convivy/private-a/Back" "$H"
 unset REGISTRY_OVERRIDE
-assert_opus "EA/2026 (private subfolder)"        "Convivy/EA/2026"        "$H"
+assert_opus "SATCHEL/2026 (private subfolder)"        "Convivy/SATCHEL/2026"        "$H"
 
 echo "== the crews listed in _co_sonnet_crews launch on Sonnet =="
-mkdir -p "$H/Convivy/write-better/.claude/agents" \
-         "$H/Convivy/nyh-architecture/nyh-etc/.claude/agents"
-: > "$H/Convivy/write-better/.claude/agents/planning-orchestrator.md"
-: > "$H/Convivy/nyh-architecture/nyh-etc/.claude/agents/planning-orchestrator.md"
-( cd "$H/Convivy/write-better" && git init -q . )
-( cd "$H/Convivy/nyh-architecture/nyh-etc" && git init -q . )
-assert_sonnet "write-better" "Convivy/write-better" "$H"
-assert_sonnet "nyh-etc (nested under nyh-architecture)" "Convivy/nyh-architecture/nyh-etc" "$H"
+mkdir -p "$H/Convivy/styleguide/.claude/agents" \
+         "$H/Convivy/oak/oak-etc/.claude/agents"
+: > "$H/Convivy/styleguide/.claude/agents/planning-orchestrator.md"
+: > "$H/Convivy/oak/oak-etc/.claude/agents/planning-orchestrator.md"
+( cd "$H/Convivy/styleguide" && git init -q . )
+( cd "$H/Convivy/oak/oak-etc" && git init -q . )
+assert_sonnet "styleguide" "Convivy/styleguide" "$H"
+assert_sonnet "oak-etc (nested under oak)" "Convivy/oak/oak-etc" "$H"
 
 echo "== an explicit model still wins, on either tier =="
 call_log=$(mktemp)
 ( cd "$H/Convivy/sig-signals" && HOME="$H" PATH="$H/stubbin:$PATH" CLAUDE_CALL_LOG="$call_log" \
-  /bin/zsh "$CO" --root-config "$(co_root_config "$H")" -m sonnet >/dev/null 2>&1 )
+  /bin/zsh "$CO" --root-config "$(co_root_config "$H" "$REPO_ROOT/tests/fixtures/rich_registry.json")" -m sonnet >/dev/null 2>&1 )
 assert_eq "sonnet" "$(_model_value "$(cat "$call_log")")" "sig-signals -m sonnet: the flag wins"
-( cd "$H/Convivy/write-better" && HOME="$H" PATH="$H/stubbin:$PATH" CLAUDE_CALL_LOG="$call_log" \
-  CO_DEFAULT_MODEL=claude-haiku-4-5 /bin/zsh "$CO" --root-config "$(co_root_config "$H")" >/dev/null 2>&1 )
+( cd "$H/Convivy/styleguide" && HOME="$H" PATH="$H/stubbin:$PATH" CLAUDE_CALL_LOG="$call_log" \
+  CO_DEFAULT_MODEL=claude-haiku-4-5 /bin/zsh "$CO" --root-config "$(co_root_config "$H" "$REPO_ROOT/tests/fixtures/rich_registry.json")" >/dev/null 2>&1 )
 assert_eq "claude-haiku-4-5" "$(_model_value "$(cat "$call_log")")" \
-    "write-better with CO_DEFAULT_MODEL: the machine-global override wins"
+    "styleguide with CO_DEFAULT_MODEL: the machine-global override wins"
 ( cd "$H/Convivy/private-a/Back" && HOME="$H" PATH="$H/stubbin:$PATH" CLAUDE_CALL_LOG="$call_log" \
   /bin/zsh "$CO" --root-config "$(co_root_config "$H" "$H/synthetic-private-registry.json")" -m sonnet >/dev/null 2>&1 )
 assert_eq "sonnet" "$(_model_value "$(cat "$call_log")")" "private-a/Back -m sonnet: the flag wins"

@@ -7,7 +7,9 @@
 # from an operator-level process (a dispatched run included) can act as
 # this key. That means the daemon itself must run as root, from a
 # root-owned binary, with a root-owned config naming the Bosun host and the
-# operator uid its Unix socket accepts a `register` request from — none of
+# accounts its Unix socket accepts a `register` request from (E12·2;
+# platform/decisions/0099 item 8: a root-owned list of admitted accounts,
+# "every account" meaning every account this config admits) — none of
 # which this script may read from, or write into, the agent-platform
 # checkout itself (ADR-0059's deploy-pinning rules apply here just as they
 # do to a per-user daemon).
@@ -40,7 +42,12 @@
 #      in the operator's home, writable by any process running as the
 #      operator's uid), then writes the root-owned configuration
 #      (`IndividuatorRootConfig`'s own JSON shape) naming the Bosun host,
-#      its address, that copy's path, and the operator uid.
+#      its address, that copy's path, and the admitted accounts (each
+#      `--account` resolved to a uid here, via `id -u`, rather than
+#      resolved later by the daemon on every connection). `--bosun-host`
+#      and `--account` each update only their own fields of an existing
+#      config when given alone, and omitting both leaves it unchanged —
+#      see usage() above for the full combination table.
 #   5. Copies the LaunchDaemon plist into the system LaunchDaemons
 #      directory (refusing to clobber a live one that has drifted from the
 #      template, unless --force — the same idiom install.sh phase 4 and
@@ -80,7 +87,8 @@ usage() {
 usage: install-individuator [--ref=<git-ref>] [--repo=<path>] [--allow-non-main]
                              [--force] [--status]
                              [--bosun-host=<name>] [--bosun-address=<host:port>]
-                             [--root-ca=<path>] [--operator-uid=<uid>]
+                             [--root-ca=<path>] [--account=<name>]...
+                             [--library-address=<host:port>]
                              [--machine-name=<name>]
                              [--key-dir=<path>] [--install-dir=<path>]
                              [--config-path=<path>] [--launch-daemons-dir=<path>]
@@ -91,7 +99,10 @@ Must be run as root (sudo).
 
   --ref=<git-ref>            Ref to build from (default: main).
   --repo=<path>              Checkout to read the ref from (default: this
-                              script's own repo, resolved via bin/builder-root).
+                              script's own repo, resolved via bin/builder-root
+                              against the invoking operator's home — SUDO_USER,
+                              never root's own — since this always runs under
+                              sudo; pass --repo if SUDO_USER is unset or root).
   --allow-non-main           Required to build anything other than main.
   --force                    Overwrite a live plist that differs from the template.
   --status                   Print what commit is currently deployed and exit.
@@ -102,8 +113,24 @@ Must be run as root (sudo).
   --root-ca=<path>           The Library's root certificate, PEM. Copied to a
                               root-owned file beside --config-path; the config
                               names that copy, never this path.
-  --operator-uid=<uid>       The uid the root daemon's Unix socket accepts a
-                              `register` request from (default: $SUDO_UID).
+  --account=<name>           A local account this machine's root daemon's
+                              Unix socket accepts a `register` request from.
+                              Repeat for more than one. Must match
+                              ^[A-Za-z_][A-Za-z0-9_.-]*$ and resolve to a uid
+                              via the system account database; a repeated
+                              name, or two names resolving to the same uid,
+                              is refused before anything is written. Required
+                              on a first install (default: the account `sudo`
+                              was run from, i.e. $SUDO_UID).
+  --library-address=<host:port> Where to dial the Library for the forwarding
+                              endpoint's Library-destined routes (E12·2 slice
+                              S5b). Optional, and independent of --bosun-host/
+                              --account: writes or updates only this one
+                              field, preserving everything else already in
+                              the config. Omitted (on a first install, or a
+                              later run that never names it) means the
+                              config carries no library_address at all, and
+                              the daemon serves no forwarding socket.
   --machine-name=<name>      THIS machine's own name for the CSR (default:
                               `hostname -s`) — independent of --bosun-host,
                               which names a different machine.
@@ -123,6 +150,22 @@ Must be run as root (sudo).
                               plist's own StandardOutPath).
   --self-test-wait-seconds=<n> How long to wait for that line to appear before
                               continuing anyway with a warning (default: 5).
+
+--bosun-host and --account are independent; against an existing
+--config-path, each may be given alone to update only its own fields:
+  both given         writes bosun_host/bosun_address/root_ca_path AND the
+                      admitted-accounts list, all from this run's flags.
+  --bosun-host only  updates bosun_host/bosun_address/root_ca_path and
+                      keeps the admitted-accounts list already there.
+  --account only     updates the admitted-accounts list and keeps
+                      bosun_host/bosun_address/root_ca_path already there.
+  neither given      leaves the config at --config-path unchanged.
+
+--library-address is independent of both of the above: given, it writes
+library_address alone (preserving every other field already there, or
+freshly written by --bosun-host/--account in this same run); omitted, it
+leaves library_address exactly as it already was (absent, on a first
+install that never names it).
 EOF
   exit 2
 }
@@ -136,7 +179,14 @@ STATUS_ONLY=0
 BOSUN_HOST=""
 BOSUN_ADDRESS=""
 ROOT_CA=""
-OPERATOR_UID="${SUDO_UID:-}"
+LIBRARY_ADDRESS=""
+# Space-separated, one name per `--account`, in the order given — never a
+# bash array: an EMPTY array subscripted as "${arr[@]}" under this script's
+# own `set -u` throws "unbound variable" on bash 3.2 (confirmed against
+# macOS's /bin/bash 3.2.57; fixed only in bash 4.4+), so a plain string
+# is the bash-3.2-safe accumulator here, the same way `declare -A`/`mapfile`/
+# `${var,,}` are avoided for ARCH-082. Account names never contain spaces.
+ACCOUNT_NAMES=""
 MACHINE_NAME=""
 KEY_DIR="/var/db/individuator"
 INSTALL_DIR="/usr/local/libexec/individuator"
@@ -170,7 +220,8 @@ for arg in "$@"; do
     --bosun-host=*) BOSUN_HOST="${arg#--bosun-host=}" ;;
     --bosun-address=*) BOSUN_ADDRESS="${arg#--bosun-address=}" ;;
     --root-ca=*) ROOT_CA="${arg#--root-ca=}" ;;
-    --operator-uid=*) OPERATOR_UID="${arg#--operator-uid=}" ;;
+    --account=*) ACCOUNT_NAMES="$ACCOUNT_NAMES ${arg#--account=}" ;;
+    --library-address=*) LIBRARY_ADDRESS="${arg#--library-address=}" ;;
     --machine-name=*) MACHINE_NAME="${arg#--machine-name=}" ;;
     --key-dir=*) KEY_DIR="${arg#--key-dir=}" ;;
     --install-dir=*) INSTALL_DIR="${arg#--install-dir=}" ;;
@@ -228,13 +279,82 @@ fi
 if [ -z "$REPO" ]; then
   _self_path="$0"; [ -L "$_self_path" ] && _self_path="$(readlink "$_self_path")"
   if [ -n "$ROOT_CONFIG" ]; then
+    # FOR TESTS ONLY: names the machine's root directly, bypassing the
+    # SUDO_USER resolution below entirely.
     _root="$("$(dirname "$_self_path")/builder-root" --root --config "$ROOT_CONFIG")" || _root=""
+    if [ -z "$_root" ]; then
+      echo "install-individuator: cannot resolve the machine's root (bin/builder-root --root --config $ROOT_CONFIG); pass --repo" >&2
+      exit 2
+    fi
   else
-    _root="$("$(dirname "$_self_path")/builder-root" --root)" || _root=""
-  fi
-  if [ -z "$_root" ]; then
-    echo "install-individuator: cannot resolve the machine's root (bin/builder-root --root); pass --repo" >&2
-    exit 2
+    # This script always runs under sudo (the root check above already
+    # passed). `bin/builder-root --root` resolves the PASSWD home of the
+    # CALLING process's own uid (builder_root.real_account_home reads
+    # pwd.getpwuid(os.getuid())), which under sudo is root's uid, 0 — so
+    # plain `builder-root --root` here always resolves root's own home,
+    # /var/root, never the invoking operator's, no matter what $HOME a
+    # shell carries into sudo. Production occurrence, 2026-11-02: `sudo
+    # install-individuator` resolved /var/root/builder/agent-platform and
+    # refused it as "not a git checkout".
+    #
+    # SUDO_USER is sudo's own report of the account it was invoked from —
+    # never inherited from the caller's environment, set by the sudo
+    # binary itself — so it is trusted here, but ONLY now that running as
+    # root (`id -u` 0) is already confirmed above; an unset SUDO_USER (a
+    # direct root login, or a sudo config that strips it) or one naming
+    # root itself names no OTHER account to resolve, so this refuses
+    # rather than silently falling back to builder-root's own (root's)
+    # home as before.
+    if [ "$(id -u)" -ne 0 ]; then
+      echo "install-individuator: internal error: REPO resolution reached with id -u != 0" >&2
+      exit 1
+    fi
+    case "${SUDO_USER:-}" in
+      "")
+        echo "install-individuator: no SUDO_USER (not invoked via sudo from another account, or it was stripped) — cannot resolve the invoking operator's checkout under sudo; pass --repo" >&2
+        exit 2
+        ;;
+      root)
+        echo "install-individuator: SUDO_USER=root — refusing to resolve root's own checkout as the invoking operator's; pass --repo" >&2
+        exit 2
+        ;;
+    esac
+    # Same strict, JSON-safe character class as --account, above: a
+    # SUDO_USER outside it resolves no real account, so this is refused
+    # before it ever reaches `dscacheutil` as an argument.
+    case "$SUDO_USER" in
+      [A-Za-z_]*) ;;
+      *) echo "install-individuator: SUDO_USER is not a valid account name: $SUDO_USER" >&2; exit 2 ;;
+    esac
+    case "$SUDO_USER" in
+      *[!A-Za-z0-9_.-]*) echo "install-individuator: SUDO_USER is not a valid account name: $SUDO_USER" >&2; exit 2 ;;
+    esac
+    # The system account database, never a string built from SUDO_USER's
+    # name: dscacheutil's `dir:` field is the account's actual configured
+    # home, which need not live under the same parent directory as every
+    # other account's.
+    _invoking_home=""
+    if command -v dscacheutil >/dev/null 2>&1; then
+      _invoking_home="$(dscacheutil -q user -a name "$SUDO_USER" 2>/dev/null | sed -n 's/^dir: *//p' | head -n 1)"
+    fi
+    if [ -z "$_invoking_home" ] || [ ! -d "$_invoking_home" ]; then
+      echo "install-individuator: cannot resolve SUDO_USER=$SUDO_USER's home via the system account database (dscacheutil); pass --repo" >&2
+      exit 2
+    fi
+    # `--home` (not `--config`) carries the invoking account's home all the
+    # way through root(): its OWN session-agent.env, its own fallback when
+    # unconfigured, and the "too wide" guard, all resolved against
+    # $_invoking_home rather than the calling (root) process's. `--config`
+    # alone is not enough — it only moves which file is read; `~`
+    # expansion, the compiled-in default root and the too-wide guard would
+    # still have resolved against root's own home (round-1 finding,
+    # confirmed empirically against f33f3d9e6: a session-agent.env naming no
+    # CREWS_ROOT, or one of `~`/`~/builder`, still resolved under /var/root).
+    _root="$("$(dirname "$_self_path")/builder-root" --root --home "$_invoking_home")" || _root=""
+    if [ -z "$_root" ]; then
+      echo "install-individuator: cannot resolve $SUDO_USER's root (bin/builder-root --root --home $_invoking_home); pass --repo" >&2
+      exit 2
+    fi
   fi
   REPO="$_root/agent-platform"
 fi
@@ -243,8 +363,66 @@ if [ -z "$BOSUN_HOST" ] && [ ! -f "$CONFIG_PATH" ]; then
   echo "install-individuator: --bosun-host is required on a first install" >&2
   exit 2
 fi
-if [ -n "$BOSUN_HOST" ] && { [ -z "$BOSUN_ADDRESS" ] || [ -z "$ROOT_CA" ] || [ -z "$OPERATOR_UID" ]; }; then
-  echo "install-individuator: --bosun-host requires --bosun-address, --root-ca and --operator-uid (or SUDO_UID)" >&2
+if [ -n "$BOSUN_HOST" ] && { [ -z "$BOSUN_ADDRESS" ] || [ -z "$ROOT_CA" ]; }; then
+  echo "install-individuator: --bosun-host requires --bosun-address and --root-ca" >&2
+  exit 2
+fi
+
+# On a first install (no config at --config-path yet), fall back to the
+# account `sudo` was run from — the same ergonomic default the retired
+# `--operator-uid` flag's "${SUDO_UID:-}" gave, just resolved to a name
+# instead of taking a uid directly.
+if [ -z "$ACCOUNT_NAMES" ] && [ ! -f "$CONFIG_PATH" ] && [ -n "${SUDO_UID:-}" ]; then
+  _default_account="$(id -un "$SUDO_UID" 2>/dev/null)" || _default_account=""
+  [ -n "$_default_account" ] && ACCOUNT_NAMES="$_default_account"
+fi
+
+# --- validate --account up front, before any build or write. Each name
+# must match this strict, JSON-safe character class and resolve to a uid
+# through the system account database (`id -u`); a name failing either is
+# refused by name, before anything is written — fixing by construction the
+# security-reviewer's PR 1110 round-1 finding that a hand-built JSON
+# string let an unescaped name close its string and add an entry naming a
+# uid the operator never gave. A name, or a uid two different names
+# resolve to, repeated across --account is refused the same way, naming
+# the duplicate, rather than reaching IndividuatorRootConfig.load as a
+# config that only fails closed there, or main.swift's admitted-accounts
+# dictionary build trapping on a duplicate key (reviewer's finding, same
+# round). ACCOUNT_PAIRS collects "<uid>:<name>" tokens, one per --account,
+# in order — uid resolved HERE, by this script itself, never carried
+# forward as the operator's own argument text. --------------------------
+ACCOUNT_PAIRS=""
+if [ -n "$ACCOUNT_NAMES" ]; then
+  _seen_account_names=""
+  _seen_account_uids=""
+  for _name in $ACCOUNT_NAMES; do
+    case "$_name" in
+      [A-Za-z_]*) ;;
+      *) echo "install-individuator: invalid --account name: $_name" >&2; exit 2 ;;
+    esac
+    case "$_name" in
+      *[!A-Za-z0-9_.-]*) echo "install-individuator: invalid --account name: $_name" >&2; exit 2 ;;
+    esac
+    case " $_seen_account_names " in
+      *" $_name "*) echo "install-individuator: duplicate --account: $_name" >&2; exit 2 ;;
+    esac
+    _uid="$(id -u "$_name" 2>/dev/null)" || {
+      echo "install-individuator: no such account: $_name" >&2
+      exit 2
+    }
+    case " $_seen_account_uids " in
+      *" $_uid "*)
+        echo "install-individuator: duplicate --account: $_name resolves to uid $_uid, already admitted by another --account" >&2
+        exit 2
+        ;;
+    esac
+    _seen_account_names="$_seen_account_names $_name"
+    _seen_account_uids="$_seen_account_uids $_uid"
+    ACCOUNT_PAIRS="$ACCOUNT_PAIRS $_uid:$_name"
+  done
+fi
+if [ -z "$ACCOUNT_PAIRS" ] && [ ! -f "$CONFIG_PATH" ]; then
+  echo "install-individuator: --account is required on a first install (repeat --account for more than one)" >&2
   exit 2
 fi
 
@@ -360,44 +538,127 @@ chmod 755 "$SOCKET_DIR"
 INDIVIDUATOR_BIN="$INSTALL_DIR/individuator"
 
 # --- the root-owned configuration (IndividuatorRootConfig's own shape) ------
-if [ -n "$BOSUN_HOST" ]; then
+# --bosun-host, --account and --library-address are all independent (see
+# usage() above for the full combination table): any may be given alone to
+# update just its own fields of an existing config, preserving the others'
+# current values.
+if [ -z "$BOSUN_HOST" ] && [ -z "$ACCOUNT_PAIRS" ] && [ -z "$LIBRARY_ADDRESS" ]; then
+  say "Config unchanged (none of --bosun-host, --account or --library-address given): $CONFIG_PATH"
+else
   mkdir -p "$(dirname "$CONFIG_PATH")"
   chmod 700 "$(dirname "$CONFIG_PATH")"
 
-  # --- pin the trust anchor: copy --root-ca into the same root-owned 0700
-  # directory as the config, rather than pointing the config at the path the
-  # operator gave as-is. The natural --root-ca value sits in the operator's
-  # home, writable by any process running as the operator's uid — including
-  # a dispatched run — which could otherwise redirect the daemon's trust
-  # anchor after this install finishes. The copy is refreshed only when the
-  # source differs from what is already there, so a re-run that passes the
-  # same --root-ca does not needlessly rewrite a root-owned file. -----------
-  ROOT_CA_COPY="$(dirname "$CONFIG_PATH")/root-ca.pem"
-  if [ -f "$ROOT_CA_COPY" ] && cmp -s "$ROOT_CA" "$ROOT_CA_COPY"; then
-    say "Root CA unchanged: $ROOT_CA_COPY"
-  else
-    ROOT_CA_TMP="$ROOT_CA_COPY.new.$$"
-    cp "$ROOT_CA" "$ROOT_CA_TMP"
-    chmod 644 "$ROOT_CA_TMP"
-    chown root:wheel "$ROOT_CA_TMP" 2>/dev/null || true
-    mv "$ROOT_CA_TMP" "$ROOT_CA_COPY"
-    say "Root CA copied: $ROOT_CA -> $ROOT_CA_COPY"
+  ROOT_CA_COPY_FOR_JSON=""
+  if [ -n "$BOSUN_HOST" ]; then
+    # --- pin the trust anchor: copy --root-ca into the same root-owned 0700
+    # directory as the config, rather than pointing the config at the path the
+    # operator gave as-is. The natural --root-ca value sits in the operator's
+    # home, writable by any process running as the operator's uid — including
+    # a dispatched run — which could otherwise redirect the daemon's trust
+    # anchor after this install finishes. The copy is refreshed only when the
+    # source differs from what is already there, so a re-run that passes the
+    # same --root-ca does not needlessly rewrite a root-owned file. -----------
+    ROOT_CA_COPY="$(dirname "$CONFIG_PATH")/root-ca.pem"
+    if [ -f "$ROOT_CA_COPY" ] && cmp -s "$ROOT_CA" "$ROOT_CA_COPY"; then
+      say "Root CA unchanged: $ROOT_CA_COPY"
+    else
+      ROOT_CA_TMP="$ROOT_CA_COPY.new.$$"
+      cp "$ROOT_CA" "$ROOT_CA_TMP"
+      chmod 644 "$ROOT_CA_TMP"
+      chown root:wheel "$ROOT_CA_TMP" 2>/dev/null || true
+      mv "$ROOT_CA_TMP" "$ROOT_CA_COPY"
+      say "Root CA copied: $ROOT_CA -> $ROOT_CA_COPY"
+    fi
+    ROOT_CA_COPY_FOR_JSON="$ROOT_CA_COPY"
   fi
 
+  # --- the admitted accounts (E12·2; platform/decisions/0099 item 8), and
+  # every other field, built through python3's json module — stock on
+  # macOS, the same `/usr/bin/python3` heredoc idiom bin/tailscale-watchdog
+  # already depends on — rather than string concatenation, so construction
+  # itself (not just the --account character-class check above) rules out
+  # a name or host string closing its JSON string early (security-reviewer
+  # finding on PR 1110 round 1). Reads whatever is already at
+  # --config-path, when something is, to preserve the half of the config
+  # (bosun_host/bosun_address/root_ca_path, or admitted_accounts/
+  # operator_uid) this run did not pass new values for. ACCOUNT_PAIRS is
+  # "<uid>:<name>" tokens, already validated and deduplicated above; a uid
+  # was resolved by this script via `id -u`, never passed through as the
+  # operator's own argument text. -------------------------------------------
   CONFIG_TMP="$CONFIG_PATH.new.$$"
-  cat > "$CONFIG_TMP" <<JSON
-{
-  "bosun_host": "$BOSUN_HOST",
-  "bosun_address": "$BOSUN_ADDRESS",
-  "root_ca_path": "$ROOT_CA_COPY",
-  "operator_uid": $OPERATOR_UID
-}
-JSON
+  if ! /usr/bin/python3 - "$CONFIG_PATH" "$BOSUN_HOST" "$BOSUN_ADDRESS" "$ROOT_CA_COPY_FOR_JSON" \
+      "$LIBRARY_ADDRESS" $ACCOUNT_PAIRS \
+      > "$CONFIG_TMP" <<'PY'
+import json
+import sys
+
+config_path, bosun_host, bosun_address, root_ca_path, library_address = sys.argv[1:6]
+pairs = sys.argv[6:]
+
+existing = {}
+try:
+    with open(config_path) as f:
+        existing = json.load(f)
+except FileNotFoundError:
+    pass
+
+doc_bosun_host = bosun_host or existing.get("bosun_host")
+doc_bosun_address = bosun_address or existing.get("bosun_address")
+doc_root_ca_path = root_ca_path or existing.get("root_ca_path")
+if None in (doc_bosun_host, doc_bosun_address, doc_root_ca_path):
+    sys.exit(
+        "install-individuator: no existing config at " + config_path
+        + " to preserve the Bosun fields from")
+# The forwarding endpoint's Library destination (E12·2 slice S5b): optional,
+# and left absent entirely (never written as JSON null) when neither this
+# run nor any prior one ever named --library-address.
+doc_library_address = library_address or existing.get("library_address")
+
+accounts = None
+operator_uid = None
+if pairs:
+    accounts = []
+    seen_uids = set()
+    seen_names = set()
+    for pair in pairs:
+        uid_str, name = pair.split(":", 1)
+        uid = int(uid_str)
+        if uid in seen_uids or name in seen_names:
+            sys.exit(
+                "install-individuator: duplicate account in admitted_accounts: " + name)
+        seen_uids.add(uid)
+        seen_names.add(name)
+        accounts.append({"uid": uid, "account": name})
+elif "admitted_accounts" in existing:
+    accounts = existing["admitted_accounts"]
+elif "operator_uid" in existing:
+    operator_uid = existing["operator_uid"]
+else:
+    sys.exit(
+        "install-individuator: no existing admitted accounts at " + config_path
+        + " to preserve")
+
+lines = ["{"]
+lines.append('  "bosun_host": %s,' % json.dumps(doc_bosun_host))
+lines.append('  "bosun_address": %s,' % json.dumps(doc_bosun_address))
+lines.append('  "root_ca_path": %s,' % json.dumps(doc_root_ca_path))
+if doc_library_address:
+    lines.append('  "library_address": %s,' % json.dumps(doc_library_address))
+if accounts is not None:
+    entries = ", ".join(json.dumps(a) for a in accounts)
+    lines.append('  "admitted_accounts": [%s]' % entries)
+else:
+    lines.append('  "operator_uid": %s' % json.dumps(operator_uid))
+lines.append("}")
+sys.stdout.write("\n".join(lines) + "\n")
+PY
+  then
+    rm -f "$CONFIG_TMP"
+    exit 2
+  fi
   chmod 600 "$CONFIG_TMP"
   mv "$CONFIG_TMP" "$CONFIG_PATH"
   say "Config written: $CONFIG_PATH"
-else
-  say "Config unchanged (no --bosun-host given): $CONFIG_PATH"
 fi
 
 # --- the plist: never clobbering a live one that has drifted from the

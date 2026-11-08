@@ -193,6 +193,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import builder_root as BR
+import projects as PJ
 
 # The machine's one root (company/decisions/0008). The name predates the
 # resolver and is kept because tests patch it.
@@ -687,9 +688,45 @@ class Mutation:
         return f"{self.repo}: " + "; ".join(bits) + f"  [{self.attribution}]"
 
 
+def _registry_homes(root: Path | None = None) -> list[Path]:
+    """Every registered unit's home directory, when it is a real git checkout
+    under *root* (`root` or this module's own `CONVIVY_ROOT`) — the homes
+    nested one level deeper than the depth-1 scan below can see
+    (`<root>/area/demo-nested`, the live shape a registry home takes today).
+
+    Reads the registry directly rather than calling
+    `worktrees._registry_homes`, which checks containment against
+    `worktrees.CONVIVY_ROOT` specifically: this guard is watched over by its
+    OWN root (patched independently by this file's tests, several of which
+    pass a `tmp_path` unrelated to the real registry), and a call into the
+    other module would ignore that root and leak the real machine's registry
+    homes into a test expecting none. Same best-effort contract as
+    `worktrees._registry_homes`: an unreadable or malformed registry, or one
+    entry with a malformed `home_dir`, contributes nothing rather than
+    raising — this is discovery, not a dispatch gate that must fail closed."""
+    try:
+        units = PJ.load()
+    except (OSError, ValueError):
+        return []
+    base = (root or CONVIVY_ROOT).resolve()
+    out: list[Path] = []
+    for slug in units:
+        try:
+            home = PJ.home_path(slug)
+        except ValueError:
+            continue
+        if home is None or not home.is_relative_to(base):
+            continue
+        if (home / ".git").is_dir():
+            out.append(home)
+    return out
+
+
 def discover_primaries(root: Path | None = None) -> list[Path]:
-    """Depth-1 checkouts under <root>. Only a primary has a real `.git`
-    DIRECTORY; a linked worktree has a `.git` FILE, which is what separates them.
+    """Every checkout under <root> this guard must watch: every depth-1 one,
+    plus a registered unit's home directory nested deeper (`_registry_homes`).
+    Only a primary has a real `.git` DIRECTORY; a linked worktree has a `.git`
+    FILE, which is what separates them.
 
     DELIBERATELY NOT `worktrees.discover_primaries()`, which looks like the same
     function and answers a different question. That one lists valid SPAWN TARGETS,
@@ -700,16 +737,33 @@ def discover_primaries(root: Path | None = None) -> list[Path]:
     leaked into it cross-repo (a convivy-orient worktree writing
     `agent-platform/bin/mcp-ops-server`). "Where may a run be dispatched" and "what
     must a run not touch" are near-inverses; sharing one list would import the
-    exclusion that matters most.
+    exclusion that matters most. `_registry_homes` above is this module's own
+    read of the registry, for the same reason: this guard's containment must
+    never depend on `worktrees.DISCOVERY_EXCLUDES` or `worktrees.CONVIVY_ROOT`
+    staying in sync with this module's.
     """
     base = root or CONVIVY_ROOT
     if not base.is_dir():
         return []
-    out = []
+    out: list[Path] = []
+    seen: set[Path] = set()
     for child in sorted(base.iterdir()):
         if child.is_dir() and (child / ".git").is_dir():
             out.append(child)
-    return out
+            try:
+                seen.add(child.resolve())
+            except OSError:
+                pass
+    for home in _registry_homes(base):
+        try:
+            resolved = home.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        out.append(home)
+        seen.add(resolved)
+    return sorted(out)
 
 
 def _read_repo(path: Path) -> dict | None:
@@ -817,6 +871,24 @@ def _orphaned_head(repo: Path, head_before: str | None, head_after: str | None) 
     return not cp.stdout.strip()
 
 
+def _relative_key(primary: Path, base: Path) -> str:
+    """The snapshot/diff key for *primary*: its path relative to *base*
+    (`root or CONVIVY_ROOT`), as POSIX text. A depth-1 primary's key is
+    unchanged by this (`"alpha"` stays `"alpha"` — there is no
+    separator to add), so a baseline written before nested registry homes
+    were discoverable still diffs against today's snapshot. A nested
+    registry home's key carries the one extra segment between it and the
+    root (`"demo-area/demo-nested"`); `diff`'s `root_of` reconstructs the
+    same path from it with a plain `Path` join, which splits on `/` exactly
+    like this one did. Falls back to the bare name on a resolve failure —
+    the same best-effort contract `discover_primaries` and `_read_repo`
+    already hold to."""
+    try:
+        return primary.resolve().relative_to(base.resolve()).as_posix()
+    except (OSError, ValueError):
+        return primary.name
+
+
 def snapshot(*, owned: Path | None = None, root: Path | None = None) -> dict[str, dict]:
     """Read every primary except the one this run legitimately occupies.
 
@@ -824,6 +896,7 @@ def snapshot(*, owned: Path | None = None, root: Path | None = None) -> dict[str
     or an orchestrator dispatched into its own checkout — writing there is the
     run's job, so that repo is excluded rather than reported every time.
     """
+    base = root or CONVIVY_ROOT
     owned_resolved = None
     if owned is not None:
         try:
@@ -840,7 +913,7 @@ def snapshot(*, owned: Path | None = None, root: Path | None = None) -> dict[str
             continue
         state = _read_repo(primary)
         if state is not None:          # unreadable → omitted, never "clean"
-            out[primary.name] = state
+            out[_relative_key(primary, base)] = state
     return out
 
 
@@ -877,6 +950,10 @@ def diff(before: dict[str, dict], after: dict[str, dict],
     base = root or CONVIVY_ROOT
 
     def root_of(name: str) -> Path:
+        # `name` is a snapshot key from `_relative_key`: a bare name for a depth-1
+        # primary, or `"<area>/<name>"` for a nested registry home. `Path.__truediv__`
+        # splits a string argument on `/` exactly like `_relative_key`'s `as_posix()`
+        # built it, so this join reconstructs either shape with no extra handling.
         return base / name
 
     out: list[Mutation] = []

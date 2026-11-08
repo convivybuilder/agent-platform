@@ -16,7 +16,7 @@ Four things, woven into plain prose (not labelled fields):
 - **Prose, not labels.** A short bolded/emoji headline sentence, then sentences. No `*What:* … *Triggered:* … *Fix:*` scaffolding — that turns each element into a labelled fragment, the exact robotic tell we're removing.
 - **Plain, not dramatic.** State the fact. "higher than usual," not "ran hot"; "12 of 13 merged," not "crushing it." Editorial colour is a missed opportunity for a real number.
 - **Self-contained.** Spell out what a lever / threshold / mechanism *is* inline. An ARCH number can be a trailing pointer for the curious, never the explanation itself.
-- **Concrete remediation.** Name the actual action ("switch Hollis back to opus-4-8", "revert to the single long-running session"), not "consider reverting."
+- **Concrete remediation.** Name the actual action ("switch Acme back to opus-4-8", "revert to the single long-running session"), not "consider reverting."
 
 ## Trigger discipline
 
@@ -30,11 +30,11 @@ Four things, woven into plain prose (not labelled fields):
 
 It names the trigger and value, says why it fires, caveats the estimate, and gives the next command.
 
-**Rewritten — a model-gate breach (was: `hollis model gate: sonnet-4-6 merge 92% vs opus-4-8 100% (>5pts below)`):**
-> ⚠️ On Hollis, the cheaper model is merging fewer PRs than the premium one. Over the last 12 Hollis PRs, sonnet-4-6 merged 11 (92%) against opus-4-8's 100%. This check compares the two so we know when a cheaper model stops keeping pace and isn't worth the savings; the gap has passed the 5-point line we flag on. Twelve PRs is a small sample, so one reading isn't decisive — if the gap holds for a few more days, switch Hollis back to opus-4-8. Full breakdown: run `model-scorecard`.
+**Rewritten — a model-gate breach (was: `acme model gate: sonnet-4-6 merge 92% vs opus-4-8 100% (>5pts below)`):**
+> ⚠️ On Acme, the cheaper model is merging fewer PRs than the premium one. Over the last 12 Acme PRs, sonnet-4-6 merged 11 (92%) against opus-4-8's 100%. This check compares the two so we know when a cheaper model stops keeping pace and isn't worth the savings; the gap has passed the 5-point line we flag on. Twelve PRs is a small sample, so one reading isn't decisive — if the gap holds for a few more days, switch Acme back to opus-4-8. Full breakdown: run `model-scorecard`.
 
 **Rewritten — overnight orchestrator cost, now edge-triggered (was a nightly metric dump):**
-> ⚠️ Overnight orchestrator spend was higher than usual last night: $19 across Hollis and sous-chef, above the ~$12–14 single-session baseline we hold it to. This tracks the cost of running the overnight orchestrator as a fresh agent per stage (triage → fix-drain → verify → digest) instead of one long session — a change made for reliability, on the agreement that a sustained overage means switching back. One night over isn't sustained; if it keeps climbing over the next several nights, revert the orchestrator to the single long-running session. History: `orchestrator-tokens-history.jsonl`.
+> ⚠️ Overnight orchestrator spend was higher than usual last night: $19 across Acme and globex, above the ~$12–14 single-session baseline we hold it to. This tracks the cost of running the overnight orchestrator as a fresh agent per stage (triage → fix-drain → verify → digest) instead of one long session — a change made for reliability, on the agreement that a sustained overage means switching back. One night over isn't sustained; if it keeps climbing over the next several nights, revert the orchestrator to the single long-running session. History: `orchestrator-tokens-history.jsonl`.
 
 On a normal night (under baseline) that one posts nothing.
 

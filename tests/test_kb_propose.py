@@ -179,6 +179,7 @@ def test_propose_opens_a_pr_and_returns_its_url(cage, agentctl, monkeypatch, cap
     assert "https://example/pr/7" in capsys.readouterr().out
 
 
+@pytest.mark.rich_registry
 def test_propose_is_the_route_for_roster_paths(cage, agentctl, monkeypatch):
     """kb apply refuses these under every provenance; propose is where they go,
     so it must NOT refuse them in turn or the rule would have no escape."""
@@ -313,6 +314,7 @@ def test_a_pr_failure_after_a_successful_push_is_reported(cage, agentctl, monkey
     assert "branch pushed but PR creation failed" in capsys.readouterr().err
 
 
+@pytest.mark.rich_registry
 def test_the_branch_name_distinguishes_different_docs(cage, agentctl, monkeypatch):
     """A title-only slug collides whenever two proposals are similarly named, and
     'update the runbook' is not a distinctive string. Including the doc means a
@@ -773,7 +775,7 @@ def test_the_agent_policy_file_proposal_opens_a_pr(cage, agentctl, monkeypatch, 
 
 @pytest.mark.parametrize("ref", [
     "projects/platform/policy/other.yaml",
-    "projects/constance/policy/agent-policy.yaml",
+    "projects/globex/policy/agent-policy.yaml",
     "projects/platform/policy/agent-policy.yml",
     "projects/platform/agent-policy.yaml",
 ])
@@ -796,6 +798,7 @@ EDIT_SEEDED = {"id": SEEDED, "edits": [{"old": "Original body.", "new": "Batched
 EDIT_ROSTER = {"id": ROSTER, "edits": [{"old": "Roster doc.", "new": "Batched roster."}]}
 
 
+@pytest.mark.rich_registry
 def test_a_batch_opens_one_pr_changing_every_document(cage, agentctl, monkeypatch, capsys):
     """A field added across a roster is one PR and one review cycle, not one per
     document; main is untouched until it merges."""
@@ -919,6 +922,7 @@ def test_a_content_entry_with_allow_overwrite_replaces_the_document(
     assert "Replaced." in _git(cage.checkout, "show", f"origin/{branch}:{SEEDED}").stdout
 
 
+@pytest.mark.rich_registry
 def test_a_re_proposal_whose_changed_set_shrank_lands_on_the_same_branch(
         cage, agentctl, monkeypatch, capsys):
     """The branch tag hashes the batch as submitted, so a second call where one

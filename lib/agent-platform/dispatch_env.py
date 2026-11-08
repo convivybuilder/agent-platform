@@ -120,12 +120,57 @@ own process ever holds the signing key for) as `GH_TOKEN`/`GITHUB_TOKEN` — see
 `dispatch_env`'s own docstring for the full mechanism, including the one case env
 redirection alone does not close (`-c credential.helper=...` on the command line) and
 why the minted token closes it anyway.
+
+A fifth gap (2026-10-21, deck-coder run-ccc745b2): SwiftPM wraps `Package.swift`
+manifest and plugin compilation in its own `sandbox-exec`, and macOS refuses a sandbox
+applied inside a sandbox — the run is already under the run sandbox (agent-platform PR
+821 measured the same refusal). A plain `swift build`/`swift test` inside a dispatched
+run fails with `sandbox-exec: sandbox_apply: Operation not permitted` while compiling
+the manifest; `--disable-sandbox` on the `swift` invocation avoids it, and disabling
+SwiftPM's OWN sandbox denies this run's manifest/plugin code nothing it didn't already
+have: the nested sandbox could never apply in the first place, and the run sandbox still
+confines everything SwiftPM runs — EXCEPT the network, which the run sandbox allows to
+a 4-host allowlist (`run_sandbox.NETWORK_ALLOWED`: github.com, api.github.com, pypi.org,
+files.pythonhosted.org) rather than denying outright the way SwiftPM's own sandbox did
+(agent-platform PR 965 round-1 security finding). Manifest/plugin code — the run's own
+package, or any dependency's — now runs with that allowance in place, in the same
+process environment that carries this run's live `GH_TOKEN`/`GITHUB_TOKEN` (the fourth
+gap's own read-only installation token, scoped to this run's one repository) and, for a
+gateway-model dispatch, `ANTHROPIC_API_KEY` (`bin/agentctl`'s `gateway_env` — a
+spend-capable LiteLLM virtual key): reading its own environment and exfiltrating what
+it reads over that allowance (the token itself, or anything it can read from that one
+repository) is not something either sandbox stops. SwiftPM ships no environment variable or
+config setting for `--disable-sandbox` itself — `SWIFTC_DISABLE_SANDBOX` exists but
+governs `swiftc`'s own sandboxing, not the manifest/plugin sandbox, and measured to have
+no effect on the failure above; `--disable-sandbox` is the only knob that does (verified
+by running both against the same minimal package manifest on 2026-10-21). `dispatch_env`
+puts a `swift` wrapper first on every run's PATH, next to the git wrapper: it adds
+`--disable-sandbox` to `build`, `test`, `run`, and `package` (every `package`
+subcommand, since all of them load the manifest) when the caller hasn't already passed
+it, and passes every other invocation through unchanged. Before any exec, on EVERY
+invocation through it (not only the ones `--disable-sandbox` applies to), it also
+unsets `GH_TOKEN`, `GITHUB_TOKEN`, and `ANTHROPIC_API_KEY` from the real `swift`
+process's own environment (`_SWIFT_WRAPPER_STRIPPED_CREDENTIALS`, below) — the three
+credentials dispatch_env()/bin/agentctl set for a run that manifest/plugin code has no
+legitimate reason to read. Neither is needed for a dependency fetch: SwiftPM resolves a
+git dependency by shelling out to `git`, which this same dispatch already points at
+`GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null` with `GIT_CONFIG_NOSYSTEM=1` (the
+fourth gap, above) — no file-based `credential.helper` is ever consulted in this
+environment regardless, and SwiftPM's own git invocation passes no
+`-c credential.helper=...` of its own, so there is no route by which a swift dependency
+fetch would have used either var even before this strip. The wrapper otherwise follows
+the git wrapper's exact discipline for the same reason the OUTAGE comments above
+`_GIT_WRAPPER_SCRIPT` give: `AGENTCTL_REAL_SWIFT`, never a bare-name PATH lookup, with
+an absolute path baked in at wrapper-write time as the fallback, and a marker line so a
+copy of this wrapper is never mistaken for the real `swift` binary.
 """
 from __future__ import annotations
 
 import atexit
 import os
+import shlex
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -133,14 +178,18 @@ from pathlib import Path
 # is stripped — every other ambient var still reaches the child as before.
 _STRIP = ("TMUX", "TMUX_PANE")
 
-# The co-only credential's path (bin/co names it only in the --mcp-config of a crew co
-# claude, and bin/mcp-ops-server reads it). `agentctl spawn` builds its env from the
-# calling shell, so a path exported there would reach every dispatched run; this strip
-# keeps it out. The path is not a secret. The dispatch sandbox (agent-platform#793) denies
-# read on the whole `.orient-control` directory the file lives in, so a dispatched run
-# cannot read it either. Kept apart from _STRIP because that tuple's
-# reason is the tmux identity.
-_CO_ONLY = ("ORIENT_OPS_CO_TOKEN_FILE",)
+# The crew ops credential's path (bin/co names it only in the --mcp-config of a crew
+# co claude, and bin/mcp-ops-server reads it — platform/contracts/library-protocol
+# §2.5). `agentctl spawn` builds its env from the calling shell, so a co's own path
+# exported there would reach every dispatched run and let it hold the co's
+# `item.create` grant; this strip keeps it out. `_dispatch_mcp_config_json` names a
+# dispatched run its OWN crew's non-co file instead, which never reaches this strip
+# since it is set directly in the run's `--mcp-config`, never inherited from the
+# calling shell's environment. The path is not a secret. The dispatch sandbox
+# (agent-platform#793) denies read on the whole `.orient-control` directory the file
+# lives in, so a dispatched run cannot read it either. Kept apart from _STRIP because
+# that tuple's reason is the tmux identity.
+_CO_ONLY = ("ORIENT_OPS_CREW_TOKEN_FILE",)
 
 # A URL scheme with no registered `git-remote-<scheme>` helper, so a push
 # rewritten to it fails immediately with "unable to find remote helper" —
@@ -273,6 +322,21 @@ _GIT_WRAPPER_MARKER = "AGENTCTL_GIT_WRAPPER_MARKER_V1"
 # wrapper again with a CORRECT AGENTCTL_REAL_GIT and must keep working — a flag that
 # refused every nested call would break them. The refusal is about what AGENTCTL_REAL_GIT
 # resolves to, never about whether this script has already run once in this process tree.
+#
+# OUTAGE, 2026-10-17 08:11-08:25 MST: a test in another repository took
+# `shutil.which("git")` as "the real git", which inside a dispatched run resolved to
+# THIS wrapper, then ran a subprocess with an env of only `PATH=<dir holding a git
+# stub>`. With AGENTCTL_REAL_GIT unset, the script below fell back to the bare name
+# `"git"` and resolved IT through that PATH too, landing on the stub; the stub called
+# `git` again, which was this wrapper again, each generation forking the next, until
+# the operator's account hit its 10,122-of-10,666 process ceiling. A self-referential
+# AGENTCTL_REAL_GIT (the 2026-10-12 shape above) is only one way a bare-name PATH
+# lookup can land back on a wrapper or a stub that calls one; the actual fix is to
+# never do that lookup here at all. `AGENTCTL_REAL_GIT`, when unset, now falls back to
+# an absolute path baked into this exact script at write time (`_private_git_wrapper_
+# dir`, resolved the same wrapper-skipping way `AGENTCTL_REAL_GIT` itself is), and the
+# script refuses outright — before any exec or probe — whenever neither value is an
+# absolute path to an executable file, rather than ever asking `$PATH` what `git` means.
 _GIT_WRAPPER_SCRIPT = """#!/bin/bash
 # @@GIT_WRAPPER_MARKER@@
 # Placed first on a dispatched run's PATH: the run's object-store redirect
@@ -294,33 +358,40 @@ real_git="$AGENTCTL_REAL_GIT"
 own_common_dir="$AGENTCTL_OWN_GIT_COMMON_DIR"
 
 if [ -z "$real_git" ]; then
-    real_git="git"
+    # Baked in at wrapper-write time by dispatch_env.py's _private_git_wrapper_dir, from
+    # THAT call's own ambient PATH (the wrapper file is written once per process, unlike
+    # AGENTCTL_REAL_GIT, which dispatch_env() re-resolves from the per-call PATH on every
+    # call in that process) -- see the second OUTAGE comment above _GIT_WRAPPER_SCRIPT for
+    # why this is a baked absolute path rather than another PATH lookup here. shlex.quote()
+    # escaped by the Python side, so a path holding a space or a shell metacharacter
+    # round-trips as one literal value, never interpreted. Empty (`''`) when that
+    # resolution itself found nothing usable.
+    real_git=@@BAKED_REAL_GIT@@
+fi
+
+# Never exec, probe, or resolve a bare command name through $PATH here -- see the second
+# OUTAGE comment above _GIT_WRAPPER_SCRIPT in dispatch_env.py: that is exactly how a stub
+# calling back into "git" turned into an unbounded fork chain. $real_git must already be
+# an absolute path to an executable file; anything else is refused before any exec or
+# probe below, whether AGENTCTL_REAL_GIT was unset and the baked fallback above is empty
+# or non-absolute, or AGENTCTL_REAL_GIT itself was.
+case "$real_git" in
+    /*) ;;
+    *)
+        echo "agentctl git wrapper: no usable real git binary (AGENTCTL_REAL_GIT is unset or not an absolute path, and the baked fallback is empty or not an absolute path) -- refusing instead of resolving a bare 'git' through PATH (see dispatch_env.py's _GIT_WRAPPER_SCRIPT docstring)" >&2
+        exit 127
+        ;;
+esac
+
+if [ ! -f "$real_git" ] || [ ! -x "$real_git" ]; then
+    echo "agentctl git wrapper: real git path '$real_git' is not an executable file -- refusing instead of resolving a bare 'git' through PATH (see dispatch_env.py's _GIT_WRAPPER_SCRIPT docstring)" >&2
+    exit 127
 fi
 
 # Refuse before any exec or probe below if $real_git resolves to a copy of THIS wrapper
-# rather than the real git binary -- see the OUTAGE comment above _GIT_WRAPPER_SCRIPT in
-# dispatch_env.py for the incident and why this has to run first, unconditionally, and
+# rather than the real git binary -- see the first OUTAGE comment above _GIT_WRAPPER_SCRIPT
+# in dispatch_env.py for the incident and why this has to run first, unconditionally, and
 # cannot be an exported "already inside the wrapper" flag.
-_agentctl_resolve_through_path() {
-    # Resolves a bare command name through $PATH exactly as `exec "$1" ...` below would
-    # (bash 3.2 compatible: no arrays-of-dirs trick needed, just a plain word-split
-    # loop). Prints the first match's path on stdout; prints nothing if $PATH has none.
-    _name="$1"
-    _old_ifs="$IFS"
-    IFS=:
-    for _dir in $PATH; do
-        IFS="$_old_ifs"
-        [ -n "$_dir" ] || _dir="."
-        if [ -f "$_dir/$_name" ] && [ -x "$_dir/$_name" ]; then
-            printf '%s\n' "$_dir/$_name"
-            return 0
-        fi
-        IFS=:
-    done
-    IFS="$_old_ifs"
-    return 1
-}
-
 _agentctl_is_wrapper_copy() {
     # True if $1 IS a copy of this wrapper: the same file as this script ($0 -- the
     # direct self-reference the 2026-10-12 incident hit), or any OTHER file carrying
@@ -333,12 +404,7 @@ _agentctl_is_wrapper_copy() {
     grep -q '@@GIT_WRAPPER_MARKER@@' "$1" 2>/dev/null
 }
 
-case "$real_git" in
-    */*) _agentctl_real_git_resolved="$real_git" ;;
-    *) _agentctl_real_git_resolved=$(_agentctl_resolve_through_path "$real_git") ;;
-esac
-
-if [ -n "$_agentctl_real_git_resolved" ] && _agentctl_is_wrapper_copy "$_agentctl_real_git_resolved"; then
+if _agentctl_is_wrapper_copy "$real_git"; then
     echo "agentctl git wrapper: AGENTCTL_REAL_GIT ('$real_git') resolves to a copy of this wrapper, not the real git binary -- refusing instead of recursing into it (see dispatch_env.py's _GIT_WRAPPER_SCRIPT docstring)" >&2
     exit 127
 fi
@@ -428,12 +494,29 @@ def _private_git_wrapper_dir() -> str:
     script (`_GIT_WRAPPER_SCRIPT`) that scopes the object-store redirect to the run's
     own repository. One per process, for the same reason `_private_tmux_tmpdir` is.
     `cleanup_private_git_wrapper_dir` is the `os._exit()`-path counterpart — see
-    `_private_tmux_tmpdir`'s docstring for why `atexit` alone is not enough."""
+    `_private_tmux_tmpdir`'s docstring for why `atexit` alone is not enough.
+
+    The script's `@@BAKED_REAL_GIT@@` fallback (the second OUTAGE comment above
+    `_GIT_WRAPPER_SCRIPT`) is resolved HERE, once, from THIS call's own ambient
+    `os.environ["PATH"]` — not the per-call PATH `dispatch_env()` resolves
+    `AGENTCTL_REAL_GIT` from for `env["PATH"]` below, because this function only ever
+    runs once per process (the `_git_wrapper_dir is None` guard) while a later
+    `dispatch_env()` call in the same process can pass a different `base`/PATH each
+    time; the written file has to carry one fixed fallback regardless. `AGENTCTL_REAL_GIT`
+    itself, set fresh on every `dispatch_env()` call, is what actually answers each
+    call's own PATH — the baked value only matters for a child that scrubs its
+    environment down to bare `PATH` and loses `AGENTCTL_REAL_GIT` entirely (the
+    2026-10-17 incident this closes). `shlex.quote()`-escaped so a path holding a
+    space or a shell metacharacter can't break the script or inject into it; empty
+    (`_resolve_real_git` found nothing) is quoted to `''`, which the script's own
+    absolute-path check then refuses."""
     global _git_wrapper_dir
     if _git_wrapper_dir is None:
         _git_wrapper_dir = tempfile.mkdtemp(prefix="gitwrap-", dir="/tmp")
+        baked_real_git = _resolve_real_git(os.environ.get("PATH", os.defpath), _git_wrapper_dir)
+        script = _GIT_WRAPPER_SCRIPT.replace("@@BAKED_REAL_GIT@@", shlex.quote(baked_real_git))
         wrapper_path = Path(_git_wrapper_dir) / "git"
-        wrapper_path.write_text(_GIT_WRAPPER_SCRIPT)
+        wrapper_path.write_text(script)
         wrapper_path.chmod(0o755)
         atexit.register(shutil.rmtree, _git_wrapper_dir, ignore_errors=True)
     return _git_wrapper_dir
@@ -480,10 +563,16 @@ def _resolve_real_git(path: str, wrapper_dir: str) -> str:
     `wrapper_dir`, so the plain `p != wrapper_dir` filter let it through and
     `shutil.which` resolved AGENTCTL_REAL_GIT straight back to that ancestor's wrapper —
     the second outage, 2026-10-12 20:52 MST, from `tests/test_dispatch_env.py`'s own
-    `dispatch_env()` call running inside a dispatched coder run. Falls back to the bare
-    name `"git"` when nothing else on `path` has one — this can't happen in a real
-    dispatch (git is how the worktree got there), only in a test with a stripped PATH
-    that also never runs git."""
+    `dispatch_env()` call running inside a dispatched coder run. Returns the empty
+    string when nothing else on `path` has one — NEVER the bare name `"git"`: that name
+    would have to be resolved through `$PATH` by SOMETHING to be of any use, and letting
+    either caller (`dispatch_env`'s `AGENTCTL_REAL_GIT`, or `_private_git_wrapper_dir`'s
+    baked fallback) carry a bare name back into the wrapper script is the exact PATH
+    lookup the 2026-10-17 outage used to turn a scrubbed-env stub into an unbounded fork
+    chain (see the second OUTAGE comment above `_GIT_WRAPPER_SCRIPT`). An empty result
+    can't happen in a real dispatch (git is how the worktree got there), only in a test
+    with a stripped PATH that also never runs git; both callers treat it as "no usable
+    real git" and the wrapper refuses rather than guessing."""
     for entry in path.split(os.pathsep):
         if not entry or entry == wrapper_dir:
             continue
@@ -493,7 +582,228 @@ def _resolve_real_git(path: str, wrapper_dir: str) -> str:
         if _is_git_wrapper_copy(candidate):
             continue
         return candidate
-    return "git"
+    return ""
+
+
+# A fixed line every copy of the swift wrapper carries, mirroring
+# `_GIT_WRAPPER_MARKER`'s reasoning: one copy has to tell another copy apart from the
+# real `swift` binary without comparing inodes.
+_SWIFT_WRAPPER_MARKER = "AGENTCTL_SWIFT_WRAPPER_MARKER_V1"
+
+# Credential-bearing vars dispatch_env()/bin/agentctl set for a run that manifest or
+# plugin code — compiled with SwiftPM's own network denial removed by
+# --disable-sandbox, below — must never see (agent-platform PR 965 round-1 security
+# finding; the module docstring's fifth-gap paragraph has the mechanism). GH_TOKEN and
+# GITHUB_TOKEN: the per-run read-only GitHub App installation token
+# `git_credential_guard_env` sets, below. ANTHROPIC_API_KEY: the gateway-model
+# dispatch's spend-capable LiteLLM virtual key `bin/agentctl`'s `gateway_env` sets.
+# Stripped from EVERY invocation through the wrapper, not only the ones
+# --disable-sandbox applies to.
+_SWIFT_WRAPPER_STRIPPED_CREDENTIALS = ("GH_TOKEN", "GITHUB_TOKEN", "ANTHROPIC_API_KEY")
+
+# Disables SwiftPM's own `sandbox-exec` around manifest/plugin compilation (the
+# module docstring's fifth-gap paragraph has the measurement and the incident).
+# `AGENTCTL_REAL_SWIFT` and the baked `@@BAKED_REAL_SWIFT@@` fallback follow the git
+# wrapper's exact discipline (see the OUTAGE comments above `_GIT_WRAPPER_SCRIPT`):
+# never resolve a bare `swift` through PATH, and never recurse into a copy of this
+# same wrapper. bash 3.2 (launchd-critical) compatible: no declare -A, mapfile,
+# ${var,,}.
+_SWIFT_WRAPPER_SCRIPT = """#!/bin/bash
+# @@SWIFT_WRAPPER_MARKER@@
+# Placed first on a dispatched run's PATH: SwiftPM wraps Package.swift manifest and
+# plugin compilation in its own sandbox-exec, which macOS refuses from inside this
+# run's own sandbox. This wrapper adds --disable-sandbox to the subcommands that
+# compile a manifest -- build, test, run, and package (every package subcommand) --
+# when the caller hasn't already passed it, and passes every other invocation
+# through unchanged. It also unsets this run's credential-bearing vars
+# (@@STRIPPED_CREDENTIALS@@) from the real swift process's own environment before any
+# exec below, on every invocation -- --disable-sandbox removes SwiftPM's own network
+# denial during manifest/plugin compilation, and that code must never be able to read
+# and exfiltrate this run's own read-only GitHub token or gateway spend key over the
+# network allowance the outer run sandbox still grants (agent-platform PR 965 round-1
+# security finding). See dispatch_env.py's module docstring (the fifth-gap paragraph)
+# for the incident, the measurement, and the finding, and the OUTAGE comments above
+# _GIT_WRAPPER_SCRIPT for why this never resolves a bare 'swift' through PATH.
+
+real_swift="$AGENTCTL_REAL_SWIFT"
+
+if [ -z "$real_swift" ]; then
+    # Baked in at wrapper-write time, from that call's own ambient PATH -- see
+    # _GIT_WRAPPER_SCRIPT's matching comment for why this is a baked absolute path
+    # rather than another PATH lookup here. shlex.quote()-escaped by the Python side.
+    real_swift=@@BAKED_REAL_SWIFT@@
+fi
+
+# Never exec, probe, or resolve a bare command name through $PATH here -- the exact
+# shape of the git wrapper's 2026-10-17 outage. $real_swift must already be an
+# absolute path to an executable file; anything else is refused before any exec.
+case "$real_swift" in
+    /*) ;;
+    *)
+        echo "agentctl swift wrapper: no usable real swift binary (AGENTCTL_REAL_SWIFT is unset or not an absolute path, and the baked fallback is empty or not an absolute path) -- refusing instead of resolving a bare 'swift' through PATH (see dispatch_env.py's _SWIFT_WRAPPER_SCRIPT docstring)" >&2
+        exit 127
+        ;;
+esac
+
+if [ ! -f "$real_swift" ] || [ ! -x "$real_swift" ]; then
+    echo "agentctl swift wrapper: real swift path '$real_swift' is not an executable file -- refusing instead of resolving a bare 'swift' through PATH (see dispatch_env.py's _SWIFT_WRAPPER_SCRIPT docstring)" >&2
+    exit 127
+fi
+
+# Refuse before any exec below if $real_swift resolves to a copy of THIS wrapper
+# rather than the real swift binary -- same reasoning as the git wrapper's
+# _agentctl_is_wrapper_copy.
+_agentctl_is_swift_wrapper_copy() {
+    [ -f "$1" ] || return 1
+    if [ "$1" -ef "$0" ]; then
+        return 0
+    fi
+    grep -q '@@SWIFT_WRAPPER_MARKER@@' "$1" 2>/dev/null
+}
+
+if _agentctl_is_swift_wrapper_copy "$real_swift"; then
+    echo "agentctl swift wrapper: AGENTCTL_REAL_SWIFT ('$real_swift') resolves to a copy of this wrapper, not the real swift binary -- refusing instead of recursing into it (see dispatch_env.py's _SWIFT_WRAPPER_SCRIPT docstring)" >&2
+    exit 127
+fi
+
+# Unset every credential this run's dispatch environment carries before any exec below
+# -- see dispatch_env.py's _SWIFT_WRAPPER_STRIPPED_CREDENTIALS for what each is and
+# where it's set. Applies to every invocation through this wrapper, not only the
+# subcommands --disable-sandbox is added to.
+for _agentctl_swift_cred in @@STRIPPED_CREDENTIALS@@; do
+    unset "$_agentctl_swift_cred"
+done
+unset _agentctl_swift_cred
+
+subcommand="$1"
+case "$subcommand" in
+    build|test|run|package)
+        already_disabled=0
+        for arg in "$@"; do
+            if [ "$arg" = "--disable-sandbox" ]; then
+                already_disabled=1
+                break
+            fi
+        done
+        if [ "$already_disabled" -eq 1 ]; then
+            exec "$real_swift" "$@"
+        fi
+        shift
+        exec "$real_swift" "$subcommand" --disable-sandbox "$@"
+        ;;
+    *)
+        exec "$real_swift" "$@"
+        ;;
+esac
+""".replace("@@SWIFT_WRAPPER_MARKER@@", _SWIFT_WRAPPER_MARKER) \
+   .replace("@@STRIPPED_CREDENTIALS@@", " ".join(_SWIFT_WRAPPER_STRIPPED_CREDENTIALS))
+
+# Same one-per-process, atexit-cleaned shape as `_git_wrapper_dir`, for the directory
+# holding the swift wrapper script.
+_swift_wrapper_dir: str | None = None
+
+
+def _private_swift_wrapper_dir() -> str:
+    """A short-lived directory, private to this process, holding the `swift` wrapper
+    script (`_SWIFT_WRAPPER_SCRIPT`). One per process, for the same reason
+    `_private_git_wrapper_dir` is. `cleanup_private_swift_wrapper_dir` is the
+    `os._exit()`-path counterpart — see `_private_tmux_tmpdir`'s docstring for why
+    `atexit` alone is not enough.
+
+    The baked `@@BAKED_REAL_SWIFT@@` fallback is resolved HERE, once, from THIS call's
+    own ambient `os.environ["PATH"]` — not the per-call PATH `dispatch_env()` resolves
+    `AGENTCTL_REAL_SWIFT` from, for the same reason `_private_git_wrapper_dir` bakes its
+    own fallback once: this function only ever runs once per process, while a later
+    `dispatch_env()` call in the same process can pass a different `base`/PATH each
+    time."""
+    global _swift_wrapper_dir
+    if _swift_wrapper_dir is None:
+        _swift_wrapper_dir = tempfile.mkdtemp(prefix="swiftwrap-", dir="/tmp")
+        baked_real_swift = _resolve_real_swift(os.environ.get("PATH", os.defpath), _swift_wrapper_dir)
+        script = _SWIFT_WRAPPER_SCRIPT.replace("@@BAKED_REAL_SWIFT@@", shlex.quote(baked_real_swift))
+        wrapper_path = Path(_swift_wrapper_dir) / "swift"
+        wrapper_path.write_text(script)
+        wrapper_path.chmod(0o755)
+        atexit.register(shutil.rmtree, _swift_wrapper_dir, ignore_errors=True)
+    return _swift_wrapper_dir
+
+
+def cleanup_private_swift_wrapper_dir() -> None:
+    """Remove this process's private swift-wrapper directory, if `dispatch_env()` ever
+    created one; a no-op otherwise. Idempotent, and never raises. Call this explicitly
+    right before any `os._exit()`, alongside `cleanup_private_tmux_tmpdir` — see that
+    function's docstring for why."""
+    global _swift_wrapper_dir
+    if _swift_wrapper_dir is not None:
+        shutil.rmtree(_swift_wrapper_dir, ignore_errors=True)
+        _swift_wrapper_dir = None
+
+
+def _is_swift_wrapper_copy(path: str) -> bool:
+    """True if the file at `path` carries `_SWIFT_WRAPPER_MARKER` — a copy of
+    `_SWIFT_WRAPPER_SCRIPT` (this process's own wrapper, or a DIFFERENT run's
+    `/tmp/swiftwrap-*/swift` already sitting on an inherited PATH), never the real
+    `swift` binary, which carries no such line. Same contract as `_is_git_wrapper_copy`."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_MARKER_PROBE_BYTES)
+    except OSError:
+        return False
+    return _SWIFT_WRAPPER_MARKER.encode() in head
+
+
+def _resolve_real_swift(path: str, wrapper_dir: str) -> str:
+    """The real `swift` binary reachable from `path`, skipping `wrapper_dir` itself AND
+    any other PATH entry whose `swift` is itself a copy of this module's wrapper
+    (`_is_swift_wrapper_copy`) — same contract as `_resolve_real_git`, for the same
+    reason (an ANCESTOR process's wrapper directory already on an inherited PATH).
+    Returns the empty string when nothing else on `path` has one — never the bare name
+    `"swift"`."""
+    for entry in path.split(os.pathsep):
+        if not entry or entry == wrapper_dir:
+            continue
+        candidate = os.path.join(entry, "swift")
+        if not (os.path.isfile(candidate) and os.access(candidate, os.X_OK)):
+            continue
+        if _is_swift_wrapper_copy(candidate):
+            continue
+        return candidate
+    return ""
+
+
+# The identity `_kb_commit` (bin/agentctl) already falls back to, per-commit, when
+# no identity resolves for a kb write (company/decisions/0009 — the same
+# no-GitHub placeholder a fresh Builder install's first commit gets). Reused here
+# rather than inventing a second placeholder for the identical "no identity
+# anywhere on this account" case, now hit at `agentctl spawn` time instead of
+# `kb apply` time: a dispatched coder's own `git commit` resolves identity the
+# same way `_kb_commit`'s probe already checks for, under this same
+# `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null` redirection.
+_FALLBACK_COMMIT_NAME = "Builder"
+_FALLBACK_COMMIT_EMAIL = "builder@localhost"
+
+
+def _git_identity_resolves(env: dict, cwd: str | None) -> bool:
+    """Whether `git var GIT_AUTHOR_IDENT` succeeds under `env` in `cwd` — the exact
+    probe `_kb_commit` (bin/agentctl) already runs before falling back to its own
+    placeholder identity, reused here so a dispatched run's own commit and a kb
+    write agree on what counts as "no identity". Must run AFTER
+    `git_credential_guard_env` has already pointed `GIT_CONFIG_GLOBAL`/
+    `GIT_CONFIG_SYSTEM` at `/dev/null` in this same `env` (CQ·418) — so this
+    probes the SAME resolution the run's own `git commit` is about to make:
+    `cwd`'s own local `.git/config` (when `cwd` sits inside a worktree) and the
+    passwd-GECOS/hostname auto-identity git falls back to on its own, never the
+    account's `~/.gitconfig`, which this same `env` already closes regardless of
+    what this probe finds. On a measured adopter Linux account with neither a
+    local identity nor a usable GECOS/hostname fallback, `git var` exits non-zero
+    with "fatal: empty ident name ... not allowed" — on the operator's own Mac,
+    the same command exits 0, resolving to the passwd GECOS name and the
+    machine's own hostname, with no `~/.gitconfig` involved either."""
+    try:
+        return subprocess.run(["git", "var", "GIT_AUTHOR_IDENT"], env=env, cwd=cwd,
+                              capture_output=True, text=True).returncode == 0
+    except OSError:
+        return False
 
 
 def git_credential_guard_env(env: dict, *, github_token: str | None = None) -> dict:
@@ -521,10 +831,34 @@ def git_credential_guard_env(env: dict, *, github_token: str | None = None) -> d
     return env
 
 
+def deny_push_env(env: dict) -> dict:
+    """Mutate and return `env` with the `GIT_CONFIG_*` pairs that rewrite a `git push`
+    to a network remote into a scheme with no registered helper (issue_01M3MMJFKSE5ZCA5YNXCJ1YCAK)
+    — see `dispatch_env`'s own docstring for the mechanism and the incident. Layers onto
+    whatever `GIT_CONFIG_*` pairs `env` already carries rather than assuming none exist:
+    `GIT_CONFIG_COUNT` is read first and used as the starting index, so an existing pair's
+    index is never reused, and the returned count covers every pair, old and new.
+
+    The one function both `dispatch_env(deny_push=True)` (the direct dispatch path) and
+    `review_launch.session_env` (the two-account launcher; every session that launcher
+    runs is review-class, so this is unconditional there rather than gated on a
+    parameter) call for this, so the two launch paths cannot diverge on what a reviewer's
+    or security-reviewer's `git` refuses to push to."""
+    start = int(env.get("GIT_CONFIG_COUNT") or 0)
+    pairs = [(f"url.{_PUSH_REFUSAL_BASE}.pushInsteadOf", prefix)
+            for prefix in _PUSH_REFUSAL_PREFIXES]
+    for offset, (key, value) in enumerate(pairs):
+        env[f"GIT_CONFIG_KEY_{start + offset}"] = key
+        env[f"GIT_CONFIG_VALUE_{start + offset}"] = value
+    env["GIT_CONFIG_COUNT"] = str(start + len(pairs))
+    return env
+
+
 def dispatch_env(base: dict | None = None, *, deny_push: bool = False,
                  private_object_dir: Path | None = None,
                  shared_object_dir: Path | None = None,
-                 github_token: str | None = None) -> dict:
+                 github_token: str | None = None,
+                 worktree: Path | None = None) -> dict:
     """A copy of *base* (default the current `os.environ`) with the
     dispatcher's tmux identity removed: `TMUX`/`TMUX_PANE` stripped, and
     `TMUX_TMPDIR` pointed at a private directory so an unqualified `tmux` in
@@ -575,6 +909,20 @@ def dispatch_env(base: dict | None = None, *, deny_push: bool = False,
     prompt, which has nothing to talk to in a dispatched run and would hang; set to 0,
     git fails the credential fill outright instead.
 
+    EVERY CALL, UNCONDITIONALLY, ALSO PUTS A `swift` WRAPPER FIRST ON `PATH`
+    (`_private_swift_wrapper_dir`, the module docstring's fifth-gap paragraph): it adds
+    `--disable-sandbox` to `build`/`test`/`run`/`package` when the caller hasn't
+    already passed it, so a dispatched run's `swift build` doesn't hit SwiftPM's own
+    sandbox-exec failing inside this run's own sandbox. `AGENTCTL_REAL_SWIFT` is set to
+    the real `swift` binary resolved from this call's own PATH, mirroring
+    `AGENTCTL_REAL_GIT`'s resolution. Because `--disable-sandbox` also removes SwiftPM's
+    own network denial around manifest/plugin compilation, the wrapper unsets
+    `GH_TOKEN`/`GITHUB_TOKEN`/`ANTHROPIC_API_KEY` (`_SWIFT_WRAPPER_STRIPPED_CREDENTIALS`)
+    from the real `swift` process's own environment before every exec, so that code
+    can't read and exfiltrate this run's read-only GitHub token or gateway spend key
+    over the network the outer run sandbox still allows (agent-platform PR 965 round-1
+    security finding).
+
     Use this for the env of any subprocess that starts a `claude` process or
     an agent run, spreading it first so per-call overrides still win:
     `{**dispatch_env(), "AGENTCTL_RUN_ID": run_id}`.
@@ -586,6 +934,25 @@ def dispatch_env(base: dict | None = None, *, deny_push: bool = False,
     any already in *base* rather than assuming none exist, so a caller that already
     sets some (there are none on this path today) doesn't get them silently
     overwritten.
+
+    A SIXTH gap (measured on an adopter's fresh Linux account, 2026-10-31): that
+    account has no git identity anywhere (no `~/.gitconfig`, which this call's own
+    `GIT_CONFIG_GLOBAL=/dev/null` closes for every dispatch regardless; no local
+    `.git/config`; and no GECOS/hostname git could fall back to on its own, unlike
+    the operator's own Mac), so the first `git commit` a dispatched coder makes
+    fails with "Author identity unknown" — after the sandbox fix above, this was
+    the next thing blocking the same adopter's first dispatched commit. `worktree`
+    (the run's own checkout, when this dispatch has one) is probed with
+    `_git_identity_resolves` — the identical `git var GIT_AUTHOR_IDENT` check
+    `_kb_commit` (bin/agentctl) already runs before its own fallback — AFTER
+    `git_credential_guard_env` has set `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`, so
+    this probes the exact resolution the run's own commit is about to make. Only
+    when that probe fails does this set `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`/
+    `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` to `_FALLBACK_COMMIT_NAME`/
+    `_FALLBACK_COMMIT_EMAIL` — the same placeholder `_kb_commit` already uses for
+    the identical "no identity anywhere" case. An account with an identity
+    (`_git_identity_resolves` true, the operator's own Mac included) gets no
+    override at all: this block changes nothing about `env` for it.
     """
     env = dict(os.environ if base is None else base)
     for key in _STRIP + _CO_ONLY:
@@ -599,6 +966,31 @@ def dispatch_env(base: dict | None = None, *, deny_push: bool = False,
     # `git_credential_guard_env`'s own docstring (the helper this and the Codex
     # review lane both call).
     env = git_credential_guard_env(env, github_token=github_token)
+    # Sixth gap, above: probed AFTER the redirection just above, so this sees the
+    # same `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM=/dev/null` the run's own commit
+    # will. `None` when this dispatch has no worktree of its own (a non-repo
+    # agent, or a test) — the probe then runs in whatever directory this process
+    # itself is in, which is never a repo this dispatch's commit will use either.
+    if not _git_identity_resolves(env, str(worktree) if worktree is not None else None):
+        env["GIT_AUTHOR_NAME"] = _FALLBACK_COMMIT_NAME
+        env["GIT_AUTHOR_EMAIL"] = _FALLBACK_COMMIT_EMAIL
+        env["GIT_COMMITTER_NAME"] = _FALLBACK_COMMIT_NAME
+        env["GIT_COMMITTER_EMAIL"] = _FALLBACK_COMMIT_EMAIL
+    # Unconditional, for every dispatch, regardless of whether this is a git
+    # dispatch at all — see the module docstring's fifth-gap paragraph. The swift
+    # wrapper goes first on PATH so a dispatched run's `swift build`/`test`/`run`/
+    # `package` doesn't hit SwiftPM's own sandbox-exec failing inside this run's own
+    # sandbox.
+    swift_wrapper_dir = _private_swift_wrapper_dir()
+    resolved_real_swift = _resolve_real_swift(env.get("PATH", os.defpath), swift_wrapper_dir)
+    if resolved_real_swift:
+        env["AGENTCTL_REAL_SWIFT"] = resolved_real_swift
+    else:
+        # Nothing usable on this call's own PATH (e.g. a test with a stripped PATH that
+        # never runs swift) -- leave AGENTCTL_REAL_SWIFT unset rather than put an empty
+        # value in its place; the wrapper's own baked fallback decides from here.
+        env.pop("AGENTCTL_REAL_SWIFT", None)
+    env["PATH"] = swift_wrapper_dir + os.pathsep + env.get("PATH", os.defpath)
     if private_object_dir is not None:
         env["GIT_OBJECT_DIRECTORY"] = str(private_object_dir)
     if shared_object_dir is not None:
@@ -613,16 +1005,18 @@ def dispatch_env(base: dict | None = None, *, deny_push: bool = False,
         # the wrapper isn't tripped by a symlink neither side resolved the same way
         # (e.g. macOS's /tmp -> /private/tmp).
         wrapper_dir = _private_git_wrapper_dir()
-        env["AGENTCTL_REAL_GIT"] = _resolve_real_git(env.get("PATH", os.defpath), wrapper_dir)
+        resolved_real_git = _resolve_real_git(env.get("PATH", os.defpath), wrapper_dir)
+        if resolved_real_git:
+            env["AGENTCTL_REAL_GIT"] = resolved_real_git
+        else:
+            # Nothing usable on this call's own PATH -- leave AGENTCTL_REAL_GIT unset
+            # rather than put an empty value in its place; the wrapper's own baked
+            # fallback (also from `_resolve_real_git`, possibly also empty) is what
+            # decides from here, and either refuses or doesn't on its own terms.
+            env.pop("AGENTCTL_REAL_GIT", None)
         env["AGENTCTL_OWN_GIT_COMMON_DIR"] = os.path.dirname(
             os.path.realpath(str(shared_object_dir)))
         env["PATH"] = wrapper_dir + os.pathsep + env.get("PATH", os.defpath)
     if deny_push:
-        start = int(env.get("GIT_CONFIG_COUNT") or 0)
-        pairs = [(f"url.{_PUSH_REFUSAL_BASE}.pushInsteadOf", prefix)
-                for prefix in _PUSH_REFUSAL_PREFIXES]
-        for offset, (key, value) in enumerate(pairs):
-            env[f"GIT_CONFIG_KEY_{start + offset}"] = key
-            env[f"GIT_CONFIG_VALUE_{start + offset}"] = value
-        env["GIT_CONFIG_COUNT"] = str(start + len(pairs))
+        env = deny_push_env(env)
     return env

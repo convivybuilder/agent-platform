@@ -685,3 +685,194 @@ def test_the_guard_is_the_process_default():
     installed = urllib.request._opener
     assert installed is not None, "vault_plane did not install its opener"
     assert any(isinstance(h, vault_plane._NoDowngrade) for h in installed.handlers)
+
+
+# --- SESSIONS_ONLY (E12-2 slice S5c): the forwarding-socket transport switch ----
+
+def _env_file(tmp_path, text):
+    p = tmp_path / "session-agent.env"
+    p.write_text(text)
+    return p
+
+
+@pytest.mark.parametrize("text,expect", [
+    (None, False),                      # absent file — the default, every host before this slice
+    ("SESSIONS_ONLY=1\n", True),
+    ("SESSIONS_ONLY=0\n", False),
+    ("CREWS_ROOT=/x\nSESSIONS_ONLY=1\n", True),   # another key in the same file
+    (" SESSIONS_ONLY = 1 \n".replace(" = ", "="), True),
+])
+def test_sessions_only_from_config(tmp_path, text, expect):
+    config = _env_file(tmp_path, text) if text is not None else tmp_path / "absent.env"
+    assert vault_plane._sessions_only_from_config(config) is expect
+
+
+@pytest.mark.parametrize("value", ["true", "false", "yes", "", "   ", "01"])
+def test_an_unrecognised_sessions_only_value_raises(tmp_path, value):
+    config = _env_file(tmp_path, f"SESSIONS_ONLY={value}\n")
+    with pytest.raises(RuntimeError, match="SESSIONS_ONLY"):
+        vault_plane._sessions_only_from_config(config)
+
+
+def test_with_the_setting_off_every_client_is_unaffected(monkeypatch):
+    """The default (SESSIONS_ONLY unset, matching every host before this
+    slice): the forwarding handler always defers, so `urlopen` reaches the
+    network exactly as it did on main."""
+    import urllib.request
+    monkeypatch.setattr(vault_plane, "SESSIONS_ONLY", False)
+    req = urllib.request.Request(vault_plane.library_url("/items"))
+    assert vault_plane._ForwardingSocketHandler().http_open(req) is None
+
+
+def test_the_forwarding_handler_is_installed_in_the_process_opener():
+    import urllib.request as _ur
+    installed = _ur._opener
+    assert any(isinstance(h, vault_plane._ForwardingSocketHandler) for h in installed.handlers)
+
+
+def test_is_library_request_matches_library_url_and_fixed_library_url(on_library):
+    import urllib.request
+    req = urllib.request.Request(vault_plane.library_url("/items"))
+    assert vault_plane._is_library_request(req)
+    req2 = urllib.request.Request(vault_plane.fixed_library_url("/signing-certificates/x"))
+    assert vault_plane._is_library_request(req2)
+
+
+def test_is_library_request_does_not_match_another_host(on_library):
+    import urllib.request
+    req = urllib.request.Request("https://api.github.com/repos/convivy/agent-platform")
+    assert not vault_plane._is_library_request(req)
+
+
+def test_a_non_library_request_is_left_untouched_even_when_sessions_only(monkeypatch):
+    """Only a Library-bound request is redirected; anything else must reach
+    the ordinary handler, never the forwarding socket."""
+    import urllib.request
+    monkeypatch.setattr(vault_plane, "SESSIONS_ONLY", True)
+    req = urllib.request.Request("https://api.github.com/repos/convivy/agent-platform")
+    assert vault_plane._ForwardingSocketHandler().http_open(req) is None
+
+
+def test_sessions_only_routes_a_library_request_through_the_socket(monkeypatch, on_library):
+    """End to end through `urlopen`: path, method and body travel to
+    `forwarding_transport.request` unchanged, and the response comes back
+    exactly as a real Library answer would — success as a normal body, and
+    a 404 as `urllib.error.HTTPError`, with no change to either call site's
+    own code (mcp-kb-server's and mcp-ops-server's pattern, exercised here
+    directly against `vault_plane`)."""
+    import urllib.request
+    monkeypatch.setattr(vault_plane, "SESSIONS_ONLY", True)
+    captured = {}
+
+    def fake_request(method, target, headers, body=b"", **kwargs):
+        captured["method"] = method
+        captured["target"] = target
+        captured["headers"] = headers
+        captured["body"] = body
+        return vault_plane._FT.ForwardResult(
+            ok=True, response=vault_plane._FT.ForwardResponse(
+                status=200, reason_phrase="OK",
+                headers=(("Content-Type", "application/json"),),
+                body=b'{"items": [1, 2]}'))
+
+    monkeypatch.setattr(vault_plane._FT, "request", fake_request)
+    req = urllib.request.Request(
+        vault_plane.library_url("/items"), headers=vault_plane.library_headers("tok"))
+    # Through the installed opener directly, not the module-level `urlopen`
+    # name: `tests/conftest.py` patches THAT name process-wide to refuse any
+    # call whose URL looks like a live vault-plane address, so a test that
+    # wants to exercise the real handler chain — with the transport itself
+    # faked below, so nothing here is a live call — goes to the opener the
+    # same way `urlopen` ultimately would.
+    with urllib.request._opener.open(req, timeout=5) as resp:
+        assert resp.status == 200
+        assert resp.read() == b'{"items": [1, 2]}'
+    assert captured["method"] == "GET"
+    assert captured["target"] == "/items"
+    assert ("Authorization", "Bearer tok") in captured["headers"]
+    assert ("Library-protocol", "1") in captured["headers"]
+
+
+def test_sessions_only_gives_the_callers_whole_timeout_to_the_forward(monkeypatch, on_library):
+    """`urlopen(req, timeout=N)`'s caller expects the WHOLE call bounded at
+    `N` seconds. `forwarding_transport.request` only sums `connect_timeout_s`
+    and `response_timeout_s` into one deadline, so leaving `connect_timeout_s`
+    at its own 10s default on top of the caller's `N` would silently widen
+    every caller's budget to `N + 10` (reviewer, round 1)."""
+    import urllib.request
+    monkeypatch.setattr(vault_plane, "SESSIONS_ONLY", True)
+    captured = {}
+
+    def fake_request(method, target, headers, body=b"", **kwargs):
+        captured.update(kwargs)
+        return vault_plane._FT.ForwardResult(
+            ok=True, response=vault_plane._FT.ForwardResponse(
+                status=200, reason_phrase="OK", headers=(), body=b"{}"))
+
+    monkeypatch.setattr(vault_plane._FT, "request", fake_request)
+    req = urllib.request.Request(vault_plane.library_url("/items"))
+    with urllib.request._opener.open(req, timeout=5) as resp:
+        resp.read()
+    assert captured["connect_timeout_s"] == 0.0
+    assert captured["response_timeout_s"] == 5
+
+
+def test_sessions_only_with_no_caller_timeout_keeps_the_transports_own_defaults(monkeypatch, on_library):
+    """A request with no `.timeout` attribute at all (every real caller
+    through `urlopen`/an opener sets one, explicitly or to the stdlib's own
+    sentinel default, but `_forward_via_socket` is called directly here to
+    isolate that case): nothing to split, so `forwarding_transport.request`
+    is left to resolve its own defaults (`connect_timeout_s=None`) exactly
+    as it did before this fix."""
+    import urllib.request
+    monkeypatch.setattr(vault_plane, "SESSIONS_ONLY", True)
+    captured = {}
+
+    def fake_request(method, target, headers, body=b"", **kwargs):
+        captured.update(kwargs)
+        return vault_plane._FT.ForwardResult(
+            ok=True, response=vault_plane._FT.ForwardResponse(
+                status=200, reason_phrase="OK", headers=(), body=b"{}"))
+
+    monkeypatch.setattr(vault_plane._FT, "request", fake_request)
+    req = urllib.request.Request(vault_plane.library_url("/items"))
+    assert not hasattr(req, "timeout")
+    vault_plane._forward_via_socket(req)
+    assert captured["connect_timeout_s"] is None
+    assert captured["response_timeout_s"] is None
+
+
+def test_sessions_only_a_404_through_the_socket_raises_http_error(monkeypatch, on_library):
+    import urllib.error
+    import urllib.request
+    monkeypatch.setattr(vault_plane, "SESSIONS_ONLY", True)
+
+    def fake_request(method, target, headers, body=b"", **kwargs):
+        return vault_plane._FT.ForwardResult(
+            ok=True, response=vault_plane._FT.ForwardResponse(
+                status=404, reason_phrase="Not Found", headers=(), body=b'{"error": "no"}'))
+
+    monkeypatch.setattr(vault_plane._FT, "request", fake_request)
+    req = urllib.request.Request(vault_plane.library_url("/items/missing"))
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request._opener.open(req, timeout=5)
+    assert exc_info.value.code == 404
+
+
+def test_sessions_only_a_refused_forward_raises_url_error(monkeypatch, on_library):
+    """A transport-level refusal (socket absent, timeout, ...) surfaces as
+    `urllib.error.URLError` — the same exception a real connection failure
+    to a reachable-but-down Library would raise, so a caller's existing
+    `except urllib.error.URLError` / bare `except Exception` still catches
+    it."""
+    import urllib.error
+    import urllib.request
+    monkeypatch.setattr(vault_plane, "SESSIONS_ONLY", True)
+
+    def fake_request(method, target, headers, body=b"", **kwargs):
+        return vault_plane._FT.ForwardResult(ok=False, reason="forwarding_socket_absent")
+
+    monkeypatch.setattr(vault_plane._FT, "request", fake_request)
+    req = urllib.request.Request(vault_plane.library_url("/items"))
+    with pytest.raises(urllib.error.URLError):
+        urllib.request._opener.open(req, timeout=5)

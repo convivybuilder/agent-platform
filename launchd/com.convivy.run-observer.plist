@@ -40,8 +40,8 @@
          July-August 2026, twenty ended this way, and ten of the twenty were review
          agents — ten PRs that received substantial review work and no verdict.
          run-af1adcd7 did 444 transcript lines on agent-platform#398 and vanished.
-         Both reviewers on vivy#1132 died fourteen seconds apart, so that PR got
-         neither.
+         Both reviewers on a product repo's PR died fourteen seconds apart, so
+         that PR got neither.
 
          WHY NOT READ THE STALE LOG INSTEAD. registry._log_stale already records
          reaped entries, but that log holds 1,414 distinct run ids over the same

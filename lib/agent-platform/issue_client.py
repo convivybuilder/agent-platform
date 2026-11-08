@@ -8,8 +8,8 @@ It does not create items. A monitor, a script or a scheduled job logs a signal
 through signal_client instead, and only a co session creates an item
 (platform/decisions/0073). So this module has no create call.
 
-Used by `agentctl`, `co-rollover`, `issue-pr-reconcile`, `issue_gate.py` and the
-dispatch path to claim, comment on and resolve items the crew sweep drains
+Used by `agentctl`, `co-rollover`, `issue-pr-reconcile` and the dispatch path
+to claim, comment on and resolve items an interactive session works
 (ARCH-359: the issue is an inbound cue, the box is the record).
 
 Renamed from bug_client → issue_client (ARCH-361 Part 2). The old bug_* names
@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import warnings
 import urllib.error
 import urllib.parse
@@ -44,7 +45,7 @@ DISPATCH_READ_TIMEOUT = 3
 
 def _post(path: str, payload: dict, tok: str) -> dict[str, Any]:
     """One authenticated POST to the issue API → {"status", "item"|"error"}. Shared
-    by the drain transitions below; never raises (a sync failure must not break the
+    by the transition calls below; never raises (a sync failure must not break the
     caller's real work)."""
     try:
         req = urllib.request.Request(
@@ -64,6 +65,73 @@ def _post(path: str, payload: dict, tok: str) -> dict[str, Any]:
         return {"status": f"error:{e.__class__.__name__}", "item": {}}
 
 
+class MergeAdmissionError(RuntimeError):
+    """`check_merge_admission` could not get a well-formed answer from the
+    Library: a transport failure, a non-200 status, a non-JSON body, or a
+    body missing `approved`. Carries `status` (the HTTP code as a string, or
+    `"transport:<ExceptionName>"`/`"no-token"`/`"bad-body"`) and the
+    Library's own error `text`, so a caller can name what happened rather
+    than fall back to its own gate alone."""
+
+    def __init__(self, status: str, text: str):
+        super().__init__(f"{status}: {text}")
+        self.status = status
+        self.text = text
+
+
+def check_merge_admission(repo: str, pr: str | int, head_sha: str, requester: str, *,
+                          tok: str | None = None, timeout: float = _TIMEOUT) -> dict[str, Any]:
+    """Ask the Library whether a merge of `repo#pr` at `head_sha` may proceed
+    (`POST /merge/admission`, library/contracts/library-protocol §6.7). The
+    Library decides from its own review records, the PR's required checks
+    and the round cap; `agentctl kb merge` calls this once its own gate has
+    passed, with the exact head it is about to merge, and obeys the answer
+    rather than merging on its own gate alone.
+
+    Returns the parsed body: `{"approved": bool, "reason": str, "head_sha":
+    str, "enforced": bool, "missing": [...]}`.
+
+    RAISES MergeAdmissionError on any transport failure, a non-200 status, a
+    non-JSON body, or a body missing `approved` — unlike the rest of this
+    module, there is no best-effort fallback here: a caller that read a
+    failed ask as permission would be merging on its own gate alone, which
+    is exactly the gap this route closes.
+
+    Runs through the SAME proxy-free, redirect-refusing opener as
+    `get_item_from_default_library`/`post_review_record`, against the
+    Library's FIXED default address, and for the same reason: the answer
+    AUTHORISES a merge, so nothing the calling process's environment
+    controls — `LIBRARY_BASE_URL`, `VAULTS_ON_LIBRARY`, `ORIENT_BASE_URL`,
+    `http_proxy` and friends — may change where this question goes or what
+    it trusts."""
+    tok = tok or token()
+    if not tok:
+        raise MergeAdmissionError("no-token", "no agent-platform bearer token available")
+    payload = {"repo": repo, "pr": pr, "head_sha": head_sha, "requester": requester}
+    try:
+        req = urllib.request.Request(
+            vault_plane.fixed_library_url("/merge/admission"),
+            data=json.dumps(payload).encode("utf-8"),
+            headers=vault_plane.library_headers(token=tok, json_body=True),
+            method="POST")
+        with pinned_opener().open(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_text = str(e)
+        try:
+            err_body = json.loads(e.read().decode("utf-8"))
+            if isinstance(err_body, dict) and isinstance(err_body.get("error"), str):
+                err_text = err_body["error"]
+        except Exception:
+            pass
+        raise MergeAdmissionError(str(e.code), err_text) from e
+    except Exception as e:
+        raise MergeAdmissionError(f"transport:{e.__class__.__name__}", str(e)) from e
+    if not isinstance(body, dict) or "approved" not in body:
+        raise MergeAdmissionError("bad-body", "response was not a JSON object with 'approved'")
+    return body
+
+
 def _issue_path(issue_id: str, action: str) -> str:
     return f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/{action}"
 
@@ -81,7 +149,7 @@ RESOLVED_STATES = frozenset({"fixed", "wontfix", "duplicate", "redirected"})
 
 
 def list_open_issues(product: str | None = None, tok: str | None = None) -> list[dict[str, Any]]:
-    """Open issues from the box, for a drain to work through. Returns [] on any
+    """Open issues from the box, for a caller to work through. Returns [] on any
     failure (best-effort). Pass `product` to narrow scope."""
     tok = tok or token()
     if not tok:
@@ -119,8 +187,19 @@ def pinned_opener() -> urllib.request.OpenerDirector:
     Shared by every call to the fixed address — `get_item_from_default_library`
     below, and `agentctl crew doctor`'s fallback-token path (security-reviewer,
     PR #708 round 2) — rather than built fresh at each site, so a hardening
-    fix made once here reaches all of them."""
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}), _RefuseRedirect())
+    fix made once here reaches all of them.
+
+    `vault_plane._ForwardingSocketHandler` rides in this opener too (E12-2
+    slice S5c): it is built fresh here rather than through vault_plane's own
+    installed opener, so without it a sessions-only host's fixed-address
+    calls — `/merge/admission`, `/items/{id}`, `/review-records` — would
+    reach past the forwarding socket for the one reason this opener exists,
+    and simply fail on a host with no Library of its own. The handler
+    itself still only ever acts when `vault_plane.sessions_only()` is set
+    and the request is Library-bound, so this changes nothing when it is
+    not."""
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _RefuseRedirect(), vault_plane._ForwardingSocketHandler())
 
 
 def get_item_from_default_library(issue_id: str, *, tok: str | None = None,
@@ -245,16 +324,16 @@ def _ledger_reporter_token() -> str | None:
 
 
 def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
-                      lane: str,
+                      lane: str, day: str | None = None,
                       agent: str | None = None, model: str | None = None,
                       item_id: str | None = None,
                       tok: str | None = None, timeout: float = _TIMEOUT) -> dict[str, Any]:
     """Report one run's cost to the Library's ledger (`POST /ledger-entries`,
     the Bosun's first writer — issue_01M0TP37M3RRRY5BD1Z4B8GCB0 Part 1).
 
-    `lane` ("gateway" or "subscription") is required and sent on every entry
-    (E1·6): the Library stores it and refuses to sum a product's gateway and
-    subscription spend together. The caller decides which lane a row belongs
+    `lane` ("gateway", "subscription" or "openai-subscription") is required
+    and sent on every entry (E1·6): the Library stores it and refuses to sum
+    a product's lanes together. The caller decides which lane a row belongs
     to; this client has no opinion on what a model's lane is.
 
     `item_id`, when given, is the work item the run served (E16·5). The
@@ -264,6 +343,16 @@ def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
     Sent only when present: an entry with no `item_id` gets `epic_id: null`
     and reads as unattributed to the Library the same way it does in
     `cost_join`'s run-record report.
+
+    `day`, when given, is the calendar day (`YYYY-MM-DD`) this entry books
+    against — the caller's own `telemetry.platform_day()` or
+    `platform_day_for()` reading of the run's finish instant. Sent only when
+    present: an entry with no `day` books to the Library's own local date on
+    arrival (`local_day()` in its route), which is the batch-arrival date a
+    once-daily sweep already produced before this parameter existed. The
+    Library refuses a `day` more than one calendar day from its own date with
+    422 — a day this far wrong is this caller's own clock or bucketing being
+    wrong, not a transient condition to retry.
 
     Returns `{"status": "recorded"|"not-recorded"|"disproportionate"|"skip"|
     "error:<code>|<ExceptionName>|bad-body", "entry": <the route's body, or
@@ -305,14 +394,16 @@ def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
     `/ledger-entries` has no Orient counterpart to translate from) and the
     `bosun-ledger-reporter` credential (`_ledger_reporter_token`), NOT the
     general `token()` this module's other calls use: the Library refuses a
-    `lane: "subscription"` entry with 403 unless the posting credential holds
-    the `ledger.spend.subscription` grant, which only this dedicated token
-    carries. `tok`, when given, overrides it — tests inject a token this way
-    rather than pointing `LEDGER_TOKEN_PATH` at a real file. An absent or
+    `lane: "subscription"` or `lane: "openai-subscription"` entry with 403
+    unless the posting credential holds the `ledger.spend.subscription`
+    grant, which only this dedicated token carries (both lanes gate on the
+    same grant). `tok`, when given, overrides it — tests inject a token this
+    way rather than pointing `LEDGER_TOKEN_PATH` at a real file. An absent or
     empty credential file is a `"skip"`, the same status an absent `token()`
     used to produce here: there is no fallback to `token()`, because the
     general credential lacks the subscription grant and a gateway-only
-    credential posting a subscription entry would still be refused."""
+    credential posting a subscription or openai-subscription entry would
+    still be refused."""
     tok = tok or _ledger_reporter_token()
     if not tok:
         return {"status": "skip", "entry": {},
@@ -321,6 +412,8 @@ def post_ledger_entry(product: str, usd: float, *, run_id: str, dedup_key: str,
         "product": product, "source": LEDGER_SOURCE, "usd": usd,
         "run_id": run_id, "dedup_key": dedup_key, "lane": lane,
     }
+    if day:
+        payload["day"] = day
     if agent:
         payload["agent"] = agent
     if model:
@@ -371,9 +464,24 @@ class IssueQueueUnavailable(RuntimeError):
 # any real queue, which is what makes hitting it a server fault rather than growth.
 _MAX_PAGES = 100
 
+# The clock `list_issues_by_state`/`list_all_items` read their own `deadline`
+# parameter against — a name tests monkeypatch instead of sleeping for real
+# seconds to exercise a slow-Library deadline.
+_monotonic = time.monotonic
 
-def list_issues_by_state(state: str, product: str | None = None,
-                         tok: str | None = None) -> list[dict[str, Any]]:
+
+def deadline_in(seconds: float) -> float:
+    """An absolute `_monotonic()` deadline `seconds` from now, for
+    `list_issues_by_state`'s/`list_all_items`'s own `deadline` parameter.
+    Callers (`ledger.resolve_item_id`) compute this ONCE and pass the same
+    absolute value through every downstream call, so a multi-state,
+    multi-page read's TOTAL time is what gets bounded, rather than each hop
+    getting its own fresh budget and the bound multiplying with every state."""
+    return _monotonic() + seconds
+
+
+def list_issues_by_state(state: str, product: str | None = None, tok: str | None = None,
+                         deadline: float | None = None) -> list[dict[str, Any]]:
     """Every issue in `state`, following pagination to the end.
 
     RAISES IssueQueueUnavailable rather than returning [] on failure, for the same
@@ -390,6 +498,16 @@ def list_issues_by_state(state: str, product: str | None = None,
     from launchd, where an unbounded loop against a misbehaving server is a machine
     hammering an API all night with nobody watching. A ceiling turns that into one
     loud failure.
+
+    `deadline`, when given, is an absolute `_monotonic()` timestamp (`deadline_in`)
+    bounding the TOTAL time this call may spend, across every page — `_MAX_PAGES`
+    means this can make up to 100 requests, each with its own `_TIMEOUT`, so a
+    per-request bound alone still leaves the call unbounded overall. Each request's
+    own timeout is `min(_TIMEOUT, time left to the deadline)`; once the deadline has
+    already passed, this raises IssueQueueUnavailable rather than starting another
+    request. `None` (every caller before this parameter existed — `bin/work-item-
+    cost`'s `fetch_items()` and the reconciler's own call) leaves this exactly as it
+    was: unbounded overall, each page bound only by `_TIMEOUT`.
     """
     tok = tok or token()
     if not tok:
@@ -397,13 +515,22 @@ def list_issues_by_state(state: str, product: str | None = None,
     out: list[dict[str, Any]] = []
     offset = 0
     for _ in range(_MAX_PAGES):
+        if deadline is not None:
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                raise IssueQueueUnavailable(
+                    f"deadline exceeded reading issue queue (state={state!r}, "
+                    f"{len(out)} items read so far)")
+            page_timeout = min(_TIMEOUT, remaining)
+        else:
+            page_timeout = _TIMEOUT
         url = vault_plane.url(
             f"/api/issues?state={urllib.parse.quote(state, safe='')}&offset={offset}")
         if product:
             url += "&product=" + urllib.parse.quote(product, safe="")
         try:
             req = urllib.request.Request(url, headers=vault_plane.headers(token=tok))
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=page_timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             raise IssueQueueUnavailable(f"could not read the issue queue: {e}") from e
@@ -417,6 +544,41 @@ def list_issues_by_state(state: str, product: str | None = None,
     raise IssueQueueUnavailable(
         f"issue queue still reports more after {_MAX_PAGES} pages ({len(out)} items); "
         "refusing to keep paging")
+
+
+# Every state an item can be in. `claimable` is left out: it is open plus expired
+# claims, so it would fetch the same items twice (mirrors bin/work-item-cost's
+# own ITEM_STATES, the first reader of this full-corpus shape).
+ALL_ITEM_STATES = ("open", "claimed", "pr-open", "fixed", "wontfix", "duplicate", "redirected")
+
+
+def list_all_items(product: str | None = None, tok: str | None = None,
+                   deadline: float | None = None) -> list[dict[str, Any]]:
+    """Every work item in every state, once each (`list_issues_by_state` per
+    state in `ALL_ITEM_STATES`, deduped by id) — a run's PR can be linked from
+    an item in any state, so a caller resolving a bare PR to its item
+    (`cost_join.item_for_pr`) needs the whole corpus, the same read
+    `bin/work-item-cost`'s own `fetch_items()` performs for
+    `cost_join.build_item_costs`. RAISES IssueQueueUnavailable on the first
+    state that fails to read, same posture as `list_issues_by_state`.
+
+    `deadline`, when given, is an absolute `_monotonic()` timestamp
+    (`deadline_in`) bounding the TOTAL time across every state in
+    `ALL_ITEM_STATES` (seven) AND every page within each. The SAME deadline
+    is threaded into every `list_issues_by_state` call below, rather than
+    each state getting its own fresh budget off of it — seven states times
+    up to `_MAX_PAGES` pages each is exactly the unbounded-total shape this
+    parameter exists to close, and resetting the budget per state would
+    still leave the whole call able to run seven times longer than intended.
+    `None` (every caller before this parameter existed — `bin/work-item-
+    cost`'s own corpus fetch, `bin/model-scorecard`'s sweep, and the
+    reconciler, none of which sit on a bounded caller's critical path)
+    leaves this exactly as it was: unbounded overall."""
+    seen: dict[str, dict[str, Any]] = {}
+    for state in ALL_ITEM_STATES:
+        for item in list_issues_by_state(state, product=product, tok=tok, deadline=deadline):
+            seen.setdefault(item["id"], item)
+    return list(seen.values())
 
 
 def get_item(item_id: str, tok: str | None = None) -> dict[str, Any]:
@@ -545,7 +707,7 @@ def list_corrections_queues(product: str | None = None,
 def list_ledger_entries(*, epic_id: str | None = None, item_id: str | None = None,
                         run_id: str | None = None, product: str | None = None,
                         source: str | None = None, day: str | None = None,
-                        tok: str | None = None) -> list[dict[str, Any]]:
+                        tok: str | None = None, timeout: float = _TIMEOUT) -> list[dict[str, Any]]:
     """Every ledger entry matching the given filters (`GET /ledger-entries`,
     `library/contracts/library-protocol` §6.4 — the read side of the Bosun's
     first ledger writer, `post_ledger_entry`), following pagination to the
@@ -554,10 +716,17 @@ def list_ledger_entries(*, epic_id: str | None = None, item_id: str | None = Non
     partial slice of the ledger as the whole one, and a real mismatch sitting
     on a later page would read as a clean match.
 
-    Each entry carries `run_id`, `usd`, `lane` (`gateway`, `subscription` or
-    null — never a `billing_source` string; see `cost_join.reconcile_epic_cost`
-    for why the two are compared without trying to share a lane vocabulary),
+    Each entry carries `run_id`, `usd`, `lane` (`gateway`, `subscription`,
+    `openai-subscription` or null — never a `billing_source` string; see
+    `cost_join.reconcile_epic_cost` for why the two are compared without
+    trying to share a lane vocabulary),
     `model`, `agent`, `item_id`, `epic_id` and `voided_at`.
+
+    `timeout` bounds EVERY page's own request; the default matches this
+    module's general `_TIMEOUT`, but `ledger.read_live_ledger_state` passes
+    a shorter one on behalf of `agentctl`'s live checkpoint, which sits
+    inline in a run's own claim loop and so wants a tighter bound than a
+    batch sweep does.
 
     Uses `vault_plane.library_url`/`library_headers`, the same as
     `post_ledger_entry`: `/ledger-entries` has no Orient counterpart to
@@ -590,7 +759,7 @@ def list_ledger_entries(*, epic_id: str | None = None, item_id: str | None = Non
         url = vault_plane.library_url(f"/ledger-entries?{qs}")
         try:
             req = urllib.request.Request(url, headers=vault_plane.library_headers(token=tok))
-            with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             raise IssueQueueUnavailable(f"could not read ledger entries: {e}") from e
@@ -609,7 +778,7 @@ def list_ledger_entries(*, epic_id: str | None = None, item_id: str | None = Non
 
 def list_claimable_issues(product: str | None = None,
                           tok: str | None = None) -> list[dict[str, Any]]:
-    """Issues a drain may take: open, plus those whose claim has expired.
+    """Issues an interactive session may take: open, plus those whose claim has expired.
 
     The expiry half matters — a co session that died holding a claim would
     otherwise strand its issue out of the queue forever. The server computes the
@@ -618,9 +787,9 @@ def list_claimable_issues(product: str | None = None,
 
     RAISES rather than returning [] on failure, unlike the best-effort helpers
     around it. An empty list here means "the queue is empty", and a caller acts
-    on that by doing nothing and reporting a quiet night. If an unreachable API
+    on that by doing nothing and reporting a quiet run. If an unreachable API
     produced the same value, an outage would be indistinguishable from an empty
-    queue and the drain would report success while blind — the ARCH-311 silent
+    queue and the caller would report success while blind — the ARCH-311 silent
     no-op, one layer down.
     """
     tok = tok or token()
@@ -652,7 +821,7 @@ def _assert_server_understands_claimable(product: str | None, tok: str) -> None:
     returned 0 claimable while 13 issues were open.
 
     That is the deploy-order trap. It fails closed, so no work is duplicated, but
-    it fails SILENTLY: the drain reports a clean night while the entire queue is
+    it fails SILENTLY: the caller reports a clean run while the entire queue is
     invisible to it. So when the result is empty, ask a question the old server
     answers differently — if `state=open` finds rows that `claimable` did not,
     the server does not implement the filter and we must say so out loud.
@@ -702,7 +871,7 @@ def checkout_issue(issue_id: str, owner: str | None = None, *,
 
     A 409 means the subtree is held, and the error names the holder and the
     expiry — enough to route to other work and come back, rather than retry. A
-    drain meeting one should move to the next item, not spin.
+    caller meeting one should move to the next item, not spin.
 
     `owner` names WHICH session holds it and defaults to this session's identity.
     `run_id` is provenance, so a reaper can cross-check whether the run behind a
@@ -725,7 +894,7 @@ def checkout_issue(issue_id: str, owner: str | None = None, *,
 
 def claim_issue(issue_id: str, owner: str | None = None,
                 tok: str | None = None) -> dict[str, Any]:
-    """Claim an issue (open → claimed) so two workers don't drain the same one.
+    """Claim an issue (open → claimed) so two workers don't take the same one.
     Returns {"status": "ok"|"error:<code>", "item": <issue>}; status error:409 means
     it is held by a live claim OR by an epic lease — skip it either way.
 
@@ -761,7 +930,7 @@ def release_issue(issue_id: str, owner: str | None = None, *, force: bool = Fals
     """Hand a claim back (claimed → open) at session end.
 
     Without this the 24h TTL is the only way out of `claimed`, so every clean
-    exit would hide an issue from the drain for a day."""
+    exit would hide an issue from the next interactive session for a day."""
     tok = tok or token()
     if not tok:
         return {"status": "skip", "item": {}}
@@ -850,19 +1019,14 @@ def resolve_issue(issue_id: str, resolution: str, outcome_note: str | None = Non
 def reconcile_pr(issue_id: str, outcome: str, tok: str | None = None) -> dict[str, Any]:
     """End a `pr-open` item's wait on its own linked PR, once the PR itself has
     reached an outcome `link_pr_to_issue` had no way back from (convivy/library#116).
-    `outcome` is `merged` | `closed` | `abandoned` — the CALLER decides which
-    applies, by polling the linked PR; this client only carries the call.
+    `outcome` is `merged` | `closed` — the CALLER decides which applies, by
+    polling the linked PR; this client only carries the call.
 
-    `merged` and `closed` both return the item to `open`, keeping its `refs`
-    (`pr`/`url`) as history: a merged PR that leaves work in the item's body (an
-    epic's slice, say) and a closed-unmerged PR both mean nothing is still open on
-    it. Neither is a resolution — the item is not `fixed`, `wontfix` or
-    `duplicate`, only unstuck from `pr-open` so it is claimable again.
-
-    `abandoned` is for a PR that is STILL OPEN. It moves nothing — an open PR
-    looks exactly like one still being worked, and freeing the item would put a
-    second worker on a live branch — and instead raises the item's `needs` to
-    `operator` so a human sees it."""
+    Both return the item to `open`, keeping its `refs` (`pr`/`url`) as history: a
+    merged PR that leaves work in the item's body (an epic's slice, say) and a
+    closed-unmerged PR both mean nothing is still open on it. Neither is a
+    resolution — the item is not `fixed`, `wontfix` or `duplicate`, only unstuck
+    from `pr-open` so it is claimable again."""
     tok = tok or token()
     if not tok:
         return {"status": "skip", "item": {}}

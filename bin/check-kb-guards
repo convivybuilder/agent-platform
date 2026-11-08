@@ -42,6 +42,25 @@ rather than a one-line `pytest -m needs_kb` in a plist:
   - every marked test SKIPPED — the checkout this runs beside has gone missing,
     so the run proved nothing while looking clean.
 
+ALONGSIDE THE PER-REPO RUNS, one more check (platform/decisions/0097 point 6):
+every `projects/<name>/` directory in the knowledge repo's tree at `origin/main`
+must name a member of `projects.legal_kb_projects()`. A directory that fails is
+unindexed under point 2 regardless, so this is a check for a document that has
+already quietly stopped reaching the index. A breach logs one signal per
+unregistered directory, naming it and the newest commit that added it — the
+add that produced the directory as it stands, not a superseded earlier add —
+deduped the same way and scoped to the UTC day. An unreadable or malformed
+project registry is its own breach, logged once, and no directory is checked
+against it that run — `legal_kb_projects()` is never caught into an empty set,
+which would read as every directory being wrong rather than as the registry
+being unreadable. Likewise, when the knowledge tree at `origin/main` itself
+could not be listed (no such ref, git failed to run), that is its own breach,
+logged once, and no directory is checked that run — a failed listing is not
+"nothing unregistered".
+This check, like the per-repo runs, only ever reads the knowledge checkout
+(`git ls-tree`/`git log` against `origin/main`); it never checks out, switches
+or writes it, since that checkout is shared and served to every agent.
+
 SAFETY. Only ever runs the repo's own test suite, read-only against the KB. No
 writes, no dispatch.
 """
@@ -301,6 +320,145 @@ def _breach_body(repo: str, reason: str, output: str, convivy_root: pathlib.Path
     )
 
 
+# --- the directory check (platform/decisions/0097 point 6) -------------------
+
+
+def project_dirs_at_origin_main(
+        knowledge_repo: pathlib.Path) -> tuple[list[str] | None, str | None]:
+    """Directory names directly under `projects/` in the knowledge repo's tree at
+    `origin/main`, read with `git ls-tree`. `knowledge_repo` is never checked
+    out, switched or written here: it is shared and served to every agent.
+
+    Returns `(dirs, error)`. `error` is `None` on success, even when `dirs` is
+    empty — an empty `projects/` tree is not a failure. When git could not
+    answer — no `origin/main`, no `projects/` tree there, or git itself failed
+    to run — `dirs` is `None` and `error` names what git reported; the caller
+    (`check_project_directories`) logs that as a breach of its own rather than
+    reading a failed listing as nothing unregistered."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(knowledge_repo), "ls-tree", "-z", "-d", "--name-only",
+             "origin/main:projects"],
+            capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, str(exc)
+    if proc.returncode != 0:
+        error = (proc.stderr or proc.stdout).strip() or f"git exited {proc.returncode}"
+        return None, error
+    return [name for name in proc.stdout.split("\0") if name], None
+
+
+def dir_added_commit(knowledge_repo: pathlib.Path, name: str) -> str | None:
+    """The newest commit on `origin/main` that added `projects/<name>/` — the
+    first line of `git log --diff-filter=A`, since that command lists newest
+    first. That is the add that produced the directory as it stands now: a
+    directory deleted and later re-added has an earlier, superseded add commit
+    too, and naming that one would send the steward to revert the wrong
+    commit. `None` when git found no such commit, or failed to run."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(knowledge_repo), "log", "--diff-filter=A", "--format=%H",
+             "origin/main", "--", f"projects/{name}/"],
+            capture_output=True, text=True, timeout=60, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    shas = [line for line in proc.stdout.splitlines() if line]
+    return shas[0] if shas else None
+
+
+def unregistered_project_dirs(
+        knowledge_repo: pathlib.Path, legal: set[str]) -> tuple[list[str] | None, str | None]:
+    """`projects/<name>/` directory names at `origin/main` that name no member
+    of `legal`, sorted. Returns `(names, error)`, carrying through
+    `project_dirs_at_origin_main`'s `(dirs, error)`: `error` is `None` and
+    `names` is `[]` when every directory is registered; `names` is `None` with
+    `error` set when the tree could not be read at all, so the caller logs
+    that failure rather than reading it as nothing unregistered."""
+    dirs, error = project_dirs_at_origin_main(knowledge_repo)
+    if dirs is None:
+        return None, error
+    return sorted(name for name in dirs if name not in legal), None
+
+
+def dir_breach_key(name: str) -> str:
+    """The dedup_key stem for an unregistered `projects/<name>/` directory — the
+    caller scopes it to the UTC day, exactly as `breach_key` is scoped."""
+    return f"kb-guards:dir:{name}"
+
+
+_REGISTRY_UNREADABLE_KEY = "kb-guards:registry-unreadable"
+_TREE_UNREADABLE_KEY = "kb-guards:tree-unreadable"
+
+
+def _dir_breach_body(name: str, commit: str | None) -> str:
+    commit_text = f"commit `{commit}`" if commit else "no commit git could find on `origin/main`"
+    return (
+        f"**KB-agreement guard breach.** `projects/{name}/` exists in the "
+        f"knowledge repo's tree at `origin/main` but names no member of "
+        f"`projects.legal_kb_projects()`.\n\n"
+        f"Added by {commit_text}.\n\n"
+        f"platform/decisions/0097 point 6: a directory that fails this check is "
+        f"unindexed under point 2 regardless. For the steward to route: revert "
+        f"the commit, or register the project in the project registry."
+    )
+
+
+def check_project_directories(knowledge_repo: pathlib.Path, day: str,
+                              *, dry_run: bool = False, verbose: bool = False) -> int:
+    """Checks every `projects/<name>/` directory in the knowledge repo's tree at
+    `origin/main` against `projects.legal_kb_projects()`. Returns 1 when it
+    logged a breach — an unreadable registry, an unreadable tree at
+    `origin/main`, or one or more unregistered directories — else 0: this
+    check counts as ONE breach for the exit code, however many unregistered
+    directories it finds, the same way a repo's `needs_kb` run counts as one
+    breach however many of its tests failed. Each unregistered directory
+    still gets its own signal, once a day it persists (`dir_breach_key`).
+
+    `legal_kb_projects()` is called fresh and never caught into an empty set:
+    an unreadable or malformed registry must refuse every directory rather
+    than silently clear them (platform/decisions/0097)."""
+    _ensure_lib_on_path()
+    import projects  # noqa: E402
+    try:
+        legal = projects.legal_kb_projects()
+    except Exception as exc:
+        _post_signal(
+            "agent-platform", "[kb-guards] the project registry could not be read",
+            f"**KB-agreement guard breach.** `projects.legal_kb_projects()` raised: "
+            f"{exc}.\n\nNo `projects/<name>/` directory was checked against it this "
+            f"run.",
+            dedup_key=f"{_REGISTRY_UNREADABLE_KEY}:{day}", dry_run=dry_run)
+        if verbose:
+            _log(f"[BREACH] project registry: could not be read: {exc}")
+        return 1
+
+    unregistered, list_error = unregistered_project_dirs(knowledge_repo, legal)
+    if list_error is not None:
+        _post_signal(
+            "agent-platform",
+            "[kb-guards] the knowledge tree at origin/main could not be listed",
+            f"**KB-agreement guard breach.** `git ls-tree` against "
+            f"`origin/main:projects` in `{knowledge_repo}` reported: {list_error}.\n\n"
+            f"No `projects/<name>/` directory was checked against the registry "
+            f"this run.",
+            dedup_key=f"{_TREE_UNREADABLE_KEY}:{day}", dry_run=dry_run)
+        if verbose:
+            _log(f"[BREACH] knowledge tree at origin/main: could not be listed: {list_error}")
+        return 1
+
+    for name in unregistered:
+        commit = dir_added_commit(knowledge_repo, name)
+        res = _post_signal(
+            "agent-platform", f"[kb-guards] projects/{name}/ is not a registered KB project",
+            _dir_breach_body(name, commit),
+            dedup_key=f"{dir_breach_key(name)}:{day}", dry_run=dry_run)
+        if verbose:
+            _log(f"[BREACH] projects/{name}/: unregistered → {res.get('status', '?')}")
+    return 1 if unregistered else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="check-kb-guards", description=__doc__)
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -338,6 +496,9 @@ def main(argv: list[str] | None = None) -> int:
                            dedup_key=f"{breach_key(repo, reason, failing)}:{day}",
                            dry_run=opts.no_report)
         _log(f"[BREACH] {repo}: {reason} → {res.get('status', '?')}", file=sys.stderr)
+
+    breaches += check_project_directories(convivy_root / "knowledge", day,
+                                          dry_run=opts.no_report, verbose=opts.verbose)
 
     if breaches == 0:
         if opts.verbose:

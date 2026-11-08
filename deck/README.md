@@ -1,52 +1,49 @@
 # Deck's session→theme mapping
 
-`theme.json` maps Convivy's session names onto themes that ship with Deck, so
-a Deck pane looks like the iTerm session for the same project.
-
-## Why it lives here and not in Deck
-
-Deck ships a palette, not a mapping. Its ten themes are named for colors
-(`ember`, `gold`, `azure`, …) rather than for products, because a table keyed
-to Convivy's session names would be unreadable and uneditable for anyone else
+Deck's pane for a crew's session should look like that crew's iTerm session.
+Deck ships a palette, not a mapping: its ten themes are named for colors
+(`ember`, `gold`, `azure`, …) rather than for crews, because a table keyed to
+Convivy's session names would be unreadable and uneditable for anyone else
 running Deck — they would install it, match nothing, and fall off the end of a
 table of ours.
 
-So Convivy's mapping ships with Convivy's platform, next to the
-`iterm/co-*.json` profiles it mirrors and installed by the same script. Deck
-itself knows nothing about `vivy` or `sous-chef`.
+## Where the mapping lives
 
-## How themes are chosen
+This file, `theme.json`, carries only settings that are not per-crew —
+`appearance` today. The per-crew mapping (which session takes which shipped
+theme, and each session's rail label) is rendered from the registry's
+`co_deck_theme` and `co_label` fields at install time, on the crew machine
+(`bin/render-co-style`, called from `install.sh` phase 5, CQ-590), into a
+generated `sessions`/`railNames` pair outside any repository — alongside the
+`iterm/co-*.json` profiles that moved there the same way. Neither this file
+nor the registry names a crew session directly in a way the Builder release
+name scan would flag; `co_deck_theme` and `co_label` are ordinary registry
+fields set per unit.
 
-Each entry is the shipped theme whose accent hue is nearest that session's
-iTerm cursor color, so the two surfaces agree.
+A unit with neither field set gets no entry in either map, the same as an
+operator who hasn't picked one yet. Adjust a session's theme by right-clicking
+its rail row in Deck, which writes to the installed file directly, independent
+of the registry.
 
-Thirteen sessions into ten themes means five themes are shared by two sessions
-each:
-
-| Theme | Sessions |
-|---|---|
-| `amber` | `nyh-park-villa`, `sous-chef` |
-| `azure` | `svc`, `vivy` |
-| `gold` | `convivy-commercial`, `deck` |
-| `indigo` | `ask`, `selector` |
-| `teal` | `nyh-etc`, `write-better` |
-
-Adjust any of them by right-clicking the rail row in Deck, which writes to the
-same file.
-
-A session absent from this file is not broken — Deck hashes the session name
+A session with no entry at all is not broken — Deck hashes the session name
 into its catalog, so it gets a stable, distinct color with no configuration.
 
 ## Install behavior
 
-The operator's own ssh-alias installer copies this to
-`~/.config/convivy/deck/theme.json` **only if that file does not already
-exist.**
+tools/install-crew-ssh-config.sh, run on the laptop, merges the rendered seed
+into `~/.config/convivy/deck/theme.json` **key by key, on every run**, through
+`lib/agent-platform/deck_config.py`'s `merge_file`: a key already present in
+that file is left untouched, and a key missing from it is filled in from this
+seed, whether the file is new or already exists.
 
 This differs from the iTerm profiles, which are overwritten every run, and the
-difference is deliberate: Deck's theme picker writes to this same path. Copying
-over it would silently discard every choice made in the app. Seeding an absent
-file is a starting point; overwriting a present one destroys user state.
+difference is deliberate: Deck's theme picker writes to this same path, so
+replacing the whole file would silently discard every choice made in the app.
+Merging per key rather than per file is also why a present file is no longer
+skipped outright: Deck writes this file on any preference change, so a file
+could already exist with no `sessions` block at all, and skipping on mere
+existence meant that file never received this mapping.
 
-To reset to what ships here, delete `~/.config/convivy/deck/theme.json` and
-re-run the installer.
+To reset a key to what ships here, remove that key (or the whole file) from
+`~/.config/convivy/deck/theme.json` and re-run the installer; an absent key is
+always filled.

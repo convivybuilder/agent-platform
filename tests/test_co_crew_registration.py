@@ -3,7 +3,7 @@
 `bin/co` launches every co on Opus unless `_co_sonnet_crews` names its crew
 (operator, 2026-09-16). It used to be the other way round: a crew reached Opus only
 through one of three lists, anything else fell to a silent Sonnet `*)`, and
-`placard` (2026-09-05), `shipwright` (2026-09-08) and Signals (2026-09-16) each
+`signpost` (2026-09-05), `shipwright` (2026-09-08) and Signals (2026-09-16) each
 launched on Sonnet until the operator noticed the model. The last one was in no registry
 this file reads, so a check against the registry could not have caught it; only
 changing the default could.
@@ -18,6 +18,7 @@ covers what actually launches, by running `co` against a fake HOME.
 """
 from __future__ import annotations
 
+import fnmatch
 import re
 from pathlib import Path
 
@@ -39,28 +40,19 @@ def co_text() -> str:
 def _zsh_array(text: str, name: str) -> list[str]:
     """The elements of the FIRST `name=( ... )` assignment, quotes stripped.
 
-    `_co_crew_dirs` is assigned twice — the literal paths, then the `:A`-resolved
-    rewrite of itself — so first-match is what reads the literals rather than the
-    `("${(@)_co_crew_dirs:A}")` re-assignment.
+    `_co_sonnet_crews` is assigned twice: `()` empty by default, then
+    rewritten from a registry read with no crew name written in by hand.
+    First-match reads that empty literal, which is exactly what the guard
+    below needs — a hardcoded name belongs there, not in the registry-driven
+    rewrite.
     """
     m = re.search(rf"^{re.escape(name)}=\((.*?)\)$", text, re.MULTILINE | re.DOTALL)
     assert m, f"bin/co has no {name}=( ... ) assignment"
     return [tok.strip("\"'") for tok in m.group(1).split()]
 
 
-def crew_dir_names(text: str) -> set[str]:
-    """Basenames of `_co_crew_dirs`, the crew cockpits `co -r` re-individuates."""
-    return {Path(p).name for p in _zsh_array(text, "_co_crew_dirs")}
-
-
 def sonnet_crews(text: str) -> set[str]:
     return set(_zsh_array(text, "_co_sonnet_crews"))
-
-
-def active_crew_dir_names() -> set[str]:
-    """The directory basename `bin/co` would see for each active registry crew."""
-    return {Path(unit["home_dir"]).name for unit in projects.load().values()
-            if unit.get("lifecycle") == "active"}
 
 
 # --- the guards --------------------------------------------------------------
@@ -113,13 +105,15 @@ def test_every_declared_model_tier_is_one_this_platform_serves():
     )
 
 
+@pytest.mark.rich_registry
 def test_the_derived_list_is_what_bin_co_used_to_hold():
     """The derivation reproduces the literal it replaced, exactly. Written as
     the explicit four rather than as a recomputation of the same query, since a
     test that derives its expectation the same way the code does cannot tell
     whether either is right."""
     assert projects.sonnet_crew_dirs() == [
-        "nyh-arch-tools", "nyh-etc", "nyh-park-villa", "write-better",
+        "northwind-concierge", "oak-arch-tools", "oak-etc", "oak-guest",
+        "oak-marketing", "oak-park-villa", "oak-properties", "styleguide",
     ]
 
 
@@ -135,47 +129,167 @@ def test_opus_is_the_default_and_sonnet_is_the_listed_exception(co_text):
     assert "*)" not in block, "a `case` fallthrough is back in the model block"
 
 
-def test_every_crew_dir_has_a_styling_arm(co_text):
-    """The crew-cockpit branch's `case ${repo_root:A}` styles each entry, and its
-    own comment said it was "exhaustive only because `_co_crew_dirs` happens to
-    list exactly these three. Nothing enforces that." Two entries were added on
-    2026-09-08; this is the enforcement that note asked for."""
-    m = re.search(r"case \$\{repo_root:A\} in\n(.*?)\n\s*esac", co_text, re.DOTALL)
-    assert m, "bin/co has no `case ${repo_root:A}` styling block"
-    styled = set(re.findall(r"\*/([\w.-]+)\)", m.group(1)))
-    missing = crew_dir_names(co_text) - styled
-    assert not missing, (
-        f"_co_crew_dirs entries with no styling arm: {sorted(missing)}"
+# --- the crew-cockpit branch, fully registry-driven (no bin/co literal left) -
+
+
+def test_bin_co_no_longer_hardcodes_a_crew_cockpit_list_or_case(co_text):
+    """`co takes its crew layout from the registry and names no crew`: the old
+    `_co_crew_dirs=(...)` six-member literal and its `case ${repo_root:A}`
+    styling block are gone. What is left to guard is that nothing like them
+    comes back, and that the branch reads its gate, style and label through
+    `projects.cockpit_gate`/`projects.co_style` rather than re-inventing either."""
+    assert "_co_crew_dirs" not in co_text
+    assert "crew_cockpit_dirs()" not in co_text, (
+        "bin/co should query the registry per-directory (cockpit_gate/co_style) "
+        "rather than build a list of every crew-cockpit home up front"
+    )
+    assert "cockpit_gate(" in co_text
+    assert "co_style(" in co_text
+
+
+def test_every_active_central_kb_crew_has_a_bin_co_launch_shape():
+    """A crew individuated from the central KB needs ONE of the four launch-shape
+    flags bin/co reads (`crew_cockpit`, `co_self_contained`, `co_generic_refresh`,
+    `company_workspace`), or `co -r` dies there with "cwd is not a recognized
+    product repo" — the gap `crew_cockpit` exists to close, generalised: a crew
+    missing all four is a crew nobody told bin/co how to launch at all, the same
+    way an unregistered one used to be missed before any of these fields existed.
+    Checked against the real, checked-in registry, by the invariant rather than
+    by naming which crew holds which flag — a retired crew leaving no row, or a
+    new one added with a flag already set, both pass with no edit here."""
+    flags = ("crew_cockpit", "co_self_contained", "co_generic_refresh",
+             "company_workspace")
+    for slug, unit in projects.load().items():
+        if unit.get("lifecycle") != "active" or unit.get("kb") != "central":
+            continue
+        assert any(unit.get(f) is True for f in flags), (
+            f"{slug} is an active, kb=central crew with none of {flags} set — "
+            f"bin/co has no dedicated branch, crew-cockpit entry or self-contained "
+            f"flag to launch it with")
+
+
+def test_every_active_crew_cockpit_unit_has_a_real_home_directory_entry():
+    """`projects.cockpit_gate`/`co_style`, which the branch calls per-directory,
+    both resolve through `home_path(slug)` — a crew_cockpit unit with no (or a
+    malformed) `home_dir` would raise there instead of failing closed to "not a
+    cockpit", so the schema test's `home_dir` check is this guard's real
+    backstop; this one just states the invariant where this file's own readers
+    will see it."""
+    for slug, unit in projects.load().items():
+        if unit.get("crew_cockpit") is not True:
+            continue
+        assert projects.home_path(slug) is not None, (
+            f"{slug} is crew_cockpit but home_path() returned None")
+
+
+# CQ·565: `test_crew_cockpit_dirs_count_matches_the_live_registry_today`, which
+# used to live here, pinned the real, checked-in registry's current
+# crew-cockpit COUNT (10), so a row gaining or losing the flag was a change a
+# reviewer had to look at. That subject is gone: the committed registry this
+# repo once counted no longer exists, and the `rich_registry` fixture's own
+# crew_cockpit rows are invented, with no live count for this test to track.
+# `test_crew_cockpit_dirs_matches_the_live_registry_today` below is
+# unaffected — it derives its own expectation from whichever registry is
+# active rather than pinning a literal.
+
+
+@pytest.mark.rich_registry
+def test_crew_cockpit_dirs_matches_the_live_registry_today():
+    """The derived list is exactly the home-directory basenames of the
+    CHECKED-IN config/projects.json's own active, `crew_cockpit: true`
+    crews. This is a statement about the real file, not about the function
+    (see test_crew_registration.py for that), and it must find at least
+    one: a registry with none would mean the one path `agentctl crew
+    register` now defaults onto has gone untested here."""
+    expected = sorted(
+        Path(unit["home_dir"]).name
+        for unit in projects.load().values()
+        if unit.get("lifecycle") == "active" and unit.get("crew_cockpit") is True
+    )
+    assert expected, "no active crew in config/projects.json sets crew_cockpit: true"
+    assert projects.crew_cockpit_dirs() == expected
+
+
+# --- every active, central-kb crew must actually reach `co -r` -------------
+
+
+def _dedicated_branch_names(text: str) -> tuple[set[str], set[str]]:
+    """The literal and glob-pattern basenames `bin/co` recognizes through its
+    own per-crew `if [[ $(basename "$repo_root") == ... ]]` branches, each
+    elsewhere in this file than the registry-driven cockpit/self-contained/
+    generic-refresh/company-workspace matches below. A crew matched here
+    needs none of those registry flags: it already has a dedicated branch
+    of its own."""
+    literal = set(re.findall(r'\(basename "\$repo_root"\) == ([A-Za-z][\w-]*)\b', text))
+    glob = set(re.findall(r'\(basename "\$repo_root"\) == (\*[\w-]+)', text))
+    return literal, glob
+
+
+def _product_case_allowlist(text: str) -> set[str]:
+    """The literal product-repo names `_co_generic_daytime_refresh`'s own
+    `case $product in` lets straight through with no adopter-crew check —
+    today just the two legacy workspaces with no registry unit of their
+    own (`knowledge`, `dev-setup`); every registered crew on this path
+    names itself via `co_generic_refresh: true` instead."""
+    m = re.search(r"case \$product in\n(?:\s*#.*\n)*\s*([\w|-]+)\)", text)
+    assert m, "bin/co's generic-tail case $product allowlist moved or was renamed"
+    return set(m.group(1).split("|"))
+
+
+def _flag_home_basenames(flag: str) -> set[str]:
+    """Home-directory basenames of active units with `flag` set True — the
+    same shape `projects.crew_cockpit_dirs()`/`self_contained_crew_dirs()`
+    already return, computed here for the two flags (`co_generic_refresh`,
+    `company_workspace`) with no basename accessor of their own, since
+    `generic_refresh_names()` answers a different question (the slugs,
+    aliases and repo names bin/co's CLI-arg validator matches, not
+    directory basenames) and `company_workspace_slug()` returns one slug
+    rather than a basename."""
+    out = set()
+    for slug, unit in projects.load().items():
+        if unit.get("lifecycle") != "active" or unit.get(flag) is not True:
+            continue
+        home = projects.home_path(slug)
+        if home is not None:
+            out.add(home.name)
+    return out
+
+
+def test_every_active_central_kb_crew_reaches_co_dash_r(co_text):
+    """`co -r` from a central-kb crew's home directory must resolve through
+    one of: a registry `crew_cockpit`/`co_self_contained`/
+    `co_generic_refresh`/`company_workspace` flag, a crew's own dedicated
+    branch elsewhere in `bin/co`, or the generic tail's legacy-workspace
+    allowlist. A crew in none of these dies with "cwd is not a recognized
+    product repo" — the gap two earlier crews each hit before
+    `crew_cockpit` existed (`projects.crew_cockpit_dirs`'s own docstring has
+    the history). No `_co_crew_dirs` literal is read any more: `co takes
+    its crew layout from the registry and names no crew` removed it, and
+    every one of its six crews now carries `crew_cockpit: true` in the
+    checked-in registry instead."""
+    literal_branches, glob_branches = _dedicated_branch_names(co_text)
+    product_allowlist = _product_case_allowlist(co_text)
+    covered = (
+        set(projects.crew_cockpit_dirs())
+        | set(projects.self_contained_crew_dirs())
+        | _flag_home_basenames("co_generic_refresh")
+        | _flag_home_basenames("company_workspace")
     )
 
-
-def test_the_crews_that_needed_co_r_are_crew_cockpits(co_text):
-    """`shipwright` and `placard` are individuated from the central KB, so
-    `_co_crew_dirs` is what gives `co -r` their knowledge pull and
-    re-individuate. The operator hit "cwd is not a recognized product repo" there before
-    the model gap was noticed."""
-    dirs = crew_dir_names(co_text)
-    assert "shipwright" in dirs
-    assert "placard" in dirs
-
-
-# --- the registry-derived cockpits (issue_01M3YN6857H5J541G73Y9P3KA1) -------
-
-
-def test_bin_co_appends_registry_derived_cockpits(co_text):
-    """`_co_crew_dirs` is still a literal for the six crews above, but it now
-    also consults the registry (`crew_cockpit_dirs()`), the same move
-    `sonnet_crew_dirs()` already made for `model_tier` — so a crew
-    `agentctl crew register` marks `crew_cockpit: true` reaches `co -r` with
-    no edit to this file."""
-    assert "crew_cockpit_dirs()" in co_text
-    assert "_co_crew_dirs+=(" in co_text
-
-
-def test_crew_cockpit_dirs_is_empty_for_the_live_registry_today():
-    """No crew in the CHECKED-IN config/projects.json sets `crew_cockpit`
-    yet — the six names above are still the hardcoded literal, not a
-    registry field — so the derived list contributes nothing on this repo's
-    own registry. This is a statement about the real file, not about the
-    function (see test_crew_registration.py for that)."""
-    assert projects.crew_cockpit_dirs() == []
+    uncovered = []
+    for slug, unit in projects.load().items():
+        if unit.get("lifecycle") != "active" or unit.get("kb") != "central":
+            continue
+        name = Path(unit["home_dir"]).name
+        if (name in covered or name in literal_branches
+                or name in product_allowlist
+                or any(fnmatch.fnmatch(name, pat) for pat in glob_branches)):
+            continue
+        uncovered.append(slug)
+    assert not uncovered, (
+        f"co -r cannot resolve these active, central-kb crews: {uncovered}. "
+        f"Each needs crew_cockpit, co_self_contained, co_generic_refresh or "
+        f"company_workspace set true (if it has no dedicated bin/co branch "
+        f"of its own), or a fix to whichever branch/allowlist should cover "
+        f"it instead."
+    )

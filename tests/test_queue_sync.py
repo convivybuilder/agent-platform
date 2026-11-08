@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -25,19 +26,27 @@ def qs():
     return mod
 
 
+@contextmanager
+def _fake_read_token_env(repo_slug):
+    """Stands in for `GA.read_token_env` in a test that drives `main()` end to
+    end without minting anything real: yields a plain dict rather than
+    reaching the install's GitHub App."""
+    yield {}
+
+
 # --- the tail dialects -------------------------------------------------------
 
-def test_strips_the_constance_landed_tail(qs):
+def test_strips_the_globex_landed_tail(qs):
     b = ("- **2026-07-13 — A1: crash guard** — architect proposal A1. Landed as "
-         "https://github.com/convivy/constance/pull/499. reviewer APPROVE; CI green.")
+         "https://github.com/convivy/globex/pull/499. reviewer APPROVE; CI green.")
     assert qs.described(b) == "- **2026-07-13 — A1: crash guard** — architect proposal A1"
 
 
-def test_strips_the_vivy_arrow_tail(qs):
-    """vivy never writes "Landed as" — 45 entries to nil. Missing this dialect left
-    every rebuilt vivy entry carrying its old PR reference and an appended new one."""
+def test_strips_the_widget_arrow_tail(qs):
+    """widget never writes "Landed as" — 45 entries to nil. Missing this dialect left
+    every rebuilt widget entry carrying its old PR reference and an appended new one."""
     b = ("- **2026-07-21** — **A2: pii_fields expansion** *(pii-fields)*: 13 keys added "
-         "→ https://github.com/convivy/vivy/pull/951")
+         "→ https://github.com/convivy/widget/pull/951")
     got = qs.described(b)
     assert "pull/951" not in got
     assert got.endswith("13 keys added")
@@ -51,7 +60,7 @@ def test_a_bare_arrow_in_a_title_survives(qs):
 
 
 def test_prose_containing_merged_is_not_truncated(qs):
-    """A loose "merged … as" match ate this real vivy line mid-sentence, leaving a
+    """A loose "merged … as" match ate this real widget line mid-sentence, leaving a
     dangling paren. A tail marker has a shape: verb, then "as", then a PR link."""
     b = ("- **2026-07-21** — **F2: webhook validator** *(or-webhook)*: Already in main via "
          "PR #992 (merged 2026-07-18) which added the validator and scoped it to the web "
@@ -79,7 +88,7 @@ def test_a_bullets_indented_continuation_stays_with_it(qs):
 
 def test_render_redates_from_the_merge_not_the_authored_date(qs):
     """The authored date is the orchestrator's end-of-run belief and predates the
-    merge — across constance it was out by up to six days."""
+    merge — across globex it was out by up to six days."""
     pr = {"mergedAt": "2026-07-19T01:24:04Z", "url": "u",
           "mergeCommit": {"oid": "abcdef1234"}, "title": "t"}
     out = qs.render(pr, "- **2026-07-13 — A3: guard** — notes")
@@ -95,35 +104,40 @@ def test_render_falls_back_to_the_pr_title_with_no_prose(qs):
 
 # --- the classification loop: the fix this PR exists for ---------------------
 # The helper tests above cover parsing. The loop that decides WHERE an entry goes
-# had none, and it is the part that deleted five real vivy items.
+# had none, and it is the part that deleted five real widget items.
 
 def _run_main(qs, monkeypatch, tmp_path, states, doc_body):
     """Drive main() with resolve() stubbed, and return its stderr report + output doc."""
     queues = tmp_path / "queues"
     queues.mkdir(parents=True)
-    doc = queues / "vivy.md"
+    doc = queues / "widget.md"
     doc.write_text("# Q\n\n## P1\n\n- pending thing\n\n"
                    "## Completed (last 30 days)\n" + doc_body)
-    (tmp_path / "Convivy" / "vivy").mkdir(parents=True)
+    (tmp_path / "Convivy" / "widget").mkdir(parents=True)
 
     monkeypatch.setattr(qs, "QUEUE_ROOT", queues)
     monkeypatch.setenv("HOME", str(tmp_path))
     # The repo dir resolves from builder_root.root(), which ignores HOME; pinned so
-    # CI, whose root is elsewhere, finds tmp_path/Convivy/vivy (PR 539's CI run).
+    # CI, whose root is elsewhere, finds tmp_path/Convivy/widget (PR 539's CI run).
     monkeypatch.setattr(qs.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    monkeypatch.setattr(qs, "resolve", lambda repo_dir, n: dict(
-        states[n], number=n, url=f"https://github.com/convivy/vivy/pull/{n}"))
-    monkeypatch.setattr(qs.sys, "argv", ["queue-sync", "vivy", "--write"])
+    # The GitHub credential seam (company/decisions/0027): main's own slug lookup
+    # and token mint are stubbed here so this test drives real classification
+    # logic without a real `.git` checkout or the install's GitHub App.
+    monkeypatch.setattr(qs, "origin_github_slug", lambda repo_dir: "convivy/widget")
+    monkeypatch.setattr(qs.GA, "read_token_env", _fake_read_token_env)
+    monkeypatch.setattr(qs, "resolve", lambda repo_dir, n, env: dict(
+        states[n], number=n, url=f"https://github.com/convivy/widget/pull/{n}"))
+    monkeypatch.setattr(qs.sys, "argv", ["queue-sync", "widget", "--write"])
     qs.main()
     return doc.read_text()
 
 
 def test_an_open_pr_item_is_kept_in_flight_not_deleted(qs, monkeypatch, tmp_path, capsys):
     """THE FIX. An OPEN PR's item was previously dropped from the doc entirely — on
-    vivy that removed five real items awaiting a human merge. It must survive, and it
+    widget that removed five real items awaiting a human merge. It must survive, and it
     must not read as completed."""
     body = ("\n- **2026-07-21 — A2: pii_fields expansion** — 13 keys "
-            "→ https://github.com/convivy/vivy/pull/951\n")
+            "→ https://github.com/convivy/widget/pull/951\n")
     out = _run_main(qs, monkeypatch, tmp_path,
                     {951: {"state": "OPEN", "title": "expand pii_fields", "mergedAt": None}},
                     body)
@@ -135,7 +149,7 @@ def test_a_closed_unmerged_item_is_removed_and_reported(qs, monkeypatch, tmp_pat
     """The #526 case, and the opposite call: closed-unmerged work never landed, so
     leaving it under Completed is how it disappears."""
     body = ("\n- **2026-07-20 — A1: dead code removal** — Landed as "
-            "https://github.com/convivy/constance/pull/526\n")
+            "https://github.com/convivy/globex/pull/526\n")
     out = _run_main(qs, monkeypatch, tmp_path,
                     {526: {"state": "CLOSED", "title": "remove dead code", "mergedAt": None}},
                     body)
@@ -145,7 +159,7 @@ def test_a_closed_unmerged_item_is_removed_and_reported(qs, monkeypatch, tmp_pat
 
 def test_an_unresolvable_item_is_kept_verbatim(qs, monkeypatch, tmp_path, capsys):
     """An issue number rather than a PR. "Could not check" must never mean "delete"."""
-    body = "\n- [ ] (triage) #424 follow-up — https://github.com/convivy/vivy/pull/424\n"
+    body = "\n- [ ] (triage) #424 follow-up — https://github.com/convivy/widget/pull/424\n"
     out = _run_main(qs, monkeypatch, tmp_path, {424: {"state": "UNKNOWN"}}, body)
     assert "(triage) #424 follow-up" in out
 
@@ -160,6 +174,132 @@ def test_a_traversing_product_name_is_refused(qs, monkeypatch, tmp_path, capsys)
     with pytest.raises(SystemExit) as e:
         qs.main()
     assert "simple identifier" in str(e.value)
+
+
+# --- origin_github_slug: the slug main mints a token for comes from the
+# checkout's own `origin` remote, not from a registry lookup -----------------
+
+def test_origin_github_slug_parses_the_https_form(qs, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        qs.subprocess, "run",
+        lambda *a, **k: type("P", (), {"returncode": 0,
+                                       "stdout": "https://github.com/convivy/widget.git\n"})())
+    assert qs.origin_github_slug(tmp_path) == "convivy/widget"
+
+
+def test_origin_github_slug_parses_the_scp_form(qs, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        qs.subprocess, "run",
+        lambda *a, **k: type("P", (), {"returncode": 0,
+                                       "stdout": "git@github.com:convivy/widget.git\n"})())
+    assert qs.origin_github_slug(tmp_path) == "convivy/widget"
+
+
+def test_origin_github_slug_is_none_without_a_github_remote(qs, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        qs.subprocess, "run",
+        lambda *a, **k: type("P", (), {"returncode": 0,
+                                       "stdout": "https://example.com/not-github.git\n"})())
+    assert qs.origin_github_slug(tmp_path) is None
+
+
+def test_origin_github_slug_is_none_when_git_fails(qs, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        qs.subprocess, "run",
+        lambda *a, **k: type("P", (), {"returncode": 1, "stdout": ""})())
+    assert qs.origin_github_slug(tmp_path) is None
+
+
+# --- the GitHub credential seam (company/decisions/0027): every `gh` call
+# runs on a token minted from the install's own GitHub App, never the
+# operator's `gh` login ------------------------------------------------------
+
+def test_main_threads_the_minted_tokens_env_into_every_resolve_call(
+        qs, monkeypatch, tmp_path):
+    """Drives `main`'s real `GA.read_token_env` (only `GA.installed_app` and
+    `GA.mint_token` are stubbed — `GA.gh_env` runs for real, and `git remote
+    get-url` is stubbed so the test needs no real checkout): the minted
+    token lands in `GH_TOKEN`, and `GH_CONFIG_DIR` is an empty, throwaway
+    directory, on the one `gh pr view` call `resolve` makes per bullet."""
+    queues = tmp_path / "queues"
+    queues.mkdir(parents=True)
+    (queues / "widget.md").write_text(
+        "# Q\n\n## P1\n\n- pending\n\n## Completed (last 30 days)\n\n"
+        "- **2026-07-21 — thing** — https://github.com/convivy/widget/pull/951\n")
+    (tmp_path / "Convivy" / "widget").mkdir(parents=True)
+    monkeypatch.setattr(qs, "QUEUE_ROOT", queues)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(qs.BR, "root", lambda *a, **k: tmp_path / "Convivy")
+    monkeypatch.setattr(qs, "origin_github_slug", lambda repo_dir: "convivy/widget")
+    monkeypatch.setattr(
+        qs.GA, "installed_app",
+        lambda: qs.GA.InstalledApp(app_id="1", key_path=Path("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(qs.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = Path(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        stdout = ('{"number": 951, "state": "MERGED", "title": "t", '
+                 '"mergedAt": "2026-07-21T00:00:00Z", "mergeCommit": {"oid": "abc1234"}, '
+                 '"url": "https://github.com/convivy/widget/pull/951"}')
+        return type("P", (), {"returncode": 0, "stdout": stdout, "stderr": ""})()
+
+    monkeypatch.setattr(qs.subprocess, "run", fake_run)
+    monkeypatch.setattr(qs.sys, "argv", ["queue-sync", "widget", "--write"])
+    qs.main()
+    assert captured, "gh must have been called with the minted token's environment"
+
+
+def test_a_mint_failure_runs_no_gh_process_and_exits_nonzero(
+        qs, monkeypatch, tmp_path, capsys):
+    """A repo whose token cannot be minted never runs `gh pr view` at all —
+    the same shape as every other upfront refusal in `main` (a traversing
+    product name, a missing repo), naming the mint's own reason."""
+    queues = tmp_path / "queues"
+    queues.mkdir(parents=True)
+    (queues / "widget.md").write_text(
+        "# Q\n\n## P1\n\n- pending\n\n## Completed (last 30 days)\n\n"
+        "- **2026-07-21 — thing** — https://github.com/convivy/widget/pull/951\n")
+    (tmp_path / "Convivy" / "widget").mkdir(parents=True)
+    monkeypatch.setattr(qs, "QUEUE_ROOT", queues)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(qs.BR, "root", lambda *a, **k: tmp_path / "Convivy")
+    monkeypatch.setattr(qs, "origin_github_slug", lambda repo_dir: "convivy/widget")
+
+    class _FailingReadTokenEnv:
+        def __init__(self, repo_slug):
+            pass
+
+        def __enter__(self):
+            raise qs.GA.Unreadable("no App key configured at .../app.pem")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(qs.GA, "read_token_env", _FailingReadTokenEnv)
+    calls = []
+    monkeypatch.setattr(qs.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(qs.sys, "argv", ["queue-sync", "widget", "--write"])
+
+    with pytest.raises(SystemExit) as e:
+        qs.main()
+    assert calls == [], "a mint failure must never fall back to running gh"
+    assert "cannot mint a GitHub token" in str(e.value)
+    assert "no App key configured" in str(e.value)
 
 
 def test_a_pr_title_cannot_break_out_of_its_markdown(qs):
@@ -180,18 +320,23 @@ def _commit_run(qs, monkeypatch, tmp_path, git_results):
     """Drive --commit with git stubbed. Returns (calls, exit_code)."""
     queues = tmp_path / "queues"
     queues.mkdir(parents=True)
-    (queues / "vivy.md").write_text(
+    (queues / "widget.md").write_text(
         "# Q\n\n## P1\n\n- pending\n\n## Completed (last 30 days)\n\n"
-        "- **2026-07-21 — thing** — https://github.com/convivy/vivy/pull/951\n")
-    (tmp_path / "Convivy" / "vivy").mkdir(parents=True)
+        "- **2026-07-21 — thing** — https://github.com/convivy/widget/pull/951\n")
+    (tmp_path / "Convivy" / "widget").mkdir(parents=True)
     monkeypatch.setattr(qs, "QUEUE_ROOT", queues)
     monkeypatch.setenv("HOME", str(tmp_path))
     # The repo dir resolves from builder_root.root(), which ignores HOME; pinned so
-    # CI, whose root is elsewhere, finds tmp_path/Convivy/vivy (PR 539's CI run).
+    # CI, whose root is elsewhere, finds tmp_path/Convivy/widget (PR 539's CI run).
     monkeypatch.setattr(qs.BR, "root", lambda *a, **k: tmp_path / "Convivy")
-    monkeypatch.setattr(qs, "resolve", lambda repo_dir, n: {
+    # The GitHub credential seam (company/decisions/0027): main's own slug lookup
+    # and token mint are stubbed here so this test drives real git-push mechanics
+    # without a real `.git` checkout or the install's GitHub App.
+    monkeypatch.setattr(qs, "origin_github_slug", lambda repo_dir: "convivy/widget")
+    monkeypatch.setattr(qs.GA, "read_token_env", _fake_read_token_env)
+    monkeypatch.setattr(qs, "resolve", lambda repo_dir, n, env: {
         "number": n, "state": "MERGED", "title": "t", "mergedAt": "2026-07-21T00:00:00Z",
-        "mergeCommit": {"oid": "abc1234"}, "url": f"https://github.com/convivy/vivy/pull/{n}"})
+        "mergeCommit": {"oid": "abc1234"}, "url": f"https://github.com/convivy/widget/pull/{n}"})
 
     calls = []
 
@@ -210,7 +355,7 @@ def _commit_run(qs, monkeypatch, tmp_path, git_results):
         return R(1) if "diff" in cmd else R(0)
 
     monkeypatch.setattr(qs.subprocess, "run", fake_run)
-    monkeypatch.setattr(qs.sys, "argv", ["queue-sync", "vivy", "--commit"])
+    monkeypatch.setattr(qs.sys, "argv", ["queue-sync", "widget", "--commit"])
     try:
         return calls, qs.main()
     except SystemExit as e:
@@ -229,7 +374,7 @@ def test_commit_adds_commits_and_pushes(qs, monkeypatch, tmp_path):
 
 # git says "nothing to commit" three different ways depending on what ELSE is dirty
 # in the tree, and the no-op guard used to match only the first. The 06:00 backstop
-# hit the third on 2026-07-23 and reported `queue-sync constance: FAILED (exit 1)`
+# hit the third on 2026-07-23 and reported `queue-sync globex: FAILED (exit 1)`
 # on a queue that was already current — a false alarm in the one log that has to stay
 # trustworthy. The guard now asks git whether anything is staged instead of reading
 # its prose, so these phrasings are pinned as the thing we must NOT depend on.
@@ -280,7 +425,7 @@ def test_the_commit_is_scoped_to_the_queue_doc(qs, monkeypatch, tmp_path):
     calls, _ = _commit_run(qs, monkeypatch, tmp_path, [])
     commit = next(c for c in calls if len(c) > 3 and c[3] == "commit")
     assert "--" in commit, commit
-    assert commit[commit.index("--") + 1].endswith("vivy.md"), commit
+    assert commit[commit.index("--") + 1].endswith("widget.md"), commit
 
 
 def test_commit_fails_loudly_when_the_push_fails(qs, monkeypatch, tmp_path, capsys):

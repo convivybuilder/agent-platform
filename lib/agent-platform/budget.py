@@ -57,9 +57,11 @@ budget-watchdog, the daily summary) use them to fire a single notification
 per threshold per day, not one per crossing observation.
 
 **Origin scoping (ARCH-156, extended ARCH-202).** The caps gate on the autonomous
-origins — `scheduled` (launchd-launched: overnight, weekly-curation,
-weekly-consulting) plus `full_monty` (the `agentctl full-monty` headroom burn) —
-and every agentctl spawn descending from them. A full-monty run is capped at the
+origins — `scheduled` (today, `agentctl`'s own root-of-inheritance fallback
+when a named parent's recorded origin is unreadable; the overnight and
+weekly-consulting launchers that used to set it directly are retired,
+platform/decisions/0102 and 0103) plus `full_monty` (the `agentctl full-monty`
+headroom burn) — and every agentctl spawn descending from them. A full-monty run is capped at the
 elevated ceiling its driver sets via the budget env vars. `interactive`-origin spend —
 workers dispatched from a human `co` session — is tracked for visibility but
 never capped: it's the operator's deliberate, in-the-loop work, not the autonomous
@@ -314,7 +316,8 @@ def inflight_estimate_usd(*, now: datetime | None = None, origin: str | None = N
     run too young to have written one yet, or whose recorded partial the
     clamp rejected. No elapsed cap on the flat-rate fallback: a hung run's
     estimate grows without bound on purpose, so a stuck/runaway agent trips
-    the cap instead of silently burning (the 2026-05-26 vivy failure mode). A
+    the cap instead of silently burning (a 2026-05-26 runaway-agent failure
+    mode on a product crew). A
     recorded partial is used exactly as written, never extrapolated forward
     past its own `written_at` — see `write_cost_partial`'s docstring on why
     staleness is left visible rather than papered over.

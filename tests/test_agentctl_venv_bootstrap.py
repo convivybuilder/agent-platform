@@ -238,7 +238,8 @@ def test_kb_sync_reexecs_before_touching_the_knowledge_checkout(tmp_path, bare_p
     operator_cfg = home / ".config" / "convivy"
     operator_cfg.mkdir(parents=True)
     (operator_cfg / "operator.json").write_text(
-        '{"excluded_crews": [], "operator_marker": "operator", "roster_crew": "operator-crew"}')
+        '{"excluded_crews": [], "operator_marker": "operator", "roster_crew": "operator-crew", '
+        '"apps_crew": "operator-crew-apps"}')
     call = f'''
 import pathlib
 mod.KNOWLEDGE_ROOT = pathlib.Path({str(fake_root)!r})

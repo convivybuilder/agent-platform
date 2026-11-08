@@ -160,6 +160,7 @@ def test_a_missing_knowledge_checkout_exits_with_a_message_naming_the_path(
     assert log_path.is_file(), "logging setup itself must still have succeeded"
 
 
+@pytest.mark.rich_registry
 def test_a_document_in_a_newly_created_subdirectory_is_indexed_from_the_directorys_own_event(
     tmp_path, monkeypatch
 ):
@@ -187,12 +188,12 @@ def test_a_document_in_a_newly_created_subdirectory_is_indexed_from_the_director
         code = mod._bootstrap()
         assert code is None
 
-        new_dir = kb_root / "projects" / "adopter-app" / "field-notes"
+        new_dir = kb_root / "projects" / "signpost" / "field-notes"
         new_dir.mkdir(parents=True)
-        (new_dir / "doc-one.md").write_text(DOC.format(project="adopter-app", slug="doc-one"))
+        (new_dir / "doc-one.md").write_text(DOC.format(project="signpost", slug="doc-one"))
         nested = new_dir / "nested"
         nested.mkdir()
-        (nested / "doc-two.md").write_text(DOC.format(project="adopter-app", slug="doc-two"))
+        (nested / "doc-two.md").write_text(DOC.format(project="signpost", slug="doc-two"))
 
         event = types.SimpleNamespace(is_directory=True, src_path=str(new_dir))
         mod.Handler().on_created(event)
@@ -205,8 +206,8 @@ def test_a_document_in_a_newly_created_subdirectory_is_indexed_from_the_director
         finally:
             conn.close()
 
-    assert "projects/adopter-app/field-notes/doc-one.md" in refs
-    assert "projects/adopter-app/field-notes/nested/doc-two.md" in refs
+    assert "projects/signpost/field-notes/doc-one.md" in refs
+    assert "projects/signpost/field-notes/nested/doc-two.md" in refs
 
 
 def test_a_directory_event_reads_the_roster_once_so_every_file_in_it_gets_one_answer(
@@ -245,6 +246,7 @@ def test_a_directory_event_reads_the_roster_once_so_every_file_in_it_gets_one_an
         ]
 
 
+@pytest.mark.rich_registry
 def test_a_directory_moved_into_the_tree_is_indexed_from_its_own_moved_event(
     tmp_path, monkeypatch
 ):
@@ -274,9 +276,9 @@ def test_a_directory_moved_into_the_tree_is_indexed_from_its_own_moved_event(
         # docs by the time the directory's own moved event arrives.
         staged = tmp_path / "staged" / "field-notes"
         staged.mkdir(parents=True)
-        (staged / "doc-one.md").write_text(DOC.format(project="adopter-app", slug="doc-one"))
+        (staged / "doc-one.md").write_text(DOC.format(project="signpost", slug="doc-one"))
 
-        dest = kb_root / "projects" / "adopter-app" / "field-notes"
+        dest = kb_root / "projects" / "signpost" / "field-notes"
         dest.parent.mkdir(parents=True)
         staged.rename(dest)
 
@@ -293,7 +295,7 @@ def test_a_directory_moved_into_the_tree_is_indexed_from_its_own_moved_event(
         finally:
             conn.close()
 
-    assert "projects/adopter-app/field-notes/doc-one.md" in refs
+    assert "projects/signpost/field-notes/doc-one.md" in refs
 
 
 def test_a_directory_event_under_dot_git_is_a_no_op(tmp_path, monkeypatch):
@@ -337,6 +339,7 @@ def test_a_directory_event_under_dot_git_is_a_no_op(tmp_path, monkeypatch):
     assert calls == [], "a directory event under .git must never trigger a walk"
 
 
+@pytest.mark.rich_registry
 def test_a_doc_in_a_projects_own_nested_git_directory_is_indexed_like_the_other_two_paths(
         tmp_path, monkeypatch):
     """A newly created directory can itself contain a nested `.git` (a
@@ -369,12 +372,12 @@ def test_a_doc_in_a_projects_own_nested_git_directory_is_indexed_like_the_other_
         code = mod._bootstrap()
         assert code is None
 
-        new_dir = kb_root / "projects" / "adopter-app" / "field-notes"
+        new_dir = kb_root / "projects" / "signpost" / "field-notes"
         new_dir.mkdir(parents=True)
-        (new_dir / "doc-one.md").write_text(DOC.format(project="adopter-app", slug="doc-one"))
+        (new_dir / "doc-one.md").write_text(DOC.format(project="signpost", slug="doc-one"))
         dotdir = new_dir / ".git"
         dotdir.mkdir()
-        (dotdir / "doc-two.md").write_text(DOC.format(project="adopter-app", slug="doc-two"))
+        (dotdir / "doc-two.md").write_text(DOC.format(project="signpost", slug="doc-two"))
 
         event = types.SimpleNamespace(is_directory=True, src_path=str(new_dir))
         mod.Handler().on_created(event)
@@ -387,12 +390,13 @@ def test_a_doc_in_a_projects_own_nested_git_directory_is_indexed_like_the_other_
         finally:
             conn.close()
 
-    assert "projects/adopter-app/field-notes/doc-one.md" in refs
-    assert "projects/adopter-app/field-notes/.git/doc-two.md" in refs, \
+    assert "projects/signpost/field-notes/doc-one.md" in refs
+    assert "projects/signpost/field-notes/.git/doc-two.md" in refs, \
         "a document inside a project's own nested .git must be indexed, matching " \
         "a file event and full_scan_and_reconcile's plain rglob"
 
 
+@pytest.mark.rich_registry
 def test_a_non_git_dot_directory_inside_a_new_directory_is_indexed(tmp_path, monkeypatch):
     """The walk prunes only `.git`, not every dot-prefixed name, so a doc
     under a non-`.git` dot-directory (an editor's `.obsidian`) is indexed by
@@ -418,11 +422,11 @@ def test_a_non_git_dot_directory_inside_a_new_directory_is_indexed(tmp_path, mon
         code = mod._bootstrap()
         assert code is None
 
-        new_dir = kb_root / "projects" / "adopter-app" / "field-notes"
+        new_dir = kb_root / "projects" / "signpost" / "field-notes"
         new_dir.mkdir(parents=True)
         dotdir = new_dir / ".obsidian"
         dotdir.mkdir()
-        (dotdir / "doc-one.md").write_text(DOC.format(project="adopter-app", slug="doc-one"))
+        (dotdir / "doc-one.md").write_text(DOC.format(project="signpost", slug="doc-one"))
 
         event = types.SimpleNamespace(is_directory=True, src_path=str(new_dir))
         mod.Handler().on_created(event)
@@ -435,7 +439,7 @@ def test_a_non_git_dot_directory_inside_a_new_directory_is_indexed(tmp_path, mon
         finally:
             conn.close()
 
-    assert "projects/adopter-app/field-notes/.obsidian/doc-one.md" in refs
+    assert "projects/signpost/field-notes/.obsidian/doc-one.md" in refs
 
 
 def test_a_subdirectory_swapped_for_a_symlink_mid_walk_yields_nothing_from_outside(

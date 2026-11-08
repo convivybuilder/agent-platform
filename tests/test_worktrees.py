@@ -9,11 +9,14 @@ buildup).
 """
 from __future__ import annotations
 
+import json
 import os as _os
+import shlex as _shlex
 import subprocess as _sp
 from pathlib import Path
 
 import pytest
+import projects as PJ
 import worktrees as W
 
 
@@ -25,14 +28,14 @@ def test_branch_for():
 
 def test_parse_worktree_porcelain():
     out = (
-        "worktree $HOME/Convivy/vivy\nHEAD abc123\nbranch refs/heads/main\n\n"
-        "worktree $HOME/Convivy/worktrees/vivy.overnight\nHEAD def456\n"
+        "worktree $HOME/Convivy/cartographer\nHEAD abc123\nbranch refs/heads/main\n\n"
+        "worktree $HOME/Convivy/worktrees/cartographer.overnight\nHEAD def456\n"
         "branch refs/heads/overnight-work\n\n"
-        "worktree $HOME/Convivy/worktrees/vivy.detached\nHEAD 999aaa\ndetached\n\n"
+        "worktree $HOME/Convivy/worktrees/cartographer.detached\nHEAD 999aaa\ndetached\n\n"
     )
     recs = W._parse_worktree_porcelain(out)
     assert len(recs) == 3
-    assert recs[0]["worktree"].endswith("/vivy")
+    assert recs[0]["worktree"].endswith("/cartographer")
     assert W._branch_name(recs[0]) == "main"
     assert W._branch_name(recs[1]) == "overnight-work"
     assert W._branch_name(recs[2]) is None  # detached
@@ -42,16 +45,16 @@ def test_parse_worktree_porcelain():
 def fake_convivy(tmp_path, monkeypatch):
     """Repoint worktrees.CONVIVY_ROOT at a tmp dir with one fake primary repo."""
     monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
-    (tmp_path / "vivy" / ".git").mkdir(parents=True)
+    (tmp_path / "cartographer" / ".git").mkdir(parents=True)
     return tmp_path
 
 
 def test_desired_path(fake_convivy):
     # primary (no purpose) is the canonical clone
-    assert W.desired_path("vivy", None) == fake_convivy / "vivy"
+    assert W.desired_path("cartographer", None) == fake_convivy / "cartographer"
     # purpose-ed worktrees live under ~/Convivy/worktrees/<repo>.<purpose>
-    assert W.desired_path("vivy", "overnight") == fake_convivy / "worktrees" / "vivy.overnight"
-    assert W.desired_path("vivy", "test-xdist") == fake_convivy / "worktrees" / "vivy.test-xdist"
+    assert W.desired_path("cartographer", "overnight") == fake_convivy / "worktrees" / "cartographer.overnight"
+    assert W.desired_path("cartographer", "test-xdist") == fake_convivy / "worktrees" / "cartographer.test-xdist"
 
 
 def test_desired_path_unknown_repo_raises(fake_convivy):
@@ -60,12 +63,358 @@ def test_desired_path_unknown_repo_raises(fake_convivy):
 
 
 def test_allocate_refuses_busy_worktree(fake_convivy, monkeypatch):
-    target = W.desired_path("vivy", "overnight")
+    target = W.desired_path("cartographer", "overnight")
     holder = {"run_id": "run-x", "agent": "overnight-orchestrator", "worktree": str(target)}
     monkeypatch.setattr(W, "in_use_map", lambda: {target: holder})
     with pytest.raises(W.WorktreeBusy) as ei:
-        W.allocate_worktree("vivy", "overnight")
+        W.allocate_worktree("cartographer", "overnight")
     assert ei.value.holder["run_id"] == "run-x"
+
+
+# --- Swift package resolve (issue_01M5CSFQ6XGEB7JVA0ATF3EN32) -----------------
+#
+# Claude Code's own Bash sandbox denies writes to a `.git/config` under the
+# run's worktree, so a sandboxed session cannot let SwiftPM clone its
+# dependencies into `.build/checkouts` itself (deck-coder run-38ff922a,
+# run-90bf883c). `resolve_swift_package` runs the resolve with the operator's
+# own privileges before that session ever starts. A stub `swift` on PATH
+# stands in for the real toolchain in every test below.
+
+
+def _stub_swift(fake_bin: Path, marker: Path, *, exit_code: int = 0, stderr: str = "") -> None:
+    """A fake `swift` that records one line per invocation to `marker` and
+    exits `exit_code`, writing `stderr` to its own stderr first."""
+    script = fake_bin / "swift"
+    script.write_text(
+        "#!/bin/bash\n"
+        f'echo "$@" >> "{marker}"\n'
+        + (f"echo {_shlex.quote(stderr)} >&2\n" if stderr else "")
+        + f"exit {exit_code}\n"
+    )
+    script.chmod(0o755)
+
+
+def test_resolve_swift_package_runs_once_when_package_swift_present(tmp_path, monkeypatch):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "Package.swift").write_text("// swift-tools-version:5.9\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "calls.txt"
+    _stub_swift(fake_bin, marker)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{_os.environ['PATH']}")
+
+    result = W.resolve_swift_package(worktree)
+
+    assert result.ran is True
+    assert result.returncode == 0
+    assert result.duration_s is not None and result.duration_s >= 0
+    calls = marker.read_text().strip().splitlines()
+    assert len(calls) == 1
+    tokens = calls[0].split()
+    assert tokens[0] == "package" and tokens[-1] == "resolve"
+
+
+def test_resolve_swift_package_skips_without_package_swift(tmp_path, monkeypatch):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "calls.txt"
+    _stub_swift(fake_bin, marker)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{_os.environ['PATH']}")
+
+    result = W.resolve_swift_package(worktree)
+
+    assert result.ran is False
+    assert result.returncode is None
+    assert not marker.exists(), "no Package.swift means no swift invocation at all"
+
+
+def test_resolve_swift_package_surfaces_stderr_on_failure(tmp_path, monkeypatch):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "Package.swift").write_text("// swift-tools-version:5.9\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "calls.txt"
+    _stub_swift(fake_bin, marker, exit_code=1, stderr="could not write config file")
+    monkeypatch.setenv("PATH", f"{fake_bin}:{_os.environ['PATH']}")
+
+    result = W.resolve_swift_package(worktree)
+
+    assert result.ran is True
+    assert result.returncode == 1
+    assert "could not write config file" in result.stderr
+
+
+def test_resolve_swift_package_runs_with_a_scrubbed_environment(tmp_path, monkeypatch):
+    """Round-1 security review: `Package.swift` is Swift code the manifest
+    process evaluates, and the subprocess used to inherit the whole ambient
+    environment verbatim — reachable to whoever last wrote that file. Only
+    PATH, HOME, TMPDIR and LANG may reach it now. Fails against the pre-fix
+    `resolve_swift_package`, which passed no `env=` at all."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "Package.swift").write_text("// swift-tools-version:5.9\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    env_dump = tmp_path / "env.txt"
+    script = fake_bin / "swift"
+    script.write_text(f'#!/bin/bash\nenv > "{env_dump}"\nexit 0\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{_os.environ['PATH']}")
+    monkeypatch.setenv("GH_TOKEN", "synthetic-value")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/synthetic-agent.sock")
+
+    result = W.resolve_swift_package(worktree)
+
+    assert result.ran is True and result.returncode == 0
+    # bash itself injects SHLVL/PWD/_ into any child it runs — those three
+    # aren't part of what `resolve_swift_package` chose to pass through, so
+    # they're excluded here rather than asserted against.
+    seen = {k: v for k, v in
+           (line.split("=", 1) for line in env_dump.read_text().splitlines() if "=" in line)
+           if k not in {"SHLVL", "PWD", "_"}}
+    assert "GH_TOKEN" not in seen, "an ambient credential must never reach the manifest process"
+    assert "SSH_AUTH_SOCK" not in seen, "an ambient credential must never reach the manifest process"
+    assert seen["PATH"].startswith(str(fake_bin))
+    assert set(seen) <= {"PATH", "HOME", "TMPDIR", "LANG"}
+
+
+def test_resolve_swift_package_isolates_swiftpm_state_in_a_removed_temp_dir(tmp_path, monkeypatch):
+    """Round-2 security review: SwiftPM's user-level config/security/cache
+    directories (`~/.swiftpm`, `~/Library/org.swift.swiftpm`) can carry a
+    `mirrors.json` or cached manifest an earlier resolve wrote. The call must
+    pass `--config-path`/`--security-path`/`--cache-path` pointed at a fresh
+    temporary directory made for this one resolve, removed once it returns.
+    Fails against the pre-fix `resolve_swift_package`, whose argv was exactly
+    `["swift", "package", "resolve"]` with none of these flags."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (worktree / "Package.swift").write_text("// swift-tools-version:5.9\n")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "calls.txt"
+    _stub_swift(fake_bin, marker)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{_os.environ['PATH']}")
+
+    result = W.resolve_swift_package(worktree)
+
+    assert result.ran is True and result.returncode == 0
+    tokens = marker.read_text().strip().split()
+    assert tokens[0] == "package" and tokens[-1] == "resolve"
+    pairs = tokens[1:-1]
+    assert len(pairs) == 6, "expected exactly the three --*-path flags before resolve"
+    flags = dict(zip(pairs[0::2], pairs[1::2]))
+    assert set(flags) == {"--config-path", "--security-path", "--cache-path"}
+    isolation_dirs = set()
+    for value in flags.values():
+        path = Path(value)
+        assert path.is_absolute()
+        assert worktree not in path.parents, "must not point inside the worktree itself"
+        isolation_dirs.add(path.parent)
+    assert len(isolation_dirs) == 1, "all three flags must share one isolation directory"
+    assert not next(iter(isolation_dirs)).exists(), \
+        "the isolation directory must be removed once the resolve returns"
+
+
+# --- the whole worktree must match origin/main before any resolve runs -------
+#
+# Round-1 security review of issue_01M5CSFQ6XGEB7JVA0ATF3EN32: `swift package
+# resolve` fetches whatever `Package.swift` names, unsandboxed, with the
+# operator's own privileges — so `bin/agentctl`'s `_spawn_dispatch` may only
+# call `resolve_swift_package` after this gate passes. Round 2: a two-file
+# comparison (Package.swift/Package.resolved only) missed every other input
+# SwiftPM reads — a version-specific manifest, `.swiftpm/configuration/`, a
+# local path dependency — so the gate now compares the whole worktree (HEAD +
+# `git status`) to origin/main instead. These test the gate in isolation,
+# against a real git worktree and a real origin remote.
+
+def _git_ok(cwd, *args):
+    return _sp.run(["git", *args], cwd=str(cwd), check=True,
+                   capture_output=True, text=True).stdout.strip()
+
+
+def _swift_repo_with_worktree(tmp_path, monkeypatch, *, extra_commit=False,
+                              untracked_version_manifest=False,
+                              untracked_swiftpm_config=False,
+                              gitignore=None,
+                              ignored_swiftpm_config=False,
+                              ignored_build_checkout=False,
+                              skip_worktree_tamper=False):
+    """A primary repo with an origin remote whose main carries Package.swift
+    + Package.resolved, and a worktree branched straight from origin/main.
+
+    `extra_commit=True` commits a change that never touches Package.swift or
+    Package.resolved at all — the shape of a revise round whose branch an
+    earlier coder wrote to, moving HEAD past origin/main while leaving the
+    two files a round-1-style comparison would check untouched.
+
+    `untracked_version_manifest=True` plants `Package@swift-6.0.swift`, which
+    SwiftPM reads in preference to `Package.swift` for a matching toolchain,
+    left untracked.
+
+    `untracked_swiftpm_config=True` plants `.swiftpm/configuration/mirrors.json`,
+    which redirects any dependency URL SwiftPM resolves, left untracked.
+
+    `gitignore`, committed onto origin's main before the worktree is branched,
+    is what makes the two round-3 scenarios below realistic rather than
+    contrived: a path it excludes is invisible to `--untracked-files=all`
+    without `--ignored` too.
+
+    `ignored_swiftpm_config=True` commits a `.gitignore` that excludes
+    `.swiftpm/` (SwiftPM's own `swift package init` template ships exactly
+    this entry) and then plants `.swiftpm/configuration/mirrors.json` under
+    it, left untracked and ignored.
+
+    `ignored_build_checkout=True` commits a `.gitignore` that excludes
+    `.build/` (the ordinary SwiftPM build-output entry) and then plants
+    `.build/checkouts/x/Package.swift`, the nested manifest SwiftPM evaluates
+    for an already-resolved local dependency checkout, left untracked and
+    ignored.
+
+    `skip_worktree_tamper=True` edits the worktree's own `Package.swift` to a
+    different dependency set, then marks it `--skip-worktree` — a tracked
+    change `git status` omits entirely, with or without `--ignored`."""
+    for k, v in {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+                 "GIT_CONFIG_GLOBAL": _os.devnull, "GIT_CONFIG_NOSYSTEM": "1"}.items():
+        monkeypatch.setenv(k, v)
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    remote = tmp_path / "remote.git"
+    _git_ok(tmp_path, "init", "-q", "--bare", "-b", "main", str(remote))
+    _git_ok(primary, "init", "-q", "-b", "main")
+    (primary / "Package.swift").write_text("// swift-tools-version:5.9\n")
+    (primary / "Package.resolved").write_text('{"pins": []}\n')
+    if ignored_swiftpm_config:
+        gitignore = (gitignore or "") + ".swiftpm/\n"
+    if ignored_build_checkout:
+        gitignore = (gitignore or "") + ".build/\n"
+    if gitignore is not None:
+        (primary / ".gitignore").write_text(gitignore)
+    _git_ok(primary, "add", "-A")
+    _git_ok(primary, "commit", "-q", "-m", "one")
+    _git_ok(primary, "remote", "add", "origin", str(remote))
+    _git_ok(primary, "push", "-q", "-u", "origin", "main")
+
+    worktree = tmp_path / "wt"
+    _git_ok(primary, "worktree", "add", "-b", "agent/x", str(worktree), "origin/main")
+
+    if extra_commit:
+        (worktree / "NOTES.md").write_text("revise round notes\n")
+        _git_ok(worktree, "add", "-A")
+        _git_ok(worktree, "commit", "-q", "-m", "revise round commit, manifest untouched")
+    if untracked_version_manifest:
+        (worktree / "Package@swift-6.0.swift").write_text("// planted\n")
+    if untracked_swiftpm_config:
+        config_dir = worktree / ".swiftpm" / "configuration"
+        config_dir.mkdir(parents=True)
+        (config_dir / "mirrors.json").write_text('{"object": {"mirrors": []}}\n')
+    if ignored_swiftpm_config:
+        config_dir = worktree / ".swiftpm" / "configuration"
+        config_dir.mkdir(parents=True)
+        (config_dir / "mirrors.json").write_text('{"object": {"mirrors": []}}\n')
+    if ignored_build_checkout:
+        checkout_dir = worktree / ".build" / "checkouts" / "x"
+        checkout_dir.mkdir(parents=True)
+        (checkout_dir / "Package.swift").write_text("// planted\n")
+    if skip_worktree_tamper:
+        (worktree / "Package.swift").write_text("// swift-tools-version:5.9 planted\n")
+        _git_ok(worktree, "update-index", "--skip-worktree", "Package.swift")
+
+    return worktree
+
+
+def test_swift_worktree_matches_origin_when_head_matches_and_clean(tmp_path, monkeypatch):
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch)
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert (ok, reason) == (True, None)
+
+
+def test_swift_worktree_matches_origin_refuses_an_untracked_version_manifest(tmp_path, monkeypatch):
+    """A version-specific manifest (`Package@swift-6.0.swift`) takes priority
+    over `Package.swift` and is left untracked here — invisible to a gate
+    that only diffs Package.swift/Package.resolved against origin/main."""
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch,
+                                         untracked_version_manifest=True)
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert ok is False
+    assert "local changes" in reason
+
+
+def test_swift_worktree_matches_origin_refuses_a_planted_swiftpm_config(tmp_path, monkeypatch):
+    """`.swiftpm/configuration/mirrors.json` can redirect any dependency URL
+    and is left untracked here — invisible to a gate that only diffs
+    Package.swift/Package.resolved against origin/main."""
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch,
+                                         untracked_swiftpm_config=True)
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert ok is False
+    assert "local changes" in reason
+
+
+def test_swift_worktree_matches_origin_refuses_head_past_origin_main(tmp_path, monkeypatch):
+    """A revise round's own commit moves HEAD one commit past origin/main even
+    though it never touches Package.swift/Package.resolved. Fails against a
+    gate that only diffs file content and never compares HEAD to origin/main
+    at all."""
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch, extra_commit=True)
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert ok is False
+    assert "is not origin/main" in reason
+
+
+def test_swift_worktree_matches_origin_refuses_a_gitignored_swiftpm_config(tmp_path, monkeypatch):
+    """Round-3 security review: when origin/main's own `.gitignore` already
+    excludes `.swiftpm/` (the entry SwiftPM's own `swift package init`
+    template ships), a planted `.swiftpm/configuration/mirrors.json` is
+    invisible to `--untracked-files=all` without `--ignored` too — fails
+    against a gate missing `--ignored` on its `git status` call, which round
+    2's own regression test (no `.gitignore` at all) never exercised."""
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch,
+                                         ignored_swiftpm_config=True)
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert ok is False
+    assert "local changes" in reason
+
+
+def test_swift_worktree_matches_origin_refuses_an_ignored_build_checkout_manifest(tmp_path, monkeypatch):
+    """`.build/checkouts/<dep>/Package.swift` is the nested manifest SwiftPM
+    evaluates for an already-resolved local dependency checkout, and `.build/`
+    is an ordinary gitignore entry — invisible the same way as the
+    `.swiftpm/configuration/` case. Allowlisting `.build` instead of adding
+    `--ignored` would leave exactly this open."""
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch,
+                                         ignored_build_checkout=True)
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert ok is False
+    assert "local changes" in reason
+
+
+def test_swift_worktree_matches_origin_refuses_a_skip_worktree_entry(tmp_path, monkeypatch):
+    """A tracked file edited and then marked `--skip-worktree` is invisible to
+    `git status` regardless of `--untracked-files`/`--ignored` — a run inside
+    a reused worktree is not shown to be denied from setting this flag with
+    its own `git update-index`."""
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch,
+                                         skip_worktree_tamper=True)
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert ok is False
+    assert "skip-worktree" in reason
+
+
+def test_swift_worktree_matches_origin_allows_the_venv_symlink_allocate_worktree_writes(
+        tmp_path, monkeypatch):
+    """`allocate_worktree`'s own `_link_primary_venv` writes a `.venv` symlink
+    into every worktree it hands back, ordinarily gitignored and so only
+    visible with `--ignored` — that write must not itself make a freshly
+    allocated worktree look dirty to this gate."""
+    worktree = _swift_repo_with_worktree(tmp_path, monkeypatch, gitignore=".venv\n")
+    (worktree / ".venv").symlink_to(tmp_path / "primary" / "nonexistent-venv")
+    ok, reason = W.swift_worktree_matches_origin(worktree)
+    assert (ok, reason) == (True, None)
 
 
 # --- cleanup classification ---------------------------------------------------
@@ -83,7 +432,7 @@ def test_is_debris():
     assert W._is_debris(".DS_Store")
     assert W._is_debris("pkg/foo.egg-info/")
     # The DOTLESS coverage artifacts. `pytest --cov-report=json` writes coverage.json,
-    # and vivy/constance do not gitignore it, so it lands as an untracked file in every
+    # and cartographer/outfitter do not gitignore it, so it lands as an untracked file in every
     # review worktree there. It used to be classified as real work (the `.coverage*`
     # prefix rule misses it), which under ARCH-344 would keep every one of those trees
     # forever and silently re-open the leak the reap exists to close. It is regenerable
@@ -149,7 +498,7 @@ def test_is_debris():
     assert not W._is_debris("slack-post-announcement.md")
     # THE ACCEPTED RESIDUAL, asserted so it is a decision rather than an oversight.
     # A four-digit run cannot be excluded without dropping real artifacts: PR
-    # numbers passed 999 (convivy/vivy is on #1114), so review-1114.md is a name
+    # numbers passed 999 (convivy/cartographer is on #1114), so review-1114.md is a name
     # the platform generates. review-2024.md collides with that shape.
     assert W._is_debris("review-1114.md")
     assert W._is_debris("review-2024.md"), "the residual named in worktrees.py"
@@ -193,7 +542,8 @@ def test_cleanup_candidates_classification(monkeypatch):
     monkeypatch.setattr(W, "all_worktrees", lambda *, base_branch, **_kw: wts)
     monkeypatch.setattr(W, "is_dispatched", lambda p: True)
     monkeypatch.setattr(W, "in_use_map", lambda: {held.path.resolve(): {"run_id": "run-x"}})
-    monkeypatch.setattr(W, "pr_merged", lambda wt: wt.label in {"merged-ahead", "locked-merged"})
+    monkeypatch.setattr(W, "pr_merged",
+                        lambda wt, gh_env_for: wt.label in {"merged-ahead", "locked-merged"})
     # Round 8: cleanup_candidates now calls unpublished_commits for every candidate
     # it would otherwise call removable, not only an `ahead` one — so "clean" and
     # "debris-only" (never ahead of base) reach this call too, and must read 0 the
@@ -281,7 +631,7 @@ def test_cleanup_squash_merged_still_reclaimed_via_pr_merged(monkeypatch):
     monkeypatch.setattr(W, "is_dispatched", lambda p: True)
     monkeypatch.setattr(W, "in_use_map", lambda: {})
     monkeypatch.setattr(W, "unpublished_commits", lambda path: 2)
-    monkeypatch.setattr(W, "pr_merged", lambda w: True)
+    monkeypatch.setattr(W, "pr_merged", lambda w, gh_env_for: True)
     reasons = {c.worktree.label: c.reason for c in W.cleanup_candidates()}
     assert reasons["squash-merged"] == "removable:pr-merged"
 
@@ -291,9 +641,9 @@ def test_cleanup_squash_merged_still_reclaimed_via_pr_merged(monkeypatch):
 
 def test_link_primary_venv_creates_symlink(fake_convivy):
     """_link_primary_venv symlinks a primary .venv into the worktree."""
-    primary = fake_convivy / "vivy"
+    primary = fake_convivy / "cartographer"
     (primary / ".venv" / "bin").mkdir(parents=True)
-    target = fake_convivy / "worktrees" / "vivy.test"
+    target = fake_convivy / "worktrees" / "cartographer.test"
     target.mkdir(parents=True)
 
     W._link_primary_venv(primary, target)
@@ -305,8 +655,8 @@ def test_link_primary_venv_creates_symlink(fake_convivy):
 
 def test_link_primary_venv_skips_when_primary_lacks_venv(fake_convivy):
     """No symlink when the primary has no .venv (e.g. repos without a venv)."""
-    primary = fake_convivy / "vivy"
-    target = fake_convivy / "worktrees" / "vivy.test"
+    primary = fake_convivy / "cartographer"
+    target = fake_convivy / "worktrees" / "cartographer.test"
     target.mkdir(parents=True)
 
     W._link_primary_venv(primary, target)
@@ -316,11 +666,11 @@ def test_link_primary_venv_skips_when_primary_lacks_venv(fake_convivy):
 
 def test_link_primary_venv_replaces_stale_symlink(fake_convivy):
     """A stale/broken symlink is replaced with a fresh one."""
-    primary = fake_convivy / "vivy"
+    primary = fake_convivy / "cartographer"
     (primary / ".venv" / "bin").mkdir(parents=True)
     stale_target = fake_convivy / "nonexistent" / ".venv"
     stale_target.parent.mkdir(parents=True)
-    target = fake_convivy / "worktrees" / "vivy.test"
+    target = fake_convivy / "worktrees" / "cartographer.test"
     target.mkdir(parents=True)
     (target / ".venv").symlink_to(str(stale_target), target_is_directory=True)
     assert not (target / ".venv").resolve().exists()  # broken
@@ -334,9 +684,9 @@ def test_link_primary_venv_replaces_stale_symlink(fake_convivy):
 
 def test_link_primary_venv_skips_on_correct_symlink(fake_convivy):
     """Already-correct symlink is a no-op (no unnecessary unlink/re-link)."""
-    primary = fake_convivy / "vivy"
+    primary = fake_convivy / "cartographer"
     (primary / ".venv" / "bin").mkdir(parents=True)
-    target = fake_convivy / "worktrees" / "vivy.test"
+    target = fake_convivy / "worktrees" / "cartographer.test"
     target.mkdir(parents=True)
     (target / ".venv").symlink_to(str(primary / ".venv"), target_is_directory=True)
 
@@ -347,22 +697,60 @@ def test_link_primary_venv_skips_on_correct_symlink(fake_convivy):
     assert symlink.resolve() == (primary / ".venv").resolve()
 
 
-def test_link_primary_venv_does_not_touch_actual_directory(fake_convivy):
-    """If a real .venv directory already exists in the target (should never
-    happen in agentctl worktrees, but guard against it), do not remove it."""
-    primary = fake_convivy / "vivy"
+def test_link_primary_venv_refuses_a_real_directory(fake_convivy):
+    """A worktree whose `.venv` is a real directory (e.g. checked out from a
+    branch that committed its own) is refused rather than left in place or
+    replaced — the worktree's `.venv` must always be the symlink this
+    function creates."""
+    primary = fake_convivy / "cartographer"
     (primary / ".venv" / "bin").mkdir(parents=True)
-    target = fake_convivy / "worktrees" / "vivy.test"
+    target = fake_convivy / "worktrees" / "cartographer.test"
     target.mkdir(parents=True)
     (target / ".venv").mkdir()  # real directory, not a symlink
     marker = target / ".venv" / "IM_A_REAL_DIR"
     marker.write_text("")
 
-    W._link_primary_venv(primary, target)
+    with pytest.raises(W.WorktreeVenvConflict):
+        W._link_primary_venv(primary, target)
 
-    # Real directory still there, not replaced by symlink
+    # Real directory left exactly as found, not replaced by a symlink.
     assert not (target / ".venv").is_symlink()
     assert marker.exists()
+
+
+def test_link_primary_venv_refuses_a_committed_venv_without_running_it(fake_convivy):
+    """A worktree whose `.venv/bin/python` is a committed script (the shape a
+    branch that committed its own `.venv` would take) is refused before that
+    script ever runs — the refusal happens in the symlink step itself, never
+    by executing whatever the worktree's own `.venv` holds."""
+    primary = fake_convivy / "sample"
+    (primary / ".venv" / "bin").mkdir(parents=True)
+    target = fake_convivy / "worktrees" / "sample.test"
+    (target / ".venv" / "bin").mkdir(parents=True)
+    marker = fake_convivy / "ran-the-worktrees-own-python"
+    fake_python = target / ".venv" / "bin" / "python"
+    fake_python.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    fake_python.chmod(0o755)
+
+    with pytest.raises(W.WorktreeVenvConflict):
+        W._link_primary_venv(primary, target)
+
+    assert not marker.exists()
+
+
+def test_link_primary_venv_refuses_a_real_file(fake_convivy):
+    """`.venv` as a plain file (not a directory) is refused the same way."""
+    primary = fake_convivy / "sample"
+    (primary / ".venv" / "bin").mkdir(parents=True)
+    target = fake_convivy / "worktrees" / "sample.test"
+    target.mkdir(parents=True)
+    (target / ".venv").write_text("not a directory")
+
+    with pytest.raises(W.WorktreeVenvConflict):
+        W._link_primary_venv(primary, target)
+
+    assert (target / ".venv").is_file()
+
 
 def test_cleanup_skip_precedence_unchanged(monkeypatch):
     """Skip checks fire in order: in_use > locked > dirty > ahead."""
@@ -374,7 +762,7 @@ def test_cleanup_skip_precedence_unchanged(monkeypatch):
     monkeypatch.setattr(W, "in_use_map",
                         lambda: {held_dirty.path.resolve(): {"run_id": "x"}})
     monkeypatch.setattr(W, "unpublished_commits", lambda path: 0)
-    monkeypatch.setattr(W, "pr_merged", lambda w: True)
+    monkeypatch.setattr(W, "pr_merged", lambda w, gh_env_for: True)
     reasons = {c.worktree.label: c.reason for c in W.cleanup_candidates()}
     assert reasons["locked-ahead"] == "skip:locked"
     assert reasons["held-dirty"] == "skip:in_use"
@@ -498,9 +886,89 @@ def test_recheck_candidate_ignores_unpublished_commits_for_pr_merged(monkeypatch
 
 def test_pr_merged_no_gh_or_branch(monkeypatch):
     # no branch → never merged; no gh on the machine → fail safe (don't reap)
-    assert W.pr_merged(_wt("detached", branch=None)) is False
+    assert W.pr_merged(_wt("detached", branch=None), None) is False
     monkeypatch.setattr(W, "_gh_path", lambda: None)
-    assert W.pr_merged(_wt("x", ahead=1)) is False
+    assert W.pr_merged(_wt("x", ahead=1), None) is False
+
+
+# --- _origin_github_slug: the slug pr_merged mints a token for comes from the
+# worktree's own `origin` remote, not from a registry lookup -----------------
+
+def test_origin_github_slug_parses_the_https_form(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        W.subprocess, "run",
+        lambda *a, **k: type("P", (), {"returncode": 0,
+                                       "stdout": "https://github.com/convivy/widget.git\n"})())
+    assert W._origin_github_slug(tmp_path) == "convivy/widget"
+
+
+def test_origin_github_slug_is_none_without_a_github_remote(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        W.subprocess, "run",
+        lambda *a, **k: type("P", (), {"returncode": 1, "stdout": ""})())
+    assert W._origin_github_slug(tmp_path) is None
+
+
+# --- the GitHub credential seam (company/decisions/0027): every `gh` call
+# runs on a token minted from the install's own GitHub App, never the
+# operator's `gh` login ------------------------------------------------------
+
+def test_pr_merged_threads_the_minted_tokens_env_into_the_gh_call(monkeypatch):
+    """Drives the real `GA.read_token_env` (only `GA.installed_app` and
+    `GA.mint_token` are stubbed — `GA.gh_env` runs for real, and `git remote
+    get-url` is stubbed so the test needs no real checkout): the minted
+    token lands in `GH_TOKEN`, and `GH_CONFIG_DIR` is an empty, throwaway
+    directory, on the `gh pr list` call."""
+    from contextlib import contextmanager
+
+    wt = _wt("squash-merged", ahead=2)
+    monkeypatch.setattr(W, "_gh_path", lambda: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(W, "_origin_github_slug", lambda path: "convivy/widget")
+    monkeypatch.setattr(
+        W.GA, "installed_app",
+        lambda: W.GA.InstalledApp(app_id="1", key_path=Path("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(W.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = Path(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(W.subprocess, "run", fake_run)
+    with W.GA.read_token_pool() as gh_env_for:
+        assert W.pr_merged(wt, gh_env_for) is False
+    assert captured, "gh must have been called with the minted token's environment"
+
+
+def test_pr_merged_a_mint_failure_runs_no_gh_process(monkeypatch):
+    """A repo whose token cannot be minted never runs `gh pr list` — the same
+    fail-safe shape as no gh binary or no branch, never a reason to reap."""
+    wt = _wt("squash-merged", ahead=2)
+    monkeypatch.setattr(W, "_gh_path", lambda: "/opt/homebrew/bin/gh")
+    monkeypatch.setattr(W, "_origin_github_slug", lambda path: "convivy/widget")
+
+    def failing_env_for(repo_slug):
+        raise W.GA.Unreadable("no App key configured at .../app.pem")
+
+    calls = []
+    monkeypatch.setattr(W.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+
+    assert W.pr_merged(wt, failing_env_for) is False
+    assert calls == [], "a mint failure must never fall back to running gh"
 
 
 def test_dirty_counts_in_real_repo(tmp_path):
@@ -576,11 +1044,11 @@ def test_new_debris_entries_in_real_repo(tmp_path):
 # --- commit-pinned worktrees (ARCH-184, review integrity) -------------------
 
 def _real_repo_with_two_commits(tmp_path, monkeypatch):
-    """A real git primary at <root>/vivy with two commits; returns (c1, c2)."""
+    """A real git primary at <root>/cartographer with two commits; returns (c1, c2)."""
     import subprocess
     monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
     monkeypatch.setattr(W, "in_use_map", lambda: {})
-    primary = tmp_path / "vivy"
+    primary = tmp_path / "cartographer"
     primary.mkdir()
 
     def git(*a):
@@ -607,7 +1075,7 @@ def _head_of(path):
 
 def test_allocate_pins_new_worktree_to_commit(tmp_path, monkeypatch):
     c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)
-    wt = W.allocate_worktree("vivy", "reviewer-x", commit=c1)
+    wt = W.allocate_worktree("cartographer", "reviewer-x", commit=c1)
     assert _head_of(wt) == c1  # detached at the pinned (older) commit, not main's tip
 
 
@@ -615,18 +1083,18 @@ def test_allocate_reuse_force_resets_to_commit(tmp_path, monkeypatch):
     # The stale-review fix: a reused review worktree must be forced to the new
     # head, not returned as-is at its round-1 HEAD.
     c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)
-    wt1 = W.allocate_worktree("vivy", "reviewer-x", commit=c1)
+    wt1 = W.allocate_worktree("cartographer", "reviewer-x", commit=c1)
     assert _head_of(wt1) == c1
-    wt2 = W.allocate_worktree("vivy", "reviewer-x", commit=c2)  # same purpose → reuse
+    wt2 = W.allocate_worktree("cartographer", "reviewer-x", commit=c2)  # same purpose → reuse
     assert wt2 == wt1 and _head_of(wt2) == c2  # force-reset to the new head
 
 
 def test_allocate_reuse_pin_discards_local_dirt(tmp_path, monkeypatch):
     c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)
-    wt = W.allocate_worktree("vivy", "reviewer-x", commit=c1)
+    wt = W.allocate_worktree("cartographer", "reviewer-x", commit=c1)
     (wt / "f.py").write_text("tampered\n")        # a stray edit in the review tree
     (wt / "junk.txt").write_text("debris\n")
-    W.allocate_worktree("vivy", "reviewer-x", commit=c2)  # re-pin
+    W.allocate_worktree("cartographer", "reviewer-x", commit=c2)  # re-pin
     assert _head_of(wt) == c2
     assert (wt / "f.py").read_text() == "v = 2\n"  # reset --hard restored tracked
     assert not (wt / "junk.txt").exists()          # clean -fdx removed untracked
@@ -635,19 +1103,262 @@ def test_allocate_reuse_pin_discards_local_dirt(tmp_path, monkeypatch):
 def test_pin_refused_on_primary(tmp_path, monkeypatch):
     c1, _ = _real_repo_with_two_commits(tmp_path, monkeypatch)
     with pytest.raises(ValueError, match="primary"):
-        W.allocate_worktree("vivy", None, commit=c1)  # never hard-reset the human's tree
+        W.allocate_worktree("cartographer", None, commit=c1)  # never hard-reset the human's tree
 
 
 def test_pin_bogus_commit_raises(tmp_path, monkeypatch):
     _real_repo_with_two_commits(tmp_path, monkeypatch)
     with pytest.raises(W.WorktreePinError):
-        W.allocate_worktree("vivy", "reviewer-y", commit="deadbeef" * 5)
+        W.allocate_worktree("cartographer", "reviewer-y", commit="deadbeef" * 5)
+
+
+# --- report_created (round-3 security review, issue_01M5CSFQ6XGEB7JVA0ATF3EN32) ---
+#
+# `bin/agentctl`'s swift-resolve gate must know, from `allocate_worktree`
+# itself, whether THIS call actually created the worktree — a reused
+# `commit=None` target is handed back completely unreset, so nothing about
+# its content proves what a prior dispatch left there.
+
+
+def test_report_created_true_for_a_brand_new_worktree(tmp_path, monkeypatch):
+    _real_repo_with_two_commits(tmp_path, monkeypatch)
+    path, created = W.allocate_worktree("cartographer", "coder-x", report_created=True)
+    assert created is True
+    assert path == W.desired_path("cartographer", "coder-x")
+
+
+def test_report_created_false_for_a_reused_unpinned_worktree(tmp_path, monkeypatch):
+    _real_repo_with_two_commits(tmp_path, monkeypatch)
+    path1, created1 = W.allocate_worktree("cartographer", "coder-x", report_created=True)
+    assert created1 is True
+    path2, created2 = W.allocate_worktree("cartographer", "coder-x", report_created=True)
+    assert (path2, created2) == (path1, False)
+
+
+def test_report_created_false_for_a_reused_pinned_worktree(tmp_path, monkeypatch):
+    c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)
+    path1, created1 = W.allocate_worktree("cartographer", "reviewer-x", commit=c1, report_created=True)
+    assert created1 is True
+    path2, created2 = W.allocate_worktree("cartographer", "reviewer-x", commit=c2, report_created=True)
+    assert (path2, created2) == (path1, False)
+
+
+def test_report_created_defaults_to_the_plain_path_when_omitted(tmp_path, monkeypatch):
+    """Every caller that doesn't ask for `report_created` keeps getting a bare
+    `Path` back — this kwarg must not change the default return shape."""
+    _real_repo_with_two_commits(tmp_path, monkeypatch)
+    path = W.allocate_worktree("cartographer", "coder-x")
+    assert path == W.desired_path("cartographer", "coder-x")
+
+
+# --- fetch_origin_first (platform/specs/reviewers-run-under-their-allow-list) ---
+
+
+def _add_fake_origin(primary, tmp_path, monkeypatch):
+    """A bare `origin` remote for `primary`, with one `fetch` call instrumented —
+    returns a path whose mtime changes on every fetch, so a test can show whether
+    this call actually ran a fetch at all, not merely that it skipped the
+    not-present-locally branch (which would also leave the commit present)."""
+    import subprocess
+
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(primary), "remote", "add", "origin", str(origin)],
+                   check=True, capture_output=True)
+    calls = tmp_path / "fetch-calls.txt"
+    calls.write_text("")
+    real_git = W._git
+
+    def spy(repo, *args, **kwargs):
+        if args[:2] == ("fetch", "origin"):
+            with calls.open("a") as f:
+                f.write("fetch\n")
+        return real_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(W, "_git", spy)
+    return calls
+
+
+def test_fetch_origin_first_fetches_even_when_the_commit_is_already_present(
+        tmp_path, monkeypatch):
+    """The fix itself: a review-class dispatch's allow-list grants no `git fetch`
+    at all, so this pin is its only chance to see a fresh `origin/main` — even on
+    a re-dispatch onto a worktree that already has the pinned commit, where the
+    OLD (every other caller's) behavior skips the fetch entirely."""
+    c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)
+    calls = _add_fake_origin(tmp_path / "cartographer", tmp_path, monkeypatch)
+    wt = W.allocate_worktree("cartographer", "reviewer-x", commit=c1)
+    assert _head_of(wt) == c1
+    calls.write_text("")  # only count the SECOND call below
+
+    W.allocate_worktree("cartographer", "reviewer-x", commit=c1, fetch_origin_first=True)
+    assert calls.read_text().strip() == "fetch", \
+        "fetch_origin_first=True must fetch even though the commit was already present"
+
+
+def test_without_fetch_origin_first_a_present_commit_skips_the_fetch(tmp_path, monkeypatch):
+    """The unchanged default: every caller before this parameter existed, and
+    every non-review caller today, never pays for a fetch it does not need."""
+    c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)
+    calls = _add_fake_origin(tmp_path / "cartographer", tmp_path, monkeypatch)
+    W.allocate_worktree("cartographer", "reviewer-x", commit=c1)
+    calls.write_text("")
+
+    W.allocate_worktree("cartographer", "reviewer-x", commit=c1)  # fetch_origin_first defaults False
+    assert calls.read_text() == "", \
+        "the commit was already present locally; this must not have fetched at all"
+
+
+def test_fetch_origin_first_on_a_brand_new_worktree_still_fetches_once(tmp_path, monkeypatch):
+    """`_git_worktree_add`'s own branch (no existing target) must thread the same
+    parameter — not only the reuse/re-pin path `_pin_existing_to_commit` covers."""
+    c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)
+    calls = _add_fake_origin(tmp_path / "cartographer", tmp_path, monkeypatch)
+    wt = W.allocate_worktree("cartographer", "reviewer-x", commit=c1, fetch_origin_first=True)
+    assert _head_of(wt) == c1
+    assert calls.read_text().strip() == "fetch"
+
+
+# --- a new branch is cut from a FRESH origin/main, not a stale local main (CQ-245) ---
+
+
+def _repo_with_origin_ahead_of_local_main(tmp_path, monkeypatch):
+    """A real `cartographer` primary cloned from an `origin` remote, where `origin/main` has
+    since moved ahead of the primary's own local `main` — e.g. something else pushed
+    to the shared remote while this checkout never pulled. Returns
+    (primary, local_main_sha, origin_main_sha), the two deliberately different so a
+    test can tell which one a new branch was actually cut from."""
+    import subprocess
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    monkeypatch.setattr(W, "in_use_map", lambda: {})
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    primary = tmp_path / "cartographer"
+    subprocess.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
+
+    def g(*a):
+        return subprocess.run(
+            ["git", "-C", str(primary), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True)
+
+    (primary / "f.py").write_text("v = 1\n")
+    g("add", ".")
+    g("commit", "-qm", "c1")
+    g("push", "-q", "origin", "main")
+    local_main = g("rev-parse", "HEAD").stdout.strip()
+
+    # Advance origin's main from a second clone, so the primary's own local main
+    # does not move with it — the drift that produced CQ-245.
+    other_clone = tmp_path / "other-clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(other_clone)], check=True)
+
+    def g2(*a):
+        return subprocess.run(
+            ["git", "-C", str(other_clone), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True)
+
+    (other_clone / "f.py").write_text("v = 2\n")
+    g2("commit", "-qam", "c2")
+    g2("push", "-q", "origin", "main")
+    origin_main = g2("rev-parse", "HEAD").stdout.strip()
+
+    return primary, local_main, origin_main
+
+
+def test_new_branch_starts_at_origin_main_not_a_stale_local_main(tmp_path, monkeypatch):
+    primary, local_main, origin_main = _repo_with_origin_ahead_of_local_main(tmp_path, monkeypatch)
+    assert local_main != origin_main, "the fixture must leave the two refs apart"
+    wt = W.allocate_worktree("cartographer", "coder-x")
+    assert _head_of(wt) == origin_main, \
+        "a new coder branch must be cut from origin/main, not the primary's own stale main"
+
+
+def test_new_branch_with_no_origin_remote_cuts_from_local_main(tmp_path, monkeypatch):
+    c1, c2 = _real_repo_with_two_commits(tmp_path, monkeypatch)  # no origin remote at all
+    wt = W.allocate_worktree("cartographer", "coder-x")
+    assert _head_of(wt) == c2, "with no origin remote, local main's own tip is the only base"
+
+
+def test_new_branch_refuses_when_origin_has_no_main_ref(tmp_path, monkeypatch):
+    """`origin` exists but was never pushed a `main` (e.g. a default-branch rename) —
+    refusing beats silently falling back to local main (ARCH-184's reasoning, applied
+    to a fresh-branch base rather than a pinned commit)."""
+    import subprocess
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    monkeypatch.setattr(W, "in_use_map", lambda: {})
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "trunk", str(origin)], check=True)
+    primary = tmp_path / "cartographer"
+    subprocess.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
+
+    def g(*a):
+        return subprocess.run(
+            ["git", "-C", str(primary), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True)
+
+    (primary / "f.py").write_text("v = 1\n")
+    g("add", ".")
+    g("commit", "-qm", "c1")
+    g("push", "-q", "origin", "trunk")
+
+    with pytest.raises(ValueError, match="refs/remotes/origin/main"):
+        W.allocate_worktree("cartographer", "coder-x")
+    assert not W.desired_path("cartographer", "coder-x").exists(), \
+        "a refused allocation must not leave a worktree behind"
+
+
+def test_new_branch_refuses_when_origin_fetch_fails(tmp_path, monkeypatch):
+    """A fetch that fails outright (network down, credential refused, a GitHub
+    outage) must refuse the dispatch, not fall through to whatever
+    `origin/main` was cached from the primary's last successful fetch — the
+    same CQ-245 defect, with `fetch` itself failing rather than merely never
+    having been run."""
+    import subprocess
+    primary, local_main, origin_main = _repo_with_origin_ahead_of_local_main(tmp_path, monkeypatch)
+    assert local_main != origin_main, "the fixture must leave the two refs apart"
+    cached = subprocess.run(
+        ["git", "-C", str(primary), "rev-parse", "refs/remotes/origin/main"],
+        check=True, capture_output=True, text=True).stdout.strip()
+    assert cached == local_main, \
+        "the stale ref must already be cached before the remote is broken"
+
+    subprocess.run(
+        ["git", "-C", str(primary), "remote", "set-url", "origin",
+         str(tmp_path / "does-not-exist.git")],
+        check=True)
+
+    with pytest.raises(ValueError, match="git fetch origin failed"):
+        W.allocate_worktree("cartographer", "coder-x")
+    assert not W.desired_path("cartographer", "coder-x").exists(), \
+        "a refused allocation must not leave a worktree behind"
+    branch_check = subprocess.run(
+        ["git", "-C", str(primary), "rev-parse", "--verify",
+         "refs/heads/agent/coder-x"],
+        capture_output=True, text=True)
+    assert branch_check.returncode != 0, \
+        "a refused allocation must not leave a branch behind either"
+
+
+def test_new_branch_ignores_a_tag_shadowing_origin_main(tmp_path, monkeypatch):
+    """A tag literally named `origin/main` resolves ahead of the remote-tracking
+    branch under a bare `git rev-parse origin/main` (agent-platform#681, #682) —
+    `_fresh_base_sha` must resolve the qualified `refs/remotes/origin/main`, not
+    fall into that shadow."""
+    import subprocess
+    primary, local_main, origin_main = _repo_with_origin_ahead_of_local_main(tmp_path, monkeypatch)
+    assert local_main != origin_main, "the fixture must leave the two refs apart"
+    subprocess.run(["git", "-C", str(primary), "tag", "origin/main", local_main],
+                   check=True)
+
+    wt = W.allocate_worktree("cartographer", "coder-x")
+    assert _head_of(wt) == origin_main, \
+        "a tag named origin/main must not shadow the remote-tracking branch"
 
 
 # --- PR-branch reuse (ARCH-347, the round-fix divergence fix) ----------------
 
 def _repo_with_origin_and_pr_branch(tmp_path, monkeypatch, branch="agent/coder-fix-x"):
-    """A real `vivy` primary with an `origin` remote and an existing PR branch pushed to
+    """A real `cartographer` primary with an `origin` remote and an existing PR branch pushed to
     it — the shape allocate_on_branch operates on. Returns (primary, branch, pr_tip).
 
     The local branch ref is deleted after push so the branch lives ONLY on origin, which
@@ -658,7 +1369,7 @@ def _repo_with_origin_and_pr_branch(tmp_path, monkeypatch, branch="agent/coder-f
     monkeypatch.setattr(W, "in_use_map", lambda: {})
     origin = tmp_path / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
-    primary = tmp_path / "vivy"
+    primary = tmp_path / "cartographer"
     subprocess.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
 
     def g(*a):
@@ -682,16 +1393,111 @@ def _repo_with_origin_and_pr_branch(tmp_path, monkeypatch, branch="agent/coder-f
 
 def test_allocate_on_branch_creates_on_pr_branch_at_origin_tip(tmp_path, monkeypatch):
     primary, branch, pr_tip = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    assert W.find_worktree_on_branch("vivy", branch) is None  # no tree holds it yet
-    wt = W.allocate_on_branch("vivy", branch)
+    assert W.find_worktree_on_branch("cartographer", branch) is None  # no tree holds it yet
+    wt = W.allocate_on_branch("cartographer", branch)
     assert _head_of(wt) == pr_tip                              # at the live PR tip
-    assert W.find_worktree_on_branch("vivy", branch) == wt     # and now findable
+    assert W.find_worktree_on_branch("cartographer", branch) == wt     # and now findable
+
+
+def test_allocate_on_branch_refuses_a_branch_that_commits_its_own_venv(
+        tmp_path, monkeypatch):
+    """A PR branch that commits its own `.venv/bin/python` is refused when a
+    round-fix allocates a worktree onto it — the preflight that would later
+    run `<worktree>/.venv/bin/python --version` never gets the chance,
+    because `_link_primary_venv` refuses before that script exists anywhere
+    reachable from this test's own assertion."""
+    import subprocess
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    monkeypatch.setattr(W, "in_use_map", lambda: {})
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    primary = tmp_path / "sample"
+    subprocess.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
+
+    def g(*a):
+        return subprocess.run(
+            ["git", "-C", str(primary), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True)
+
+    (primary / "f.py").write_text("v = 1\n")
+    g("add", ".")
+    g("commit", "-qm", "c1")
+    g("push", "-q", "origin", "main")
+
+    branch = "agent/coder-fix-venv"
+    g("checkout", "-q", "-b", branch)
+    marker = tmp_path / "ran-the-branchs-own-venv"
+    venv_bin = primary / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    committed_python = venv_bin / "python"
+    committed_python.write_text(f"#!/bin/sh\ntouch {marker}\n")
+    committed_python.chmod(0o755)
+    g("add", "-f", ".venv")
+    g("commit", "-qm", "commits its own venv")
+    g("push", "-q", "origin", branch)
+    g("checkout", "-q", "main")
+    g("branch", "-qD", branch)
+
+    # The primary's own, legitimate .venv — written after the branch dance
+    # above so it reflects the primary checkout's actual on-disk state, the
+    # same state `_link_primary_venv` reads at allocation time.
+    primary_python = primary / ".venv" / "bin" / "python"
+    primary_python.parent.mkdir(parents=True, exist_ok=True)
+    primary_python.write_text("#!/bin/sh\nexit 0\n")
+    primary_python.chmod(0o755)
+
+    with pytest.raises(W.WorktreeVenvConflict):
+        W.allocate_on_branch("sample", branch)
+
+    assert not marker.exists()
+
+
+def test_allocate_on_branch_still_dispatches_with_an_ordinary_primary_venv(
+        tmp_path, monkeypatch):
+    """A worktree allocated onto a branch that carries no `.venv` of its own
+    still gets the primary's `.venv` symlinked in — the refusal above is
+    specific to a worktree carrying a real `.venv`, not to every branch
+    allocated against a primary that has one."""
+    import subprocess
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    monkeypatch.setattr(W, "in_use_map", lambda: {})
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    primary = tmp_path / "sample"
+    subprocess.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
+
+    def g(*a):
+        return subprocess.run(
+            ["git", "-C", str(primary), "-c", "user.email=t@t", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True)
+
+    (primary / "f.py").write_text("v = 1\n")
+    g("add", ".")
+    g("commit", "-qm", "c1")
+    g("push", "-q", "origin", "main")
+    branch = "agent/coder-fix-x"
+    g("checkout", "-q", "-b", branch)
+    (primary / "f.py").write_text("v = 2\n")
+    g("commit", "-qam", "pr head")
+    g("push", "-q", "origin", branch)
+    g("checkout", "-q", "main")
+    g("branch", "-qD", branch)  # branch now lives only on origin
+
+    (primary / ".venv" / "bin").mkdir(parents=True)
+    (primary / ".venv" / "bin" / "python").write_text("#!/bin/sh\necho 3.11.0\n")
+    (primary / ".venv" / "bin" / "python").chmod(0o755)
+
+    wt = W.allocate_on_branch("sample", branch)
+
+    venv = wt / ".venv"
+    assert venv.is_symlink()
+    assert venv.resolve() == (primary / ".venv").resolve()
 
 
 def test_allocate_on_branch_reuses_the_same_tree(tmp_path, monkeypatch):
     primary, branch, pr_tip = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    wt1 = W.allocate_on_branch("vivy", branch)
-    wt2 = W.allocate_on_branch("vivy", branch)   # a round-2 fix reuses, never forks
+    wt1 = W.allocate_on_branch("cartographer", branch)
+    wt2 = W.allocate_on_branch("cartographer", branch)   # a round-2 fix reuses, never forks
     assert wt2 == wt1
 
 
@@ -701,7 +1507,7 @@ def test_allocate_on_branch_resets_reused_tree_to_new_origin_tip(tmp_path, monke
     guarantee the review pin makes. The tree stays clean, so the clobber-guard is silent."""
     import subprocess
     primary, branch, pr_tip = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    wt = W.allocate_on_branch("vivy", branch)
+    wt = W.allocate_on_branch("cartographer", branch)
     assert _head_of(wt) == pr_tip
 
     # Advance the PR branch on origin from a SEPARATE clone, leaving `wt` behind + clean.
@@ -720,7 +1526,7 @@ def test_allocate_on_branch_resets_reused_tree_to_new_origin_tip(tmp_path, monke
     new_tip = g(other, "rev-parse", "HEAD").stdout.strip()
     assert new_tip != pr_tip
 
-    wt2 = W.allocate_on_branch("vivy", branch)       # reuse — must ff to the new tip
+    wt2 = W.allocate_on_branch("cartographer", branch)       # reuse — must ff to the new tip
     assert wt2 == wt and _head_of(wt2) == new_tip
     assert (wt2 / "f.py").read_text() == "v = 3\n"
 
@@ -743,7 +1549,7 @@ def test_allocate_on_branch_creates_at_the_exact_remote_tracking_tip(tmp_path, m
                             capture_output=True, text=True, check=True).stdout.strip()
     assert forged != pr_tip
     _plant_branch_decoys(primary, branch, forged)
-    wt = W.allocate_on_branch("vivy", branch)
+    wt = W.allocate_on_branch("cartographer", branch)
     assert _head_of(wt) == pr_tip
     upstream = subprocess.run(
         ["git", "-C", str(wt), "for-each-ref", "--format=%(upstream)", f"refs/heads/{branch}"],
@@ -772,15 +1578,15 @@ def test_allocate_on_branch_refuses_a_tag_standing_in_for_an_absent_remote_ref(
                                capture_output=True, text=True).stdout.strip()
     assert stands_in == pr_tip, "the fixture must make the qualified name resolve, or it tests nothing"
     with pytest.raises(W.WorktreePinError, match="not found after fetch"):
-        W.allocate_on_branch("vivy", branch)
-    assert W.find_worktree_on_branch("vivy", branch) is None
+        W.allocate_on_branch("cartographer", branch)
+    assert W.find_worktree_on_branch("cartographer", branch) is None
 
 
 def test_allocate_on_branch_reset_takes_the_exact_remote_tracking_tip(tmp_path, monkeypatch):
     """The reuse path's `reset --hard` and its ahead-count read `origin/<branch>`."""
     import subprocess
     primary, branch, pr_tip = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    wt = W.allocate_on_branch("vivy", branch)
+    wt = W.allocate_on_branch("cartographer", branch)
     origin = tmp_path / "origin.git"
     other = tmp_path / "other"
     subprocess.run(["git", "clone", "-q", "-b", branch, str(origin), str(other)], check=True)
@@ -795,7 +1601,7 @@ def test_allocate_on_branch_reset_takes_the_exact_remote_tracking_tip(tmp_path, 
     g(other, "push", "-q", "origin", branch)
     new_tip = g(other, "rev-parse", "HEAD").stdout.strip()
     _plant_branch_decoys(primary, branch, pr_tip)      # the stale tip, as a tag and a branch
-    wt2 = W.allocate_on_branch("vivy", branch)
+    wt2 = W.allocate_on_branch("cartographer", branch)
     assert wt2 == wt
     assert _head_of(wt2) == new_tip
     assert (wt2 / "f.py").read_text() == "v = 3\n"
@@ -805,10 +1611,10 @@ def test_allocate_on_branch_refuses_to_clobber_unlanded_work(tmp_path, monkeypat
     """The guardrail: a reused tree carrying uncommitted work is NOT reset away. A
     round-fix between rounds is clean, so dirt means something we must not lose."""
     primary, branch, _ = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    wt = W.allocate_on_branch("vivy", branch)
+    wt = W.allocate_on_branch("cartographer", branch)
     (wt / "important.py").write_text("uncommitted work\n")   # real, non-debris
     with pytest.raises(W.WorktreePinError, match="uncommitted"):
-        W.allocate_on_branch("vivy", branch)
+        W.allocate_on_branch("cartographer", branch)
     assert (wt / "important.py").exists()                    # not clobbered
 
 
@@ -819,7 +1625,7 @@ def test_allocate_on_branch_refuses_committed_but_unpublished_work(tmp_path, mon
     ahead-count catches it. Losing those commits has no recovery path."""
     import subprocess
     primary, branch, _ = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    wt = W.allocate_on_branch("vivy", branch)
+    wt = W.allocate_on_branch("cartographer", branch)
 
     def g(*a):
         return subprocess.run(
@@ -830,7 +1636,7 @@ def test_allocate_on_branch_refuses_committed_but_unpublished_work(tmp_path, mon
     g("commit", "-qam", "committed but never published")   # clean tree, HEAD ahead of origin
     saved = g("rev-parse", "HEAD").stdout.strip()
     with pytest.raises(W.WorktreePinError, match="never published"):
-        W.allocate_on_branch("vivy", branch)
+        W.allocate_on_branch("cartographer", branch)
     assert g("rev-parse", "HEAD").stdout.strip() == saved   # the commit survives
 
 
@@ -860,7 +1666,7 @@ def test_allocate_on_branch_imports_a_dead_dispatchers_commit_before_refusing_to
     published" refusal does its job cleanly instead of either outcome."""
     import run_sandbox as RS
     primary, branch, pr_tip = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    wt = W.allocate_on_branch("vivy", branch)
+    wt = W.allocate_on_branch("cartographer", branch)
 
     git_dir = RS.git_common_dir(wt)
     private_dir = RS.run_private_objects_dir(wt, git_dir)
@@ -878,7 +1684,7 @@ def test_allocate_on_branch_imports_a_dead_dispatchers_commit_before_refusing_to
     # The commit is reachable only through `private_dir` at this point.
 
     with pytest.raises(W.WorktreePinError, match="never published"):
-        W.allocate_on_branch("vivy", branch)
+        W.allocate_on_branch("cartographer", branch)
 
     # The reset never ran — HEAD is exactly where the dead run left it.
     assert _sp.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
@@ -899,7 +1705,7 @@ def test_allocate_on_branch_refuses_when_the_ahead_check_itself_errors(tmp_path,
     (not the private-store case, which is covered by the import above) must still refuse
     rather than fall through to `reset --hard`."""
     primary, branch, pr_tip = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    W.allocate_on_branch("vivy", branch)
+    W.allocate_on_branch("cartographer", branch)
 
     real_git = W._git
 
@@ -911,7 +1717,7 @@ def test_allocate_on_branch_refuses_when_the_ahead_check_itself_errors(tmp_path,
     monkeypatch.setattr(W, "_git", fake_git)
 
     with pytest.raises(W.WorktreePinError, match="could not determine"):
-        W.allocate_on_branch("vivy", branch)
+        W.allocate_on_branch("cartographer", branch)
 
 
 def test_allocate_on_branch_create_path_refuses_when_the_ahead_check_itself_errors(
@@ -932,7 +1738,7 @@ def test_allocate_on_branch_create_path_refuses_when_the_ahead_check_itself_erro
                     check=True, capture_output=True, text=True).stdout.strip()
     _sp.run(["git", "-C", str(primary), "update-ref", f"refs/heads/{branch}", extra],
             check=True, capture_output=True)
-    assert W.find_worktree_on_branch("vivy", branch) is None
+    assert W.find_worktree_on_branch("cartographer", branch) is None
 
     real_git = W._git
 
@@ -945,23 +1751,349 @@ def test_allocate_on_branch_create_path_refuses_when_the_ahead_check_itself_erro
     monkeypatch.setattr(W, "_git", fake_git)
 
     with pytest.raises(W.WorktreePinError, match="could not determine"):
-        W.allocate_on_branch("vivy", branch)
+        W.allocate_on_branch("cartographer", branch)
 
     # The ref was never force-moved, and no worktree got created on the stale tip.
     assert _sp.run(["git", "-C", str(primary), "rev-parse", f"refs/heads/{branch}"],
                    check=True, capture_output=True, text=True).stdout.strip() == extra
-    assert W.find_worktree_on_branch("vivy", branch) is None
+    assert W.find_worktree_on_branch("cartographer", branch) is None
 
 
 def test_allocate_on_branch_missing_origin_branch_raises(tmp_path, monkeypatch):
     primary, branch, _ = _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
     with pytest.raises(W.WorktreePinError, match="not found after fetch"):
-        W.allocate_on_branch("vivy", "agent/no-such-branch")
+        W.allocate_on_branch("cartographer", "agent/no-such-branch")
 
 
 def test_find_worktree_on_branch_absent_is_none(tmp_path, monkeypatch):
     _repo_with_origin_and_pr_branch(tmp_path, monkeypatch)
-    assert W.find_worktree_on_branch("vivy", "agent/nope") is None
+    assert W.find_worktree_on_branch("cartographer", "agent/nope") is None
+
+
+# --- commit_in_pr (agentctl spawn --pr N --review-sha S, agent-platform#1004) --
+
+def _repo_with_a_pr(tmp_path, monkeypatch, *, merge_strategy=None):
+    """A real `demo` primary + bare `origin`, with a two-commit PR branch pushed
+    to `refs/pull/42/head` (GitHub's own ref, kept for the PR's life even once its
+    named branch is deleted) and, when `merge_strategy` is given, folded into
+    `main` the way GitHub actually does it: "merge" makes a real two-parent merge
+    commit (this repo's own actual strategy); "squash" makes a single new commit
+    on `main` with no graph link back to the branch at all. `None` leaves the PR
+    open and unmerged.
+
+    Returns (primary, base_only, round1, round2, merge_commit) — `base_only` is
+    the repo's own root commit, on `main` before the PR branched at all;
+    `merge_commit` is the resulting commit's sha on `main`, or None when
+    `merge_strategy` is None."""
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    origin = tmp_path / "origin.git"
+    _sp.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    primary = tmp_path / "demo"
+    _sp.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
+
+    def g(*a):
+        return _sp.run(
+            ["git", "-C", str(primary), "-c", "user.email=t@t.example", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True)
+
+    (primary / "f.py").write_text("v = 1\n")
+    g("add", ".")
+    g("commit", "-qm", "c1")
+    g("push", "-q", "origin", "main")
+    base_only = g("rev-parse", "HEAD").stdout.strip()
+
+    g("checkout", "-q", "-b", "prbranch")
+    (primary / "round1.txt").write_text("round1\n")
+    g("add", "-A")
+    g("commit", "-qm", "round1")
+    round1 = g("rev-parse", "HEAD").stdout.strip()
+    (primary / "round2.txt").write_text("round2\n")
+    g("add", "-A")
+    g("commit", "-qm", "round2")
+    round2 = g("rev-parse", "HEAD").stdout.strip()
+    g("push", "-q", "origin", "HEAD:refs/pull/42/head")
+
+    merge_commit = None
+    g("checkout", "-q", "main")
+    if merge_strategy == "merge":
+        g("merge", "-q", "--no-ff", "-m", "Merge pull request #42", "prbranch")
+        merge_commit = g("rev-parse", "HEAD").stdout.strip()
+        g("push", "-q", "origin", "main")
+    elif merge_strategy == "squash":
+        g("merge", "-q", "--squash", "prbranch")
+        g("commit", "-qm", "Squashed PR #42")
+        merge_commit = g("rev-parse", "HEAD").stdout.strip()
+        g("push", "-q", "origin", "main")
+    if merge_strategy:
+        g("branch", "-qD", "prbranch")  # GitHub deletes a merged PR's branch
+    return primary, base_only, round1, round2, merge_commit
+
+
+def test_commit_in_pr_accepts_the_head_and_an_earlier_commit_after_a_true_merge_commit(
+        tmp_path, monkeypatch):
+    """Reproduces the reviewer's finding against agent-platform#1004: once a PR
+    merges with a true two-parent merge commit — this repo's own actual merge
+    strategy, e.g. PR #1000's own `ee48c3d36` — the PR's head is an ancestor of
+    `main`'s current tip, so a fork point recomputed as merge-base(head, main)
+    degenerates to the head itself and would reject every one of the PR's own
+    commits, head included.
+
+    This is also the only reachable shape in which `commit_in_pr`'s cut point
+    (`merge_commit^1`, rather than `merge_commit` itself or the base's live
+    tip) is load-bearing: only a true merge commit gives the PR's head a
+    second parent that makes it an ancestor of `merge_commit`, so cutting at
+    `merge_commit` itself would wrongly read every PR commit as already on
+    base. A squash or rebase merge's commit(s) on the base, by contrast, are
+    folded or replayed with no graph edge back to the PR's own original
+    commits at all (`refs/pull/N/head`), so for those strategies every
+    candidate cut point gives the same answer and the squash and rebase
+    tests below exercise only acceptance of the PR's own commits and
+    refusal of a base-only commit, not the choice of cut point."""
+    _primary, _base_only, round1, round2, merge_commit = _repo_with_a_pr(
+        tmp_path, monkeypatch, merge_strategy="merge")
+    assert merge_commit is not None
+    assert W.commit_in_pr("demo", 42, "main", round2, merge_commit=merge_commit) is None
+    assert W.commit_in_pr("demo", 42, "main", round1, merge_commit=merge_commit) is None
+
+
+def test_commit_in_pr_refuses_a_base_only_commit_after_a_true_merge_commit(
+        tmp_path, monkeypatch):
+    _primary, base_only, _round1, _round2, merge_commit = _repo_with_a_pr(
+        tmp_path, monkeypatch, merge_strategy="merge")
+    problem = W.commit_in_pr("demo", 42, "main", base_only, merge_commit=merge_commit)
+    assert problem is not None and "before PR #42 began" in problem
+
+
+def test_commit_in_pr_accepts_the_head_and_an_earlier_commit_after_a_squash_merge(
+        tmp_path, monkeypatch):
+    """A squash merge leaves `refs/pull/42/head` holding the PR's own original,
+    unsquashed commits (GitHub never rewrites it) — unlike the true-merge-commit
+    case, the squash commit on `main` has no graph link back to them at all, so
+    the cut point is never exercised here; this guards only that the PR's own
+    commits are accepted and a base-only commit is refused, confirmed so the
+    fix does not regress it."""
+    _primary, _base_only, round1, round2, merge_commit = _repo_with_a_pr(
+        tmp_path, monkeypatch, merge_strategy="squash")
+    assert merge_commit is not None
+    assert W.commit_in_pr("demo", 42, "main", round2, merge_commit=merge_commit) is None
+    assert W.commit_in_pr("demo", 42, "main", round1, merge_commit=merge_commit) is None
+
+
+def test_commit_in_pr_refuses_a_base_only_commit_after_a_squash_merge(tmp_path, monkeypatch):
+    _primary, base_only, _round1, _round2, merge_commit = _repo_with_a_pr(
+        tmp_path, monkeypatch, merge_strategy="squash")
+    problem = W.commit_in_pr("demo", 42, "main", base_only, merge_commit=merge_commit)
+    assert problem is not None and "before PR #42 began" in problem
+
+
+def test_commit_in_pr_unaffected_for_an_open_pr(tmp_path, monkeypatch):
+    """The OPEN-PR case (`merge_commit=None`) is unaffected by the fix: a PR
+    commit is accepted, a commit already on `main` before the PR began is
+    not."""
+    _primary, base_only, round1, round2, merge_commit = _repo_with_a_pr(tmp_path, monkeypatch)
+    assert merge_commit is None
+    assert W.commit_in_pr("demo", 42, "main", round2) is None
+    assert W.commit_in_pr("demo", 42, "main", round1) is None
+    problem = W.commit_in_pr("demo", 42, "main", base_only)
+    assert problem is not None and "before PR #42 began" in problem
+
+
+def test_commit_in_pr_membership_check_distinguishes_a_git_error_from_not_already_on_base(
+        tmp_path, monkeypatch):
+    """`base_only` is the repo's own root commit — it has no parent, so passing
+    it as `merge_commit` makes `<base_only>^1` unresolvable: a synthetic git
+    failure (never the shape of a real GitHub merge commit), used only to prove
+    `commit_in_pr` reports a git failure with its own message rather than
+    reading it as a legitimate "not already on base" result (security review,
+    agent-platform#1004)."""
+    _primary, base_only, round1, _round2, _merge_commit = _repo_with_a_pr(
+        tmp_path, monkeypatch, merge_strategy="merge")
+    problem = W.commit_in_pr("demo", 42, "main", round1, merge_commit=base_only)
+    assert problem is not None
+    assert "before PR #42 began" not in problem
+    assert "git exited" in problem
+
+
+def _repo_with_a_rebase_merged_pr(tmp_path, monkeypatch):
+    """A real `demo` primary + bare `origin`, with a three-commit PR branch pushed
+    to `refs/pull/42/head`, `main` advanced by one commit after the PR branched,
+    then the PR folded in the way GitHub's "Rebase and merge" actually does it:
+    each PR commit is replayed onto the advanced `main` as a brand-new commit
+    (own committer identity, so its id differs from the original even though the
+    diff and message match), and `main` fast-forwards to the last of those
+    replayed commits. `main` is then advanced by one more commit after the merge.
+
+    Returns (primary, base_only, first, middle, head, base_advanced, merge_commit,
+    first_rebased, post_merge):
+    - `base_only`: `main`'s root commit, before the PR branched.
+    - `first`, `middle`, `head`: the PR's own three original commits, as
+      `refs/pull/42/head` records them.
+    - `base_advanced`: `main`'s tip after the PR branched but before it merged.
+    - `merge_commit`: the last replayed commit — GitHub's reported `mergeCommit`
+      for a rebase merge.
+    - `first_rebased`: the replayed commit standing in for `first`, with a
+      different id from it.
+    - `post_merge`: `main`'s tip after the merge landed."""
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    origin = tmp_path / "origin.git"
+    _sp.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    primary = tmp_path / "demo"
+    _sp.run(["git", "clone", "-q", str(origin), str(primary)], check=True)
+
+    def g(*a):
+        return _sp.run(
+            ["git", "-C", str(primary), "-c", "user.email=t@t.example", "-c", "user.name=t", *a],
+            check=True, capture_output=True, text=True)
+
+    def g_rebase_identity(*a):
+        # A different committer identity from the PR's own commits, the same way
+        # GitHub's rebase-and-merge replay recommits each PR commit as itself
+        # rather than as the PR's author — enough on its own to give each
+        # replayed commit a new id even when its diff and message match.
+        return _sp.run(
+            ["git", "-C", str(primary),
+             "-c", "user.email=rebase-merge@rebase-merge.example", "-c", "user.name=rebase-merge",
+             *a],
+            check=True, capture_output=True, text=True)
+
+    (primary / "f.py").write_text("v = 1\n")
+    g("add", ".")
+    g("commit", "-qm", "c1")
+    g("push", "-q", "origin", "main")
+    base_only = g("rev-parse", "HEAD").stdout.strip()
+
+    g("checkout", "-q", "-b", "prbranch")
+    (primary / "first.txt").write_text("first\n")
+    g("add", "-A")
+    g("commit", "-qm", "first")
+    first = g("rev-parse", "HEAD").stdout.strip()
+    (primary / "middle.txt").write_text("middle\n")
+    g("add", "-A")
+    g("commit", "-qm", "middle")
+    middle = g("rev-parse", "HEAD").stdout.strip()
+    (primary / "head.txt").write_text("head\n")
+    g("add", "-A")
+    g("commit", "-qm", "head")
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("push", "-q", "origin", "HEAD:refs/pull/42/head")
+
+    g("checkout", "-q", "main")
+    (primary / "base_advanced.txt").write_text("base_advanced\n")
+    g("add", "-A")
+    g("commit", "-qm", "base advanced after the PR branched")
+    base_advanced = g("rev-parse", "HEAD").stdout.strip()
+    g("push", "-q", "origin", "main")
+
+    g("checkout", "-q", "-b", "rebase-temp")
+    g_rebase_identity("cherry-pick", first)
+    first_rebased = g("rev-parse", "HEAD").stdout.strip()
+    g_rebase_identity("cherry-pick", middle)
+    g_rebase_identity("cherry-pick", head)
+    merge_commit = g("rev-parse", "HEAD").stdout.strip()
+    assert merge_commit != head and first_rebased != first
+
+    g("checkout", "-q", "main")
+    g("merge", "-q", "--ff-only", "rebase-temp")
+    g("push", "-q", "origin", "main")
+    g("branch", "-qD", "rebase-temp", "prbranch")  # GitHub deletes a merged PR's branch
+
+    (primary / "post_merge.txt").write_text("post_merge\n")
+    g("add", "-A")
+    g("commit", "-qm", "landed after the rebase merge")
+    post_merge = g("rev-parse", "HEAD").stdout.strip()
+    g("push", "-q", "origin", "main")
+
+    return (primary, base_only, first, middle, head, base_advanced, merge_commit,
+            first_rebased, post_merge)
+
+
+def test_commit_in_pr_accepts_the_prs_own_commits_after_a_rebase_merge(tmp_path, monkeypatch):
+    """GitHub's third merge strategy, "Rebase and merge", replays each PR commit
+    onto the base as a new commit with a new id, so none of the PR's own
+    original commits ever becomes reachable from `main` at all; the cutpoint
+    formula (`merge_commit^1` vs. the live base tip vs. `merge_commit` itself)
+    is therefore never actually exercised by this fixture — like the squash
+    case above, this one was already sound before the fix and is kept only
+    to confirm the fix does not regress it. The cut point itself is
+    load-bearing only for a true merge commit and is pinned by
+    `test_commit_in_pr_accepts_the_head_and_an_earlier_commit_after_a_true_merge_commit`."""
+    _primary, _base_only, first, middle, head, _base_advanced, merge_commit, _first_rebased, \
+        _post_merge = _repo_with_a_rebase_merged_pr(tmp_path, monkeypatch)
+    assert W.commit_in_pr("demo", 42, "main", head, merge_commit=merge_commit) is None
+    assert W.commit_in_pr("demo", 42, "main", first, merge_commit=merge_commit) is None
+    assert W.commit_in_pr("demo", 42, "main", middle, merge_commit=merge_commit) is None
+
+
+def test_commit_in_pr_refuses_a_base_commit_from_before_the_pr_after_a_rebase_merge(
+        tmp_path, monkeypatch):
+    _primary, base_only, _first, _middle, _head, _base_advanced, merge_commit, _first_rebased, \
+        _post_merge = _repo_with_a_rebase_merged_pr(tmp_path, monkeypatch)
+    problem = W.commit_in_pr("demo", 42, "main", base_only, merge_commit=merge_commit)
+    assert problem is not None and "before PR #42 began" in problem
+
+
+def test_commit_in_pr_refuses_a_base_commit_landed_after_the_rebase_merge(tmp_path, monkeypatch):
+    _primary, _base_only, _first, _middle, _head, _base_advanced, merge_commit, _first_rebased, \
+        post_merge = _repo_with_a_rebase_merged_pr(tmp_path, monkeypatch)
+    problem = W.commit_in_pr("demo", 42, "main", post_merge, merge_commit=merge_commit)
+    assert problem is not None
+
+
+def test_commit_in_pr_refuses_a_replayed_commit_distinct_from_the_prs_own(tmp_path, monkeypatch):
+    """A rebase merge's replayed commits are not the PR's own commits as
+    `refs/pull/42/head` records them, even though one shares the PR's diff and
+    message — `commit_in_pr` must refuse it rather than mistake it for
+    membership."""
+    _primary, _base_only, _first, _middle, _head, _base_advanced, merge_commit, first_rebased, \
+        _post_merge = _repo_with_a_rebase_merged_pr(tmp_path, monkeypatch)
+    problem = W.commit_in_pr("demo", 42, "main", first_rebased, merge_commit=merge_commit)
+    assert problem is not None
+
+
+# Assembled from parts, rather than as one scheme-plus-authority literal, so
+# the fixture itself is not shaped like a credentialed connection string.
+_FETCH_FAILURE_CRED = "user" + ":" + "secret"
+
+
+def _credentialed_fetch_failure_stderr():
+    url = "https://" + _FETCH_FAILURE_CRED + "@example.invalid/x.git/"
+    return f"fatal: unable to access '{url}': The requested URL returned error: 403"
+
+
+def test_commit_in_pr_redacts_a_credentialed_url_from_the_head_fetch_failure(
+        tmp_path, monkeypatch):
+    _repo_with_a_pr(tmp_path, monkeypatch, merge_strategy="merge")
+    real_git = W._git
+
+    def spy(primary, *args, **kwargs):
+        if args and args[0] == "fetch" and "refs/pull/42/head" in args[-1]:
+            return _sp.CompletedProcess(
+                args, 1, stdout="", stderr=_credentialed_fetch_failure_stderr())
+        return real_git(primary, *args, **kwargs)
+    monkeypatch.setattr(W, "_git", spy)
+
+    problem = W.commit_in_pr("demo", 42, "main", "a" * 40)
+    assert problem is not None
+    assert "secret" not in problem
+    assert "<url omitted>" in problem
+
+
+def test_commit_in_pr_redacts_a_credentialed_url_from_the_base_fetch_failure(
+        tmp_path, monkeypatch):
+    _repo_with_a_pr(tmp_path, monkeypatch, merge_strategy="merge")
+    real_git = W._git
+
+    def spy(primary, *args, **kwargs):
+        if args and args[0] == "fetch" and "refs/heads/main" in args[-1]:
+            return _sp.CompletedProcess(
+                args, 1, stdout="", stderr=_credentialed_fetch_failure_stderr())
+        return real_git(primary, *args, **kwargs)
+    monkeypatch.setattr(W, "_git", spy)
+
+    problem = W.commit_in_pr("demo", 42, "main", "a" * 40)
+    assert problem is not None
+    assert "secret" not in problem
+    assert "<url omitted>" in problem
 
 
 # --- dispatchability (ARCH-392) -----------------------------------------------
@@ -970,8 +2102,8 @@ def test_find_worktree_on_branch_absent_is_none(tmp_path, monkeypatch):
 # PR thread renders as an approval).
 
 def test_is_dispatch_target_accepts_bare_name_and_full_slug(fake_convivy):
-    assert W.is_dispatch_target("vivy") is True
-    assert W.is_dispatch_target("convivy/vivy") is True
+    assert W.is_dispatch_target("cartographer") is True
+    assert W.is_dispatch_target("convivy/cartographer") is True
 
 
 def test_is_dispatch_target_rejects_unknown_repo(fake_convivy):
@@ -1012,6 +2144,133 @@ def test_is_dispatch_target_requires_a_git_directory(fake_convivy):
     assert W.is_dispatch_target("not-a-repo") is False
 
 
+# --- a registry home nested below the root (a crew's checkout one level deeper
+# than the depth-1 layout, e.g. `<root>/area/demo-nested`) ---------------------
+
+
+@pytest.fixture
+def nested_registry(tmp_path, monkeypatch):
+    """A registry with one unit, "demo-nested", whose `home_dir` sits one level
+    below the root rather than as a direct child — the shape
+    `_registry_primary_for` exists to resolve. Points `worktrees.CONVIVY_ROOT`
+    and the root a registry home resolves against (`projects.ROOT_OVERRIDE`)
+    at the same `tmp_path`, as they agree in production (both read
+    `builder_root.root()`). Yields `(root, home)`."""
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    monkeypatch.setattr(PJ, "ROOT_OVERRIDE", tmp_path)
+    reg = {
+        "demo-nested": {
+            "class": "project", "display": "Demo Nested", "owner": "convivy",
+            "home_dir": "<root>/area/demo-nested", "dirs": [], "crew": "demo-nested",
+            "lifecycle": "active", "products": [], "repos": ["demo-nested"],
+            "aliases": [], "kb": "local",
+        },
+    }
+    reg_path = tmp_path / "projects.json"
+    reg_path.write_text(json.dumps(reg))
+    monkeypatch.setattr(PJ, "PROJECTS_JSON", reg_path)
+    PJ._load_raw.cache_clear()
+    home = tmp_path / "area" / "demo-nested"
+    home.mkdir(parents=True)
+    _sp.run(["git", "init", "-q", "-b", "main", str(home)], check=True)
+    yield tmp_path, home
+    PJ._load_raw.cache_clear()
+
+
+def test_primary_for_resolves_a_nested_registry_home(nested_registry):
+    _root, home = nested_registry
+    assert W._primary_for("demo-nested") == home
+
+
+def test_discover_primaries_includes_a_nested_registry_home(nested_registry):
+    _root, home = nested_registry
+    assert home in W.discover_primaries()
+
+
+def test_is_dispatch_target_true_for_a_nested_registry_home(nested_registry):
+    assert W.is_dispatch_target("demo-nested") is True
+
+
+def test_a_registry_home_outside_this_modules_root_is_refused(tmp_path, monkeypatch):
+    """`projects.home_path` already refuses a `home_dir` that escapes this
+    user's real home (`_expand_own_home`); this exercises the SECOND, narrower
+    guard `_registry_primary_for`/`_registry_homes` apply against
+    `worktrees.CONVIVY_ROOT` specifically. The two roots agree in production
+    (both read `builder_root.root()`); here they are deliberately pointed at
+    two different temp directories, so a registry home that resolves cleanly
+    under its OWN root (`root_b`) still escapes `CONVIVY_ROOT` (`root_a`) and
+    must be refused rather than returned."""
+    root_a = tmp_path / "root-a"
+    root_b = tmp_path / "root-b"
+    root_a.mkdir()
+    root_b.mkdir()
+    monkeypatch.setattr(W, "CONVIVY_ROOT", root_a)
+    monkeypatch.setattr(PJ, "ROOT_OVERRIDE", root_b)
+    reg = {
+        "demo-nested": {
+            "class": "project", "display": "Demo Nested", "owner": "convivy",
+            "home_dir": "<root>/area/demo-nested", "dirs": [], "crew": "demo-nested",
+            "lifecycle": "active", "products": [], "repos": ["demo-nested"],
+            "aliases": [], "kb": "local",
+        },
+    }
+    reg_path = tmp_path / "projects.json"
+    reg_path.write_text(json.dumps(reg))
+    monkeypatch.setattr(PJ, "PROJECTS_JSON", reg_path)
+    PJ._load_raw.cache_clear()
+    home = root_b / "area" / "demo-nested"
+    home.mkdir(parents=True)
+    _sp.run(["git", "init", "-q", "-b", "main", str(home)], check=True)
+    try:
+        assert W._registry_primary_for("demo-nested") is None
+        assert "demo-nested" not in [p.name for p in W.discover_primaries()]
+        with pytest.raises(ValueError, match="unknown repo"):
+            W._primary_for("demo-nested")
+        assert W.is_dispatch_target("demo-nested") is False
+    finally:
+        PJ._load_raw.cache_clear()
+
+
+def test_registry_homes_skips_a_malformed_home_dir_rather_than_raising(tmp_path, monkeypatch):
+    """`_registry_homes`'s own docstring claims a malformed `home_dir` (one
+    `projects.home_path` refuses — anything neither root-relative nor `~/`)
+    contributes nothing rather than raising. Unexercised until now
+    (reviewer, PR #1001 round 1)."""
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    monkeypatch.setattr(PJ, "ROOT_OVERRIDE", tmp_path)
+    reg = {
+        "demo-bad": {
+            "class": "project", "display": "Demo Bad", "owner": "convivy",
+            "home_dir": "/etc/not-root-relative", "dirs": [], "crew": "demo-bad",
+            "lifecycle": "active", "products": [], "repos": ["demo-bad"],
+            "aliases": [], "kb": "local",
+        },
+    }
+    reg_path = tmp_path / "projects.json"
+    reg_path.write_text(json.dumps(reg))
+    monkeypatch.setattr(PJ, "PROJECTS_JSON", reg_path)
+    PJ._load_raw.cache_clear()
+    try:
+        assert W._registry_homes() == []
+        assert W._registry_primary_for("demo-bad") is None
+    finally:
+        PJ._load_raw.cache_clear()
+
+
+def test_registry_homes_is_empty_for_an_unreadable_registry(tmp_path, monkeypatch):
+    """The other half of the same claim: a registry that cannot be read at
+    all (here, `PROJECTS_JSON` pointing nowhere) degrades to `[]`/`None`
+    rather than raising out of `_registry_homes`/`_registry_primary_for`."""
+    monkeypatch.setattr(W, "CONVIVY_ROOT", tmp_path)
+    monkeypatch.setattr(PJ, "PROJECTS_JSON", tmp_path / "does-not-exist.json")
+    PJ._load_raw.cache_clear()
+    try:
+        assert W._registry_homes() == []
+        assert W._registry_primary_for("anything") is None
+    finally:
+        PJ._load_raw.cache_clear()
+
+
 # --- the individuated .claude/ that defeated the ARCH-344 reap -----------------
 
 
@@ -1036,7 +2295,7 @@ def _individuate_claude(repo):
     (c / "skills" / "some-skill").mkdir(parents=True)
     (c / "skills" / "some-skill" / "SKILL.md").write_text("# skill\n")
     (c / "CLAUDE.md").write_text("extras\n")
-    (c / ".active-profile").write_text("vivy/reviewer\n")
+    (c / ".active-profile").write_text("cartographer/reviewer\n")
     owned = ["agents/reviewer.md", "skills/some-skill/SKILL.md",
              "CLAUDE.md", ".active-profile", W._MANIFEST_NAME]
     (c / W._MANIFEST_NAME).write_text("\n".join(sorted(owned)) + "\n")
@@ -1221,8 +2480,8 @@ def test_the_dispatchers_own_suppression_is_not_unlanded_work(tmp_path):
     """`allocate_on_branch` refuses reuse when `unlanded_entries` is non-empty,
     and it asks BEFORE its reset. The dispatcher deletes CLAUDE.md/AGENTS.md
     before every run, so without this exemption the ARCH-347 round-fix reuse is
-    refused on the very next round after any coder dispatch — on vivy, hollis,
-    sous-chef and convivy-orient, which is the first revision of any PR there.
+    refused on the very next round after any coder dispatch — on cartographer, galley,
+    styleguide and convivy-orient, which is the first revision of any PR there.
 
     Same reasoning as the `.claude/` exemption above it: a change the PLATFORM
     made before the agent started is not the agent's work.
@@ -1390,7 +2649,7 @@ def _demo_root(tmp_path, monkeypatch, *, tracked_claude=True, repo="demo"):
     _git_in(primary, "push", "-q", "origin", "main")
     monkeypatch.setattr(W, "CONVIVY_ROOT", root)
     monkeypatch.setattr(W, "in_use_map", lambda: {})
-    monkeypatch.setattr(W, "pr_merged", lambda wt: False)
+    monkeypatch.setattr(W, "pr_merged", lambda wt, gh_env_for: False)
     return root, primary
 
 

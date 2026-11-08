@@ -191,8 +191,8 @@ _LIST_PATH_TOOLS = {
 # person typed: running `/handoff-leave` records `<command-name>/handoff-leave
 # </command-name>`, and the skill body it pulls in arrives as a separate `isMeta`
 # record. Both the raw TUI and this renderer showed them, so running one command
-# dumped a skill's entire instructions into the pane (the operator, 2026-07-24, on both
-# sous-chef via Deck and hollis in the terminal). The TUI's display is
+# dumped a skill's entire instructions into the pane (the operator, 2026-07-24, on
+# one product crew via Deck and another in the terminal). The TUI's display is
 # Anthropic's; this is the half we own, and the pane is meant to read cleaner
 # than the terminal, not the same.
 _COMMAND_TAGS = (
@@ -617,7 +617,7 @@ def classify(rec) -> list[dict]:
         # A task notification and a stopped-agent line are ordinary user records:
         # no `toolUseResult`, no `isMeta`. So they reached the row below and were
         # drawn as full-width turns labelled "you" — the operator reading his own pane and
-        # finding himself apparently writing XML. Measured on a live selector
+        # finding himself apparently writing XML. Measured on a live product-crew
         # transcript: 19 such records against 5 real prompts, so the surface was
         # mostly attributing the harness to him.
         event = _harness_event(text)

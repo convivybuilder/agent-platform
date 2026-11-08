@@ -14,37 +14,44 @@ import projects
 
 # The table as it stood before the two copies were merged (both were equal).
 # Enumerated, not sampled: a changed or dropped row must fail here.
+#
+# `northwind-concierge` is NOT here: main's hardcoded table self-mapped it, but
+# the per-unit `kb_project_by_repo` refactor (#988) carries forward only
+# the rows the old table held at #988's own branch point, and
+# its own unit (config/projects.json) carries no `kb_project_by_repo` entry
+# — it resolves through the ordinary projects/<name>/ directory fallback
+# instead, the same path every self-mapping row relied on before it got an
+# explicit row.
 EXPECTED = {
-    'constance': 'constance',
-    'vivy': 'vivy',
-    'sous-chef': 'sous-chef',
-    'vivy-ownerrez-sandbox-tools': 'vivy',
-    'vivy-commercial': 'vivy',
-    'constance-commercial': 'constance',
-    'constance-updates': 'constance-landing',
-    'convivy-commercial': 'company',
+    'harbor': 'harbor',
+    'finch': 'finch',
+    'galley': 'galley',
+    'finch-ownerrez-sandbox-tools': 'finch',
+    'finch-commercial': 'finch',
+    'harbor-commercial': 'harbor',
+    'harbor-updates': 'harbor-landing',
+    'northwind-commercial': 'company',
     'dev-setup': 'platform',
     'agent-platform': 'agent-platform',
     'knowledge': 'knowledge',
-    'selector': 'selector',
-    'hollis': 'hollis',
-    'convivy-app-kit': 'convivy-app-kit',
-    'convivy-services': 'convivy-services',
-    'convivy-orient': 'convivy-orient',
+    'beacon': 'beacon',
+    'atlas': 'atlas',
+    'foundry-kit': 'foundry-kit',
+    'foundry-services': 'foundry-services',
+    'northwind-orient': 'northwind-orient',
     'www': 'www',
-    'convivy-deck': 'deck',
-    'placard': 'placard',
-    'selector-backend': 'selector',
-    'constance-landing': 'constance-landing',
-    'vivy-landing': 'vivy-landing',
+    'northwind-deck': 'deck',
+    'signpost': 'signpost',
+    'beacon-backend': 'beacon',
+    'harbor-landing': 'harbor-landing',
+    'finch-landing': 'finch-landing',
     'substrate': 'platform',
-    'EA': 'platform',
-    'shipwright': 'shipwright',
-    'homebrew-tap': 'shipwright',
-    'signals': 'signals',
-    'write-better': 'write-better',
+    'SATCHEL': 'platform',
+    'outfitter': 'outfitter',
+    'brewcask-tap': 'outfitter',
+    'telemetry': 'telemetry',
     'library': 'library',
-    'archy': 'archy',
+    'cartographer': 'cartographer',
 }
 
 DEFAULT_YAML = "name: default\n"
@@ -138,17 +145,20 @@ def _library_serves(knowledge_ctx, monkeypatch, kb):
     monkeypatch.setattr(knowledge_ctx, "_library_request", request)
 
 
+@pytest.mark.rich_registry
 def test_the_explicit_table_is_unchanged():
     assert projects.EXPLICIT_PROJECT_BY_NAME == EXPECTED
 
 
-def test_vivy_landing_dispatches_under_crew_vivy(tmp_path):
+@pytest.mark.rich_registry
+def test_finch_landing_dispatches_under_crew_finch(tmp_path):
     # Without the registry entry, crew_for_repo falls through to the explicit row
-    # and returns the nonexistent crew "vivy-landing"; EXPECTED does not see crew.
+    # and returns the nonexistent crew "finch-landing"; EXPECTED does not see crew.
     kb = _kb(tmp_path)
-    assert projects.crew_for_repo("vivy-landing", kb) == "vivy"
+    assert projects.crew_for_repo("finch-landing", kb) == "finch"
 
 
+@pytest.mark.rich_registry
 @pytest.mark.parametrize("name,project", sorted(EXPECTED.items()))
 def test_every_registered_name_resolves_as_before_in_both_clis(
         knowledge_ctx, agentctl, tmp_path, monkeypatch, name, project):
@@ -161,20 +171,18 @@ def test_every_registered_name_resolves_as_before_in_both_clis(
     assert agentctl.default_profile(name, "coder").split("/")[0] == project
 
 
-# The eight crews with a recorded narrowing: the seven the crew-creation epic's
-# done-clause 1 records as deliberate KEEP exceptions (epic comment 4425,
-# issue_01M2NYBBY0FXCDHWWD8XBR9RR3, or for constance-updates,
-# issue_01M3V1J89CG19ZGD3JY4WFY7V0 comment 4432), plus vivy-landing (orchestrator
-# ruling, 2026-10-02). Named here rather than read off
-# `projects.kb_scope_exceptions()`, so this stays a real check against
-# config/projects.json's content rather than testing the registry against itself.
+# The nine repos with a recorded narrowing in the rich test registry. Named
+# here rather than read off `projects.kb_scope_exceptions()`, so this stays a
+# real check against the registry's content rather than testing it against
+# itself.
 _RECORDED_EXCEPTION_REPOS = sorted({
-    "knowledge", "convivy-app-kit", "convivy-services", "www",
-    "shipwright", "constance-landing", "constance-updates", "vivy-landing",
-    "homebrew-tap",
+    "knowledge", "foundry-kit", "foundry-services", "www",
+    "outfitter", "finch-landing", "harbor-landing", "harbor-updates",
+    "brewcask-tap",
 })
 
 
+@pytest.mark.rich_registry
 @pytest.mark.parametrize("repo", _RECORDED_EXCEPTION_REPOS)
 def test_a_recorded_exceptions_narrow_scope_is_what_resolution_returns(
         knowledge_ctx, agentctl, tmp_path, monkeypatch, repo):
@@ -191,9 +199,10 @@ def test_a_recorded_exceptions_narrow_scope_is_what_resolution_returns(
     assert agentctl.default_profile(repo, "coder").split("/")[0] == exc["kb_project"]
 
 
+@pytest.mark.rich_registry
 def test_an_explicit_row_wins_over_a_same_named_directory(tmp_path):
-    kb = _kb(tmp_path, "vivy-commercial")
-    assert projects.resolve_project("vivy-commercial", kb) == "vivy"
+    kb = _kb(tmp_path, "finch-commercial")
+    assert projects.resolve_project("finch-commercial", kb) == "finch"
 
 
 def test_an_unlisted_name_with_a_project_directory_resolves_in_both_clis(
@@ -298,7 +307,7 @@ def test_a_restricted_directory_never_takes_the_default(
     kb = _kb(tmp_path, "platform", default=True)
     _ctx(knowledge_ctx, monkeypatch, tmp_path, kb)
     with pytest.raises(SystemExit) as exc:
-        knowledge_ctx.load_profile_or_default("platform", "ea-daytime", True, True)
+        knowledge_ctx.load_profile_or_default("platform", "satchel-daytime", True, True)
     assert exc.value.code == 1   # "profile not found", as before
 
 
@@ -436,11 +445,27 @@ def test_the_agentctl_profile_path_to_an_unmapped_repo_refuses(
 
 
 def test_resolve_project_needs_the_on_disk_spelling(tmp_path):
-    kb = _kb(tmp_path, "vivy-real")
+    kb = _kb(tmp_path, "widget-real")
     (kb / "projects" / "casey").mkdir()
     assert projects.resolve_project("casey", kb) == "casey"
     assert projects.resolve_project("Casey", kb) is None
     assert projects.resolve_project("CASEY", kb) is None
+
+
+def test_resolve_project_degrades_rather_than_raises_when_the_library_is_unavailable(
+        tmp_path, monkeypatch, capsys):
+    """Round 5 review: before `_explicit_project_by_name()` caught
+    `RegistryUnavailable`, a Library outage raised it straight out of
+    `resolve_project` for a name with no on-disk project directory either —
+    `agentctl`'s `default_profile` and `knowledge-ctx`'s `detect_project` have
+    no handler around this call, so the outage crashed both."""
+    kb = _kb(tmp_path)   # no project directories at all
+
+    def _boom():
+        raise projects.RegistryUnavailable("stub: the Library is down")
+    monkeypatch.setattr(projects, "_load_raw", _boom)
+    assert projects.resolve_project("widget-crew-satellite", kb) is None
+    assert "_explicit_project_by_name() could not read the registry" in capsys.readouterr().err
 
 
 def test_the_fallback_line_names_the_real_cause(
@@ -458,18 +483,45 @@ def test_the_fallback_line_names_the_real_cause(
             in capsys.readouterr().err)
 
 
-def test_ea_takes_no_fallback_through_main(
+@pytest.mark.rich_registry
+def test_satchel_takes_no_fallback_through_main(
         knowledge_ctx, tmp_path, monkeypatch):
-    """The wiring, not just the helper: `use ea-daytime` in an EA directory with a
-    default.yaml present and platform/ea-daytime.yaml absent must refuse."""
+    """The wiring, not just the helper: `use satchel-daytime` in a SATCHEL directory
+    with a default.yaml present and platform/satchel-daytime.yaml absent must refuse."""
     kb = _kb(tmp_path, "platform", default=True)
     _ctx(knowledge_ctx, monkeypatch, tmp_path, kb)
-    (tmp_path / "EA").mkdir()
-    monkeypatch.chdir(tmp_path / "EA")
-    monkeypatch.setattr("sys.argv", ["knowledge-ctx", "use", "ea-daytime", "--dry-run"])
+    (tmp_path / "SATCHEL").mkdir()
+    monkeypatch.chdir(tmp_path / "SATCHEL")
+    monkeypatch.setattr("sys.argv", ["knowledge-ctx", "use", "satchel-daytime", "--dry-run"])
     with pytest.raises(SystemExit) as exc:
         knowledge_ctx.main()
     assert exc.value.code == 1   # "profile not found"; the default was not taken
+
+
+@pytest.mark.rich_registry
+def test_satchel_is_refused_not_defaulted_when_the_library_is_unavailable(
+        knowledge_ctx, tmp_path, monkeypatch, capsys):
+    """Same black-box directory and the same hardcoded, registry-independent
+    allowlist guard as the test above, with the registry itself unreadable
+    this time (round 5 review): `_explicit_project_by_name()` now degrades to
+    `{}` rather than raising, which makes the directory read as unmapped and
+    eligible for the generic default fallback — `_default_refused` is what
+    still refuses it there, with no registry read of its own needed."""
+    kb = _kb(tmp_path, "platform", default=True)
+    _ctx(knowledge_ctx, monkeypatch, tmp_path, kb)
+    satchel = tmp_path / "SATCHEL"
+    satchel.mkdir()
+    monkeypatch.chdir(satchel)
+
+    def _boom():
+        raise projects.RegistryUnavailable("stub: the Library is down")
+    monkeypatch.setattr(projects, "_load_raw", _boom)
+
+    monkeypatch.setattr("sys.argv", ["knowledge-ctx", "use", "daytime", "--dry-run"])
+    with pytest.raises(SystemExit) as exc:
+        knowledge_ctx.main()
+    assert exc.value.code == knowledge_ctx.NO_PROJECT_MAPPING
+    assert "takes no default profile" in capsys.readouterr().err
 
 
 def test_agentctl_default_profile_falls_back_and_names_it(
@@ -524,12 +576,13 @@ def test_agentctl_names_the_cause_when_it_defaults(agentctl, tmp_path, monkeypat
     assert "maps to no project" in capsys.readouterr().err
 
 
+@pytest.mark.rich_registry
 def test_agentctl_default_profile_resolves_with_no_knowledge_checkout_on_disk(
         agentctl, tmp_path, monkeypatch):
     """CQ·371 (issue_01M43AE2QD6H3JZMKM2RR2NK2W): `default_profile`'s existence
     checks must answer from the Library even when `KNOWLEDGE_ROOT` names a
     directory that was never created — a machine with its knowledge checkout
-    removed still resolves a dispatch's profile. `vivy` resolves through
+    removed still resolves a dispatch's profile. `finch` resolves through
     `projects.EXPLICIT_PROJECT_BY_NAME`, not a disk read, so this isolates the
     has-profiles/has-default checks this item moves to the Library."""
     never_created = tmp_path / "no-such-knowledge-checkout"
@@ -538,11 +591,11 @@ def test_agentctl_default_profile_resolves_with_no_knowledge_checkout_on_disk(
     def fake_get(path, name):
         assert path == "/profiles"
         return {"profiles": [{"project": "platform", "variant": "default"},
-                             {"project": "vivy", "variant": "daytime"}],
+                             {"project": "finch", "variant": "daytime"}],
                 "count": 2}
     monkeypatch.setattr(agentctl, "_library_get", fake_get)
     assert not never_created.exists()
-    assert agentctl.default_profile("vivy", "coder") == "vivy/daytime"
+    assert agentctl.default_profile("finch", "coder") == "finch/daytime"
 
 
 def test_an_unreachable_library_refuses_default_profile_by_naming_it(
@@ -602,7 +655,7 @@ def test_activate_profile_says_nothing_and_reports_nothing_without_a_fallback(
 
 def test_an_explicit_profile_forbids_the_fallback(agentctl, tmp_path, monkeypatch):
     calls = _stub_ctx(agentctl, monkeypatch, "")
-    agentctl.activate_profile(tmp_path, "constance/daytme", allow_default=False)
+    agentctl.activate_profile(tmp_path, "globex/daytme", allow_default=False)
     assert "--no-default-fallback" in calls[0]
 
 
@@ -638,10 +691,11 @@ def test_default_yaml_is_a_profile_of_its_own_for_any_other_project(agentctl):
 
 # --- private crews never take the default (platform/decisions/0043) -----------
 #
-# The allowlist and the explicit table key on the exact string `EA`, but the disk
-# is case-insensitive and a resolved cwd keeps the operator's spelling, so `ea`
-# reached the fallback. `CFO` and `privatecrew` have neither a project directory nor
-# an allowlist row. All of them come from the registry, driven here from a fixture.
+# The allowlist and the explicit table key on the exact string of a registered
+# unit's own spelling, but the disk is case-insensitive and a resolved cwd keeps
+# the operator's spelling, so a lowercased variant reached the fallback.
+# `LEDGER` and `privatecrew` have neither a project directory nor an allowlist
+# row. All of them come from the registry, driven here from a fixture.
 
 def _private(slug, display, home):
     return {"class": "project", "display": display, "home_dir": f"<root>/{home}",
@@ -651,11 +705,21 @@ def _private(slug, display, home):
 
 FIXTURE_REGISTRY = {
     "_meta": {},
-    "cfo": _private("cfo", "CFO", "CFO"),
-    "ea": _private("ea", "EA", "EA"),
+    "ledger": _private("ledger", "LEDGER", "LEDGER"),
+    "orbit": _private("orbit", "ORBIT", "ORBIT"),
     "privatecrew": _private("privatecrew", "privatecrew.com", "privatecrew"),
     "datecli": {"class": "project", "display": "DateCLI", "repos": ["datecli"],
                 "aliases": [], "kb": "central"},
+    # No `crew`, `repos` or `aliases` name "paper-trail" — the project it maps to
+    # is deliberately not this unit's own crew, which is the fact
+    # test_an_explicit_row_naming_another_project_is_not_a_crew exists to pin.
+    "orchestrator": {"class": "project", "display": "Orchestrator",
+                      "repos": ["orchestrator-repo"], "aliases": [], "kb": "central",
+                      "kb_project": "platform",
+                      "kb_project_by_repo": {"paper-trail": {
+                          "kb_project": "platform",
+                          "reason": "a synthetic fixture: the mapped project "
+                                    "differs from this unit's own crew"}}},
 }
 
 
@@ -682,19 +746,19 @@ def _use_default(knowledge_ctx, monkeypatch, tmp_path, dirname):
     return knowledge_ctx.main()
 
 
-@pytest.mark.parametrize("dirname", ["EA", "ea", "CFO", "cfo", "privatecrew", "PrivateCrew"])
+@pytest.mark.parametrize("dirname", ["ORBIT", "orbit", "LEDGER", "ledger", "privatecrew", "PrivateCrew"])
 def test_a_private_crew_directory_takes_no_default_under_any_spelling(
         knowledge_ctx, tmp_path, monkeypatch, capsys, fixture_registry, dirname):
     with pytest.raises(SystemExit) as exc:
         _use_default(knowledge_ctx, monkeypatch, tmp_path, dirname)
-    # EA resolves explicitly to `platform`, so it is refused by the allowlist (43);
+    # A unit with an allowlist row is refused by the allowlist (43);
     # every other spelling resolves to nothing and is refused by the fallback (42).
     assert exc.value.code in (knowledge_ctx.NO_PROJECT_MAPPING,
                               knowledge_ctx.PROFILE_NOT_ALLOWED)
     assert "using" not in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("dirname", ["ea", "cfo", "CFO", "privatecrew", "PrivateCrew"])
+@pytest.mark.parametrize("dirname", ["orbit", "ledger", "LEDGER", "privatecrew", "PrivateCrew"])
 def test_the_refusal_says_the_directory_is_a_private_crew(
         knowledge_ctx, tmp_path, monkeypatch, capsys, fixture_registry, dirname):
     with pytest.raises(SystemExit) as exc:
@@ -703,12 +767,13 @@ def test_the_refusal_says_the_directory_is_a_private_crew(
     assert "private crew" in capsys.readouterr().err
 
 
-def test_the_allowlist_applies_to_a_lowercase_ea(knowledge_ctx):
-    assert knowledge_ctx.allowed_profiles("ea") == {"ea-daytime"}
-    assert knowledge_ctx.allowed_profiles("EA") == {"ea-daytime"}
+@pytest.mark.rich_registry
+def test_the_allowlist_applies_to_a_lowercase_satchel(knowledge_ctx):
+    assert knowledge_ctx.allowed_profiles("satchel") == {"satchel-daytime"}
+    assert knowledge_ctx.allowed_profiles("SATCHEL") == {"satchel-daytime"}
     assert knowledge_ctx.allowed_profiles("datecli") is None
     with pytest.raises(SystemExit) as exc:
-        knowledge_ctx.check_profile_allowed("ea", "default")
+        knowledge_ctx.check_profile_allowed("satchel", "default")
     assert exc.value.code == knowledge_ctx.PROFILE_NOT_ALLOWED
 
 
@@ -775,7 +840,7 @@ def test_list_offers_the_default_profile_to_a_mapped_project_with_none(
     assert "default" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("repo", ["cfo", "CFO", "privatecrew", "PrivateCrew", "ea"])
+@pytest.mark.parametrize("repo", ["ledger", "LEDGER", "privatecrew", "PrivateCrew", "orbit"])
 def test_agentctl_gives_a_private_crew_no_default(
         agentctl, tmp_path, monkeypatch, capsys, fixture_registry, repo):
     kb = _kb(tmp_path, default=True)
@@ -853,7 +918,7 @@ def test_an_unregistered_crew_with_no_directory_says_so_on_stderr_and_in_the_rec
     assert "not composed" in record["crew"]["reason"]
 
 
-@pytest.mark.parametrize("name", ["ea", "Cfo", "PrivateCrew"])
+@pytest.mark.parametrize("name", ["orbit", "Ledger", "PrivateCrew"])
 def test_a_private_crew_under_a_case_variant_resolves_to_nothing(
         tmp_path, fixture_registry, name):
     """The variant is not a registered spelling, so only the directory rule could
@@ -879,8 +944,8 @@ def test_every_registered_repo_and_alias_resolves_as_before(tmp_path):
 
 def test_an_explicit_row_naming_another_project_is_not_a_crew(tmp_path, fixture_registry):
     kb = _kb(tmp_path, "platform")
-    assert projects.resolve_project("dev-setup", kb) == "platform"
-    assert projects.crew_for_repo("dev-setup", kb) is None
+    assert projects.resolve_project("paper-trail", kb) == "platform"
+    assert projects.crew_for_repo("paper-trail", kb) is None
 
 
 def test_activate_profile_re_emits_the_no_crew_line(

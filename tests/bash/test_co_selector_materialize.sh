@@ -1,18 +1,18 @@
 #!/bin/bash
-# Tests for bin/co's selector branch re-individuating on `-r`
+# Tests for bin/co's beacon branch re-individuating on `-r`
 # (issue_01M2GJYJ4ZFY13MQRM5PRVM4DC).
 #
-# THE BUG. selector#472 (merged 2026-09-14) stopped tracking selector's
+# THE BUG. beacon#472 (merged 2026-09-14) stopped tracking beacon's
 # .claude/agents/ and .claude/skills/ in git and moved the sel- crew to the
-# selector/daytime KB profile instead. bin/co's selector branch never called
+# beacon/daytime KB profile instead. bin/co's beacon branch never called
 # `_co_reindividuate`, so `co -r` never ran `knowledge-ctx use daytime
-# --force`. selector's own deploy job (com.selector.deploy) periodically pulls
-# selector's checkout, and once #472 removed .claude/agents/ and
+# --force`. beacon's own deploy job (com.beacon.deploy) periodically pulls
+# beacon's checkout, and once #472 removed .claude/agents/ and
 # .claude/skills/ from git tracking, that pull removed the now-untracked files
 # from a working tree that still had them — same as any git pull removing
 # files a merge commit deleted. (knowledge-autopull is not the mechanism: it
 # only ever touches ~/Convivy/knowledge, never a product checkout.) A
-# relaunched selector session found .claude/ empty — `co -r` launched claude
+# relaunched beacon session found .claude/ empty — `co -r` launched claude
 # with /handoff-pickup into a session with no skills or agents at all
 # ("Unknown command").
 #
@@ -44,7 +44,7 @@ _git_ident() { # <repo>
 # A fake HOME with a real ~/Convivy/knowledge tracking a real bare origin (the
 # `-r` path pulls it before individuating, so a fake would abort first and
 # every assertion below would pass for the wrong reason), the real
-# ~/Convivy/selector with a crew fixture matching what selector#472 left
+# ~/Convivy/beacon with a crew fixture matching what beacon#472 left
 # tracked in git before the untracking (a stand-in for pre-#472 state, so a
 # regression back to "never reindividuate" would still leave the files it
 # expects there and pass for the wrong reason), and a same-basename near-miss
@@ -75,7 +75,7 @@ setup() { # -> echoes fake HOME
     git clone -q "$origin" "$kb"
     _git_ident "$kb"
 
-    for d in Convivy/selector Convivy/worktrees/selector elsewhere/selector; do
+    for d in Convivy/beacon Convivy/worktrees/beacon elsewhere/beacon; do
         mkdir -p "$home/$d/.claude/agents"
         : > "$home/$d/.claude/agents/sel-orchestrator.md"
         ( cd "$home/$d" && git init -q . )
@@ -136,7 +136,7 @@ run_co() {
     ( cd "$home/$dir" && \
       HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$claude_log" SPY_LOG="$spy_log" AGENTCTL_LOG="$spy_log" KCTX_RC="${KCTX_RC:-0}" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "$@" >/dev/null 2>"$stderr_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" "$@" >/dev/null 2>"$stderr_log" )
     RC=$?
     STDERR=$(cat "$stderr_log")
     SPY=$(cat "$spy_log")
@@ -144,10 +144,10 @@ run_co() {
     rm -f "$stderr_log" "$spy_log" "$claude_log"
 }
 
-echo "== co -r in ~/Convivy/selector re-individuates from the daytime profile, after pulling =="
+echo "== co -r in ~/Convivy/beacon re-individuates from the daytime profile, after pulling =="
 H=$(setup)
-run_co "$H" Convivy/selector -r
-assert_rc 0 "$RC" "selector -r succeeds"
+run_co "$H" Convivy/beacon -r
+assert_rc 0 "$RC" "beacon -r succeeds"
 assert_eq "1" "$(echo "$SPY" | grep -qx 'use daytime --force' && echo 1 || echo 0)" \
     "knowledge-ctx is called as 'use daytime --force'"
 assert_eq "1" "$([ -n "$CLAUDE_ARGS" ] && echo 1 || echo 0)" \
@@ -167,8 +167,8 @@ echo "== plain co does NOT individuate =="
 # Individuating rmtrees two trees, so it belongs to the explicit refresh a
 # person asked for, not to every launch.
 H=$(setup)
-run_co "$H" Convivy/selector
-assert_rc 0 "$RC" "selector without -r succeeds"
+run_co "$H" Convivy/beacon
+assert_rc 0 "$RC" "beacon without -r succeeds"
 assert_eq "0" "$(echo "$SPY" | grep -qx 'use daytime --force' && echo 1 || echo 0)" \
     "knowledge-ctx is not invoked at all"
 assert_eq "1" "$([ -n "$CLAUDE_ARGS" ] && echo 1 || echo 0)" "claude still launches"
@@ -177,8 +177,8 @@ rm -rf "$H"
 echo "== a same-basename near-miss is NOT individuated, but still pulls and launches =="
 # The branch matches a basename; the individuate step matches the full path.
 # Without that asymmetry, `--force` would rmtree .claude/agents and
-# .claude/skills in any directory on disk named `selector`.
-for near in Convivy/worktrees/selector elsewhere/selector; do
+# .claude/skills in any directory on disk named `beacon`.
+for near in Convivy/worktrees/beacon elsewhere/beacon; do
     H=$(setup)
     run_co "$H" "$near" -r
     assert_rc 0 "$RC" "$near: co -r still succeeds"
@@ -196,8 +196,8 @@ echo "== a failed individuate aborts before launching =="
 # crew is worse than no session, and the usual cause is a live session
 # holding the directory.
 H=$(setup)
-KCTX_RC=1 run_co "$H" Convivy/selector -r
-assert_rc 1 "$RC" "selector -r aborts when knowledge-ctx fails"
+KCTX_RC=1 run_co "$H" Convivy/beacon -r
+assert_rc 1 "$RC" "beacon -r aborts when knowledge-ctx fails"
 assert_eq "" "$CLAUDE_ARGS" "claude is never launched"
 assert_eq "1" "$(echo "$STDERR" | grep -q 'knowledge-ctx use failed' && echo 1 || echo 0)" \
     "the loud abort message fires"
@@ -212,8 +212,8 @@ advance_origin "$H"
 echo local > "$H/Convivy/knowledge/localonly.md"
 git -C "$H/Convivy/knowledge" add -A
 git -C "$H/Convivy/knowledge" commit -qm "local-only"
-run_co "$H" Convivy/selector -r
-assert_rc 1 "$RC" "selector -r aborts when the knowledge pull fails"
+run_co "$H" Convivy/beacon -r
+assert_rc 1 "$RC" "beacon -r aborts when the knowledge pull fails"
 assert_eq "" "$CLAUDE_ARGS" "claude is never launched"
 assert_eq "0" "$(echo "$SPY" | grep -qx 'use daytime --force' && echo 1 || echo 0)" \
     "knowledge-ctx is never reached"

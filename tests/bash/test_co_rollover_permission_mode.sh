@@ -30,7 +30,7 @@ PROMPT="/handoff-pickup /x/handoff.md"
 # `-r` path pulls it before individuating, so a fake would abort first and
 # every assertion below would pass for the wrong reason), plus one product
 # fixture (the generic product-branch tail, which requires cwd's basename be
-# in its own `-r` allowlist — `vivy` is).
+# in its own `-r` allowlist — `finch` is).
 setup() { # -> echoes fake HOME
     local home
     home=$(mktemp -d)
@@ -51,9 +51,9 @@ setup() { # -> echoes fake HOME
         git push -q -u origin main
     ) >/dev/null 2>&1
 
-    mkdir -p "$home/Convivy/vivy/.claude/agents"
-    : > "$home/Convivy/vivy/.claude/agents/planning-orchestrator.md"
-    ( cd "$home/Convivy/vivy" && git init -q . )
+    mkdir -p "$home/Convivy/finch/.claude/agents"
+    : > "$home/Convivy/finch/.claude/agents/planning-orchestrator.md"
+    ( cd "$home/Convivy/finch" && git init -q . )
 
     # Records argv AND whether any of the three rollover markers reached this
     # process — bin/co is supposed to consume all three before `exec claude`
@@ -100,7 +100,7 @@ run_co() {
       CLAUDE_CALL_LOG="$call_log" CLAUDE_ENV_LOG="$env_log" KX_CALL_LOG="$kx_log" \
       CO_ROLLOVER_SUCCESSOR="${CO_ROLLOVER_SUCCESSOR:-}" \
       CO_ROLLOVER_PERMISSION_MODE="${CO_ROLLOVER_PERMISSION_MODE:-}" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "$@" >/dev/null 2>"$err_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" "$@" >/dev/null 2>"$err_log" )
     RC=$?
     CLAUDE_ARGS=$(cat "$call_log")
     CLAUDE_ENV=$(cat "$env_log")
@@ -118,7 +118,7 @@ H=$(setup)
 
 echo "== a rollover successor launches with the predecessor's current permission mode =="
 
-CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_PERMISSION_MODE=plan run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_PERMISSION_MODE=plan run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + plan mode: co -r exits 0"
 assert_eq "plan" "$(_permission_mode_value "$CLAUDE_ARGS")" \
     "marked successor + plan mode: claude launches with --permission-mode plan"
@@ -128,7 +128,7 @@ assert_eq "" "$CLAUDE_ENV" \
 echo "== every known Claude Code mode is passed through unchanged =="
 
 for mode in default acceptEdits bypassPermissions dontAsk; do
-    CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_PERMISSION_MODE="$mode" run_co "$H" Convivy/vivy -r "$PROMPT"
+    CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_PERMISSION_MODE="$mode" run_co "$H" Convivy/finch -r "$PROMPT"
     assert_rc 0 "$RC" "marked successor + $mode: co -r exits 0"
     assert_eq "$mode" "$(_permission_mode_value "$CLAUDE_ARGS")" \
         "marked successor + $mode: claude launches with --permission-mode $mode"
@@ -136,7 +136,7 @@ done
 
 echo "== a missing mode falls back to bypassPermissions (today's behaviour) =="
 
-CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor, no mode captured: co -r exits 0"
 assert_eq "bypassPermissions" "$(_permission_mode_value "$CLAUDE_ARGS")" \
     "marked successor, no mode captured: falls back to bypassPermissions"
@@ -145,7 +145,7 @@ assert_eq "" "$(echo "$ERR" | grep -F 'invalid permission mode')" \
 
 echo "== an invalid mode falls back to bypassPermissions and says so =="
 
-CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_PERMISSION_MODE="not-a-real-mode" run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_SUCCESSOR=1 CO_ROLLOVER_PERMISSION_MODE="not-a-real-mode" run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "marked successor + invalid mode: co -r exits 0"
 assert_eq "bypassPermissions" "$(_permission_mode_value "$CLAUDE_ARGS")" \
     "marked successor + invalid mode: falls back to bypassPermissions"
@@ -154,7 +154,7 @@ assert_contains "$ERR" "invalid permission mode" \
 
 echo "== a non-rollover launch ignores CO_ROLLOVER_PERMISSION_MODE entirely =="
 
-CO_ROLLOVER_PERMISSION_MODE=plan run_co "$H" Convivy/vivy -r "$PROMPT"
+CO_ROLLOVER_PERMISSION_MODE=plan run_co "$H" Convivy/finch -r "$PROMPT"
 assert_rc 0 "$RC" "unmarked launch + mode set: co -r exits 0"
 assert_eq "bypassPermissions" "$(_permission_mode_value "$CLAUDE_ARGS")" \
     "unmarked launch + mode set: still launches with the fixed bypassPermissions"
@@ -163,7 +163,7 @@ assert_eq "" "$CLAUDE_ENV" \
 
 echo "== an ordinary co -r (no markers at all) is unaffected =="
 
-run_co "$H" Convivy/vivy -r
+run_co "$H" Convivy/finch -r
 assert_rc 0 "$RC" "ordinary co -r: exits 0"
 assert_eq "bypassPermissions" "$(_permission_mode_value "$CLAUDE_ARGS")" \
     "ordinary co -r: still launches with bypassPermissions"

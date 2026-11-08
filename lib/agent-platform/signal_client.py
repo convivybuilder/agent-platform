@@ -25,6 +25,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import projects
 import vault_plane
 
 # **THE PLANE IS `vault_plane`'s TO DECIDE, and this constant is kept only for
@@ -53,7 +54,14 @@ _DELIVERY_TIMEOUT = 30
 # channels (cost, alerts, briefings, docs-validation, general-*) have no single
 # product, so they carry the "platform" label. product is only a scope label —
 # the agent-platform token holds products ["*"], so any label is writable.
-_PRODUCT_PREFIXES = ("vivy", "constance", "sous-chef", "selector", "hollis")
+#
+# The prefixes themselves live in the project registry (each unit's own
+# `channel_prefixes`), not here — this module holds no
+# list of products, so a project onboarding or retiring a Slack channel prefix
+# never needs a code change here. A unit's matched product is its own slug,
+# unless it sets the registry's optional `signal_product` override
+# (`projects.signal_product`) — for a unit whose slug would otherwise split a
+# product string a signal reader already stores under a different name.
 
 
 def token() -> str | None:
@@ -85,15 +93,16 @@ def _warn_no_token_once() -> None:
 
 
 def product_for_channel(label: str) -> str:
-    """Best-effort product from a channel key/id. A per-product channel
-    (`vivy-explanations`, `sous-chef-bugs`) maps to its product; `svc-*` is the
-    app-kit suite; everything else is `platform`."""
+    """Best-effort product from a channel key/id. A per-product channel maps to
+    the registered unit whose own `channel_prefixes` it
+    starts with — that unit's `signal_product` override (`projects.
+    signal_product`) when it sets one, else its own slug; everything else is
+    `platform`."""
     lbl = (label or "").lower()
-    for prod in _PRODUCT_PREFIXES:
-        if lbl.startswith(prod):
-            return prod
-    if lbl.startswith("svc"):
-        return "convivy-app-kit"
+    for slug, unit in projects.load().items():
+        for prefix in unit.get("channel_prefixes") or []:
+            if lbl.startswith(prefix):
+                return projects.signal_product(slug)
     return "platform"
 
 

@@ -1,6 +1,6 @@
 """`session-agent crews` — the crew specs new-crew writes, served to Deck.
 
-The failure these cover is the one that happened: placard was created through
+The failure these cover is the one that happened: a crew was created through
 the only sanctioned path on 2026-09-05, its spec sat in crews.d with no
 `project`, and Deck drew a rail row with no cockpit until the operator set the field by
 hand. So the tests drive real files in a temp crews.d against a temp registry
@@ -27,9 +27,9 @@ def host(tmp_path, monkeypatch):
     fake HOME, and an index holding that project's bead. Returns the crews.d
     path; each test writes the specs it needs."""
     home = tmp_path / "home"
-    (home / "Convivy" / "placard").mkdir(parents=True)
+    (home / "Convivy" / "crate").mkdir(parents=True)
     (home / "Convivy" / "shipwright" / "inbox").mkdir(parents=True)
-    (home / "Convivy" / "EA" / "mail").mkdir(parents=True)
+    (home / "Convivy" / "DESK" / "mail").mkdir(parents=True)
     (home / "Convivy" / "old-thing").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(SCR, "_real_account_home", lambda: home)
@@ -42,9 +42,9 @@ def host(tmp_path, monkeypatch):
             "crew": None, "lifecycle": "active", "products": [], "aliases": [],
             "kb": "local"}
     registry.write_text(json.dumps({
-        "placard": {**unit, "home_dir": "~/Convivy/placard", "repos": ["placard"]},
+        "crate": {**unit, "home_dir": "~/Convivy/crate", "repos": ["crate"]},
         "shipwright": {**unit, "home_dir": "~/Convivy/shipwright", "repos": ["shipwright"]},
-        "ea": {**unit, "home_dir": "~/Convivy/EA", "repos": ["EA"], "private": True},
+        "desk": {**unit, "home_dir": "~/Convivy/DESK", "repos": ["DESK"], "private": True},
         "old-thing": {**unit, "home_dir": "~/Convivy/old-thing", "repos": ["old-thing"],
                       "lifecycle": "sunset"},
     }))
@@ -57,7 +57,7 @@ def host(tmp_path, monkeypatch):
     conn.execute(
         "INSERT INTO docs (id, source, source_ref, kind, project, title, status, body, "
         "body_hash, updated_at) VALUES (?, 'files', ?, 'bead', ?, 't', 'current', 'b', 'h', 'now')",
-        ("placard/bead/placard", "projects/placard/bead/placard.md", "placard"))
+        ("crate/bead/crate", "projects/crate/bead/crate.md", "crate"))
     conn.commit()
     conn.close()
     monkeypatch.setattr(SCR, "KB_INDEX", db)
@@ -86,13 +86,13 @@ def test_no_crews_d_reads_as_no_crews(host):
 
 
 def test_a_spec_as_the_skill_writes_it_is_enough_for_a_cockpit(host):
-    """The placard case. No project, no bead in the file; the host fills both
+    """The crate case. No project, no bead in the file; the host fills both
     from the registry and the index, and says which it filled."""
-    _spec(host, "placard")
+    _spec(host, "crate")
     row = SCR.crews()["crews"][0]
-    assert row["id"] == "placard"
-    assert row["project"] == "placard"
-    assert row["bead"] == "placard/bead/placard"
+    assert row["id"] == "crate"
+    assert row["project"] == "crate"
+    assert row["bead"] == "crate/bead/crate"
     assert row["derived"] == ["project", "bead"]
     assert row["sessionId"] == "$58"
 
@@ -105,26 +105,26 @@ def test_a_spec_that_chose_its_fields_keeps_them(host):
     assert row["project"] == "shipwright"
     assert row["bead"] == "company/bead/convivy-builder"
     assert row["derived"] == ["project"]
-    _spec(host, "placard", project="shipwright", bead="platform/bead/platform")
-    row = next(r for r in SCR.crews()["crews"] if r["id"] == "placard")
+    _spec(host, "crate", project="shipwright", bead="platform/bead/platform")
+    row = next(r for r in SCR.crews()["crews"] if r["id"] == "crate")
     assert row["project"] == "shipwright" and row["bead"] == "platform/bead/platform"
     assert row["derived"] == []
 
 
 def test_a_private_crews_row_is_not_served(host):
     """ADR-0043, the posture run-register-api already takes for /runs and
-    /sessions: a black-box crew's row is dropped whole, not field-redacted. EA's
-    spec is on the host today with its real directory and `project: ea`."""
-    _spec(host, "placard")
-    _spec(host, "ea", project="ea", workingDirectory=f"{host.parents[3]}/Convivy/EA")
-    assert [r["id"] for r in SCR.crews()["crews"]] == ["placard"]
+    /sessions: a black-box crew's row is dropped whole, not field-redacted. DESK's
+    spec is on the host today with its real directory and `project: desk`."""
+    _spec(host, "crate")
+    _spec(host, "desk", project="desk", workingDirectory=f"{host.parents[3]}/Convivy/DESK")
+    assert [r["id"] for r in SCR.crews()["crews"]] == ["crate"]
 
 
 def test_a_spec_cannot_claim_a_private_project_by_name(host):
-    """A public directory naming `project: ea` would bind a cockpit to a private
+    """A public directory naming `project: desk` would bind a cockpit to a private
     crew's Library content; the row is withheld, never served with the field
     stripped."""
-    _spec(host, "placard", project="ea")
+    _spec(host, "crate", project="desk")
     assert SCR.crews()["crews"] == []
 
 
@@ -132,18 +132,18 @@ def test_a_directory_inside_a_private_home_is_withheld_even_unnamed(host):
     """The second path the security reviewer named: no `project` in the spec, a
     `workingDirectory` under (or symlinked into) a private home. Inode, not
     string: the symlink case is the one a string compare misses."""
-    _spec(host, "placard", workingDirectory=f"{host.parents[3]}/Convivy/EA/mail")
+    _spec(host, "crate", workingDirectory=f"{host.parents[3]}/Convivy/DESK/mail")
     assert SCR.crews()["crews"] == []
-    link = host.parents[3] / "ea-link"
-    link.symlink_to(host.parents[3] / "Convivy" / "EA")
-    _spec(host, "placard", workingDirectory=str(link))
+    link = host.parents[3] / "desk-link"
+    link.symlink_to(host.parents[3] / "Convivy" / "DESK")
+    _spec(host, "crate", workingDirectory=str(link))
     assert SCR.crews()["crews"] == []
 
 
 def test_an_unreadable_registry_serves_nothing(host, monkeypatch):
     """Cannot tell is not public. A registry hiccup costs a poll's worth of
     rows; the other direction costs a private crew's path on every poll."""
-    _spec(host, "placard")
+    _spec(host, "crate")
     missing = host.parents[3] / "no-registry.json"
     monkeypatch.setattr(projects, "PROJECTS_JSON", missing)
     projects._load_raw.cache_clear()
@@ -164,9 +164,9 @@ def test_a_sunset_project_is_not_a_cockpits_home(host):
 def test_a_named_project_must_be_a_registered_slug(host):
     """A spec naming a project the registry does not know is treated as naming
     none, so the cockpit derives from the directory instead."""
-    _spec(host, "placard", project="not-a-project")
+    _spec(host, "crate", project="not-a-project")
     row = SCR.crews()["crews"][0]
-    assert row["project"] == "placard"
+    assert row["project"] == "crate"
     assert row["derived"] == ["project", "bead"]
 
 
@@ -176,23 +176,23 @@ def test_a_cockpit_inside_the_project_home_still_resolves(host):
     _spec(host, "shipwright", workingDirectory=f"{host.parents[3]}/Convivy/shipwright/inbox")
     assert SCR.crews()["crews"][0]["project"] == "shipwright"
     link = host.parents[3] / "pl-link"
-    link.symlink_to(host.parents[3] / "Convivy" / "placard")
-    _spec(host, "placard", workingDirectory=str(link))
-    row = next(r for r in SCR.crews()["crews"] if r["id"] == "placard")
-    assert row["project"] == "placard"
+    link.symlink_to(host.parents[3] / "Convivy" / "crate")
+    _spec(host, "crate", workingDirectory=str(link))
+    row = next(r for r in SCR.crews()["crews"] if r["id"] == "crate")
+    assert row["project"] == "crate"
 
 
 def test_a_file_that_is_not_a_spec_is_skipped_and_the_rest_served(host):
     """Deck skips a row it cannot parse; this host never serves one it cannot
     vouch for. Bad JSON, an id that disagrees with the filename, and an id
     outside the session-name charset are each a skipped file, nothing more."""
-    _spec(host, "placard")
+    _spec(host, "crate")
     (host / "broken.json").write_text("{not json")
     (host / "renamed.json").write_text(json.dumps({"id": "other", "displayName": "x"}))
     (host / "bad id.json").write_text(json.dumps({"id": "bad id"}))
     (host / "notes.txt").write_text("ignored")
     out = SCR.crews()["crews"]
-    assert [r["id"] for r in out] == ["placard"]
+    assert [r["id"] for r in out] == ["crate"]
 
 
 def test_fields_are_typed_bounded_and_unknown_keys_dropped(host):
@@ -200,15 +200,15 @@ def test_fields_are_typed_bounded_and_unknown_keys_dropped(host):
     a child session with a bad tmux id, and a key the contract does not name
     all fall away rather than reach Deck. (A control character in the
     directory withholds the whole row; see the relative-path test.)"""
-    _spec(host, "placard",
+    _spec(host, "crate",
           sessionId="58", secret="drop me",
-          sessions=[{"name": "placard--build", "displayName": "Build", "sessionId": "$19"},
-                    {"name": "placard--bad", "sessionId": "nope"},
+          sessions=[{"name": "crate--build", "displayName": "Build", "sessionId": "$19"},
+                    {"name": "crate--bad", "sessionId": "nope"},
                     {"name": "bad name!"}, "not a row"])
     row = SCR.crews()["crews"][0]
     assert row["sessionId"] is None
     assert "secret" not in row
-    assert [c["name"] for c in row["sessions"]] == ["placard--build", "placard--bad"]
+    assert [c["name"] for c in row["sessions"]] == ["crate--build", "crate--bad"]
     assert row["sessions"][1]["sessionId"] is None
     assert set(row) == {"id", "displayName", "workingDirectory", "sessionId", "host",
                         "project", "bead", "sessions", "derived"}
@@ -217,15 +217,15 @@ def test_fields_are_typed_bounded_and_unknown_keys_dropped(host):
 def test_a_relative_working_directory_withholds_the_row(host):
     """Without a usable directory the privacy question has no answer, and the
     skill says the field must never be omitted, so the row is not served."""
-    _spec(host, "placard", workingDirectory="Convivy/placard")
+    _spec(host, "crate", workingDirectory="Convivy/crate")
     assert SCR.crews()["crews"] == []
 
 
 def test_an_absent_index_costs_the_bead_and_nothing_else(host, monkeypatch):
     monkeypatch.setattr(SCR, "KB_INDEX", host.parents[3] / "missing.db")
-    _spec(host, "placard")
+    _spec(host, "crate")
     row = SCR.crews()["crews"][0]
-    assert row["project"] == "placard"
+    assert row["project"] == "crate"
     assert row["bead"] is None
     assert row["derived"] == ["project"]
 
@@ -235,11 +235,11 @@ def test_two_beads_for_a_project_default_to_none(host):
     conn = sqlite3.connect(str(SCR.KB_INDEX))
     conn.execute(
         "INSERT INTO docs (id, source, source_ref, kind, project, title, status, body, "
-        "body_hash, updated_at) VALUES ('placard/bead/other', 'files', 'x', 'bead', "
-        "'placard', 't', 'current', 'b', 'h2', 'now')")
+        "body_hash, updated_at) VALUES ('crate/bead/other', 'files', 'x', 'bead', "
+        "'crate', 't', 'current', 'b', 'h2', 'now')")
     conn.commit()
     conn.close()
-    _spec(host, "placard")
+    _spec(host, "crate")
     assert SCR.crews()["crews"][0]["bead"] is None
 
 
@@ -254,19 +254,19 @@ def test_the_caps_hold_and_truncate_silently(host):
     """The contract calls the caps load-bearing and truncation silent, so a
     refactor that dropped a slice must fail here rather than at crew #201."""
     big = host / "big.json"
-    big.write_text(json.dumps({"id": "big", "workingDirectory": str(host.parents[3] / "Convivy" / "placard"),
+    big.write_text(json.dumps({"id": "big", "workingDirectory": str(host.parents[3] / "Convivy" / "crate"),
                                "pad": "x" * (SCR.MAX_SPEC_BYTES + 1)}))
     assert [r["id"] for r in SCR.crews()["crews"]] == []
     big.unlink()
 
-    children = [{"name": f"placard--{i}", "sessionId": f"${i}"} for i in range(SCR.MAX_CHILD_SESSIONS + 5)]
-    _spec(host, "placard", host="h" * (SCR.MAX_TEXT + 1), sessions=children)
+    children = [{"name": f"crate--{i}", "sessionId": f"${i}"} for i in range(SCR.MAX_CHILD_SESSIONS + 5)]
+    _spec(host, "crate", host="h" * (SCR.MAX_TEXT + 1), sessions=children)
     row = SCR.crews()["crews"][0]
     assert row["host"] is None
     assert len(row["sessions"]) == SCR.MAX_CHILD_SESSIONS
 
     for i in range(SCR.MAX_CREWS + 3):
-        _spec(host, f"c{i:03d}", workingDirectory=str(host.parents[3] / "Convivy" / "placard"))
+        _spec(host, f"c{i:03d}", workingDirectory=str(host.parents[3] / "Convivy" / "crate"))
     assert len(SCR.crews()["crews"]) == SCR.MAX_CREWS
 
 
@@ -275,19 +275,19 @@ def test_one_bad_spec_costs_one_row_never_the_listing(host):
     which is a RuntimeError and slipped every except clause, and the whole
     listing went down on every poll until the file was removed. One file, one
     row (security-reviewer, #507 round 1)."""
-    _spec(host, "placard")
+    _spec(host, "crate")
     (host / "nested.json").write_text("[" * 20000 + "]" * 20000)
-    assert [r["id"] for r in SCR.crews()["crews"]] == ["placard"]
+    assert [r["id"] for r in SCR.crews()["crews"]] == ["crate"]
 
 
 def test_an_unreadable_private_home_withholds_rather_than_serves(host, monkeypatch):
     """Cannot tell is withheld on every path, including a samefile that raises
     for the one private home that would have matched."""
-    _spec(host, "placard")
+    _spec(host, "crate")
     real = SCR.os.path.samefile
 
     def flaky(a, b):
-        if str(b).endswith("/EA"):
+        if str(b).endswith("/DESK"):
             raise OSError("transient")
         return real(a, b)
     monkeypatch.setattr(SCR.os.path, "samefile", flaky)
@@ -304,17 +304,17 @@ def test_the_size_cap_is_a_bounded_read_not_a_stat(host, monkeypatch):
 
     def lying_stat(p, *a, **kw):
         st = real_stat(p, *a, **kw)
-        if str(p).endswith("placard.json"):
+        if str(p).endswith("crate.json"):
             return os.stat_result((*st[:6], 10, *st[7:]))
         return st
     monkeypatch.setattr(os, "stat", lying_stat)
-    big = host / "placard.json"
-    big.write_text(json.dumps({"id": "placard", "workingDirectory": str(host.parents[3] / "Convivy" / "placard"),
+    big = host / "crate.json"
+    big.write_text(json.dumps({"id": "crate", "workingDirectory": str(host.parents[3] / "Convivy" / "crate"),
                                "pad": "x" * (SCR.MAX_SPEC_BYTES + 1)}))
     assert SCR.crews()["crews"] == []
 
 
 def test_crews_are_sorted_by_id(host):
-    for cid in ("shipwright", "placard"):
+    for cid in ("shipwright", "crate"):
         _spec(host, cid)
-    assert [r["id"] for r in SCR.crews()["crews"]] == ["placard", "shipwright"]
+    assert [r["id"] for r in SCR.crews()["crews"]] == ["crate", "shipwright"]

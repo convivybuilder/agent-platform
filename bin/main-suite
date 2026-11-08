@@ -1,0 +1,29 @@
+#!/usr/bin/env python3.11
+"""main-suite — nightly runner that tests every opted-in product's main
+branch on the host that runs the job.
+
+Dispatched by launchd at 20:00 (com.convivy.main-suite) to catch combination
+drift from the day's merges before the 21:00 preflight and overnight pipeline.
+Silent on pass; logs an alert signal on failure.
+
+Exit codes: 0 pass, 1 test failure, 2 harness error (suite could not run, or
+the product registry itself could not be read).
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# Prefer this checkout's own lib over the installed farm (bin/knowledge-watcher's
+# shape) — a Builder deploy area has bin/ and lib/agent-platform/ together but no
+# ~/.local farm at all.
+for _libdir in ((Path(__file__).resolve().parent.parent / "lib" / "agent-platform"),
+                Path.home() / ".local" / "lib" / "agent-platform"):
+    if (_libdir / "main_suite.py").is_file():
+        sys.path.insert(0, str(_libdir))
+        break
+
+import main_suite as ms  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(ms.run())

@@ -2,7 +2,7 @@
 
 THE BUG THESE PIN. Seeding only when the FILE was absent meant one Cmd-minus in
 Deck created the file and locked the user out of Convivy's mapping forever —
-observed as the operator's Hollis rendering blue where iTerm renders pink. The unit of
+observed as the operator's Globex rendering blue where iTerm renders pink. The unit of
 "already present" is a key, not a file, so the tests that matter are the ones
 where a partial config exists: the user's entries survive and only the gaps fill.
 
@@ -35,6 +35,14 @@ def _script_text() -> str:
             .replace("@MINI_ROOT@", FAKE_MINI_ROOT)
             .replace("@STANDBY_ROOT@", FAKE_STANDBY_ROOT))
 THEME_JSON = REPO / "deck" / "theme.json"
+# A synthetic seed for the merge/seed-logic tests below (CQ-590 moved the real
+# per-crew mapping out of THEME_JSON, into install.sh's registry-driven
+# render), with its own matching ssh text, so neither names a real crew.
+SAMPLE_THEME_JSON = REPO / "tests" / "fixtures" / "deck_theme_seed_sample.json"
+SAMPLE_SSH_TEXT = (
+    "RemoteCommand printf 'x'; tmux attach -d -t widget || "
+    "tmux new -s widget -c /Users/example/widget\n"
+)
 
 
 @pytest.fixture
@@ -72,20 +80,20 @@ def test_session_themes_merge_one_level_down(DC):
     """The whole reason this module exists: a user with three themes picked
     keeps those three and gains the rest."""
     merged, filled = DC.merge(
-        {"sessions": {"vivy": "rose"}},
-        {"sessions": {"vivy": "azure", "deck": "gold", "hollis": "rose"}},
+        {"sessions": {"widget": "rose"}},
+        {"sessions": {"widget": "azure", "deck": "gold", "globex": "rose"}},
     )
-    assert merged["sessions"]["vivy"] == "rose", "the user's own pick must win"
+    assert merged["sessions"]["widget"] == "rose", "the user's own pick must win"
     assert merged["sessions"]["deck"] == "gold"
-    assert filled == ["sessions.deck", "sessions.hollis"]
+    assert filled == ["sessions.deck", "sessions.globex"]
 
 
 def test_the_reported_bug_a_file_with_no_sessions_block(DC):
     """The operator's actual file: created by Deck on a font-size change, carrying
     typography and nothing else. It must gain the mapping."""
     existing = {"terminal": {"fontSize": 13.0}, "appearance": "system"}
-    merged, filled = DC.merge(existing, {"sessions": {"hollis": "rose"}, "appearance": "light"})
-    assert merged["sessions"] == {"hollis": "rose"}
+    merged, filled = DC.merge(existing, {"sessions": {"globex": "rose"}, "appearance": "light"})
+    assert merged["sessions"] == {"globex": "rose"}
     assert merged["terminal"] == {"fontSize": 13.0}, "typography is untouched"
     assert merged["appearance"] == "system", "their appearance wins"
     assert filled == ["sessions"]
@@ -104,12 +112,12 @@ def test_merging_is_idempotent(DC):
 
 def test_rail_is_derived_from_the_tmux_create_clause(DC):
     text = """
-    RemoteCommand printf 'x'; tmux attach -d -t vivy || tmux new -s vivy -c /Users/example/Convivy/vivy
+    RemoteCommand printf 'x'; tmux attach -d -t widget || tmux new -s widget -c /Users/example/Convivy/widget
     RemoteCommand printf 'x'; tmux attach -d -t deck || tmux new -s deck -c /Users/example/Convivy/convivy-deck
     """
     rail = DC.rail_from_ssh_config(text)
-    assert [r["session"] for r in rail] == ["vivy", "deck"]
-    assert rail[0]["workdir"] == "/Users/example/Convivy/vivy"
+    assert [r["session"] for r in rail] == ["widget", "deck"]
+    assert rail[0]["workdir"] == "/Users/example/Convivy/widget"
 
 
 def test_rail_keeps_the_workdir_when_the_create_is_grouped_behind_the_server_check(DC):
@@ -117,9 +125,9 @@ def test_rail_keeps_the_workdir_when_the_create_is_grouped_behind_the_server_che
     The `)` closing that group is not part of the workdir: read into it, the
     workdir fails `_SAFE_WORKDIR`, and the rail silently loses the directory."""
     text = ("  RemoteCommand printf 'x'; ~/.local/bin/session-agent ensure-server && "
-            "(tmux attach -d -t vivy || tmux new -s vivy -c /Users/example/Convivy/vivy)\n")
+            "(tmux attach -d -t widget || tmux new -s widget -c /Users/example/Convivy/widget)\n")
     rail = DC.rail_from_ssh_config(text)
-    assert rail == [{"session": "vivy", "workdir": "/Users/example/Convivy/vivy"}]
+    assert rail == [{"session": "widget", "workdir": "/Users/example/Convivy/widget"}]
 
 
 def test_rail_keeps_ssh_config_order(DC):
@@ -139,8 +147,8 @@ def test_a_display_name_equal_to_the_session_is_omitted(DC):
     """Deck falls back to the session name, so writing it twice is noise."""
     rail = DC.rail_from_ssh_config("tmux new -s deck -c /d", {"deck": "deck"})
     assert "name" not in rail[0]
-    rail = DC.rail_from_ssh_config("tmux new -s svc -c /s", {"svc": "Convivy Kit"})
-    assert rail[0]["name"] == "Convivy Kit"
+    rail = DC.rail_from_ssh_config("tmux new -s kit -c /s", {"kit": "Example Kit"})
+    assert rail[0]["name"] == "Example Kit"
 
 
 # MARK: - No drift between the rail and the aliases
@@ -183,10 +191,15 @@ def test_every_rail_session_is_a_valid_tmux_name():
         assert ".." not in row["workdir"], row
 
 
-def test_shipped_theme_json_parses_and_carries_rail_names():
+def test_shipped_theme_json_carries_no_per_crew_styling():
+    """CQ-590: iterm/co-*.json and this file's own sessions/railNames entries
+    were the Builder release name scan's target — any crew-specific mapping
+    now has to be rendered from the registry at install time (bin/render-co-
+    style), so the committed file carries only generic settings."""
     doc = json.loads(THEME_JSON.read_text())
-    assert isinstance(doc.get("sessions"), dict)
-    assert isinstance(doc.get("railNames"), dict)
+    assert doc.get("appearance") == "system"
+    assert "sessions" not in doc
+    assert "railNames" not in doc
 
 
 # MARK: - The installer's entry point
@@ -195,14 +208,14 @@ def test_shipped_theme_json_parses_and_carries_rail_names():
 def test_seed_document_folds_the_rail_in_and_drops_rail_names(DC):
     """railNames labels rail rows and would be meaningless in the installed
     file, so it is consumed rather than passed through."""
-    seed = DC.seed_document(THEME_JSON.read_text(), _script_text())
+    seed = DC.seed_document(SAMPLE_THEME_JSON.read_text(), SAMPLE_SSH_TEXT)
     assert "railNames" not in seed
-    assert seed["rail"], "the shipped config should seed a rail"
-    assert any(r.get("name") == "Convivy Kit" for r in seed["rail"])
+    assert seed["rail"], "the sample config should seed a rail"
+    assert any(r.get("name") == "Widget Co" for r in seed["rail"])
 
 
 def test_merge_file_round_trips_and_sorts(DC):
-    out, filled = DC.merge_file(None, THEME_JSON.read_text(), _script_text())
+    out, filled = DC.merge_file(None, SAMPLE_THEME_JSON.read_text(), SAMPLE_SSH_TEXT)
     doc = json.loads(out)
     assert doc["rail"] and doc["sessions"]
     assert out == json.dumps(doc, indent=2, sort_keys=True) + "\n"
@@ -213,13 +226,13 @@ def test_an_unparseable_existing_file_is_treated_as_absent(DC):
     """Refusing to install because the user hand-edited their config into
     invalid JSON helps nobody, and Deck itself degrades a malformed config to
     defaults rather than failing."""
-    out, filled = DC.merge_file("{not json", THEME_JSON.read_text(), _script_text())
+    out, filled = DC.merge_file("{not json", SAMPLE_THEME_JSON.read_text(), SAMPLE_SSH_TEXT)
     assert json.loads(out)["sessions"]
     assert "sessions" in filled
 
 
 def test_a_non_object_existing_file_is_treated_as_absent(DC):
-    out, _ = DC.merge_file("[1,2,3]", THEME_JSON.read_text(), _script_text())
+    out, _ = DC.merge_file("[1,2,3]", SAMPLE_THEME_JSON.read_text(), SAMPLE_SSH_TEXT)
     assert isinstance(json.loads(out), dict)
 
 
@@ -230,7 +243,7 @@ def test_merge_does_not_mutate_its_input(DC):
     """A shallow dict() copy leaves the inner dict aliased, so the nested merge
     would quietly populate the caller's own config. merge_file happens to let
     `existing` go out of scope, which is what would hide this."""
-    existing = {"sessions": {"vivy": "rose"}}
+    existing = {"sessions": {"widget": "rose"}}
     before = json.dumps(existing, sort_keys=True)
     DC.merge(existing, {"sessions": {"deck": "gold"}})
     assert json.dumps(existing, sort_keys=True) == before
@@ -239,7 +252,7 @@ def test_merge_does_not_mutate_its_input(DC):
 def test_merge_does_not_mutate_its_seed(DC):
     seed = {"sessions": {"deck": "gold"}}
     before = json.dumps(seed, sort_keys=True)
-    DC.merge({"sessions": {"vivy": "rose"}}, seed)
+    DC.merge({"sessions": {"widget": "rose"}}, seed)
     assert json.dumps(seed, sort_keys=True) == before
 
 
@@ -251,7 +264,7 @@ def test_a_second_install_leaves_an_existing_rail_alone(DC):
     curated, and once the key exists nothing here can tell "never customised"
     from "deliberately removed rows". Re-adding a deleted row is the worse
     error."""
-    theme, ssh = THEME_JSON.read_text(), _script_text()
+    theme, ssh = SAMPLE_THEME_JSON.read_text(), SAMPLE_SSH_TEXT
     first, _ = DC.merge_file(None, theme, ssh)
     expanded = ssh + "\n  RemoteCommand tmux attach -d -t brand-new || tmux new -s brand-new -c /Users/example/new\n"
 
@@ -263,7 +276,7 @@ def test_a_second_install_leaves_an_existing_rail_alone(DC):
 
 def test_deleting_the_rail_key_is_the_documented_refresh(DC):
     """The escape hatch the docs promise has to actually work."""
-    theme, ssh = THEME_JSON.read_text(), _script_text()
+    theme, ssh = SAMPLE_THEME_JSON.read_text(), SAMPLE_SSH_TEXT
     first, _ = DC.merge_file(None, theme, ssh)
     expanded = ssh + "\n  RemoteCommand tmux attach -d -t brand-new || tmux new -s brand-new -c /Users/example/new\n"
 
@@ -277,7 +290,7 @@ def test_deleting_the_rail_key_is_the_documented_refresh(DC):
 def test_a_new_session_theme_DOES_arrive_on_a_re_install(DC):
     """`sessions` is nested-merged, so unlike the rail it does track additions.
     The two keys behave differently on purpose; this pins the difference."""
-    theme, ssh = THEME_JSON.read_text(), _script_text()
+    theme, ssh = SAMPLE_THEME_JSON.read_text(), SAMPLE_SSH_TEXT
     first, _ = DC.merge_file(None, theme, ssh)
     grown = json.loads(theme)
     grown["sessions"]["brand-new"] = "teal"
@@ -301,7 +314,7 @@ def test_a_workdir_with_shell_metacharacters_is_dropped(DC):
 
 
 def test_a_legitimate_workdir_survives_the_guard(DC):
-    for good in ("/Users/example/Convivy/vivy", "~/work/x", "/Users/example/nyh-architecture/nyh-etc"):
+    for good in ("/Users/example/Convivy/widget", "~/work/x", "/Users/example/acme/acme-etc"):
         rail = DC.rail_from_ssh_config(f"tmux new -s x -c {good}")
         assert rail[0]["workdir"] == good
 

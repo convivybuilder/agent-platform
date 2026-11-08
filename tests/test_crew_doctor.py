@@ -16,7 +16,7 @@ a confident, wrong report about a healthy crew:
     resolves (shipwright "broken", signals nearly)
   - comparing `crew_for_repo` against the registry KEY instead of the crew name
     (convivy-deck "broken")
-  - a hardcoded `daytime` variant (ea and convivy-commercial "broken")
+  - a hardcoded `daytime` variant (satchel and northwind-commercial "broken")
 """
 from __future__ import annotations
 
@@ -156,6 +156,49 @@ def test_a_crew_with_no_prefix_is_not_asserted_to_pass():
                                  ).state == CD.NOT_APPLICABLE
 
 
+def test_a_list_valued_prefix_resolving_to_a_worktree_passes():
+    """ARCH-397 Phase 2 lets `agent_prefix` hold a list (a crew with a live
+    prefix and a retired one still authenticating old review stamps). Before
+    this fix, a list read straight off `unit.get("agent_prefix")` built the
+    garbage agent name `"['acme-', 'legacy-']coder"`, which `derive_purpose`
+    never resolves — a false MISSING on a healthy crew."""
+    res = CD.check_agent_prefix(
+        "x", {"agent_prefix": ["acme-", "legacy-"]},
+        derive_purpose=lambda name, task, pr=None: f"{name}-slug")
+    assert res.state == CD.PRESENT
+    assert "acme-coder" in res.detail and "legacy-coder" in res.detail
+
+
+def test_a_list_valued_prefix_with_one_bad_entry_fails_naming_it():
+    res = CD.check_agent_prefix(
+        "x", {"agent_prefix": ["acme-", "zzz-"]},
+        derive_purpose=lambda name, task, pr=None: None if "zzz" in name else f"{name}-slug")
+    assert res.state == CD.MISSING
+    assert "zzz-coder" in res.detail and "PRIMARY" in res.detail
+
+
+def test_a_private_crews_prefix_resolving_to_the_primary_checkout_passes():
+    """platform/decisions/0043: a private crew's dispatch always stays in the
+    primary, worktree-class role included, so `derive_purpose` returning None
+    for its prefixed coder/reviewer is the EXPECTED answer, not the MISSING
+    failure a public crew's same answer would be."""
+    res = CD.check_agent_prefix("x", {"agent_prefix": "box-", "private": True},
+                                derive_purpose=lambda *a, **k: None)
+    assert res.state == CD.PRESENT
+    assert "private" in res.detail
+
+
+def test_a_private_crews_prefix_resolving_to_a_worktree_fails():
+    """The inverted failure: a private crew's prefixed coder/reviewer getting a
+    REAL worktree is the ADR-0043 wall violation this site exists to catch for
+    one, the mirror image of the public-crew check above."""
+    res = CD.check_agent_prefix(
+        "x", {"agent_prefix": "box-", "private": True},
+        derive_purpose=lambda name, task, pr=None: f"{name}-slug")
+    assert res.state == CD.MISSING
+    assert "box-coder" in res.detail and "private" in res.detail
+
+
 # --- co --resolve ----------------------------------------------------------
 
 def test_co_without_the_flag_reads_as_unchecked_not_as_a_broken_crew(tmp_path):
@@ -187,6 +230,39 @@ def test_co_naming_the_crew_is_the_evidence(tmp_path):
     assert "crew=signals" in res.detail
 
 
+def test_co_refresh_output_before_the_crew_line_still_reads_present(tmp_path):
+    """`co --resolve` runs co's workspace refresh first, which prints to stdout
+    ahead of the `crew=` line. Requiring the WHOLE stdout to start with `crew=`
+    read a working crew as MISSING whenever the refresh printed anything."""
+    fake = tmp_path / "co"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "echo 'knowledge-ctx: widget/daytime is current.'\n"
+        "echo 'crew=widget label=Widget dir=/x'\n"
+    )
+    fake.chmod(0o755)
+    res = CD.check_co_resolves("x", tmp_path, co_bin=fake)
+    assert res.state == CD.PRESENT
+    assert res.detail == "crew=widget label=Widget dir=/x"
+
+
+def test_a_stderr_warning_alongside_refresh_output_still_reads_present(tmp_path):
+    """A stderr line (an auth-token notice, a refresh warning) alongside stdout
+    refresh lines ahead of the `crew=` line, and a zero exit, is not a failure —
+    the detail is the `crew=` line, not the stderr noise."""
+    fake = tmp_path / "co"
+    fake.write_text(
+        "#!/bin/sh\n"
+        "echo 'co: auth token - 5.3h left.' >&2\n"
+        "echo '+ document some-thing'\n"
+        "echo 'crew=gadget label=Gadget dir=/x'\n"
+    )
+    fake.chmod(0o755)
+    res = CD.check_co_resolves("x", tmp_path, co_bin=fake)
+    assert res.state == CD.PRESENT
+    assert res.detail == "crew=gadget label=Gadget dir=/x"
+
+
 def test_every_co_launch_goes_through_the_one_choke_point():
     """FIFTEEN branches used to `exec claude` directly, and under `--resolve` any
     of them would have STARTED A SESSION — which `crew doctor --all` would then do
@@ -198,7 +274,13 @@ def test_every_co_launch_goes_through_the_one_choke_point():
             if re.match(r"^\s*exec claude\b", ln)]
     assert bare == ['exec claude "$@"'], \
         f"a launch bypasses _co_exec_claude: {bare}"
-    assert co.count("_co_exec_claude ") >= 15
+    # Floor moved from 15 to 12 when the crew-layout-from-the-registry refactor
+    # collapsed four separately-named branches that each called
+    # `_co_exec_claude` once into a single registry-driven branch, and two more
+    # into another — a real reduction in call sites, not a dropped wrapper
+    # (every merged branch still ends in exactly one `_co_exec_claude` call,
+    # reached unconditionally once its registry match fires).
+    assert co.count("_co_exec_claude ") >= 12
 
 
 def test_no_launcher_renames_a_tmux_window_it_does_not_own():
@@ -206,7 +288,7 @@ def test_no_launcher_renames_a_tmux_window_it_does_not_own():
 
     Untargeted, tmux resolves a command to the current session's ACTIVE window,
     so a rename with no `-t` lands on whatever the operator was last looking at.
-    It renamed the operator's main Ask window on 2026-09-06
+    It renamed the operator's main walled-off-crew window on 2026-09-06
     (issue_01M1VTRHKRERY7MJEYCF4WR2G2), and on 2026-09-16 it labelled the live
     `bosun` window `operator.com` and earlier `Shipwright`
     (issue_01M2PXARYZ2HA08G9MJ4QPQYW9), which was first read as a lost session.
@@ -337,12 +419,12 @@ def test_a_missing_index_is_unchecked_rather_than_broken(tmp_path):
 # --- the variant -----------------------------------------------------------
 
 def test_the_variant_comes_from_the_crew_not_from_a_constant(tmp_path):
-    """`ea` runs `platform/ea-daytime` and `convivy-commercial` runs
+    """`satchel` runs `platform/satchel-daytime` and `northwind-commercial` runs
     `company/commercial`. A doctor hardcoding `daytime` reported both broken for
     running the profile they are supposed to run."""
     (tmp_path / ".claude").mkdir()
-    (tmp_path / ".claude" / ".active-profile").write_text("platform/ea-daytime\n")
-    assert CD.active_variant(tmp_path) == "ea-daytime"
+    (tmp_path / ".claude" / ".active-profile").write_text("platform/satchel-daytime\n")
+    assert CD.active_variant(tmp_path) == "satchel-daytime"
 
 
 def test_a_crew_that_never_individuated_falls_back_to_the_default(tmp_path):
@@ -369,9 +451,9 @@ def test_no_agents_is_the_signals_failure_and_must_fail(tmp_path):
 
 
 def test_agents_committed_in_the_repo_count(tmp_path):
-    """`convivy-deck` and `hollis` keep `.claude/agents/` committed and never
+    """`convivy-deck` and `galley` keep `.claude/agents/` committed and never
     individuate, which `bin/co`'s deck branch says in as many words. A draft
-    checked for the marker file and reported both broken, with `svc` and
+    checked for the marker file and reported both broken, with `relay` and
     `write-better`. The site is whether a session finds agents."""
     res = CD.check_crew_context(_crew_dir(tmp_path, agents=["coder.md"]), "deck", "daytime")
     assert res.state == CD.PRESENT
@@ -512,7 +594,7 @@ def test_diagnose_walks_every_site_for_an_adopters_crew(monkeypatch, tmp_path):
 
     sites = [r.site for r in res]
     assert sites == [
-        "registry entry (config/projects.json)",
+        "registry entry",
         "home directory",
         "dispatch resolves (crew_for_repo)",
         "agent prefix dispatches to a worktree",
@@ -646,10 +728,16 @@ def test_an_unchecked_site_fails_the_command_too(agentctl, monkeypatch, capsys):
 # there and never `agent-platform-token`, so the doctor 401'd on every adopter
 # crew while working here (issue_01M3NW81FC33701HQE3WV7HFRE).
 #
+# `ops-mcp-token` IS NOT A FALLBACK (the Library is revoking the shared
+# credential it names now that each crew presents its own, and
+# `mcp-ops-server` itself no longer reads this file). A lone `ops-mcp-token`
+# on disk must read as no token at all, not as a dead one sent to the
+# Library.
+#
 # THE FALLBACK TOKEN NEVER PAIRS WITH THE ENV-DERIVED URL (security-reviewer,
-# PR #708 round 2). `library-token`/`ops-mcp-token` resolve, in the Library's
-# own identity.py, to an `agent`-/`system`-kind credential holding far more
-# than the `roster.read` this command needs — `merge.admit`, `ledger.spend`,
+# PR #708 round 2). `library-token` resolves, in the Library's own
+# identity.py, to an `agent`-/`system`-kind credential holding far more than
+# the `roster.read` this command needs — `merge.admit`, `ledger.spend`,
 # `item.resolve` among them — so it must go only to `vault_plane.
 # fixed_library_url()`, never to `vault_plane.base_url()`, an address
 # `LIBRARY_BASE_URL` lets the environment repoint anywhere `https://`. Every
@@ -693,23 +781,25 @@ def test_falls_back_to_library_token_an_install_writes(agentctl, monkeypatch, tm
     assert auth.pinned is True
 
 
-def test_falls_back_to_ops_mcp_token_when_library_token_is_absent(agentctl, monkeypatch, tmp_path):
-    """The ops MCP server's own credential — a real Library client in this
-    repo, sending a token gated the same way (`roster.read`) — is the next
-    fallback rather than a 401, and it is bound to the fixed address the same
-    way `library-token` is."""
+def test_ops_mcp_token_is_no_longer_a_fallback(agentctl, monkeypatch, tmp_path):
+    """THE BUG THIS PINS, THE OTHER WAY: once the Library revokes the shared
+    `ops-mcp-token` credential, a lone `ops-mcp-token` file left on disk must
+    read as no token at all — never as a dead token sent to the Library's
+    fixed address."""
     monkeypatch.setattr(agentctl.SC, "token", lambda: None)
     monkeypatch.setattr(agentctl, "_ORIENT_CONTROL_DIR", tmp_path)
     monkeypatch.setattr(vault_plane, "LIBRARY_BASE_URL", _OFF_BOX_LIBRARY_URL)
     (tmp_path / "ops-mcp-token").write_text("ops-tok\n")
     auth = agentctl._doctor_auth()
-    assert auth.token == "ops-tok"
-    assert auth.base_url == vault_plane.fixed_library_url("")
-    assert auth.base_url != _OFF_BOX_LIBRARY_URL
-    assert auth.pinned is True
+    assert auth.token is None
+    assert auth.base_url == vault_plane.base_url()
+    assert auth.pinned is False
 
 
-def test_library_token_is_preferred_over_ops_mcp_token(agentctl, monkeypatch, tmp_path):
+def test_library_token_is_used_even_when_an_unrelated_ops_mcp_token_file_is_present(
+        agentctl, monkeypatch, tmp_path):
+    """`ops-mcp-token` is not consulted at all, so its presence alongside
+    `library-token` makes no difference to the result."""
     monkeypatch.setattr(agentctl.SC, "token", lambda: None)
     monkeypatch.setattr(agentctl, "_ORIENT_CONTROL_DIR", tmp_path)
     (tmp_path / "library-token").write_text("lib-tok\n")
@@ -827,10 +917,16 @@ def test_the_command_sends_the_installs_token_when_sc_token_is_absent(
     assert seen["opener"] is sentinel_opener
 
 
-def test_the_command_sends_the_ops_mcp_fallback_to_the_fixed_url_too(
+def test_the_command_sends_no_fallback_for_a_lone_ops_mcp_token(
         agentctl, monkeypatch, tmp_path):
+    """END TO END: a lone `ops-mcp-token` file — all that is left once an
+    install's shared credential is revoked — must not pin the doctor to the
+    fixed address or send a dead token; it reads exactly as no token at all,
+    the same env-derived address and unpinned opener as `test_the_command_
+    keeps_the_env_derived_url_when_sc_token_is_present` below."""
     monkeypatch.setattr(agentctl.SC, "token", lambda: None)
     monkeypatch.setattr(agentctl, "_ORIENT_CONTROL_DIR", tmp_path)
+    monkeypatch.setattr(vault_plane, "VAULTS_ON_LIBRARY", True)
     monkeypatch.setattr(vault_plane, "LIBRARY_BASE_URL", _OFF_BOX_LIBRARY_URL)
     (tmp_path / "ops-mcp-token").write_text("ops-tok\n")
     sentinel_opener = object()
@@ -840,10 +936,9 @@ def test_the_command_sends_the_ops_mcp_fallback_to_the_fixed_url_too(
         CD, "diagnose",
         lambda crew, **kw: seen.update(kw) or [CD.Result("a site", "Bosun", CD.PRESENT, "fine")])
     assert agentctl.cmd_crew_doctor(_args(crew="x")) == 0
-    assert seen["headers"].get("Authorization") == "Bearer ops-tok"
-    assert seen["base_url"] == vault_plane.fixed_library_url("")
-    assert seen["base_url"] != _OFF_BOX_LIBRARY_URL
-    assert seen["opener"] is sentinel_opener
+    assert "Authorization" not in seen["headers"]
+    assert seen["base_url"] == _OFF_BOX_LIBRARY_URL == vault_plane.base_url()
+    assert seen["opener"] is None
 
 
 def test_the_command_keeps_the_env_derived_url_when_sc_token_is_present(
@@ -1183,7 +1278,7 @@ def test_a_missing_knowledge_ctx_is_unchecked_not_a_broken_crew(tmp_path):
 
 
 def test_knowledge_ctx_refusing_the_directory_reports_its_reason(tmp_path):
-    """The real failure for cfo, operator and the nyh crews — the reason has to
+    """The real failure for ledger, operator and the oak crews — the reason has to
     survive to the report, or the operator is told only that something is wrong."""
     kctx = _fake_kctx(tmp_path, stderr="knowledge-ctx: no project mapping for cwd\\n", rc=1)
     project, why = CD.resolve_profile_project(tmp_path, knowledge_ctx=kctx)
@@ -1229,7 +1324,7 @@ def test_own_bin_falls_back_to_the_machine_root_when_the_checkout_lacks_it(tmp_p
 # Every SITE had coverage; the function that COMPOSES them did not, beyond the
 # early registry stop. The decisions below are made in `diagnose` and nowhere
 # else, so a site passing in isolation says nothing about them — and one of them,
-# the variant selection, is where a real bug lived (ea and convivy-commercial
+# the variant selection, is where a real bug lived (satchel and northwind-commercial
 # reported broken for running their own profiles).
 
 def _wire(monkeypatch, tmp_path, *, unit, home=None, project="p",
@@ -1259,7 +1354,7 @@ def test_diagnose_stops_when_the_home_directory_is_missing(monkeypatch, tmp_path
     """Reporting eight more MISSING lines for a crew whose directory is not there
     buries the one line that matters."""
     res = _wire(monkeypatch, tmp_path, unit=_ACTIVE, home=tmp_path / "nope")
-    assert [r.site for r in res] == ["registry entry (config/projects.json)", "home directory"]
+    assert [r.site for r in res] == ["registry entry", "home directory"]
     assert res[-1].state == CD.MISSING
 
 
@@ -1289,22 +1384,22 @@ def test_diagnose_stops_when_knowledge_ctx_cannot_name_the_project(monkeypatch, 
 
 
 def test_diagnose_checks_the_variant_the_crew_actually_runs(monkeypatch, tmp_path):
-    """THE LINE A REAL BUG LIVED ON. `ea` runs `platform/ea-daytime` and
-    `convivy-commercial` runs `company/commercial`; a hardcoded `daytime`
+    """THE LINE A REAL BUG LIVED ON. `satchel` runs `platform/satchel-daytime` and
+    `northwind-commercial` runs `company/commercial`; a hardcoded `daytime`
     reported both broken for running their own profiles. The selection happens
     in `diagnose`, so no site test reaches it."""
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
-    (home / ".claude" / ".active-profile").write_text("p/ea-daytime\n")
+    (home / ".claude" / ".active-profile").write_text("p/satchel-daytime\n")
     res = _wire(monkeypatch, tmp_path, unit=_ACTIVE, home=home)
-    assert any("profile served (p/ea-daytime)" == r.site for r in res), [r.site for r in res]
+    assert any("profile served (p/satchel-daytime)" == r.site for r in res), [r.site for r in res]
 
 
 def test_an_explicit_variant_still_wins_over_the_crews_own(monkeypatch, tmp_path):
     """So a caller can ask about a variant the crew does not run."""
     home = tmp_path / "home"
     (home / ".claude").mkdir(parents=True)
-    (home / ".claude" / ".active-profile").write_text("p/ea-daytime\n")
+    (home / ".claude" / ".active-profile").write_text("p/satchel-daytime\n")
     monkeypatch.setattr(CD.projects, "get", lambda s: _ACTIVE)
     monkeypatch.setattr(CD.projects, "home_path", lambda s: home)
     monkeypatch.setattr(CD.projects, "crew_for_repo", lambda r: "x")

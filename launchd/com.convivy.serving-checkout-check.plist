@@ -20,7 +20,7 @@
          none of it served) does not train the reader to ignore the output.
          Logs an alert signal per checkout per finding kind (branch vs dirty, tracked
          independently); silent on pass. Never reads a file's content, only its
-         path and git status — safe against black-box crews (CFO) by design. -->
+         path and git status — safe against black-box crews by design. -->
     <!-- Deploy-pinned per platform/decisions/0059 rule 1
          (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
          production USE of check-serving-checkouts, not someone working on it, so this

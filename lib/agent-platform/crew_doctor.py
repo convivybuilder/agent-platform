@@ -6,7 +6,7 @@ GitHub repo, a tmux session and a Deck spec, and was reported done. A day later
 it had no skills, `co -r` did nothing but run `/handoff-pickup`, it launched on
 Sonnet, and no writing agent could be dispatched to it. The operator found every one of
 those by USING it. Each was a registration site the `new-crew` skill never
-touched. Placard (2026-09-05) and shipwright (2026-09-06) each missed a
+touched. A third crew (2026-09-05) and shipwright (2026-09-06) each missed a
 different subset. Three crews in eleven days is a broken process, not three
 slips (`issue_01M2NYBBY0FXCDHWWD8XBR9RR3`).
 
@@ -18,9 +18,9 @@ executed here, and it is what this module keeps for the Library's trees. But
 for the Bosun's own code it is the wrong question, and it answers wrongly in
 both directions:
 
-  - **False MISSING.** `selector` and `hollis` are absent from `_co_crew_dirs`
+  - **False MISSING.** Some crews are absent from `_co_crew_dirs`
     and work perfectly, because they reach `co -r` through a dedicated branch
-    instead. A checker reading the array reports two healthy crews broken.
+    instead. A checker reading the array reports a healthy crew broken.
   - **False PRESENT.** A name can sit in every list this repo keeps and the crew
     still fail, because what decides at runtime is a function, not a literal.
     `sig-` was in both prefix tuples before anything confirmed that
@@ -175,21 +175,21 @@ def check_registry(crew: str, *, knowledge_root: Path | str | None = None
     if unit is not None:
         life = unit.get("lifecycle")
         if life != "active":
-            return Result("registry entry (config/projects.json)", "Bosun", MISSING,
+            return Result("registry entry", "Bosun", MISSING,
                           f"lifecycle is '{life}', not 'active'"), unit
-        return Result("registry entry (config/projects.json)", "Bosun", PRESENT,
+        return Result("registry entry", "Bosun", PRESENT,
                       unit.get("display") or crew), unit
-    # No row in config/projects.json. `resolve_project`'s own fallback — a name
+    # No row in the registry. `resolve_project`'s own fallback — a name
     # with a `projects/<name>/` directory in the knowledge tree resolves to
     # itself — is what gives an adopter's crew its crew-scoped instruction
     # blocks with no entry here, so a name that resolves that way is a real
     # crew rather than a broken one, and every later site in this module
     # diagnoses it the same way it diagnoses a registered one.
     if projects.resolve_project(crew, knowledge_root) == crew:
-        return Result("registry entry (config/projects.json)", "Bosun", PRESENT,
+        return Result("registry entry", "Bosun", PRESENT,
                       f"projects/{crew}/ in the knowledge tree — no registry row "
                       f"by design"), None
-    return Result("registry entry (config/projects.json)", "Bosun", MISSING,
+    return Result("registry entry", "Bosun", MISSING,
                   f"no unit named '{crew}'"), None
 
 
@@ -245,41 +245,61 @@ def check_dispatch(crew: str, unit: dict) -> Result:
 
 
 def check_agent_prefix(crew: str, unit: dict, *, derive_purpose) -> Result:
-    """A write-class agent for this crew gets a WORKTREE, not the primary.
+    """A write-class agent for this crew gets a WORKTREE, not the primary —
+    UNLESS `unit` is a PRIVATE crew (platform/decisions/0043), for which the
+    expectation inverts: every dispatch, worktree-class role included, stays
+    in the primary (`bin/agentctl`'s `_dispatch_purpose`), so a prefixed
+    `coder`/`reviewer` resolving to a real worktree is the wall violation this
+    site exists to catch for a private crew, not the health signal it is for
+    a public one.
 
     `derive_purpose` is the dispatcher's own decision function and it is pure —
     unlike `spawn --dry-run`, which creates a worktree, registers a run and
     writes a stub transcript, and would therefore dirty the machine every time a
-    scheduled `--all` ran. `None` is the failure: it means the primary checkout,
-    which is how an unregistered prefix leaves a coder committing into the crew's
-    shared tree and then leaves it on a feature branch.
+    scheduled `--all` ran. It is also PRIVACY-BLIND BY DESIGN (it decides purely
+    by role, never reading a registry): this site, not `derive_purpose`, is
+    where `unit`'s own `private` field is applied to its answer.
     """
-    prefix = unit.get("agent_prefix")
-    if not prefix:
+    raw = unit.get("agent_prefix")
+    if not raw:
         # Slice 2 puts `agent_prefix` in the registry. Until then a crew that
         # dispatches only bare roles is legitimately prefix-less, and saying
         # PRESENT here would be a check that cannot fail.
         return Result("agent prefix dispatches to a worktree", "Bosun", NOT_APPLICABLE,
                       "the entry declares no agent_prefix")
+    private = bool(unit.get("private"))
+    # ARCH-397 Phase 2 lets a unit carry one prefix or a list of them (a crew
+    # with a live prefix and a retired one it still has to authenticate old
+    # review stamps under — see projects.agent_prefixes()). Same normalization
+    # here: a bare string reads as the single-element case rather than being
+    # iterated character by character.
+    prefixes = (raw,) if isinstance(raw, str) else tuple(raw)
     bad = []
-    for role in ("coder", "reviewer"):
-        name = f"{prefix}{role}"
-        purpose = derive_purpose(name, _PROBE_TASK, pr=None)
-        if not purpose:
-            bad.append(f"{name} -> the PRIMARY checkout")
+    for prefix in prefixes:
+        for role in ("coder", "reviewer"):
+            name = f"{prefix}{role}"
+            purpose = derive_purpose(name, _PROBE_TASK, pr=None)
+            if private:
+                if purpose:
+                    bad.append(f"{name} -> a worktree (this crew is private: "
+                              f"platform/decisions/0043 expects the primary)")
+            elif not purpose:
+                bad.append(f"{name} -> the PRIMARY checkout")
     if bad:
         return Result("agent prefix dispatches to a worktree", "Bosun", MISSING,
                       "; ".join(bad))
-    return Result("agent prefix dispatches to a worktree", "Bosun", PRESENT,
-                  f"{prefix}coder, {prefix}reviewer")
+    detail = ", ".join(f"{prefix}coder, {prefix}reviewer" for prefix in prefixes)
+    if private:
+        detail += " (primary checkout — this crew is private)"
+    return Result("agent prefix dispatches to a worktree", "Bosun", PRESENT, detail)
 
 
 def check_co_resolves(crew: str, home: Path, *, co_bin: Path) -> Result:
     """`co --resolve` agrees this directory is a crew it can launch.
 
     RUN, NOT PARSED, and this is the site that proves why. `_co_crew_dirs` does
-    not name `selector` or `hollis`, which reach `co -r` by a dedicated branch
-    and work — a checker reading the array calls two healthy crews broken. Asking
+    not name every crew that reaches `co -r` by a dedicated branch instead and
+    works — a checker reading the array calls a healthy crew broken. Asking
     `co` what it would do covers both paths and needs no exception list.
     """
     if not co_bin.exists():
@@ -289,6 +309,8 @@ def check_co_resolves(crew: str, home: Path, *, co_bin: Path) -> Result:
     except (OSError, subprocess.SubprocessError) as exc:
         return Result("co -r resolves the crew", "Bosun", UNKNOWN, f"could not run co: {exc}")
     out = (cp.stdout or "").strip()
+    crew_lines = [ln for ln in out.splitlines() if ln.startswith("crew=")]
+    crew_line = crew_lines[-1] if crew_lines else None
 
     # THE `crew=` LINE IS THE ONLY EVIDENCE, and a zero exit is not a substitute.
     # `co` forwards flags it does not recognise straight through to `claude`, so a
@@ -298,8 +320,10 @@ def check_co_resolves(crew: str, home: Path, *, co_bin: Path) -> Result:
     # detail "(Did you mean --resume?)", which is claude's error, not co's, and it
     # started a process per crew to produce it. Requiring the line means an older
     # `co` reads as UNKNOWN — a check that could not run — instead of as a broken
-    # crew or, worse, a passing one.
-    if not out.startswith("crew="):
+    # crew or, worse, a passing one. `co --resolve` runs co's workspace refresh
+    # first, which prints to stdout ahead of the line, so the line can follow
+    # refresh output and need not open it.
+    if crew_line is None:
         detail = (cp.stderr or out or "no output").strip().splitlines()
         last = detail[-1][:120] if detail else "no output"
         if "--resume" in last or "claude" in last.lower():
@@ -309,7 +333,7 @@ def check_co_resolves(crew: str, home: Path, *, co_bin: Path) -> Result:
     if cp.returncode != 0:
         return Result("co -r resolves the crew", "Bosun", MISSING,
                       (cp.stderr or out or "co refused").strip().splitlines()[-1][:160])
-    return Result("co -r resolves the crew", "Bosun", PRESENT, out[:160])
+    return Result("co -r resolves the crew", "Bosun", PRESENT, crew_line[:160])
 
 
 def check_kb_admits(crew: str, unit: dict, *, allowed: set[str], id_pattern) -> Result:
@@ -464,10 +488,10 @@ def check_index_serves(doc_ids: list[str], *, index_db: Path) -> Result:
 def active_variant(home: Path, default: str = "daytime") -> str:
     """The variant this crew actually runs, read from its own marker.
 
-    NOT A CONSTANT `daytime`. `ea` runs `platform/ea-daytime` and
-    `convivy-commercial` runs `company/commercial`; a doctor hardcoding the
-    default reported both broken for running the profile they are supposed to
-    run. The crew's own marker is the authority on which variant is its, and
+    NOT A CONSTANT `daytime`. A private crew with a restricted profile can run
+    something like `platform/<its>-daytime`, and a company-level commercial
+    workspace can run `company/commercial`; a doctor hardcoding the default
+    reported both broken for running the profile they are supposed to run. The crew's own marker is the authority on which variant is its, and
     `daytime` is only the fallback for a crew that has never individuated.
     """
     try:
@@ -483,11 +507,11 @@ def check_crew_context(home: Path, project: str, variant: str) -> Result:
     THE SITE IS THE EFFECT, NOT THE MECHANISM, and this one took two tries to
     state. Signals' failure was that it had NO AGENTS — `co -r` did nothing but
     run a skill, because nothing had ever rendered them. But rendering is only
-    one of the two legitimate ways a crew gets them: `convivy-deck` and `hollis`
-    keep `.claude/agents/` COMMITTED in their own repositories and deliberately
-    never individuate, which `bin/co`'s own deck branch says in as many words. A
-    draft checked for the `.active-profile` marker and reported both broken,
-    along with `svc` and `write-better`.
+    one of the two legitimate ways a crew gets them: `convivy-deck` and other
+    crews keep `.claude/agents/` COMMITTED in their own repositories and
+    deliberately never individuate, which `bin/co`'s own deck branch says in as
+    many words. A draft checked for the `.active-profile` marker and reported
+    several of those broken, write-better included.
 
     So the question asked here is the one that matters to a session — are there
     agents — and the answer names which way this crew gets them, because an

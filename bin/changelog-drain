@@ -56,6 +56,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / 
 import signal_client as SC  # noqa: E402
 import vault_plane  # noqa: E402
 import review_protocol as RP  # noqa: E402
+import projects  # noqa: E402
 
 import builder_root as BR
 RUNS_ROOT = BR.runs_root()
@@ -94,17 +95,15 @@ _DEFAULT_WINDOW_HOURS = 6
 # Without this the first backfill wrote entries for 6 of 12 repos and failed 40
 # of 88 merges, in two ways that look different and are both resolution failures:
 #
-#   * hollis, selector, convivy-app-kit, convivy-deck and convivy-services are
-#     agentctl's LOCAL_AGENT_REPOS — they resolve agents from their own
-#     `.claude/agents/`, and not one of them defines an `explainer` (their crews
-#     are prefixed: sel-*, hollis-*, deck-*, svc-*). "agent 'explainer' not
-#     found".
-#   * selector-backend has no knowledge-ctx project mapping, so profile
-#     activation failed before the agent ever ran.
+#   * some repos are agentctl's LOCAL_AGENT_REPOS — they resolve agents from
+#     their own `.claude/agents/`, and not one of them defines an `explainer`
+#     (their crews are prefixed instead). "agent 'explainer' not found".
+#   * a repo with no knowledge-ctx project mapping fails profile activation
+#     before the agent ever runs.
 #
 # Passing `--agents-dir` fixes both, because agentctl treats a directory-resolved
 # agent as local: it reads the definition off disk and skips profile activation.
-# Verified against convivy-deck and selector-backend before this landed.
+# Verified against two such repos before this landed.
 #
 # It is passed for every repo rather than only the broken ones, so the drain does
 # not carry its own copy of LOCAL_AGENT_REPOS to drift against agentctl's. One
@@ -112,9 +111,11 @@ _DEFAULT_WINDOW_HOURS = 6
 #
 # The donors are individuated copies of the SAME indexed explainer agentctl would
 # otherwise resolve, so this is a cache rather than a second source of truth.
-# Several are listed because a missing or mid-rebase checkout must not take the
-# drain down; the first that exists wins.
-_EXPLAINER_DONORS = ("vivy", "constance", "sous-chef")
+# Several are listed (the registry's shared-coverage products, in the registry's
+# own declared donor order — projects.explainer_donors(), NOT the alphabetical
+# shared_coverage_products()) because a missing or mid-rebase checkout must not
+# take the drain down; the first that exists wins.
+_EXPLAINER_DONORS = tuple(projects.explainer_donors())
 
 
 def _agents_dir() -> pathlib.Path | None:

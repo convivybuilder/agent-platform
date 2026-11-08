@@ -3,21 +3,21 @@
 #
 # THE FAILURE THIS COVERS, which the operator hit twice on the evening of 2026-09-08:
 #
-#     operator@mini shipwright % co -r
-#     co: cwd is not a recognized product repo (got 'shipwright').
+#     operator@mini outfitter % co -r
+#     co: cwd is not a recognized product repo (got 'outfitter').
 #
-# The refresh path has several branches and `shipwright` was in none of them, so
+# The refresh path has several branches and `outfitter` was in none of them, so
 # it fell to the generic `case` at the end of the file, which is a closed list
-# that rejects anything not named in it. `placard` was in the same state and had
+# that rejects anything not named in it. `signpost` was in the same state and had
 # never been individuated at all — no `.claude/` directory existed in it, so the
-# `placard/daytime` profile had gone unused since the crew was registered.
+# `signpost/daytime` profile had gone unused since the crew was registered.
 #
 # tests/test_co_crew_registration.py asserts the NAMES are in the lists. This
 # asserts the BEHAVIOUR those names buy: `co -r` there pulls knowledge,
 # re-individuates, and launches, rather than exiting 1 on an unrecognized repo.
 # The two are separable — a name can be in `_co_crew_dirs` and still not reach
 # the branch, which is exactly what an entry for a directory with no `.git`
-# does (the `EA` case in test_co_opus_pin.sh).
+# does (the `SATCHEL` case in test_co_opus_pin.sh).
 #
 # `co` is zsh (excluded from the ARCH-082 bash-3.2 contract by lint.sh's shebang
 # filter); bash invoking it here is exactly how a login shell will.
@@ -54,7 +54,7 @@ setup() { # -> echoes fake HOME
         git push -q -u origin main
     ) >/dev/null 2>&1
 
-    for crew in shipwright placard signals library; do
+    for crew in outfitter telemetry library; do
         mkdir -p "$home/Convivy/$crew/.claude/agents"
         : > "$home/Convivy/$crew/.claude/agents/planning-orchestrator.md"
         ( cd "$home/Convivy/$crew" && git init -q . )
@@ -111,7 +111,7 @@ run_co_r_in() {
     ( cd "$home/$rel" && HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$call_log" KX_CALL_LOG="$kx_log" \
       env -u TMUX -u TMUX_PANE "$@" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" -r >/dev/null 2>"$err_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" -r >/dev/null 2>"$err_log" )
     RC=$?
     CLAUDE_ARGS=$(cat "$call_log")
     KX_ARGS=$(cat "$kx_log")
@@ -121,8 +121,8 @@ run_co_r_in() {
 
 H=$(setup)
 
-echo "== the crews registered on 2026-09-08 and signals (2026-09-16) =="
-for crew in shipwright placard signals; do
+echo "== the crews registered on 2026-09-08 and telemetry (2026-09-16) =="
+for crew in outfitter telemetry; do
     run_co_r_in "$H" "Convivy/$crew"
     assert_rc 0 "$RC" "$crew: co -r exits 0 rather than rejecting the cwd"
     assert_contains "$ERR" "$crew crew" \
@@ -137,7 +137,7 @@ echo "== the regression the operator reported, stated as the string they saw =="
 # Asserted on the message rather than only on the exit code: `co -r` has several
 # ways to exit 1 (knowledge pull failure, knowledge-ctx failure), and this test
 # would pass on any of them if it only checked the code.
-for crew in shipwright placard signals; do
+for crew in outfitter telemetry; do
     run_co_r_in "$H" "Convivy/$crew"
     case "$ERR" in
         *"not a recognized product repo"*)
@@ -166,27 +166,27 @@ assert_contains "$ERR" "not a recognized product repo" \
 kx_use_calls() { printf '%s\n' "$KX_ARGS" | grep -c '^use'; }
 
 echo "== a subcrew child under a live parent session skips knowledge-ctx use =="
-# 2026-10-06: `co -r` in shipwright--site while the parent Shipwright session was
+# 2026-10-06: `co -r` in outfitter--site while the parent Outfitter session was
 # live in the same directory. The parent had already individuated it, and the
 # live-process guard refused the child's `use` (exit 2). The child launches
 # without re-individuating, and the guard stays untouched.
-run_co_r_in "$H" "Convivy/shipwright" \
+run_co_r_in "$H" "Convivy/outfitter" \
     TMUX=/tmp/fake-tmux,1,0 TMUX_PANE=%0 \
-    TMUX_STUB_SESSION=shipwright--site KX_REFUSE_USE=1
-assert_rc 0 "$RC" "shipwright--site: co -r exits 0 under a live parent"
+    TMUX_STUB_SESSION=outfitter--site KX_REFUSE_USE=1
+assert_rc 0 "$RC" "outfitter--site: co -r exits 0 under a live parent"
 assert_contains "$ERR" "skipping knowledge-ctx use --force" \
-    "shipwright--site: co -r says it skipped the re-individuate"
+    "outfitter--site: co -r says it skipped the re-individuate"
 assert_contains "$CLAUDE_ARGS" "--model" \
-    "shipwright--site: co -r reaches the launch"
-assert_eq 0 "$(kx_use_calls)" "shipwright--site: knowledge-ctx use is never called"
+    "outfitter--site: co -r reaches the launch"
+assert_eq 0 "$(kx_use_calls)" "outfitter--site: knowledge-ctx use is never called"
 
 echo "== a plain crew session still re-individuates =="
-run_co_r_in "$H" "Convivy/shipwright" \
-    TMUX=/tmp/fake-tmux,1,0 TMUX_PANE=%0 TMUX_STUB_SESSION=shipwright
-assert_rc 0 "$RC" "shipwright (no --): co -r exits 0"
-assert_eq 1 "$(kx_use_calls)" "shipwright (no --): knowledge-ctx use is called once"
+run_co_r_in "$H" "Convivy/outfitter" \
+    TMUX=/tmp/fake-tmux,1,0 TMUX_PANE=%0 TMUX_STUB_SESSION=outfitter
+assert_rc 0 "$RC" "outfitter (no --): co -r exits 0"
+assert_eq 1 "$(kx_use_calls)" "outfitter (no --): knowledge-ctx use is called once"
 assert_contains "$ERR" "knowledge-ctx use daytime --force" \
-    "shipwright (no --): co -r announces the re-individuate"
+    "outfitter (no --): co -r announces the re-individuate"
 
 rm -rf "$H"
 finish

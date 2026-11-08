@@ -6,8 +6,8 @@
 # since the ARCH-355 KB unification. A commit left on its local `main` is
 # invisible to everyone until someone pushes, so it silently accumulates and
 # forces whichever co pushes next to adjudicate other products' unpushed work.
-# On 2026-07-22 the shared `main` reached 10 commits ahead of origin — deck
-# session-pane specs, a hollis reset, a vivy ADR — piled up by sessions that
+# On 2026-07-22 the shared `main` reached 10 commits ahead of origin — Deck
+# session-pane specs, another crew's reset, another crew's ADR — piled up by sessions that
 # committed straight to `main` and never pushed. Two co's hit the divergence and
 # could not push their own work.
 #

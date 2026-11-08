@@ -48,9 +48,18 @@ def test_a_reviewer_dispatched_with_a_pr_is_pinned_to_its_pr_repo_and_commit(run
     assert (t.pr, t.repo, t.commit, t.agent) == ("99999", "convivy/agent-platform", COMMIT, "reviewer")
 
 
+@pytest.mark.rich_registry
 def test_a_security_reviewer_and_a_crew_variant_are_review_class(runs_root):
-    _run_dir(runs_root, agent="svc-security-reviewer")
-    assert RV.target_for(RUN, runs_root=runs_root).agent == "svc-security-reviewer"
+    _run_dir(runs_root, agent="relay-security-reviewer")
+    assert RV.target_for(RUN, runs_root=runs_root).agent == "relay-security-reviewer"
+
+
+def test_a_shadow_reviewer_posts_too(runs_root):
+    """CQ·526: the shadow review is a genuine review-class dispatch for this
+    refusal's purposes — it posts its own verdict the same way reviewer and
+    security-reviewer do, even though its stamp never gates the merge."""
+    _run_dir(runs_root, agent="shadow-reviewer")
+    assert RV.target_for(RUN, runs_root=runs_root).agent == "shadow-reviewer"
 
 
 @pytest.mark.parametrize("agent", ["platform-coder", "scout", "bug-fixer", "platform-architect"])
@@ -85,31 +94,33 @@ def test_a_call_naming_the_same_pr_is_accepted(runs_root):
 
 def test_a_call_naming_another_repository_is_refused_and_a_bare_or_owned_name_is_matched(runs_root):
     _run_dir(runs_root)
-    assert "pinned to convivy/agent-platform" in _refusal(RUN, runs_root, repo="constance")
-    assert "pinned to convivy/agent-platform" in _refusal(RUN, runs_root, repo="convivy/constance")
+    assert "pinned to convivy/agent-platform" in _refusal(RUN, runs_root, repo="globex")
+    assert "pinned to convivy/agent-platform" in _refusal(RUN, runs_root, repo="convivy/globex")
     assert RV.target_for(RUN, runs_root=runs_root, repo="convivy/agent-platform").repo == \
         "convivy/agent-platform"
     assert RV.target_for(RUN, runs_root=runs_root, repo="agent-platform").repo == \
         "convivy/agent-platform"
 
 
+@pytest.mark.rich_registry
 def test_a_repo_with_a_registered_non_convivy_owner_is_slugged_correctly(runs_root):
-    """Before homebrew-tap's `repo_owners` entry existed, this read
-    convivy/homebrew-tap, the wrong owner."""
-    _run_dir(runs_root, repo="homebrew-tap")
-    assert RV.target_for(RUN, runs_root=runs_root).repo == "convivybuilder/homebrew-tap"
+    """Before brewcask-tap's `repo_owners` entry existed, this read
+    convivy/brewcask-tap, the wrong owner."""
+    _run_dir(runs_root, repo="brewcask-tap")
+    assert RV.target_for(RUN, runs_root=runs_root).repo == "caskforge/brewcask-tap"
 
 
-def test_an_nyh_repo_is_slugged_under_its_units_github_owner(runs_root):
+@pytest.mark.rich_registry
+def test_an_oak_repo_is_slugged_under_its_units_github_owner(runs_root):
     """Round-1 review (PR #881, comment 6150937461): before this call routed
-    through `projects.repo_github_slug`, it built `convivy/nyh-arch-tools`
+    through `projects.repo_github_slug`, it built `convivy/oak-arch-tools`
     unconditionally, ignoring the unit's own github_owner — a 404ing slug for
     a merge-gate `_head_advanced_beyond_pin` or stamp-posting call against an
-    NYH repo."""
-    owner = projects.get("nyh-arch-tools")["github_owner"]
+    OAK repo."""
+    owner = projects.get("oak-arch-tools")["github_owner"]
     assert owner and owner != "convivy"
-    _run_dir(runs_root, repo="nyh-arch-tools")
-    assert RV.target_for(RUN, runs_root=runs_root).repo == f"{owner}/nyh-arch-tools"
+    _run_dir(runs_root, repo="oak-arch-tools")
+    assert RV.target_for(RUN, runs_root=runs_root).repo == f"{owner}/oak-arch-tools"
 
 
 def test_a_call_naming_another_commit_is_refused(runs_root):
@@ -209,6 +220,23 @@ def test_the_mcp_config_names_the_server_and_carries_the_run_id_in_its_env(tmp_p
     assert entry["type"] == "stdio"
     assert set(entry["env"]) == {"AGENTCTL_RUN_ID"}
     assert "GH_TOKEN" not in entry["env"] and "GITHUB_TOKEN" not in entry["env"]
+
+
+def test_private_review_token_path_is_one_file_per_product_beside_the_general_token(
+        monkeypatch, tmp_path):
+    """CQ·557: the per-product path is deterministic from PRODUCT alone, lives
+    in the same directory as `signal_client.TOKEN_FILE`
+    (~/.orient-control/agent-platform-token — already outside a dispatched
+    run's sandbox via `run_sandbox.DENIED_DIRS`), and two products never
+    collide on one file."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(RV, "PRIVATE_REVIEW_TOKEN_DIR", home / ".orient-control")
+    a = RV.private_review_token_path("crew-test")
+    b = RV.private_review_token_path("another-crew")
+    assert a != b
+    assert a.parent == home / ".orient-control"
+    assert "crew-test" in a.name
 
 
 def test_review_post_refuses_a_record_seam_that_is_not_loopback(agentctl, monkeypatch):

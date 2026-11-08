@@ -4,8 +4,8 @@ morning decision is one paragraph rather than a dozen tabs.
 
 WHY THIS EXISTS.
 
-Measured 2026-07-30: 73 dependabot PRs merged across vivy, constance and
-sous-chef in 30 days. The operator's account of the cost was that dependabot plus nightly
+Measured 2026-07-30: 73 dependabot PRs merged across the product repos
+in 30 days. The operator's account of the cost was that dependabot plus nightly
 bugs plus issues consumed roughly the first ten hours of his day, leaving a thin
 window for product work.
 
@@ -18,7 +18,7 @@ WHAT IT DOES NOT DO, and why.
 
 It does NOT merge. Auto-merge was considered and dropped: the required-status-
 check sets on these repos are far thinner than the checks that actually run
-(constance requires none at all), so "merge when required CI is green" would
+(one product requires none at all), so "merge when required CI is green" would
 have merged on almost nothing. Fixing that means restructuring branch protection,
 which the operator declined for products with no users. See signal
 branch-protection-required-checks-thin-2026-07-30. So the human merge click
@@ -60,7 +60,7 @@ and a weekly PR would otherwise be re-reviewed six times for nothing.
 
 Usage:
     dependabot-review                  # every dispatchable repo
-    dependabot-review --repo vivy      # one repo
+    dependabot-review --repo acme      # one repo
     dependabot-review --dry-run        # classify and print, dispatch nothing
 """
 from __future__ import annotations
@@ -80,6 +80,7 @@ import projects        # noqa: E402
 import registry as R  # noqa: E402
 from worktrees import is_dispatch_target  # noqa: E402
 import builder_root as BR  # noqa: E402
+import github_app as GA  # noqa: E402
 
 # The sibling agentctl, falling back to the deployed one: ~/.local/bin
 # symlinks into whichever branch the agent-platform checkout is on
@@ -197,8 +198,14 @@ _TITLE_RE = re.compile(
     re.I)
 
 
-def _gh(args: list[str], repo: str) -> str | None:
-    """Run gh. Returns stdout, or None when the call FAILED.
+def _gh(args: list[str], repo: str, env: dict) -> str | None:
+    """Run gh, authenticated as the install's own GitHub App (company/decisions/
+    0027 — the operator's own `gh` login never runs on a machine that serves
+    sessions). Returns stdout, or None when the call FAILED.
+
+    `env` is the one `read`-scoped token's environment minted for `repo` by
+    this run's caller (main's per-repo loop) — one mint per repo per pass,
+    reused across every `_gh` call that repo makes, never minted here per call.
 
     None and "" are deliberately different answers, and conflating them is what
     made the first version fail open: `gh pr list` erroring on an expired token
@@ -209,7 +216,7 @@ def _gh(args: list[str], repo: str) -> str | None:
     """
     try:
         p = subprocess.run(["gh", *args, "--repo", projects.repo_github_slug(repo)],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, timeout=120, env=env)
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         print(f"  ! gh {args[0]} {args[1] if len(args) > 1 else ''} on {repo} "
               f"failed: {type(exc).__name__}", file=sys.stderr)
@@ -309,11 +316,11 @@ def classify(title: str, body: str, labels: list[str]) -> tuple[list[str], list[
     return security, breaking
 
 
-def open_prs(repo: str) -> list[dict] | None:
+def open_prs(repo: str, env: dict) -> list[dict] | None:
     """Open dependabot PRs, or None when the listing itself failed."""
     raw = _gh(["pr", "list", "--author", DEPENDABOT, "--state", "open",
                "--limit", "50", "--json",
-               "number,title,body,headRefOid,labels,isDraft"], repo)
+               "number,title,body,headRefOid,labels,isDraft"], repo, env)
     if raw is None:
         return None
     try:
@@ -323,15 +330,15 @@ def open_prs(repo: str) -> list[dict] | None:
         return None
 
 
-def ci_state(repo: str, number: int) -> str:
+def ci_state(repo: str, number: int, env: dict) -> str:
     """"pending" | "red" | "green" | "unknown" for the PR's checks.
 
     PENDING IS THE ONE THAT MUST NOT BE REVIEWED. A reviewer dispatched against
     unfinished CI is required by the machine-global rule to return
     REQUEST_CHANGES citing only "CI still in progress", so the round is spent
-    learning nothing. Observed the first night this ran: 3 of 4 vivy PRs came
-    back REQUEST_CHANGES with no substantive finding, purely because vivy's
-    serial gate had not landed. They are skipped and picked up on the next pass,
+    learning nothing. Observed the first night this ran: 3 of 4 PRs on one
+    product came back REQUEST_CHANGES with no substantive finding, purely
+    because that product's serial gate had not landed. They are skipped and picked up on the next pass,
     which is at most three hours away.
 
     RED IS REVIEWED, deliberately, and this is not a concession. On that same
@@ -341,7 +348,7 @@ def ci_state(repo: str, number: int) -> str:
     single thing here worth most of the operator's time, so red earns a review and the
     reviewer is told the failure is the subject.
     """
-    raw = _gh(["pr", "view", str(number), "--json", "statusCheckRollup"], repo)
+    raw = _gh(["pr", "view", str(number), "--json", "statusCheckRollup"], repo, env)
     if not raw:
         return "unknown"  # includes the None case: unknown is not green
     try:
@@ -372,14 +379,14 @@ def ci_state(repo: str, number: int) -> str:
     return "red" if red else "green"
 
 
-def reviewed_at_head(repo: str, number: int, sha: str) -> bool:
+def reviewed_at_head(repo: str, number: int, sha: str, env: dict) -> bool:
     """Has a reviewer already stamped this exact head?
 
     Read from the PR's own comments rather than from any local state, so a
     review posted by a different session, or by a human, still counts. Nightly
     re-review of an unchanged weekly PR is the failure this prevents.
     """
-    raw = _gh(["pr", "view", str(number), "--json", "comments"], repo)
+    raw = _gh(["pr", "view", str(number), "--json", "comments"], repo, env)
     if not raw:
         return False  # includes the None case: unknown means review it again
     try:
@@ -562,49 +569,60 @@ def main(argv: list[str] | None = None) -> int:
 
     total = skipped = waiting = failed = 0
     for repo in targets:
-        prs = open_prs(repo)
-        if prs is None:
-            # NOT "0 PRs". The listing failed, so this repo's PRs are unreviewed
-            # and nobody knows which. Counted, shouted, and reflected in the exit
-            # code, because launchd's only visible signal is that status.
-            print(f"{repo}: COULD NOT LIST PRs — repo skipped, PRs left unreviewed",
-                  file=sys.stderr)
+        # One `read`-scoped token per repo per pass (company/decisions/0027):
+        # minted once here, reused by every `_gh` call this repo's PRs make
+        # below, revoked before the loop moves to the next repo.
+        try:
+            with GA.read_token_env(projects.repo_github_slug(repo)) as env:
+                prs = open_prs(repo, env)
+                if prs is None:
+                    # NOT "0 PRs". The listing failed, so this repo's PRs are
+                    # unreviewed and nobody knows which. Counted, shouted, and
+                    # reflected in the exit code, because launchd's only
+                    # visible signal is that status.
+                    print(f"{repo}: COULD NOT LIST PRs — repo skipped, PRs left unreviewed",
+                          file=sys.stderr)
+                    failed += 1
+                    continue
+                print(f"{repo}: {len(prs)} open dependabot PR(s)")
+                for pr in prs:
+                    if pr.get("isDraft"):
+                        continue
+                    labels = [lbl.get("name", "") for lbl in pr.get("labels", [])]
+                    updates = parse_updates(pr.get("title", ""), pr.get("body", ""))
+                    sec, brk = classify(pr.get("title", ""), pr.get("body", ""), labels)
+                    head = pr["headRefOid"]
+                    tier = "security" if sec else ("breaking" if brk else "changelog")
+                    note = (sec or brk or [""])[0]
+                    print(f"  #{pr['number']} [{tier}] {len(updates)} package(s)"
+                          + (f" — {note}" if note else ""))
+                    if not args.force and reviewed_at_head(repo, pr["number"], head, env):
+                        print("    already reviewed at this head; skipping")
+                        skipped += 1
+                        continue
+                    ci = ci_state(repo, pr["number"], env)
+                    if ci == "pending" and not args.ignore_ci:
+                        print("    CI still running; leaving it for the next pass")
+                        waiting += 1
+                        continue
+                    dispatched: set[str] = set()
+                    if dispatch(repo, "reviewer", pr,
+                                _task(repo, pr, sec, brk, updates, security=False, ci=ci),
+                                args.dry_run):
+                        dispatched.add("reviewer")
+                    if sec and dispatch(repo, "security-reviewer", pr,
+                                        _task(repo, pr, sec, brk, updates, security=True, ci=ci),
+                                        args.dry_run):
+                        dispatched.add("security-reviewer")
+                    if dispatched:
+                        label = "would-be gate" if args.dry_run else "gate"
+                        print(f"    {label}: {_gate_command(repo, pr['number'], sorted(dispatched))}")
+                    total += 1
+        except GA.Unreadable as e:
+            print(f"{repo}: COULD NOT MINT A GITHUB TOKEN ({e}) — repo skipped, "
+                  f"PRs left unreviewed", file=sys.stderr)
             failed += 1
             continue
-        print(f"{repo}: {len(prs)} open dependabot PR(s)")
-        for pr in prs:
-            if pr.get("isDraft"):
-                continue
-            labels = [lbl.get("name", "") for lbl in pr.get("labels", [])]
-            updates = parse_updates(pr.get("title", ""), pr.get("body", ""))
-            sec, brk = classify(pr.get("title", ""), pr.get("body", ""), labels)
-            head = pr["headRefOid"]
-            tier = "security" if sec else ("breaking" if brk else "changelog")
-            note = (sec or brk or [""])[0]
-            print(f"  #{pr['number']} [{tier}] {len(updates)} package(s)"
-                  + (f" — {note}" if note else ""))
-            if not args.force and reviewed_at_head(repo, pr["number"], head):
-                print("    already reviewed at this head; skipping")
-                skipped += 1
-                continue
-            ci = ci_state(repo, pr["number"])
-            if ci == "pending" and not args.ignore_ci:
-                print("    CI still running; leaving it for the next pass")
-                waiting += 1
-                continue
-            dispatched: set[str] = set()
-            if dispatch(repo, "reviewer", pr,
-                        _task(repo, pr, sec, brk, updates, security=False, ci=ci),
-                        args.dry_run):
-                dispatched.add("reviewer")
-            if sec and dispatch(repo, "security-reviewer", pr,
-                                _task(repo, pr, sec, brk, updates, security=True, ci=ci),
-                                args.dry_run):
-                dispatched.add("security-reviewer")
-            if dispatched:
-                label = "would-be gate" if args.dry_run else "gate"
-                print(f"    {label}: {_gate_command(repo, pr['number'], sorted(dispatched))}")
-            total += 1
 
     summary = (f"dependabot-review: {total} PR(s) dispatched, "
                f"{skipped} already current, {waiting} waiting on CI")

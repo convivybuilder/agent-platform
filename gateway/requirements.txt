@@ -2,11 +2,26 @@
 # NOT read by the repo's pytest, CI, or install.sh (isolation is the architecture).
 # Platform requirements*.txt and pyproject.toml are deliberately untouched.
 #
-# Pin: verify/update the exact litellm version at venv-create time.
-# As of 2026-05-31, latest stable is in the 1.x line; <2.0 guards against
-# breaking changes in the 2.x API.
-litellm[proxy]>=1.40.0,<2.0.0
-# LiteLLM's database code imports prisma (E17·1). Pinned to the version litellm 1.86.2
-# declares in its extras metadata. It is pinned here directly, and not through litellm's
+# Pinned to 1.91.5 (up from 1.86.2): the floor carries the reasoning-stream fix. In
+# 1.86.2 the Anthropic streaming adapter's content-block classifier
+# (_translate_streaming_openai_chunk_to_anthropic_content_block in
+# litellm/llms/anthropic/experimental_pass_through/adapters/transformation.py)
+# returns "text" for a delta that carries only `reasoning_content`, the field
+# DeepSeek and Moonshot send reasoning in (Anthropic- and Bedrock-shaped providers
+# send `thinking_blocks` instead). So streaming_iterator.py opens content block 0
+# as {"type":"text"} and then emits the model's reasoning into it as
+# thinking_delta events, a shape Claude Code's Anthropic client rejects ("Stream
+# event unreadable") before falling back to a non-streamed resend of the same
+# turn. The provider bills both requests; LiteLLM logs only the resend, because it
+# logs a stream only once it completes, so every such turn is billed twice but
+# recorded once. 1.91.0 is the first release whose classifier adds `elif
+# isinstance(choice, StreamingChoices) and getattr(choice.delta,
+# "reasoning_content", None): return "thinking", ...`; 1.91.5 is the last 1.91
+# patch release. Confirmed by reading both: the installed 1.86.2 venv, and the
+# 1.91.5 wheel downloaded for this change (2026-10-19).
+litellm[proxy]==1.91.5
+# LiteLLM's database code imports prisma (E17·1). 1.86.2 pinned prisma==0.11.0
+# exactly in its extras metadata; 1.91.5 widens that to prisma>=0.11.0,<1.0, so
+# 0.11.0 still satisfies it. Pinned here directly, and not through litellm's
 # extra-proxy extra, which would also install Azure and Google Cloud packages.
 prisma==0.11.0

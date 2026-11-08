@@ -41,8 +41,11 @@ def payload(tool_name, tool_input, **extra):
 
 
 def run_shim(call, env_extra=None):
-    """(exit code, parsed stdout) of the real shim on `call`."""
-    env = {k: v for k, v in os.environ.items() if k != "AGENTCTL_RUN_ID"}
+    """(exit code, parsed stdout) of the real shim on `call`. CODEX_HOME is blanked
+    from the inherited environment by default — never the real `~/.codex` — so a
+    file-touching tool call denies by default (no confinement stamp found) unless a
+    test names its own CODEX_HOME in `env_extra`."""
+    env = {k: v for k, v in os.environ.items() if k not in ("AGENTCTL_RUN_ID", "CODEX_HOME")}
     env.update(env_extra or {})
     raw = call if isinstance(call, str) else json.dumps(call)
     run = subprocess.run([sys.executable, str(SHIM)], input=raw, capture_output=True,
@@ -85,7 +88,6 @@ def test_shim_denies_a_push_to_main_only_from_a_dispatched_run():
 @needs_jq
 def test_shim_lets_an_ordinary_command_and_a_non_command_tool_through():
     assert run_shim(payload("exec_command", {"cmd": "ls -la"})) == (0, {})
-    assert run_shim(payload("apply_patch", {"input": "*** Begin Patch"})) == (0, {})
     assert run_shim(payload("write_stdin", {"session_id": 3, "chars": ""})) == (0, {})
 
 
@@ -131,6 +133,11 @@ def test_shim_denies_a_payload_it_cannot_parse():
 
 INERT_TOOLS = ["apply_patch", "update_plan", "view_image", "web_search", "request_user_input",
                "read_file", "list_dir", "grep_files", "Read", "Glob", "Grep"]
+# INERT_TOOLS minus update_plan/request_user_input (touch no file, reach no network:
+# allowed unconditionally) and web_search (reaches no file but IS denied — always,
+# by a separate, unconditional rule, never by the confinement stamp this set tests).
+FILE_TOUCHING_INERT_TOOLS = [t for t in INERT_TOOLS
+                            if t not in ("update_plan", "request_user_input", "web_search")]
 
 
 def test_shim_denies_an_unknown_tool_it_cannot_read_a_command_from():
@@ -147,9 +154,196 @@ def test_shim_denies_an_unknown_tool_it_cannot_read_a_command_from():
         assert f"'{name}'" in reason and "not known to be inert" in reason
 
 
-@pytest.mark.parametrize("name", INERT_TOOLS)
+@pytest.mark.parametrize("name", ["update_plan", "request_user_input"])
 def test_shim_allows_each_inert_tool(name):
+    """Narrowed to the two file-touching INERT_TOOLS does NOT reach (slice 1): every
+    other member now needs a confinement stamp, or is denied unconditionally."""
     assert run_shim(payload(name, {"input": "x"})) == (0, {})
+
+
+# --- read confinement: the file-touching INERT_TOOLS members and web_search
+# (platform/specs/codex-coder-lane, slice 1) -------------------------------------
+
+def test_codex_probes_own_attempt_registry_covers_every_file_touching_inert_tool():
+    """codex_probe.py cannot import this module (tools/ is not on its path — see its
+    own comment), so its FILE_TOUCHING_INERT_TOOLS tuple is a literal duplicate. This
+    is the test that catches the two drifting: a probe attempt must exist for every
+    file-touching member this module actually denies by default."""
+    import codex_probe
+    assert set(codex_probe.FILE_TOUCHING_INERT_TOOLS) == set(FILE_TOUCHING_INERT_TOOLS)
+
+
+def test_codex_probes_reviewer_always_refused_tools_matches_the_real_shim(tmp_path):
+    """codex_probe.REVIEWER_ALWAYS_REFUSED_TOOLS is a literal duplicate, for the same
+    reason FILE_TOUCHING_INERT_TOOLS above already is one. Checked against the real
+    shim's own behavior here, not a second hand-written literal: with every member
+    confined by the stamp, the set that is STILL refused is exactly the set
+    `evaluate_read_confinement` must exclude from `passed`, or `passed` could never
+    be reached through any real probe (round 2's fix)."""
+    import codex_probe
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "agent-platform-codex-probe.json").write_text(json.dumps(
+        {"gpt-6-astra": {"confined_tools": {t: "confined" for t in FILE_TOUCHING_INERT_TOOLS}}}))
+    env = {"CODEX_HOME": str(home), "AGENTCTL_CODEX_REVIEWER": "1"}
+    refused = set()
+    for name in FILE_TOUCHING_INERT_TOOLS:
+        args = {"action": {"path": "/x"}} if name == "apply_patch" else {"path": "/x"}
+        code, _ = run_shim(payload(name, args), env)
+        if code != 0:
+            refused.add(name)
+    assert refused == set(codex_probe.REVIEWER_ALWAYS_REFUSED_TOOLS)
+
+
+@pytest.mark.parametrize("name", FILE_TOUCHING_INERT_TOOLS)
+def test_shim_denies_a_file_touching_inert_tool_with_no_confinement_stamp(name):
+    decision, reason = denial(run_shim(payload(name, {"path": "/x"}))[1])
+    assert decision == "deny"
+    assert f"{name!r}" in reason
+
+
+# --- probe mode: PROBE_ROLE_ENV, observed live rather than judged by this shim
+# (platform/specs/codex-coder-lane, slice 1, round 3) ---------------------------
+#
+# Round 1's defect: before a model's FIRST EVER probe, no stamp exists, so the old
+# "tool not in confined_tools -> deny" gate denied the probe's own allowed-path
+# attempt too, and no later probe could do better. Round 2 fixed that by having
+# PROBE_ROLE_ENV check the call's own target against the shared deny list directly
+# (`_probe_denies`) instead of the stamp. The security reviewer's round-2 blocking
+# finding (PR #961 comment 6308726984): that measured the SHIM's own judgement of
+# the target, not Codex's — so a tool credited `confined` from a probe pass earned
+# that way had never actually been refused by Codex itself, and the dispatched
+# branch trusts `confined` to mean exactly that for ANY path. Round 3 removes
+# `_probe_denies` entirely: under PROBE_ROLE_ENV the shim skips the stamp lookup
+# and does not judge the target at all, so BOTH the allowed-path and the
+# denied-path attempt reach Codex unjudged, and the probe (codex_probe.py) is what
+# has to observe from Codex's own event stream whether Codex itself refused.
+
+def _a_denied_path():
+    """One real entry from the shared deny list for this account — the same source
+    `run_sandbox.codex_permission_overrides` renders into Codex's own permission
+    profile. Used here only to show the shim does not single it out any more."""
+    import run_sandbox
+    dirs, files = run_sandbox.denied_read_paths([run_sandbox.passwd_home()])
+    return str(sorted({*dirs, *files}, key=str)[0])
+
+
+def test_shim_does_not_judge_either_of_a_probes_attempt_paths(tmp_path):
+    """Round 3 (PR #961 comment 6308726984): the shim's only job under
+    AGENTCTL_CODEX_PROBE is to skip the stamp lookup — never to decide whether a
+    target is denied. Both an ordinary path and a real shared-deny-list path pass
+    through unjudged; whether Codex itself refuses the deny-list one is for the
+    probe to observe from the event stream, not for this shim to pre-empt."""
+    allowed = tmp_path / "ok.txt"
+    allowed.write_text("ok")
+    assert run_shim(payload("view_image", {"path": str(allowed)}),
+                    {"AGENTCTL_CODEX_PROBE": "1"}) == (0, {})
+    assert run_shim(payload("view_image", {"path": _a_denied_path()}),
+                    {"AGENTCTL_CODEX_PROBE": "1"}) == (0, {})
+
+
+def test_shim_does_not_judge_a_probe_call_with_no_readable_target_either():
+    """Same fix, the edge case: a target `tool_target_path` cannot read is no longer
+    denied by this shim under probe mode either — there is no path judgement left
+    to fail closed on. (Outside probe mode this call is still denied, by the
+    ordinary stamp check — see test_probe_role_env_unset_leaves_the_stamp_gate_
+    as_the_only_check below.)"""
+    assert run_shim(payload("view_image", {"notpath": "x"}),
+                    {"AGENTCTL_CODEX_PROBE": "1"}) == (0, {})
+
+
+def test_shim_still_denies_apply_patch_during_a_probe_on_an_allowed_path(tmp_path):
+    """The unconditional reviewer-run refusal runs ahead of the probe-mode path
+    check, so it denies even a path the deny list does not name at all — apply_patch
+    stays unavailable through a probe, by design (REVIEWER_ALWAYS_REFUSED_TOOLS)."""
+    allowed = tmp_path / "ok.txt"
+    allowed.write_text("ok")
+    decision, reason = denial(run_shim(
+        payload("apply_patch", {"action": {"path": str(allowed)}}),
+        {"AGENTCTL_CODEX_PROBE": "1", "AGENTCTL_CODEX_REVIEWER": "1"})[1])
+    assert decision == "deny"
+    assert "reviewer run" in reason
+
+
+def test_shim_denies_web_search_during_a_probe_too():
+    decision, _ = denial(run_shim(payload("web_search", {"query": "x"}),
+                                 {"AGENTCTL_CODEX_PROBE": "1"})[1])
+    assert decision == "deny"
+
+
+def test_probe_role_env_unset_leaves_the_stamp_gate_as_the_only_check(tmp_path):
+    """PROBE_ROLE_ENV must be opt-in: an allowed, readable path with no stamp and no
+    AGENTCTL_CODEX_PROBE is denied exactly as before this round (`_confined_tools`
+    is the only gate), never allowed on the strength of its path alone."""
+    allowed = tmp_path / "ok.txt"
+    allowed.write_text("ok")
+    decision, _ = denial(run_shim(payload("view_image", {"path": str(allowed)}))[1])
+    assert decision == "deny"
+
+
+def test_shim_denies_web_search_even_with_a_confinement_stamp(tmp_path):
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "agent-platform-codex-probe.json").write_text(json.dumps(
+        {"gpt-6-astra": {"confined_tools": {"web_search": "confined"}}}))
+    decision, reason = denial(run_shim(payload("web_search", {"query": "x"}),
+                                      {"CODEX_HOME": str(home)})[1])
+    assert decision == "deny"
+    assert "web search is disabled" in reason
+
+
+def test_shim_denies_apply_patch_on_a_reviewer_run_even_when_confined(tmp_path):
+    """A reviewer needs no write tool, whatever the confinement stamp says about it —
+    this overrides the stamp, rather than being implied by its absence."""
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "agent-platform-codex-probe.json").write_text(json.dumps(
+        {"gpt-6-astra": {"confined_tools": {"apply_patch": "confined"}}}))
+    decision, reason = denial(run_shim(
+        payload("apply_patch", {"input": "*** Begin Patch"}),
+        {"CODEX_HOME": str(home), "AGENTCTL_CODEX_REVIEWER": "1"})[1])
+    assert decision == "deny"
+    assert "reviewer run" in reason
+
+
+def test_shim_allows_a_file_touching_tool_the_stamp_lists_as_confined(tmp_path):
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "agent-platform-codex-probe.json").write_text(json.dumps(
+        {"gpt-6-astra": {"confined_tools": {"view_image": "confined"}}}))
+    assert run_shim(payload("view_image", {"path": "/x"}), {"CODEX_HOME": str(home)}) == (0, {})
+
+
+def test_shim_does_not_credit_a_tool_confined_for_a_different_model(tmp_path):
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "agent-platform-codex-probe.json").write_text(json.dumps(
+        {"gpt-5.5": {"confined_tools": {"view_image": "confined"}}}))
+    decision, _ = denial(run_shim(payload("view_image", {"path": "/x"}),
+                                 {"CODEX_HOME": str(home)})[1])
+    assert decision == "deny"
+
+
+def test_shim_denies_when_the_stamp_names_the_tool_not_confined(tmp_path):
+    home = tmp_path / "codex"
+    home.mkdir()
+    (home / "agent-platform-codex-probe.json").write_text(json.dumps(
+        {"gpt-6-astra": {"confined_tools": {"view_image": "unavailable"}}}))
+    decision, _ = denial(run_shim(payload("view_image", {"path": "/x"}),
+                                 {"CODEX_HOME": str(home)})[1])
+    assert decision == "deny"
+
+
+def test_shim_denies_a_file_touching_tool_denial_records_its_target(tmp_path):
+    """The record the probe reads back for an in-process tool attempt carries the
+    tool name and target, not the (None) shell command."""
+    log = tmp_path / "d.jsonl"
+    env = {"AGENTCTL_CODEX_DENIAL_LOG": str(log), "CODEX_HOME": str(tmp_path / "missing-home")}
+    run_shim(payload("read_file", {"path": "/denied/path"}), env)
+    (line,) = log.read_text().splitlines()
+    record = json.loads(line)
+    assert record["tool"] == "read_file"
+    assert record["target"] == "/denied/path"
 
 
 def test_an_unknown_tool_that_carries_a_readable_command_is_judged_as_one():
@@ -379,7 +573,7 @@ def test_cmd_spawn_refuses_a_codex_roster_model_before_any_side_effect(agentctl,
                         lambda name, repo=None, agents_dir=None: {"model_alias": "gpt-6-astra"})
     monkeypatch.setattr(agentctl.R, "can_spawn", lambda *a, **kw: (_ for _ in ()).throw(
         AssertionError("a Codex dispatch without guards must be refused before R.can_spawn")))
-    args = types.SimpleNamespace(agent="reviewer", task="t", on="agent-platform", profile=None,
+    args = types.SimpleNamespace(agent="reviewer", task="t", on="widget-crew", profile=None,
                                  agents_dir=None, parent=None, pr=None, review_sha=None,
                                  model=None, reason=None)
     assert agentctl.cmd_spawn(args) == 2
@@ -557,7 +751,7 @@ def test_the_install_command_in_the_refusal_runs(bridge, tmp_path):
 
 
 def _override_args(types_mod=types):
-    return types_mod.SimpleNamespace(agent="reviewer", task="t", on="agent-platform", profile=None,
+    return types_mod.SimpleNamespace(agent="reviewer", task="t", on="widget-crew", profile=None,
                                      agents_dir=None, parent=None, pr=None, review_sha=None,
                                      model="gpt-6-astra", reason="test")
 
@@ -799,3 +993,93 @@ def test_the_shims_guards_and_the_bridges_guards_are_the_same_set(bridge):
                       and any(getattr(t, "id", None) == "GUARDS" for t in node.targets))
     shim_names = {name for name, _interpreter in ast.literal_eval(shim_tuple)}
     assert shim_names == set(bridge.GUARDS)
+
+
+# --- trusted_project_refusal (platform/specs/codex-coder-lane, slice 1) ---------
+#
+# A trusted Codex project can supply its OWN .codex/config.toml from inside the
+# worktree, with no launch flag to disable it — the hand probe (2026-10-19) found
+# this holds for a linked worktree of a trusted main checkout too.
+
+def test_trusted_project_refusal_is_none_with_no_config(bridge, tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    assert bridge.trusted_project_refusal(worktree, tmp_path / "codex-home") is None
+
+
+def test_trusted_project_refusal_is_none_when_nothing_is_trusted(bridge, tmp_path):
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (home / "config.toml").write_text(
+        f'[projects."{tmp_path / "somewhere-else"}"]\ntrust_level = "trusted"\n')
+    assert bridge.trusted_project_refusal(worktree, home) is None
+
+
+def test_trusted_project_refusal_refuses_a_directly_trusted_worktree(bridge, tmp_path):
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (home / "config.toml").write_text(f'[projects."{worktree}"]\ntrust_level = "trusted"\n')
+    refusal = bridge.trusted_project_refusal(worktree, home)
+    assert refusal is not None and str(worktree) in refusal
+
+
+def test_trusted_project_refusal_ignores_an_untrusted_entry(bridge, tmp_path):
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    (home / "config.toml").write_text(f'[projects."{worktree}"]\ntrust_level = "untrusted"\n')
+    assert bridge.trusted_project_refusal(worktree, home) is None
+
+
+def test_trusted_project_refusal_a_linked_worktree_inherits_its_main_checkouts_trust(
+        bridge, tmp_path):
+    """The hand probe's own finding (2026-10-19): a linked worktree of a trusted
+    main checkout is refused too, even though only the main checkout's path is
+    named in config.toml."""
+    import subprocess
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    linked = tmp_path / "linked"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(linked), "-b", "feature"],
+                   check=True)
+    (home / "config.toml").write_text(f'[projects."{main}"]\ntrust_level = "trusted"\n')
+    assert bridge.trusted_project_refusal(linked, home) is not None
+    assert bridge.trusted_project_refusal(main, home) is not None
+
+
+def test_trusted_project_refusal_an_untrusted_linked_worktree_is_not_refused(bridge, tmp_path):
+    import subprocess
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    main = tmp_path / "main"
+    main.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main", str(main)], check=True)
+    subprocess.run(["git", "-C", str(main), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    linked = tmp_path / "linked"
+    subprocess.run(["git", "-C", str(main), "worktree", "add", "-q", str(linked), "-b", "feature"],
+                   check=True)
+    assert bridge.trusted_project_refusal(linked, home) is None
+
+
+def test_trusted_project_refusal_matches_either_a_tmp_or_private_tmp_spelling(bridge, tmp_path):
+    """`/tmp` resolves to `/private/tmp` on macOS (a real symlink) — a project
+    recorded under either spelling must still be caught."""
+    home = tmp_path / "codex-home"
+    home.mkdir()
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    from pathlib import Path
+    resolved = str(Path(worktree).resolve())
+    (home / "config.toml").write_text(f'[projects."{resolved}"]\ntrust_level = "trusted"\n')
+    assert bridge.trusted_project_refusal(worktree, home) is not None

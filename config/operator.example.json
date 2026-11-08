@@ -3,12 +3,21 @@
   "excluded_crews": ["private-a", "private-b"],
   "operator_marker": "operator",
   "roster_crew": "operator-crew",
+  "_doc_apps_crew": "Optional: `knowledge.py` reads this with `operator_config.get_optional()`, which returns None for a missing key. Omit it on an install with no apps crew.",
+  "apps_crew": "operator-crew-apps",
   "github_login": "operator-login",
   "tailnet_host": "tailnet.example",
+  "_doc_ssh": "All five keys below are read only by bin/render-ssh-config, on the CREW machine, with operator_config.get_optional() (so all are optional); none is read from the laptop's own operator.json, which needs only tailnet_host (above) to bootstrap reading the crew machine's root over ssh before any rendered file is reachable. The ssh/mosh render is skipped entirely without tailnet_host and ssh_user: neither this config nor the render script guesses a destination or a login name. standby_tailnet_host or standby_alias alone missing skips the whole standby block (the plain-shell alias plus every standby_sessions block); standby_sessions alone missing leaves just the plain-shell alias. standby_sessions names SESSIONS, not crews: each entry is a unit's own tmux_session when it sets one, else its crew, so a crew running more than one session can be named on the standby machine by either one. The standby host itself reaches the laptop installer through the rendered directory, not a laptop-side config key, since reading the standby machine's own root needs it only when a standby block was actually rendered.",
+  "ssh_user": "operator",
+  "standby_tailnet_host": "standby-tailnet.example",
+  "standby_alias": "standby",
+  "standby_sessions": ["widget"],
   "_doc_person_id": "Read by `agentctl crew register` (lib/agent-platform/operator_config.py) to write a new project entry's `created_by`. Optional: absent on a fresh install, before the Library's bootstrap has minted this operator a person id, and a crew registered with it absent is registered without a `created_by` rather than refused.",
   "person_id": "person_01ARZ3NDEKTSV4RRFFQ69G5FAV",
   "_doc_publish_scan": "The next three keys are read by lib/agent-platform/publish_scan.py and are optional: each has a default (see that module), so a machine without them still runs `agentctl publish`'s content scan as long as Shipwright sits beside this repository's primary checkout.",
   "shipwright_checkout": "/path/to/shipwright",
   "builder_private_names_file": "/path/to/private-names",
-  "builder_machine_names_file": "/path/to/machine-names"
+  "builder_machine_names_file": "/path/to/machine-names",
+  "_doc_rehearsal_repository_owners": "Optional: read by lib/agent-platform/github_app.py's `rehearsal` verb (E10 S11, platform/specs/github-credential-seam). Each owner here, paired with the repository name `builder-merge-rehearsal` fixed in code, is the only repository the minter will issue that verb's token for; omitting the key, or leaving it empty, refuses the verb for every repository. Set by tools/merge-refusal-rehearsal's own run.",
+  "rehearsal_repository_owners": ["example-org", "example-person"]
 }

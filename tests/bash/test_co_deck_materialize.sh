@@ -1,12 +1,12 @@
 #!/bin/bash
-# Tests for bin/co's convivy-deck branch re-individuating on `-r`
+# Tests for bin/co's northwind-deck branch re-individuating on `-r`
 # (issue_01M35K490CAR4Q69B9TAR7Z39X, closing a duplicate of
 # issue_01M2PCH82X17T26SB42MNJN53Z).
 #
-# THE BUG. PR #446 took convivy-deck out of LOCAL_AGENT_REPOS, so `agentctl
+# THE BUG. PR #446 took northwind-deck out of LOCAL_AGENT_REPOS, so `agentctl
 # spawn` has resolved deck's agents through the shared KB index (deck/daytime)
 # since 2026-08-26 — a DISPATCHED deck agent has always gotten the profile.
-# The convivy-deck branch of bin/co never called `_co_pull_knowledge` or
+# The northwind-deck branch of bin/co never called `_co_pull_knowledge` or
 # `_co_reindividuate`, though: it only set /handoff-pickup and exec'd claude,
 # so the interactive session's .claude/ carried only whatever was last
 # hand-placed or checked into git. On 2026-09-22 the operator ran `co -r` across every
@@ -40,7 +40,7 @@ _git_ident() { # <repo>
 # A fake HOME with a real ~/Convivy/knowledge tracking a real bare origin (the
 # `-r` path pulls it before individuating, so a fake would abort first and
 # every assertion below would pass for the wrong reason), the real
-# ~/Convivy/convivy-deck with a crew fixture matching what convivy-deck still
+# ~/Convivy/northwind-deck with a crew fixture matching what northwind-deck still
 # tracks in git today (a stand-in for the pre-fix, still-tracked state, so a
 # regression back to "never reindividuate" would still leave the files it
 # expects there and pass for the wrong reason), and a same-basename near-miss
@@ -71,7 +71,7 @@ setup() { # -> echoes fake HOME
     git clone -q "$origin" "$kb"
     _git_ident "$kb"
 
-    for d in Convivy/convivy-deck Convivy/worktrees/convivy-deck elsewhere/convivy-deck; do
+    for d in Convivy/northwind-deck Convivy/worktrees/northwind-deck elsewhere/northwind-deck; do
         mkdir -p "$home/$d/.claude/agents"
         : > "$home/$d/.claude/agents/deck-coder.md"
         ( cd "$home/$d" && git init -q . )
@@ -132,7 +132,7 @@ run_co() {
     ( cd "$home/$dir" && \
       HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$claude_log" SPY_LOG="$spy_log" AGENTCTL_LOG="$spy_log" KCTX_RC="${KCTX_RC:-0}" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "$@" >/dev/null 2>"$stderr_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" "$@" >/dev/null 2>"$stderr_log" )
     RC=$?
     STDERR=$(cat "$stderr_log")
     SPY=$(cat "$spy_log")
@@ -140,9 +140,9 @@ run_co() {
     rm -f "$stderr_log" "$spy_log" "$claude_log"
 }
 
-echo "== co -r in ~/Convivy/convivy-deck re-individuates from the daytime profile, after pulling =="
+echo "== co -r in ~/Convivy/northwind-deck re-individuates from the daytime profile, after pulling =="
 H=$(setup)
-run_co "$H" Convivy/convivy-deck -r
+run_co "$H" Convivy/northwind-deck -r
 assert_rc 0 "$RC" "deck -r succeeds"
 assert_eq "1" "$(echo "$SPY" | grep -qx 'use daytime --force' && echo 1 || echo 0)" \
     "knowledge-ctx is called as 'use daytime --force'"
@@ -163,7 +163,7 @@ echo "== plain co does NOT individuate =="
 # Individuating clears two trees, so it belongs to the explicit refresh a
 # person asked for, not to every launch.
 H=$(setup)
-run_co "$H" Convivy/convivy-deck
+run_co "$H" Convivy/northwind-deck
 assert_rc 0 "$RC" "deck without -r succeeds"
 assert_eq "0" "$(echo "$SPY" | grep -qx 'use daytime --force' && echo 1 || echo 0)" \
     "knowledge-ctx is not invoked at all"
@@ -173,8 +173,8 @@ rm -rf "$H"
 echo "== a same-basename near-miss is NOT individuated, but still pulls and launches =="
 # The branch matches a basename; the individuate step matches the full path.
 # Without that asymmetry, `--force` would clear .claude/agents and
-# .claude/skills in any directory on disk named `convivy-deck`.
-for near in Convivy/worktrees/convivy-deck elsewhere/convivy-deck; do
+# .claude/skills in any directory on disk named `northwind-deck`.
+for near in Convivy/worktrees/northwind-deck elsewhere/northwind-deck; do
     H=$(setup)
     run_co "$H" "$near" -r
     assert_rc 0 "$RC" "$near: co -r still succeeds"
@@ -192,7 +192,7 @@ echo "== a failed individuate aborts before launching =="
 # worse than no session, and the usual cause is a live session holding the
 # directory.
 H=$(setup)
-KCTX_RC=1 run_co "$H" Convivy/convivy-deck -r
+KCTX_RC=1 run_co "$H" Convivy/northwind-deck -r
 assert_rc 1 "$RC" "deck -r aborts when knowledge-ctx fails"
 assert_eq "" "$CLAUDE_ARGS" "claude is never launched"
 assert_eq "1" "$(echo "$STDERR" | grep -q 'knowledge-ctx use failed' && echo 1 || echo 0)" \
@@ -208,7 +208,7 @@ advance_origin "$H"
 echo local > "$H/Convivy/knowledge/localonly.md"
 git -C "$H/Convivy/knowledge" add -A
 git -C "$H/Convivy/knowledge" commit -qm "local-only"
-run_co "$H" Convivy/convivy-deck -r
+run_co "$H" Convivy/northwind-deck -r
 assert_rc 1 "$RC" "deck -r aborts when the knowledge pull fails"
 assert_eq "" "$CLAUDE_ARGS" "claude is never launched"
 assert_eq "0" "$(echo "$SPY" | grep -qx 'use daytime --force' && echo 1 || echo 0)" \

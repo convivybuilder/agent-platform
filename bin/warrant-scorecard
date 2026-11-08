@@ -3,7 +3,7 @@
 (ARCH-309). The spurious-work / warrant dimension, sibling to model-scorecard
 (does it work?) and security-scorecard (is it safe?).
 
-The failure it measures (vivy #764, 2026-07-03): an agent spun a plausible-but-
+The failure it measures (a product repo's #764, 2026-07-03): an agent spun a plausible-but-
 false narrative from data it saw, decided the app "needed" an enhancement, built
 it, and it rode through a merged PR — the code was fine, but the CHANGE SHOULD NOT
 HAVE EXISTED. Such a PR scores POSITIVELY on every other axis (merged, survives 7d,
@@ -48,6 +48,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import builder_root as BR
 import projects
+import github_app as GA
 RUNS_ROOT = BR.runs_root()
 SCORECARD_LEDGER = RUNS_ROOT / "scorecard" / "scorecard.jsonl"    # the merged agent-PR set (ARCH-107)
 LEDGER_PATH = RUNS_ROOT / "scorecard" / "warrant.jsonl"
@@ -63,11 +64,15 @@ _REASON_RE = re.compile(r"revert-reason:\s*([a-z-]+)", re.IGNORECASE)
 VALID_REASONS = {"unwarranted", "bug", "superseded", "other"}
 
 
-def _gh_json(args: list[str]) -> list | dict | None:
+def _gh_json(args: list[str], env: dict) -> list | dict | None:
     """Run a `gh` command returning JSON; None on any failure (read-only harvester
-    degrades, never crashes, on a gh/network hiccup)."""
+    degrades, never crashes, on a gh/network hiccup).
+
+    `env` is the one `read`-scoped token's environment minted for this call's
+    repo (company/decisions/0027) — one mint per repo per pass, never minted
+    in here."""
     try:
-        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False, env=env)
         if cp.returncode != 0 or not cp.stdout.strip():
             return None
         return json.loads(cp.stdout)
@@ -136,11 +141,11 @@ def _parse_revert(title: str, body: str) -> tuple[int | None, str]:
     return int(m.group(1)), reason
 
 
-def find_reverts(repo: str) -> list[dict]:
+def find_reverts(repo: str, env: dict) -> list[dict]:
     """Detected reverts in a repo: {revert_pr, original_pr, reason, reverted_at}."""
     data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
                      "--limit", str(REVERT_SCAN_LIMIT), "--json",
-                     "number,title,body,createdAt,state"]) or []
+                     "number,title,body,createdAt,state"], env) or []
     if len(data) >= REVERT_SCAN_LIMIT:
         print(f"warrant-scorecard: WARNING: {repo} PR scan hit the "
               f"{REVERT_SCAN_LIMIT}-PR limit — older reverts may be missed; "
@@ -166,7 +171,17 @@ def harvest(days: int) -> list[dict]:
     merged = merged_agent_prs(days)
     rows = []
     for repo, prmap in merged.items():
-        for rev in find_reverts(repo):
+        # One `read`-scoped token per repo per pass (company/decisions/0027):
+        # minted once here for the one `find_reverts` call this repo makes,
+        # revoked before the loop moves to the next repo.
+        try:
+            with GA.read_token_env(projects.repo_github_slug(repo)) as env:
+                reverts = find_reverts(repo, env)
+        except GA.Unreadable as e:
+            print(f"warrant-scorecard: cannot mint a GitHub token for {repo} ({e}); "
+                  f"its reverts are unscanned this pass.", file=sys.stderr)
+            continue
+        for rev in reverts:
             ctx = prmap.get(rev["original_pr"])
             if ctx is None:
                 continue  # revert of a non-agent or out-of-window PR — not ours to score

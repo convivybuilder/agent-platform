@@ -332,10 +332,40 @@ jobs:
           else
             sudo apt-get update && sudo apt-get install -y zsh
           fi
+      # test_linux_bwrap_sandbox_commits_without_a_stale_lock and
+      # test_linux_bwrap_sandbox_refuses_a_siblings_branch_ref (tests/test_run_sandbox.py)
+      # build a real bwrap sandbox from settings()'s own rendered sandbox.filesystem. The
+      # Linux runner's image has no bwrap. Same root-vs-sudo split as the npx/zsh steps
+      # above; apt-get is this image's package manager.
+      - name: install bubblewrap (for the real bwrap sandbox tests)
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: |
+          set -euo pipefail
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update && apt-get install -y bubblewrap
+          else
+            sudo apt-get update && sudo apt-get install -y bubblewrap
+          fi
+      # PR #1111: the three real-bwrap tests failed here with "bwrap: setting
+      # up uid map: Permission denied" — bwrap ran but this runner refuses
+      # the unprivileged user namespace it needs. Diagnoses why and tries
+      # bwrap's own documented remediations (see the script's own header for
+      # the two known causes and why each is tried); never fails this job —
+      # the pytest step below (AGENTCTL_REQUIRE_BWRAP=1) stays the real gate,
+      # so bwrap left unusable still fails there with bwrap's own stderr.
+      - name: diagnose and remediate bwrap user-namespace availability
+        if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        run: /bin/bash scripts/ci/bwrap-userns-diagnose.sh
       - if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
         run: pip install -r requirements-dev.txt
       - name: pytest (with coverage)
         if: (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true') && needs.changes.outputs.tree_skip != 'true'
+        env:
+          # Makes a missing or unusable bwrap a failing test, not a silent skip, on this
+          # runner — see @requires_bwrap's own comment in tests/test_run_sandbox.py. Unset
+          # for every other caller (a macOS dev run included), where the two bwrap tests
+          # keep skipping with a stated reason.
+          AGENTCTL_REQUIRE_BWRAP: "1"
         run: python -m pytest -rs --durations=25 --cov --cov-report=term-missing --cov-report=json
       # `always()` publishes the number even when pytest fails, but it must not
       # outlive the gate: with the suite skipped there is no coverage.json to

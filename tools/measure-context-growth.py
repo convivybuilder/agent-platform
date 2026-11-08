@@ -32,7 +32,7 @@ apart):
     its name to a REGISTERED, non-private project; skip it unopened
     otherwise. The denylist alone fails open — a headless `claude -p` job
     with no `WorkingDirectory` runs at cwd `/`, sanitizes to the dirname `-`,
-    and matches no crew's prefix at all, which is how EA's private prompts
+    and matches no crew's prefix at all, which is how a private crew's prompts
     leaked before `bin/transcript-capture` was fixed for the identical bug
     (its own docstring, "Capture is an allowlist"). The allowlist closes
     that: an unregistered directory has no registered slug to resolve to, so

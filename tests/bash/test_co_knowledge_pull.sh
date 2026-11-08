@@ -159,7 +159,7 @@ run_co_r() {
       HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$claude_log" GIT_SPY_LOG="$spy_log" \
       AGENTCTL_LOG="$agentctl_log" AGENTCTL_STUB_GIT="$REAL_GIT" GH_SPY_LOG="$gh_log" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" -r >/dev/null 2>"$stderr_log" )
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" -r >/dev/null 2>"$stderr_log" )
     RC=$?
     STDERR=$(cat "$stderr_log")
     GIT_CALLS=$(cat "$spy_log")

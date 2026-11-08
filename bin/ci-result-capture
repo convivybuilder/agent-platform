@@ -8,26 +8,30 @@ way PR state already is. Until this job covers it, the Library's own
 personal `gh` login — forbidden by platform/decisions/0051, the same rule
 `bin/pr-state-capture` answers for PR state. This job answers it for CI.
 
-AUTHENTICATES AS THE `convivy-bosun` GITHUB APP (app id 4666673), never `gh`,
-mirroring `bin/pr-state-capture` end to end: same App, same org-wide
+AUTHENTICATES AS THE INSTALL'S OWN GITHUB APP (`github_app.installed_app()`), never
+`gh`, mirroring `bin/pr-state-capture` end to end: same App, same org-wide
 installation, same read-only posture (`_READ_ONLY_PERMISSIONS` mints a token
 that can only read `actions` and `metadata`, so a bug that tried to write
 would be refused by GitHub itself). See that script's module docstring and
 `lib/agent-platform/github_app.py` for the shared JWT/token plumbing both use.
 
-**THE TRACKED LIST IS OWNED HERE, A COPY, NOT A LIVE READ OF THE LIBRARY'S
-OWN `TRACKED`.** The Library's fetcher lives in a separate repository
-(`convivy/library`) this job cannot import across a deploy boundary without
-making itself depend on that repo's own install layout — the two jobs must
-be able to run independently through changeover, including the day the
-Library's own is retired. `TRACKED` below is seeded from that file's list as
-read on 2026-10-13 (all ~20 pairs, not a vivy-specific subset), so the two
-jobs cover the same ground during the overlap and `dedup_key` absorbs
-whichever one gets to a run first. Keeping the two lists in sync from here
-on is a manual cost, accepted the same way `bin/pr-state-capture`'s own
-`repos_to_capture()` note (derived from the registry, not copied) chose the
-opposite tradeoff for repo lists that change far more often than CI workflow
-wiring does.
+**THE TRACKED LIST IS READ FROM THE LIBRARY'S OWN `GET /ci/tracked` ON EVERY
+PASS (`fetch_tracked_pairs()`), NOT A COPY OF ITS RULE.** This job used to
+rebuild the list itself each pass from `config/projects.json`, reimplementing
+the same rule the Library's own `convivy/library` applies to that file
+(`ci_tracked.tracked()`) — a copy of a rule drifts exactly as a copy of the
+list it once was did (the `TRACKED` tuple seeded once on 2026-10-13, stale by
+2026-10-26). Merge admission reads the Library's own list, so this job now
+reads that list directly (library#335, deployed as a6dc51af) rather than
+deriving a second answer to the same question. See
+`platform/contracts/library-protocol` §6.8 for the route's contract: the body
+is `{"tracked": [...], "count": n}`, one row per pair naming `repo`,
+`workflow_file`, `product` and `on_pull_request`; any answer other than 200
+means there is no list, and this job must not capture against a remembered or
+empty one in its place — `fetch_tracked_pairs()` refuses the whole pass
+before touching any cursor, rotation or signal write (see `main()`) rather
+than falling back to an empty or partial list. `dedup_key` absorbs whichever
+job gets to a run first while both still run.
 
 READ-ONLY, separate from any write path: the only non-GET calls here are the
 GitHub App token mint (`github_app.installation_token`, a POST to
@@ -47,25 +51,76 @@ BYTE, SO BOTH CAN RUN DURING CHANGEOVER WITH NO DUPLICATE ROW: `source: ci`,
 `kind: test-result`, `actor: github-actions`, `stream` the workflow's slug
 (`workflow_slug`), `refs.commit` the run's head sha (the Library's `GET
 /signals/pr-state` joins a PR's CI by it), `dedup_key:
-ci:<product>:<workflow-slug>:<run-id>` — the same scheme a retired push used
-before it (see that file's own docstring), so a run captured by either path
-first makes the other's post a no-op `duplicate`, never a second row.
+ci:<product>:<workflow-slug>:<run-id>` for a run's first attempt — the same
+scheme a retired push used before it (see that file's own docstring), so a
+run captured by either path first makes the other's post a no-op
+`duplicate`, never a second row.
+
+**CQ-533 (issue_01M5FM5NFRPHFJVD8XFK85ABHP, 2026-10-21) appends the run's own
+`run_attempt` to `dedup_key` from the SECOND attempt on**
+(`ci:<product>:<workflow-slug>:<run-id>:<run-attempt>`), never for the
+first: a run that fails and is re-run keeps its `id`, so without this the
+re-run's passing result shared its failing attempt's `dedup_key` and was
+dropped as a `duplicate`, never posted at all. Attempt 1's key is left
+exactly as `ci_result_fetch.py` and the retired push both already shaped
+it, since nothing in this repository's own `bin`/`lib` matches `dedup_key`
+by this scheme today to tell this job whether a reader elsewhere depends on
+that exact shape for an ordinary, never-re-run result (the Library's own
+merge admission, in `convivy/library`, is outside this repo's reach to
+check); the unconditional suffix this fix could have used instead would
+have changed every row's key, first attempt included, with no way from here
+to confirm that is safe.
+
+**CQ-533 ALSO MOVES `produced_at` FROM THE RUN'S `created_at` TO ITS
+`updated_at`**: a re-run keeps attempt 1's `created_at`, so attempt 2's row
+would otherwise carry attempt 1's timestamp — identical to attempt 1's own
+`produced_at` — despite reporting the opposite conclusion, breaking the
+field's documented meaning ("when the reported thing was true",
+`signal_client.py`) and leaving a reader with no way to tell the two rows
+apart by time. `produced_at` is the only field `signal_from_run` derives
+from either timestamp; every other field (`refs`, `meta`, `dedup_key`,
+`body`) is read from the run's id, conclusion or other attributes, none of
+which this change touches.
 
 **THE CURSOR INVARIANTS ARE THE SAME ONES `ci_result_fetch.py`'s MODULE
 DOCSTRING DERIVES FROM A PRODUCTION BUG (2026-08-31)**, carried over here
 rather than re-derived, because the bug is general to any "poll since a
 cursor, in flight runs excluded by a status filter" design, not specific to
 that file's own transport (`gh api` there, this module's own
-`urllib`/`github_app` here):
+`urllib`/`github_app` here).
 
-  - `gh_runs` fetches every run since the cursor REGARDLESS of status; a
-    completed run is turned into a signal, an incomplete one holds the
-    cursor back to its own `created_at` so it is asked for again until it
-    finishes. Filtering to `status=completed` server-side is what caused the
-    original bug: a run still in flight is excluded from the page that would
-    have caught it, and once the cursor moves past its creation time on
-    wall-clock alone it is excluded from every later page too — gone, with
-    no error and nothing in the log.
+**CQ-533 (issue_01M5FM5NFRPHFJVD8XFK85ABHP, 2026-10-21) moved every
+invariant below from each run's `created_at` to its `updated_at`, and the
+measurement below (2026-10-25) moved the FORWARD FETCH back to `created_at`
+while keeping `updated_at` for re-run detection.** GitHub's list-workflow-
+runs endpoint documents a `created` filter and has no `updated` filter at
+all — it accepts the parameter and silently ignores it, so CQ-533's
+`updated`-filtered fetch was never actually filtering: measured 2026-10-25
+against a tracked repository with 1233 workflow runs (`total_count` with no filter: 1233;
+`updated=>=2099-01-01`: 1233; a one-second `updated` range: 1233; control
+`created=>=2099-01-01`: 0), every query after CQ-533 fetched the pair's
+WHOLE history, which for a pair over `GITHUB_CREATED_FILTER_CAP` runs tripped
+the pagination guard at every split level `_gh_runs_window` tried, proved no
+window, and left that pair's cursor exactly where it was, pass after pass —
+no CI result reached the Library for any pair over the cap from CQ-533's
+merge until this fix. `gh_runs` reads `created` now, the filter GitHub
+actually honours; the bullets below read `created_at` for everything a
+FORWARD poll needs (the window itself, and holding an incomplete run's
+cursor back so the next poll still asks for it), and `updated_at` for
+everything a RE-RUN needs (see the re-run paragraph after these bullets,
+and `RERUN_LOOKBACK`) — a re-run keeps its original `id` and its original
+`created_at`, so nothing building its cursor from `created_at` alone would
+ever see one:
+
+  - `gh_runs` fetches every run with `created_at` since the cursor
+    REGARDLESS of status; a completed run is turned into a signal, an
+    incomplete one holds the cursor back to its own `created_at` so the next
+    poll's forward window still starts at or before it and asks for it
+    again until it finishes. Filtering to `status=completed` server-side is
+    what caused the original (2026-08-31) bug: a run still in flight is
+    excluded from the page that would have caught it, and once the cursor
+    moves past its own creation time it is excluded from every later page
+    too — gone, with no error and nothing in the log.
   - The held-back cursor uses `created >=`, not `>`: holding to the run's
     EXACT `created_at` and then re-querying with a strict `>` would exclude
     that exact run on the very next poll, the same class of loss one step
@@ -74,7 +129,10 @@ that file's own transport (`gh api` there, this module's own
     pair's cursor back before it is treated as abandoned — excluded from the
     watermark and logged loudly as `stale_pending`, not dropped silently —
     so one run that never legitimately finishes cannot freeze that pair's
-    cursor and grow its refetch window forever.
+    cursor and grow its refetch window forever. Staleness itself is still
+    measured against the run's `updated_at` (GitHub's own "last touched"
+    field), not its fixed `created_at`: a run GitHub is still actively
+    updating is not stuck, however long ago it started.
   - A pair's cursor advances once its whole window is fetched AND posted
     with zero errors (`capture_workflow`'s own `errors` tally) — a fetch
     failure or an ordinary failed post leaves the cursor exactly where it
@@ -108,12 +166,49 @@ that file's own transport (`gh api` there, this module's own
     (`convivy/knowledge#ci.yml`'s 90-day window: `total_count` 2500, page 10
     returned 100, page 11 returned 0). A pair whose window holds more than
     the cap would otherwise have its cursor advanced past runs the capped
-    query never returned. `gh_runs` answers this the same way that file's
-    own `gh_runs` does: a `>=since` query that comes back at exactly the cap
-    is re-fetched as a split, recursive range query (`_gh_runs_window`)
-    instead of trusted as the whole window, and a capped range already
-    under one second wide raises rather than being trusted, since splitting
-    it any further cannot produce evidence it covered the window in full.
+    query never returned. `gh_runs` answers this the way that file's own
+    `gh_runs` answers it: a `>=since` query that comes back at exactly the
+    cap is re-fetched as a split range query (`_gh_runs_window`) instead of
+    trusted as the whole window, and a capped range already under one
+    second wide raises rather than being trusted, since splitting it any
+    further cannot produce evidence it covered the window in full.
+  - A SECOND EXCEPTION, added 2026-10-25: a pair whose cursor sits far
+    enough behind can need `_gh_runs_window` to split a capped window many
+    times over — measured against convivy/library, convivy/knowledge and
+    convivy/agent-platform taking most of an hour EACH on 2026-10-25, long
+    enough to run past the installation token `main()` minted at the start
+    of the run (GitHub expires one within the hour), so every pair reached
+    after the token turned over failed with a 401 nothing in the run ever
+    recovered from, and the next pass started from the very same cursors
+    and failed the same way again. Two fixes, together: `GhTokenRefresher`
+    re-mints the token as this run's own GitHub reads need it (see that
+    class's own docstring), and `_RUN_DEADLINE_SECONDS` now bounds the
+    WHOLE run, fetch included, not posting alone — `main()` stops starting
+    new pairs once it passes, and `_gh_runs_window` stops splitting a
+    capped window once it passes, in both cases raising/leaving a cursor
+    exactly where today's invariants already allow: `FetchBudgetExceeded`
+    carries the proven-complete PREFIX of an interrupted window the same
+    shape the sustained-429 case above already does, so a pair this
+    deadline interrupts still advances through what it proved, posts what
+    it fetched, and picks up the rest on the next pass instead of being
+    stuck at today's cursor forever.
+
+**RE-RUNS, SINCE THE FORWARD FETCH CAN NO LONGER SEE THEM:** a run's
+`created_at` never changes, so once the forward cursor passes it, a later
+re-run of that same run is invisible to `gh_runs`'s `created`-filtered
+window no matter how much later its `updated_at` becomes. `capture_reruns`
+answers this independently of the forward cursor: each pass, for each pair,
+it re-fetches every run `created` in the bounded window
+`[since - RERUN_LOOKBACK, since)` (`gh_reruns`, reusing `_gh_runs_window`'s
+own cap-and-split fetch over an explicit range) and posts whichever of them
+are both `completed` and `updated_at` after `since` — i.e. touched again
+since this pair's last poll, the signature of a re-run. `dedup_key`'s own
+`run_attempt` suffix (CQ-533) makes reposting an already-captured re-run
+harmless, so `capture_reruns` carries no cursor of its own and simply reruns
+this check every pass; `RERUN_LOOKBACK` bounds how far behind the forward
+cursor it looks, so a re-run triggered more than that long after its own
+original run's `created_at` is this design's documented, tested limit, not
+a case this job claims to cover.
 
 Usage:
     ci-result-capture
@@ -126,56 +221,129 @@ import json
 import os
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 
-import builder_root as BR  # noqa: E402
 import github_app as GA  # noqa: E402
+import projects as PR  # noqa: E402
 import signal_client as SC  # noqa: E402
+import vault_plane as VP  # noqa: E402
 
-# The convivy-bosun GitHub App, the same installation `bin/pr-state-capture`
-# already reads through (issue_01M2KV16ZRG3N49GRER8Q7545H, app id 4666673,
-# installed org-wide). Re-derived per run, never stored.
-APP_ID = "4666673"
-OWNER = "convivy"
-
-# Read from the passwd home, never $HOME — see builder_root.real_account_home.
-KEY_PATH = BR.real_account_home() / ".config" / "convivy" / "bosun-app.pem"
+# The install's own GitHub App, the same installation `bin/pr-state-capture`
+# already reads through (issue_01M2KV16ZRG3N49GRER8Q7545H), resolved fresh on
+# every run through `GA.installed_app()` — never a literal, and never cached.
+# No single OWNER constant any more: a pass mints one token per distinct owner
+# the pairs it is about to walk actually name — see `main()`.
 
 # The token this script mints can only ever read workflow runs and the
 # installation's own metadata, whatever the App itself holds — see the
 # module docstring's READ-ONLY section.
 _READ_ONLY_PERMISSIONS = {"actions": "read", "metadata": "read"}
 
-# Every (repo, workflow_file) pair this job captures, and the product each
-# posts under — see the module docstring's TRACKED-LIST section for why this
-# is a copy of, not a live read of, the Library's own list. Read from
-# `convivy/library`'s `bin/ci_result_fetch.py` on 2026-10-13.
-TRACKED = (
-    {"repo": "convivy/constance", "workflow_file": "ci.yml", "product": "constance"},
-    {"repo": "convivy/vivy", "workflow_file": "ci.yml", "product": "vivy"},
-    {"repo": "convivy/vivy", "workflow_file": "e2e-stage-smoke.yml", "product": "vivy"},
-    {"repo": "convivy/vivy-ownerrez-sandbox-tools", "workflow_file": "ci.yml", "product": "vivy"},
-    {"repo": "convivy/sous-chef", "workflow_file": "ci.yml", "product": "sous-chef"},
-    {"repo": "convivy/hollis", "workflow_file": "ci.yml", "product": "hollis"},
-    {"repo": "convivy/selector", "workflow_file": "ci.yml", "product": "selector"},
-    {"repo": "convivy/selector-backend", "workflow_file": "ci.yml", "product": "selector"},
-    {"repo": "convivy/library", "workflow_file": "ci.yml", "product": "library"},
-    {"repo": "convivy/knowledge", "workflow_file": "ci.yml", "product": "library"},
-    {"repo": "convivy/agent-platform", "workflow_file": "ci.yml", "product": "bosun"},
-    {"repo": "convivy/placard", "workflow_file": "ci.yml", "product": "placard"},
-    {"repo": "convivy/shipwright", "workflow_file": "ci.yml", "product": "shipwright"},
-    {"repo": "convivy/convivy-orient", "workflow_file": "ci.yml", "product": "convivy-orient"},
-    {"repo": "convivy/www", "workflow_file": "build-deploy.yml", "product": "convivy-orient"},
-    {"repo": "convivy/convivy-app-kit", "workflow_file": "ci.yml", "product": "svc"},
-    {"repo": "convivy/convivy-services", "workflow_file": "ci.yml", "product": "svc"},
-    {"repo": "convivy/convivy-deck", "workflow_file": "ci.yml", "product": "convivy-deck"},
-    {"repo": "convivy/substrate", "workflow_file": "checks.yml", "product": "steward"},
-    {"repo": "convivy/vivy-landing", "workflow_file": "ci.yml", "product": "vivy"},
-)
+# The Library's own route for the tracked-pairs list (library-protocol §6.8).
+_CI_TRACKED_ROUTE = "/ci/tracked"
+
+# Same budget as `projects._REGISTRY_TIMEOUT_S` — this sits on the same
+# critical path (a scheduled pass, not an interactive one), reached through
+# the same client against the same service.
+_CI_TRACKED_TIMEOUT_S = 5
+
+# A tracked-pairs row must carry at least these; `on_pull_request` is read by
+# nothing downstream today, so it is dropped rather than carried into the
+# pair dicts `main()` walks.
+_TRACKED_ROW_FIELDS = ("repo", "workflow_file", "product")
+
+
+class TrackedPairsUnavailable(RuntimeError):
+    """Raised when the Library's `GET /ci/tracked` did not answer with a
+    usable list: any status other than 200, a network error or timeout, a
+    body that isn't `{"tracked": [...], "count": n}`, a row missing one of
+    `_TRACKED_ROW_FIELDS`, a `count` that disagrees with the list's length,
+    or an empty `tracked` list (count 0) — the Library's own contract (§6.8)
+    is that any answer other than 200 means there is no list, and a caller
+    must not capture against a remembered or empty one in its place. The
+    message names the cause and, for an HTTP response, the status — never
+    the token. Nothing in this module catches this; `main()` lets it refuse
+    the whole pass before any cursor, rotation or signal write."""
+
+
+def fetch_tracked_pairs() -> tuple[dict, ...]:
+    """Every (repo, workflow_file, product) pair this job captures, read
+    fresh from the Library's `GET /ci/tracked` every pass — see the module
+    docstring's tracked-list section. Uses the same registry-reader
+    credential and the same client `lib/agent-platform/projects.py` uses for
+    `GET /registry` (`projects._registry_token()`, `vault_plane.library_url`/
+    `library_headers`), rather than a second token path.
+
+    Raises `TrackedPairsUnavailable` on every way the list cannot be trusted
+    — see that class's own docstring. A caller must not catch this and fall
+    back to an empty or partial list (see the module docstring and
+    `main()`)."""
+    token = PR._registry_token()
+    if not token:
+        raise TrackedPairsUnavailable(
+            f"no registry token: {PR.REGISTRY_TOKEN_ENV} is unset and "
+            f"{PR._registry_token_file()} could not be read")
+    req = urllib.request.Request(
+        VP.library_url(_CI_TRACKED_ROUTE), headers=VP.library_headers(token=token))
+    try:
+        with urllib.request.urlopen(req, timeout=_CI_TRACKED_TIMEOUT_S) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        raise TrackedPairsUnavailable(f"GET {_CI_TRACKED_ROUTE} returned {e.code}") from e
+    except Exception as e:
+        raise TrackedPairsUnavailable(
+            f"GET {_CI_TRACKED_ROUTE} failed: {e.__class__.__name__}") from e
+    rows = body.get("tracked") if isinstance(body, dict) else None
+    if not isinstance(rows, list):
+        raise TrackedPairsUnavailable(
+            f"GET {_CI_TRACKED_ROUTE} returned a body with no 'tracked' list")
+    if body.get("count") != len(rows):
+        raise TrackedPairsUnavailable(
+            f"GET {_CI_TRACKED_ROUTE}: count {body.get('count')!r} disagrees "
+            f"with {len(rows)} row(s)")
+    if not rows:
+        raise TrackedPairsUnavailable(
+            f"GET {_CI_TRACKED_ROUTE} returned an empty tracked list")
+    pairs: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict) or not all(f in row for f in _TRACKED_ROW_FIELDS):
+            raise TrackedPairsUnavailable(
+                f"GET {_CI_TRACKED_ROUTE}: a row is missing one of "
+                f"{_TRACKED_ROW_FIELDS}: {row!r}")
+        pairs.append({f: row[f] for f in _TRACKED_ROW_FIELDS})
+    return tuple(pairs)
+
+
+def _pair_owner(entry: dict) -> str:
+    """The owner half of one pair's `repo` field (`"owner/repo"`)."""
+    return entry["repo"].split("/", 1)[0]
+
+
+# TEST-ONLY OVERRIDE. Every test in this suite that is not itself about
+# `fetch_tracked_pairs()` pins its own tiny pair list via
+# `monkeypatch.setattr(ci_result_capture, "TRACKED", (...))`, bypassing the
+# Library read entirely so it can exercise `capture_workflow`/rotation/
+# token-refresh behaviour against pairs with no matching Library response at
+# all. `None`, the production default, means "read fresh via
+# `fetch_tracked_pairs()` every pass" — see `_pairs_for_this_pass`, the only
+# reader.
+TRACKED: tuple[dict, ...] | None = None
+
+
+def _pairs_for_this_pass() -> tuple[dict, ...]:
+    """`TRACKED` when a test has pinned one, else `fetch_tracked_pairs()` —
+    see that function and `TRACKED`'s own comment. Called once per pass, at
+    the very start of `main()`, so a pair the Library starts or stops
+    tracking always reaches the NEXT pass rather than waiting for a deploy
+    to notice it."""
+    if TRACKED is not None:
+        return TRACKED
+    return fetch_tracked_pairs()
 
 # This job's OWN POST /signals credential, the same reasoning as
 # `pr-state-capture`'s `SIGNAL_TOKEN_ENV`/`SIGNAL_TOKEN_FILE` (library#176:
@@ -203,7 +371,7 @@ ROTATION_FILE_NAME = "rotation.json"
 # next cursor sits a little behind "now" rather than exactly at it.
 # `dedup_key` absorbs the re-covered runs this creates. This is a fallback
 # for that gap alone — a run still incomplete when a pass started holds the
-# cursor back to its OWN `created_at` regardless of how long it takes to
+# cursor back to its OWN `updated_at` regardless of how long it takes to
 # finish (see `capture_workflow`).
 OVERLAP = dt.timedelta(minutes=5)
 
@@ -218,11 +386,33 @@ STALE_PENDING_AFTER = dt.timedelta(hours=24)
 # a bounded recent window rather than a workflow's entire history.
 NO_CURSOR_WINDOW_DAYS = 90
 
-# Bounds one run deadline the same way `pr-state-capture._RUN_DEADLINE_SECONDS`
-# does: this job's own `StartInterval` is 180s; a pass that runs long has its
-# next scheduled fire skipped rather than overlapping it (launchd.plist(5),
-# StartInterval), so 150s bounds how long a stuck pass is retried, not a race
-# against the next fire.
+# How far behind the forward cursor `capture_reruns` looks, by `created`, for
+# a re-run of an already-captured result — a run's `created_at` never
+# changes when it is re-triggered (see the module docstring's re-run
+# paragraph), so the forward, `created`-filtered cursor alone can never see
+# one. A week is a practical bound on how long after a failure someone
+# comes back to press "re-run" (long enough to span a holiday weekend),
+# chosen so this lookback stays small rather than growing forever; a re-run
+# outside it is this design's documented limit, not a case covered here —
+# see the tests for one re-run inside this window being captured and one
+# outside it being missed.
+RERUN_LOOKBACK = dt.timedelta(days=7)
+
+# Bounds the WHOLE run — every pair's fetch and every pair's post together,
+# not posting alone — the same way `pr-state-capture._RUN_DEADLINE_SECONDS`
+# bounds its own run: this job's own `StartInterval` is 180s; a pass that
+# runs long has its next scheduled fire skipped rather than overlapping it
+# (launchd.plist(5), StartInterval), so 150s bounds how long a stuck pass is
+# retried, not a race against the next fire. Before this covered fetch too,
+# a pair whose cursor sat weeks behind could spend most of an hour inside
+# `_gh_runs_window`'s own recursive re-fetch alone (measured against
+# convivy/library, convivy/knowledge and convivy/agent-platform on
+# 2026-10-25), long enough to outlive the installation token `main()` minted
+# at the start of the run — see `GhTokenRefresher` for the other half of
+# that fix. `main()` checks this deadline before starting each pair, and
+# `_gh_runs_window` checks it before fetching each sub-window of a capped
+# range, so both a pair that has not yet been started and a pair whose own
+# fetch is still splitting stop at the same wall-clock budget.
 _RUN_DEADLINE_SECONDS = 150
 
 # The delivery-wanting timeout `signal_client._DELIVERY_TIMEOUT` uses for a
@@ -234,10 +424,12 @@ _PAGE_SIZE = 100
 
 # GitHub's own cap on a `created`-filtered run list, regardless of how many
 # pages are asked for — see the module docstring's cursor-invariants
-# section for the production measurement this is carried over from. A
-# `>=since` (or split range) query that comes back at exactly this many
-# results has not necessarily seen the whole window; `gh_runs` and
-# `_gh_runs_window` answer that, not `_gh_runs_page`'s own pagination loop.
+# section for the production measurement this is carried over from
+# (`convivy/knowledge#ci.yml`'s 90-day window, page 10 100 results, page 11
+# empty). A `>=since` (or split range) query that comes back at exactly
+# this many results has not necessarily seen the whole window; `gh_runs`
+# and `_gh_runs_window` answer that, not `_gh_runs_page`'s own pagination
+# loop.
 GITHUB_CREATED_FILTER_CAP = 1000
 
 # One more than `GITHUB_CREATED_FILTER_CAP` divided into `_PAGE_SIZE`-sized
@@ -260,6 +452,14 @@ _GH_RETRYABLE_STATUSES = (502, 503, 504)
 _GH_5XX_RETRY_ATTEMPTS = 3
 _GH_5XX_RETRY_BACKOFF_SECONDS = 2.0
 
+# How long before an installation token's own `expires_at` `GhTokenRefresher`
+# mints a replacement, rather than waiting for a request to come back 401.
+# GitHub documents installation tokens as expiring within the hour
+# (`github_app.installation_token`'s own docstring); 5 minutes is headroom
+# against this job's own request latency between the check and the next
+# request actually going out, not a measured deadline.
+_TOKEN_REFRESH_MARGIN = dt.timedelta(minutes=5)
+
 _CONCLUSION_TO_META_STATUS = {"success": "pass", "failure": "fail"}
 
 
@@ -268,6 +468,131 @@ class CaptureError(RuntimeError):
     into a signal. Raised rather than swallowed, and raised BEFORE anything
     in the same batch is posted, so a partial or malformed page never
     leaves the cursor advanced past data this run never actually wrote."""
+
+
+class FetchBudgetExceeded(Exception):
+    """Raised by `_gh_runs_window` alone — never `gh_runs`'s own, un-split
+    `>=since` path, which is always one fast query — when this run's
+    wall-clock `deadline` passes before a capped window finishes being
+    split and re-fetched (see `_RUN_DEADLINE_SECONDS`: a pair whose cursor
+    sits weeks behind can need far more requests than one run's budget
+    allows). `_gh_runs_window` processes a capped range oldest-first, so
+    everything gathered before the deadline hit is a PROVEN-COMPLETE,
+    CONTIGUOUS covering of `[since, safe_until]` — `runs` carries exactly
+    that, and `safe_until` is the one point `capture_workflow` may trust as
+    fully fetched. Everything from `safe_until` to the window's own `until`
+    was never queried and must be asked for again on the next pass.
+
+    Not a `CaptureError`: a capture error means nothing in this batch can be
+    trusted, so the cursor must not move at all. Running out of budget
+    partway through an oldest-first traversal means the PREFIX up to
+    `safe_until` can still be trusted, so `capture_workflow` treats this the
+    same way it already treats a sustained 429 mid-batch — advance through
+    what was proven, post what was fetched, and re-ask for the rest."""
+
+    def __init__(self, runs: list[dict], safe_until: dt.datetime):
+        super().__init__(f"fetch budget exceeded; proven complete through "
+                         f"{safe_until.strftime('%Y-%m-%dT%H:%M:%SZ')}")
+        self.runs = runs
+        self.safe_until = safe_until
+
+
+class GhTokenRefresher:
+    """One convivy-bosun installation token for the whole run, re-minted
+    before it is within `_TOKEN_REFRESH_MARGIN` of its own `expires_at`
+    (`token()`), or unconditionally, right after a request gets 401 despite
+    that margin (`force_refresh()`, called only from `_gh_runs_request` —
+    the one place every GitHub read in this module goes through — at most
+    once per attempt of that call's own retry loop, so up to
+    `_GH_5XX_RETRY_ATTEMPTS` times across one call to it).
+
+    This answers the root cause measured on 2026-10-25: `main()` used to
+    mint ONE token at the start of the run and hold it for every pair, but
+    GitHub's installation tokens expire within the hour and a pair whose
+    cursor sits weeks behind can keep `_gh_runs_window` fetching for most of
+    an hour on its own (see `FetchBudgetExceeded`'s own docstring and
+    `_RUN_DEADLINE_SECONDS`), so every pair reached after the token turned
+    over failed with a 401 that nothing in the run ever recovered from —
+    the next pass started from the same cursors and failed the same way.
+
+    A plain token string still works everywhere this class does: every
+    function that takes a `token` (`gh_runs`, `_gh_runs_window`,
+    `_gh_runs_page`, `_gh_runs_request`, `capture_workflow`) accepts either
+    one, via `_resolve_gh_token`. Only `main()` constructs this class; every
+    caller that passes a bare string (every test that does not exercise
+    token refresh) gets exactly today's behaviour — no refresh, a bare 401
+    raised as `CaptureError` on the spot.
+
+    Mints through `github_app.installation_token_payload` directly, not the
+    thin `installation_token` wrapper, because this class needs the real
+    `expires_at` GitHub returns, not just the token string.
+
+    *repositories*, when given, is passed straight through to every mint
+    (`installation_token_payload`'s own `repositories=`) — the token then
+    covers only those repos rather than every repo the installation can
+    see. `None` (every caller in this module today) mints unscoped, exactly
+    as before; `bin/check-ci-workflow-drift` is the first caller to pass it,
+    so one owner's token cannot read a sibling repo under the same
+    installation that caller has already excluded."""
+
+    def __init__(self, jwt: str, installation_id: str, *, permissions: dict[str, str],
+                repositories: list[str] | None = None,
+                opener=urllib.request.urlopen, margin: dt.timedelta = _TOKEN_REFRESH_MARGIN):
+        self._jwt = jwt
+        self._installation_id = installation_id
+        self._permissions = permissions
+        self._repositories = repositories
+        self._opener = opener
+        self._margin = margin
+        self._token: str | None = None
+        self._expires_at: dt.datetime | None = None
+
+    def token(self) -> str:
+        """The held token, minting one first when none is held yet or the
+        held one is within `_margin` of its own expiry."""
+        if self._token is None or self._near_expiry():
+            self._mint()
+        return self._token
+
+    def force_refresh(self) -> str:
+        """Unconditionally mints a fresh token — `_gh_runs_request`'s retry
+        after a request got 401 even though `token()` judged the held one
+        not yet near expiry (GitHub can revoke or shorten a token's life for
+        reasons this class cannot see coming). Called at most once per
+        `_gh_runs_request` attempt, so up to `_GH_5XX_RETRY_ATTEMPTS` times
+        across one call to it."""
+        self._mint()
+        return self._token
+
+    def _near_expiry(self) -> bool:
+        return dt.datetime.now(dt.timezone.utc) >= self._expires_at - self._margin
+
+    def _mint(self) -> None:
+        # `repositories=` is passed only when a caller gave one — never
+        # `repositories=None` by default — so every caller before this
+        # parameter existed (and every test stubbing `installation_token_payload`
+        # with that narrower, no-`repositories` signature) keeps calling this
+        # exactly as it did before `repositories` existed.
+        kwargs = {"repositories": self._repositories} if self._repositories is not None else {}
+        payload = GA.installation_token_payload(
+            self._jwt, self._installation_id, permissions=self._permissions,
+            opener=self._opener, **kwargs)
+        self._token = payload["token"]
+        self._expires_at = _parse_timestamp(payload["expires_at"])
+
+
+def _resolve_gh_token(token):
+    """*token* is either a plain token string (every caller before this fix,
+    and every test that does not exercise token refresh) or a
+    `GhTokenRefresher` (`main()`'s own, from this fix): returns the token
+    string to use for the next request, and — only for a refresher — the
+    zero-arg callable `_gh_runs_request` calls to mint a replacement after
+    that request comes back 401, at most once per attempt of its own retry
+    loop. `None` in that second slot for a plain string, since there is
+    nothing this module can mint a replacement from."""
+    if isinstance(token, GhTokenRefresher):
+        return token.token(), token.force_refresh
+    return token, None
 
 
 # --- pure transforms (unit-tested, no network) ------------------------------
@@ -296,12 +621,25 @@ def conclusion_to_meta_status(conclusion: str | None) -> str | None:
 
 def signal_from_run(run: dict, product: str, workflow: str) -> dict:
     """One completed GitHub Actions run -> one Library `POST /signals` body,
-    matching `ci_result_fetch.py`'s `signal_from_run` field for field (see
-    the module docstring). Raises `CaptureError` when the run is missing a
-    field the dedup key depends on (`id`, `created_at`)."""
+    matching `ci_result_fetch.py`'s `signal_from_run` field for field except
+    `produced_at` (see below and the module docstring). Raises `CaptureError`
+    when the run is missing a field this function reads (`id`, `updated_at`).
+
+    `dedup_key` carries the run's own `run_attempt` from the second attempt
+    on (CQ-533, issue_01M5FM5NFRPHFJVD8XFK85ABHP), so a failed run's re-run
+    gets its own row instead of sharing the failing attempt's key and being
+    dropped as a `duplicate` — see the module docstring's signal-contract
+    section for why attempt 1 keeps the unsuffixed key unchanged.
+
+    **`produced_at` comes from the run's `updated_at`, not its `created_at`**
+    (also CQ-533): a re-run keeps attempt 1's `created_at`, so a `produced_at`
+    read from it would tie attempt 2's row to attempt 1's timestamp even
+    though the two report opposite conclusions. `produced_at` documents "when
+    the reported thing was true" (`signal_client.py`'s own docstring), and
+    for attempt 2 that is its own completion time, not attempt 1's start."""
     run_id = run.get("id")
-    created_at = run.get("created_at")
-    if not isinstance(run_id, int) or not created_at:
+    updated_at = run.get("updated_at")
+    if not isinstance(run_id, int) or not updated_at:
         raise CaptureError(f"malformed workflow run in GitHub's response: {run!r}")
     conclusion = run.get("conclusion")
     meta = {"run_number": run.get("run_number"), "event": run.get("event"),
@@ -309,6 +647,10 @@ def signal_from_run(run: dict, product: str, workflow: str) -> dict:
     status = conclusion_to_meta_status(conclusion)
     if status is not None:
         meta["status"] = status
+    dedup_key = f"ci:{product}:{workflow}:{run_id}"
+    run_attempt = run.get("run_attempt")
+    if isinstance(run_attempt, int) and run_attempt != 1:
+        dedup_key = f"{dedup_key}:{run_attempt}"
     return {
         "source": "ci",
         "kind": "test-result",
@@ -323,22 +665,36 @@ def signal_from_run(run: dict, product: str, workflow: str) -> dict:
             "run_url": run.get("html_url"),
         },
         "meta": meta,
-        "produced_at": created_at,
-        "dedup_key": f"ci:{product}:{workflow}:{run_id}",
+        "produced_at": updated_at,
+        "dedup_key": dedup_key,
     }
 
 
 # --- I/O: GitHub fetch, signal post, cursor and token files -----------------
 
 
-def _gh_runs_request(repo: str, workflow_file: str, url: str, token: str, opener,
+def _gh_runs_request(repo: str, workflow_file: str, url: str, token, opener,
                      page: int, created_filter: str) -> list[dict]:
     """One page's GET, retried up to `_GH_5XX_RETRY_ATTEMPTS` times in total
     when GitHub answers 502/503/504 — see `_GH_RETRYABLE_STATUSES`'s own
     comment for the occurrence this answers. Any other non-200, or a
-    malformed body, still raises on the first attempt, with no retry."""
+    malformed body, still raises on the first attempt, with no retry.
+
+    `token` is either a plain token string or a `GhTokenRefresher`
+    (`_resolve_gh_token`, see that function and `GhTokenRefresher`'s own
+    docstring) — a 401 against a refresher's token mints one replacement
+    and retries THIS SAME request once more; a second 401 on that retry (or
+    a plain string's only attempt) still raises here, same as before,
+    naming 401 as the code. A 401 can recur on a later attempt of the
+    retry loop above (after an intervening retryable 5xx), minting another
+    replacement there too, so one call to this function can mint up to
+    `_GH_5XX_RETRY_ATTEMPTS` replacements in total, never more."""
+    current_token, refresh = _resolve_gh_token(token)
     for attempt in range(1, _GH_5XX_RETRY_ATTEMPTS + 1):
-        code, payload = GA.request("GET", url, token, None, opener=opener)
+        code, payload = GA.request("GET", url, current_token, None, opener=opener)
+        if code == 401 and refresh is not None:
+            current_token = refresh()
+            code, payload = GA.request("GET", url, current_token, None, opener=opener)
         runs = payload.get("workflow_runs") if isinstance(payload, dict) else None
         if code == 200 and isinstance(runs, list):
             return runs
@@ -354,13 +710,15 @@ def _gh_runs_request(repo: str, workflow_file: str, url: str, token: str, opener
     raise AssertionError("unreachable: the loop above always returns or raises")
 
 
-def _gh_runs_page(repo: str, workflow_file: str, created_filter: str, token: str, *,
+def _gh_runs_page(repo: str, workflow_file: str, created_filter: str, token, *,
                   opener=urllib.request.urlopen) -> list[dict]:
     """Every run GitHub returns for this exact `created` filter value,
     paginated up to `_MAX_PAGES` pages — the shared low-level fetch both
     `gh_runs` and `_gh_runs_window` build on. `created_filter` is the
     complete, already `urllib.parse.quote`d query-string value to send as
-    `created=<created_filter>`.
+    `created=<created_filter>` — the filter GitHub's list-workflow-runs
+    endpoint actually documents and honours (see the module docstring's
+    2026-10-25 measurement for why this is `created`, not `updated`).
 
     `_MAX_PAGES` is sized to actually reach the short page GitHub returns
     past `GITHUB_CREATED_FILTER_CAP`, so this call's own result length is
@@ -388,54 +746,82 @@ def _gh_runs_page(repo: str, workflow_file: str, created_filter: str, token: str
 
 
 def _gh_runs_window(repo: str, workflow_file: str, since_dt: dt.datetime,
-                    until_dt: dt.datetime, token: str, *,
-                    opener=urllib.request.urlopen) -> list[dict]:
+                    until_dt: dt.datetime, token, *,
+                    opener=urllib.request.urlopen,
+                    deadline: float | None = None) -> list[dict]:
     """Every run with `created` inside `[since_dt, until_dt]`, BOTH ends
-    inclusive (GitHub's `A..B` range syntax) — recursing by splitting the
-    range in half whenever one query comes back at exactly
-    `GITHUB_CREATED_FILTER_CAP` results, which means GitHub truncated it
-    rather than that being the true count for the range. Deduplicates by
-    `id` across the two halves, since the shared inclusive boundary can
-    return the same run from both.
+    inclusive (GitHub's `A..B` range syntax) — splitting the range in half
+    whenever one query comes back at exactly `GITHUB_CREATED_FILTER_CAP`
+    results, which means GitHub truncated it rather than that being the
+    true count for the range. Deduplicates by `id` across sub-windows,
+    since a shared inclusive boundary can return the same run from both
+    sides of a split. Also the fetch `gh_reruns` uses directly, for an
+    explicit bounded range rather than an open-ended `>=since` query — see
+    that function.
+
+    ITERATIVE, OLDEST-FIRST (a stack of sub-windows, always popping the
+    oldest-starting one still unprocessed), not the recursive newest-first
+    traversal this had before this fix — so that at any point, every
+    sub-window already resolved forms a single PROVEN-COMPLETE, CONTIGUOUS
+    covering of `[since_dt, safe_until]` for whatever `safe_until` this call
+    has reached so far. That is what makes `deadline` safe to check only
+    once per sub-window, between querying one and splitting or accepting
+    it, rather than needing to unwind a partial recursion: when `deadline`
+    (checked before popping the next sub-window) has passed, every run
+    gathered so far is still trustworthy, and `FetchBudgetExceeded` carries
+    exactly that — `runs` and `safe_until` — rather than throwing it away
+    (see that class's own docstring for why `capture_workflow` can still use
+    it, and `_RUN_DEADLINE_SECONDS` for the run this answers: a pair whose
+    cursor sits weeks behind needing far more requests than one run's
+    budget allows).
 
     Raises `CaptureError` — never silently returns a window it cannot prove
     it covered in full — if a capped query's range is already under one
     second wide and so cannot be split any further. That needs over
-    `GITHUB_CREATED_FILTER_CAP` runs created inside the same second and has
-    never been observed; failing the fetch (which leaves the pair's cursor
-    exactly where it was, same as any other `CaptureError`) is the correct
-    answer to a case this code cannot prove it got right, not a guess at
-    one."""
-    since_s = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    until_s = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    created_filter = urllib.parse.quote(f"{since_s}..{until_s}", safe="")
-    runs = _gh_runs_page(repo, workflow_file, created_filter, token, opener=opener)
-    if len(runs) < GITHUB_CREATED_FILTER_CAP:
-        return runs
-    if until_dt - since_dt <= dt.timedelta(seconds=1):
-        raise CaptureError(
-            f"{repo}/{workflow_file}: created-filter cap "
-            f"({GITHUB_CREATED_FILTER_CAP}) reached for a window "
-            f"({since_s}..{until_s}) under one second wide — cannot split it "
-            f"any further, refusing to advance the cursor past a range this "
-            f"call cannot prove it fetched in full")
-    mid_dt = since_dt + (until_dt - since_dt) / 2
-    newer = _gh_runs_window(repo, workflow_file, mid_dt, until_dt, token, opener=opener)
-    older = _gh_runs_window(repo, workflow_file, since_dt, mid_dt, token, opener=opener)
-    seen_ids = set()
-    merged = []
-    for run in newer + older:
-        run_id = run.get("id")
-        if run_id not in seen_ids:
-            seen_ids.add(run_id)
-            merged.append(run)
-    return merged
+    `GITHUB_CREATED_FILTER_CAP` runs created inside the same second; failing
+    the fetch (which leaves the pair's cursor exactly where it was, same as
+    any other `CaptureError`) is the correct answer to a case this code
+    cannot prove it got right, not a guess at one."""
+    collected: list[dict] = []
+    seen_ids: set = set()
+    safe_until = since_dt
+    stack: list[tuple[dt.datetime, dt.datetime]] = [(since_dt, until_dt)]
+    while stack:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise FetchBudgetExceeded(collected, safe_until)
+        lo, hi = stack.pop()
+        lo_s = lo.strftime("%Y-%m-%dT%H:%M:%SZ")
+        hi_s = hi.strftime("%Y-%m-%dT%H:%M:%SZ")
+        created_filter = urllib.parse.quote(f"{lo_s}..{hi_s}", safe="")
+        runs = _gh_runs_page(repo, workflow_file, created_filter, token, opener=opener)
+        if len(runs) < GITHUB_CREATED_FILTER_CAP:
+            for run in runs:
+                run_id = run.get("id")
+                if run_id not in seen_ids:
+                    seen_ids.add(run_id)
+                    collected.append(run)
+            safe_until = hi
+            continue
+        if hi - lo <= dt.timedelta(seconds=1):
+            raise CaptureError(
+                f"{repo}/{workflow_file}: created-filter cap "
+                f"({GITHUB_CREATED_FILTER_CAP}) reached for a window "
+                f"({lo_s}..{hi_s}) under one second wide — cannot split it "
+                f"any further, refusing to advance the cursor past a range this "
+                f"call cannot prove it fetched in full")
+        mid_dt = lo + (hi - lo) / 2
+        stack.append((mid_dt, hi))  # the newer half, pushed first so it pops second
+        stack.append((lo, mid_dt))  # the older half: pops next, keeping the walk
+                                    # oldest-first and safe_until contiguous
+    return collected
 
 
-def gh_runs(repo: str, workflow_file: str, since: str, token: str, *,
-           opener=urllib.request.urlopen) -> list[dict]:
+def gh_runs(repo: str, workflow_file: str, since: str, token, *,
+           opener=urllib.request.urlopen, deadline: float | None = None) -> list[dict]:
     """Every run of one workflow — ANY status, completed or not — with
-    `created` on/after `since` (GitHub's inclusive `>=` range filter).
+    `created` on/after `since` (GitHub's inclusive `>=` range filter, the
+    only time filter this endpoint actually documents and honours — see the
+    module docstring's 2026-10-25 measurement).
 
     Deliberately not filtered to `status=completed` server-side — see the
     module docstring's cursor-invariants section for the bug that filter
@@ -443,25 +829,63 @@ def gh_runs(repo: str, workflow_file: str, since: str, token: str, *,
     itself, because only it can hold the cursor back for whatever this call
     returns as still running.
 
+    **Filters on `created`, not `updated`:** a failed run that is later
+    re-run keeps its original `id` and its original `created_at`, so this
+    function alone never sees a re-run once the cursor has passed that
+    run's creation time — `capture_reruns`/`gh_reruns` answer that
+    separately, by `updated_at`, bounded to `RERUN_LOOKBACK` (see the module
+    docstring's re-run paragraph). `GITHUB_UPDATED_FILTER_CAP` doesn't
+    exist: GitHub ignores an `updated` filter rather than capping anything
+    against it.
+
     **A `>=since` query that comes back at exactly `GITHUB_CREATED_FILTER_CAP`
-    results is retried as a split, recursive range fetch instead of returned
+    results is retried as a split, iterative range fetch instead of returned
     as-is** (`_gh_runs_window`, over `[since, now]`) — see that constant's
     own comment for the cap this answers. The ordinary, nowhere-near-the-cap
     case (every tracked pair's incremental poll, and most pairs' very first
     fetch) costs exactly the one `>=since` query this function always used
     to make; only a pair whose window holds more than the cap pays for the
-    extra queries the split needs.
+    extra queries the split needs, and only that path reads `deadline` (the
+    single query here is never worth bounding on its own).
+
+    `token` may be a `GhTokenRefresher` instead of a plain string — see
+    `_resolve_gh_token`, used at the one place this module actually makes a
+    GitHub request (`_gh_runs_request`).
 
     Raises `CaptureError` on any non-200 or malformed response that retrying
-    does not resolve (`_GH_RETRYABLE_STATUSES`) — never returns a partial
-    list silently."""
+    does not resolve (`_GH_RETRYABLE_STATUSES`), and `FetchBudgetExceeded`
+    (from `_gh_runs_window` alone) when `deadline` passes before a capped
+    window finishes — never returns a partial list silently as if it were
+    the whole window."""
     created_filter = f"%3E%3D{urllib.parse.quote(since, safe='')}"
     runs = _gh_runs_page(repo, workflow_file, created_filter, token, opener=opener)
     if len(runs) < GITHUB_CREATED_FILTER_CAP:
         return runs
     since_dt = _parse_timestamp(since)
     until_dt = dt.datetime.now(dt.timezone.utc)
-    return _gh_runs_window(repo, workflow_file, since_dt, until_dt, token, opener=opener)
+    return _gh_runs_window(repo, workflow_file, since_dt, until_dt, token,
+                           opener=opener, deadline=deadline)
+
+
+def gh_reruns(repo: str, workflow_file: str, since: str, token, *,
+             opener=urllib.request.urlopen, deadline: float | None = None) -> list[dict]:
+    """Every run `created` inside the bounded lookback window behind this
+    pair's forward cursor, `[since - RERUN_LOOKBACK, since)` — the range
+    `capture_reruns` checks for a re-run of a run GitHub created before
+    `since` (so `gh_runs`'s own forward, `created`-filtered window will
+    never fetch it again) but whose `updated_at` moved after `since` (so it
+    was touched again since this pair's last poll). Reuses
+    `_gh_runs_window`'s own cap-and-split fetch over this explicit range,
+    rather than `gh_runs`'s open-ended `>=since` shortcut, because this
+    range's own upper bound (`since`, not "now") is already known — see that
+    function's own docstring for the split/dedup/deadline behaviour this
+    inherits unchanged. `until_dt` is `since_dt` exclusive-in-spirit but
+    GitHub's own range syntax is inclusive both ends; a run created exactly
+    at `since` is also inside `gh_runs`'s own `[since, now]` window and
+    `dedup_key` absorbs the harmless overlap."""
+    since_dt = _parse_timestamp(since)
+    return _gh_runs_window(repo, workflow_file, since_dt - RERUN_LOOKBACK, since_dt,
+                           token, opener=opener, deadline=deadline)
 
 
 def signal_token() -> str | None:
@@ -604,33 +1028,48 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
     """One tracked (repo, workflow_file) pair. Returns a tally dict with keys
     `created`/`duplicate`/`errors`/`stale_pending`, plus `next_since` — the
     cursor value `main()` should persist for this pair when `errors == 0`
-    OR `rate_limited` is true (`None` whenever it isn't safe to advance at
-    all) — `rate_limited`, true only when the batch stopped on a sustained
-    429 and had no OTHER post failure — and `reason`, the first failure's
-    text (`None` on a clean run).
+    OR `rate_limited` OR `budget_exceeded` is true (`None` whenever it isn't
+    safe to advance at all) — `rate_limited`, true only when the batch
+    stopped on a sustained 429 and had no OTHER post failure; `budget_exceeded`,
+    true only when the FETCH ran out of this run's deadline and had no
+    ordinary post failure either (see `FetchBudgetExceeded`) — and `reason`,
+    the first failure's text (`None` on a clean run).
 
     See the module docstring's cursor-invariants section for why an
-    incomplete run holds `next_since` back to its own `created_at`, why a
-    run stuck past `stale_pending_after` is excluded from that watermark
+    incomplete run holds `next_since` back to its own `created_at` (so
+    `gh_runs`'s own forward, `created`-filtered window still asks for it
+    next poll), why staleness is still judged by `updated_at` instead, why a
+    run stuck past `stale_pending_after` is excluded from the watermark
     instead, why `errors` is what gates whether `main()` advances this
-    pair's cursor at all, and why a sustained 429 alone is the one
-    exception.
+    pair's cursor at all, and why a sustained 429 or an exhausted fetch
+    budget, alone, are the two exceptions. This function has no notion of a
+    re-run — see `capture_reruns`, called independently by `main()` against
+    the same `since`, for the one that does.
 
     `fetcher`/`poster` default to the module-level `gh_runs`/
     `signal_client.post_signal`, resolved at call time so a caller going
     through `main()` still gets whatever the module currently names; a test
-    passes its own fake directly.
+    passes its own fake directly. `deadline` (this run's shared wall-clock
+    budget, covering fetch and post together — see `_RUN_DEADLINE_SECONDS`)
+    is passed to `fetcher` the same way it already was to `poster`.
 
-    A fetch failure, OR one incomplete run with no parseable `created_at`,
-    aborts the WHOLE window before anything is posted — the watermark
-    cannot be computed safely without it, so the whole window aborts rather
-    than guessing.
+    A fetch failure, OR one run — completed or not — with no parseable
+    `created_at` or `updated_at`, aborts the WHOLE window before anything is
+    posted — the watermark cannot be computed safely without both (the
+    former for the cursor itself, the latter for staleness and for
+    `signal_from_run`'s own `produced_at`), so the whole window aborts
+    rather than guessing. `fetcher` raising `FetchBudgetExceeded` instead is
+    NOT this case: it carries its own proven-complete prefix (`ex.runs`,
+    `ex.safe_until`), which this function posts and bounds the watermark to
+    exactly the way a sustained 429 already does below — see that
+    exception's own docstring.
 
     Completed runs are posted OLDEST `created_at` FIRST, not in whatever
     order `fetcher` returned them (GitHub's own API returns newest first;
     `gh_runs` makes no promise either way) — this is what makes "the first
     unposted run" also "the oldest unposted run" once a sustained 429 stops
-    the loop, which is what `next_since` needs below.
+    the loop, which is what `next_since` needs below, in the same dimension
+    `gh_runs`'s own forward window is filtered on.
 
     A signal reporting `'error:429'` (`post_signal`'s own retry-to-deadline
     exhausted) stops the posting loop for the REST of this pair's batch: the
@@ -639,11 +1078,13 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
     no gain. `rate_limited` is set and `next_since` is pulled back to include
     this stopping point's own run's `created_at`, so `main()` can still
     advance the cursor through whatever was delivered before the 429. Any
-    other post failure is tallied as an ordinary error, clears the
-    `rate_limited` exception for the whole batch (even one that also hits a
-    429 later), and the loop continues — only a sustained 429, and nothing
-    else wrong in the same batch, is a case where the already-delivered
-    prefix is still trustworthy enough to advance past."""
+    other post failure is tallied as an ordinary error, clears both the
+    `rate_limited` AND the `budget_exceeded` exception for the whole batch
+    (even one that also hits a 429 later, or followed a budget-truncated
+    fetch), and the loop continues — only a sustained 429 or an exhausted
+    fetch budget, and nothing else wrong in the same batch, is a case where
+    the already-delivered prefix is still trustworthy enough to advance
+    past."""
     fetcher = fetcher if fetcher is not None else gh_runs
     poster = poster if poster is not None else SC.post_signal
     run_started = run_started if run_started is not None else dt.datetime.now(dt.timezone.utc)
@@ -651,9 +1092,18 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
                            else STALE_PENDING_AFTER)
     workflow = workflow_slug(workflow_file)
     tally = {"created": 0, "duplicate": 0, "errors": 0, "stale_pending": 0,
-            "next_since": None, "reason": None, "rate_limited": False}
+            "next_since": None, "reason": None, "rate_limited": False,
+            "budget_exceeded": False}
+    budget_safe_until: dt.datetime | None = None
     try:
-        runs = fetcher(repo, workflow_file, since, gh_token)
+        runs = fetcher(repo, workflow_file, since, gh_token, deadline=deadline)
+    except FetchBudgetExceeded as ex:
+        runs = ex.runs
+        budget_safe_until = ex.safe_until
+        print(f"ci-result-capture: {repo}/{workflow_file}: {ex}; posting what "
+             f"was fetched and leaving the rest for the next pass", file=sys.stderr)
+        tally["errors"] += 1
+        tally["reason"] = str(ex)
     except CaptureError as ex:
         print(f"ci-result-capture: {repo}/{workflow_file}: {ex}", file=sys.stderr)
         tally["errors"] += 1
@@ -662,33 +1112,48 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
 
     completed_runs = [r for r in runs if r.get("status") == "completed"]
     incomplete_runs = [r for r in runs if r.get("status") != "completed"]
+
+    def _require_timestamp(r: dict, field: str) -> dt.datetime:
+        """`r`'s own `field` (`created_at` or `updated_at`), parsed — raises
+        `CaptureError` when it is missing or unparseable, since this
+        pair's forward cursor (held on `created_at`, since that's the only
+        time filter GitHub's own endpoint honours — see the module
+        docstring's cursor-invariants section) and its staleness check
+        (judged on `updated_at`) both need every fetched run, completed or
+        still in flight, dated this way."""
+        value = r.get(field)
+        if not value:
+            raise CaptureError(
+                f"{repo}/{workflow_file}: run with no {field}, cannot "
+                f"safely place it relative to the cursor: {r!r}")
+        try:
+            return _parse_timestamp(value)
+        except (ValueError, AttributeError, TypeError) as ex:
+            raise CaptureError(
+                f"{repo}/{workflow_file}: run with an unparseable "
+                f"{field}, cannot safely place it relative to the "
+                f"cursor: {r!r} ({type(ex).__name__}: {ex})") from ex
+
     try:
-        payloads = sorted(
-            (signal_from_run(r, product, workflow) for r in completed_runs),
-            key=lambda p: p["produced_at"])
+        completed_by_created = sorted(
+            ((_require_timestamp(r, "created_at"), r) for r in completed_runs),
+            key=lambda pair: pair[0])
+        for _, r in completed_by_created:
+            _require_timestamp(r, "updated_at")  # signal_from_run needs it too
+        payloads = [signal_from_run(r, product, workflow) for _, r in completed_by_created]
+        created_dts = [created_dt for created_dt, _ in completed_by_created]
+
         in_flight_created_ats = []
         for r in incomplete_runs:
-            created_at = r.get("created_at")
-            if not created_at:
-                raise CaptureError(
-                    f"{repo}/{workflow_file}: incomplete run with no "
-                    f"created_at, cannot safely place it relative to the "
-                    f"cursor: {r!r}")
-            try:
-                created_dt = _parse_timestamp(created_at)
-            except (ValueError, AttributeError, TypeError) as ex:
-                raise CaptureError(
-                    f"{repo}/{workflow_file}: incomplete run with an "
-                    f"unparseable created_at, cannot safely place it "
-                    f"relative to the cursor: {r!r} "
-                    f"({type(ex).__name__}: {ex})") from ex
-            age = run_started - created_dt
+            created_dt = _require_timestamp(r, "created_at")
+            updated_dt = _require_timestamp(r, "updated_at")
+            age = run_started - updated_dt
             if age > stale_pending_after:
                 print(f"ci-result-capture: {repo}/{workflow_file}: STALE_PENDING "
                      f"(still {r.get('status')!r} after {age}, past the "
                      f"{stale_pending_after} ceiling — treated as abandoned, "
                      f"excluded from this pair's watermark): run {r.get('id')}, "
-                     f"created {created_at}", file=sys.stderr)
+                     f"updated {r.get('updated_at')}", file=sys.stderr)
                 tally["stale_pending"] += 1
             else:
                 in_flight_created_ats.append(created_dt)
@@ -701,7 +1166,7 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
     rate_limited = False
     ordinary_post_failure = False
     first_unposted_dt = None
-    for payload in payloads:
+    for payload, created_dt in zip(payloads, created_dts):
         result = poster(payload, tok=sig_tok, timeout=_SIGNAL_TIMEOUT,
                         deadline=deadline, sleep=sleep)
         if result == "created":
@@ -724,7 +1189,7 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
             if tally["reason"] is None:
                 tally["reason"] = f"sustained 429 on {payload['dedup_key']}"
             rate_limited = True
-            first_unposted_dt = _parse_timestamp(payload["produced_at"])
+            first_unposted_dt = created_dt
             break
         else:
             print(f"ci-result-capture: {repo}/{workflow_file}: post failed: "
@@ -737,30 +1202,174 @@ def capture_workflow(repo: str, workflow_file: str, product: str, since: str,
     watermark_candidates = [run_started - OVERLAP, *in_flight_created_ats]
     if rate_limited and first_unposted_dt is not None:
         watermark_candidates.append(first_unposted_dt)
+    if budget_safe_until is not None:
+        watermark_candidates.append(budget_safe_until)
     tally["next_since"] = min(watermark_candidates).strftime("%Y-%m-%dT%H:%M:%SZ")
     tally["rate_limited"] = rate_limited and not ordinary_post_failure
+    tally["budget_exceeded"] = budget_safe_until is not None and not ordinary_post_failure
+    return tally
+
+
+def capture_reruns(repo: str, workflow_file: str, product: str, since: str,
+                   gh_token, sig_tok: str | None, *, fetcher=None, poster=None,
+                   deadline: float | None = None, sleep=time.sleep) -> dict:
+    """Independently of `capture_workflow`'s own forward cursor, posts every
+    re-run `capture_workflow` can no longer see: a run GitHub `created`
+    before `since` (so it is behind this pair's forward window and
+    `gh_runs` will never ask for it again) whose `updated_at` moved after
+    `since` (so it was touched again since this pair's last poll) and is
+    now `completed` — see the module docstring's re-run paragraph.
+
+    Returns a tally dict with keys `created`/`duplicate`/`errors`/`reason`
+    only — no `next_since`, `rate_limited` or `budget_exceeded`: this
+    function owns no cursor of its own and never advances or holds back
+    `capture_workflow`'s. `dedup_key`'s `run_attempt` suffix (CQ-533) makes
+    reposting the same re-run on a later pass harmless, so running this
+    check every pass with no cursor is safe, if not the cheapest possible
+    design.
+
+    `fetcher` defaults to `gh_reruns` (the bounded, `RERUN_LOOKBACK`-wide
+    fetch); `poster` defaults to `signal_client.post_signal`, resolved at
+    call time like `capture_workflow`'s own. A `CaptureError` tallies one
+    error and stops this function's own work for this pair this pass — the
+    lookback is retried from scratch next pass. `FetchBudgetExceeded` is
+    different: its `ex.runs` is the proven-complete PREFIX of the lookback
+    window (see that exception's own docstring), and this function takes it
+    and carries on checking it for re-runs exactly as if it were the whole
+    window, tallying no error for the budget cut itself. (`capture_workflow`
+    tallies one error and reports it on `FetchBudgetExceeded`; the two
+    functions' handling differs.) Neither ever raises past this
+    function (a stuck re-run check must not cost `capture_workflow`'s own
+    forward progress its turn in `main()`'s loop)."""
+    fetcher = fetcher if fetcher is not None else gh_reruns
+    poster = poster if poster is not None else SC.post_signal
+    workflow = workflow_slug(workflow_file)
+    tally = {"created": 0, "duplicate": 0, "errors": 0, "reason": None}
+    since_dt = _parse_timestamp(since)
+    try:
+        runs = fetcher(repo, workflow_file, since, gh_token, deadline=deadline)
+    except FetchBudgetExceeded as ex:
+        runs = ex.runs
+    except CaptureError as ex:
+        print(f"ci-result-capture: {repo}/{workflow_file}: re-run lookback: "
+             f"{ex}", file=sys.stderr)
+        tally["errors"] += 1
+        tally["reason"] = str(ex)
+        return tally
+
+    reruns = []
+    for r in runs:
+        if r.get("status") != "completed":
+            continue
+        updated_at = r.get("updated_at")
+        if not updated_at:
+            continue
+        try:
+            updated_dt = _parse_timestamp(updated_at)
+        except (ValueError, AttributeError, TypeError):
+            continue
+        if updated_dt > since_dt:
+            reruns.append((updated_dt, r))
+    reruns.sort(key=lambda pair: pair[0])
+
+    for _, r in reruns:
+        payload = signal_from_run(r, product, workflow)
+        result = poster(payload, tok=sig_tok, timeout=_SIGNAL_TIMEOUT,
+                        deadline=deadline, sleep=sleep)
+        if result == "created":
+            tally["created"] += 1
+        elif result == "duplicate":
+            tally["duplicate"] += 1
+        elif result == "error:429":
+            # Named separately from an ordinary post failure, the same
+            # distinction `capture_workflow` draws — this function owns no
+            # cursor either way, so the distinction changes nothing about
+            # what happens next here, only what the stderr line says a
+            # reader diagnosing a stuck re-run channel sees.
+            print(f"ci-result-capture: {repo}/{workflow_file}: re-run "
+                 f"channel: sustained 429 on {payload['dedup_key']}; "
+                 f"stopping this pair's re-run batch here, the rest "
+                 f"re-checked next poll", file=sys.stderr)
+            tally["errors"] += 1
+            if tally["reason"] is None:
+                tally["reason"] = f"re-run sustained 429 on {payload['dedup_key']}"
+            break
+        else:
+            # Unlike the sustained-429 break above, an ordinary failure here
+            # does not stop the batch: this function has no cursor, sorts
+            # oldest-`updated_at` first, and a re-run whose post is always
+            # rejected would otherwise block every re-run sorted after it on
+            # every pass, until the blocked one's run ages out of the
+            # lookback window without ever being attempted. Tally it and
+            # keep going.
+            print(f"ci-result-capture: {repo}/{workflow_file}: re-run post "
+                 f"failed: {result} ({payload['dedup_key']}); continuing "
+                 f"this pair's re-run batch", file=sys.stderr)
+            tally["errors"] += 1
+            if tally["reason"] is None:
+                tally["reason"] = f"re-run post failed: {result} ({payload['dedup_key']})"
     return tally
 
 
 def main() -> int:
     argparse.ArgumentParser(
         description="Capture tracked repositories' CI results as signals, "
-                    "authenticating as the convivy-bosun GitHub App.").parse_args()
+                    "authenticating as the install's own GitHub App.").parse_args()
 
-    problem = GA.key_problem(KEY_PATH, label="the convivy-bosun App")
-    if problem:
-        print(f"ci-result-capture: {problem}", file=sys.stderr)
-        return 1
     try:
-        jwt = GA.app_jwt(KEY_PATH, APP_ID)
-        inst = GA.installation_for_owner(jwt, OWNER, label="the convivy-bosun App")
-        inst_id = str(inst.get("id") or "")
-        if not inst_id:
-            raise GA.Unreadable("the installation carries no id")
-        gh_token = GA.installation_token(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS)
+        app = GA.installed_app()
     except GA.Unreadable as e:
         print(f"ci-result-capture: {e}", file=sys.stderr)
         return 1
+
+    problem = GA.key_problem(app.key_path, label="the install's GitHub App")
+    if problem:
+        print(f"ci-result-capture: {problem}", file=sys.stderr)
+        return 1
+
+    try:
+        pairs = _pairs_for_this_pass()
+    except Exception as ex:
+        # "If the tracked list cannot be read, the pass refuses and leaves
+        # every cursor as it is; it never runs with an empty or partial
+        # list" — refused BEFORE `load_cursor()` is even called, so this
+        # path never writes a cursor or rotation file at all.
+        print(f"ci-result-capture: the tracked pairs could not be read "
+             f"({type(ex).__name__}: {ex}); refusing this pass", file=sys.stderr)
+        return 1
+
+    try:
+        jwt = GA.app_jwt(app.key_path, app.app_id)
+    except GA.Unreadable as e:
+        print(f"ci-result-capture: {e}", file=sys.stderr)
+        return 1
+
+    # One read-only `GhTokenRefresher` per distinct owner the pairs this
+    # pass is about to walk actually name (CQ-455's own single
+    # `OWNER = "convivy"` could not reach a repo owned elsewhere, even once
+    # the registry started tracking CI for one). An owner whose installation
+    # cannot be resolved, or whose token mint fails, loses only that
+    # owner's pairs this pass — see the per-pair loop below, which looks
+    # its token up by owner and skips a pair with none, leaving that
+    # pair's cursor exactly where it was.
+    gh_tokens: dict[str, GhTokenRefresher] = {}
+    for owner in sorted({_pair_owner(p) for p in pairs}):
+        try:
+            inst = GA.installation_for_owner(jwt, owner, label="the install's GitHub App")
+            inst_id = str(inst.get("id") or "")
+            if not inst_id:
+                raise GA.Unreadable("the installation carries no id")
+            # Minted eagerly, not lazily on first use, so a key or
+            # permissions problem for this owner is caught now rather than
+            # on whichever of its pairs happens to read first.
+            refresher = GhTokenRefresher(jwt, inst_id, permissions=_READ_ONLY_PERMISSIONS)
+            refresher.token()
+            gh_tokens[owner] = refresher
+        except GA.Unreadable as e:
+            print(f"ci-result-capture: {owner}: the install's GitHub App "
+                 f"installation token could not be minted ({e}); every {owner} "
+                 f"pair is skipped this pass, their cursors left unchanged",
+                 file=sys.stderr)
 
     sig_tok = signal_token()
     if not sig_tok:
@@ -772,14 +1381,21 @@ def main() -> int:
     run_started = dt.datetime.now(dt.timezone.utc)
     no_cursor_since = (run_started - dt.timedelta(days=NO_CURSOR_WINDOW_DAYS)
                       ).strftime("%Y-%m-%dT%H:%M:%SZ")
-    cursor = load_cursor()
+    # Every pair this pass is about to walk, by key — a stored cursor entry
+    # for a pair no longer in that set (a repo dropped from the registry, or
+    # whose CI workflows changed) is dropped here rather than carried
+    # forward forever; one still in the set keeps its value regardless of
+    # whether this pass reaches it (see the per-iteration `save_cursor`
+    # calls below).
+    pair_keys = {_pair_key(p) for p in pairs}
+    cursor = {k: v for k, v in load_cursor().items() if k in pair_keys}
     # One deadline for the whole run, not per signal — see
     # `pr-state-capture._RUN_DEADLINE_SECONDS` for the same reasoning.
     deadline = time.monotonic() + _RUN_DEADLINE_SECONDS
 
     exit_code = 0
     grand = {"created": 0, "duplicate": 0, "errors": 0, "stale_pending": 0}
-    order = rotation_order(TRACKED, load_rotation_start())
+    order = rotation_order(pairs, load_rotation_start())
     # The start this pass actually used, after `rotation_order`'s own
     # fallback to the top — the pass-didn't-deliver-anything default below
     # is this, not whatever (possibly stale or absent) value the rotation
@@ -787,6 +1403,28 @@ def main() -> int:
     next_start = _pair_key(order[0]) if order else None
     for i, entry in enumerate(order):
         key = _pair_key(entry)
+        if time.monotonic() >= deadline:
+            # The run's own budget is gone: every pair from here on is left
+            # untouched, not attempted and not failed — "never advance past
+            # one that was not read" applies to not even starting it, the
+            # same as it does to a page this run already began. Rotation
+            # (the `next_start` logic below) already starts the NEXT pass at
+            # whichever pair last delivered, so these get the front of it.
+            print(f"ci-result-capture: run budget exhausted; {len(order) - i} "
+                 f"pair(s) starting at {key} left for the next pass",
+                 file=sys.stderr)
+            break
+        gh_token = gh_tokens.get(_pair_owner(entry))
+        if gh_token is None:
+            # This owner's token could not be minted this pass (logged
+            # above) — skip the pair outright rather than calling
+            # `capture_workflow` with nothing to authenticate it, and leave
+            # its cursor exactly where it was.
+            grand["errors"] += 1
+            exit_code = 1
+            save_cursor(cursor)
+            save_rotation_start(next_start)
+            continue
         since = cursor.get(key) or no_cursor_since
         try:
             t = capture_workflow(entry["repo"], entry["workflow_file"], entry["product"],
@@ -797,21 +1435,43 @@ def main() -> int:
             # `capture_workflow` only catches `CaptureError` — anything else (a
             # transport failure `gh_runs`/`GA.request` doesn't wrap, say)
             # propagates here uncaught. Caught at THIS level and tallied as an
-            # error for this pair alone, so every OTHER pair in `TRACKED` still
+            # error for this pair alone, so every OTHER pair this pass still
             # gets its turn and its own `save_cursor` call below, rather than
             # one pair's unexpected exception aborting the rest of this run.
             print(f"ci-result-capture: {key}: unexpected failure: "
                  f"{type(ex).__name__}: {ex}", file=sys.stderr)
             t = {"created": 0, "duplicate": 0, "errors": 1, "stale_pending": 0,
                 "next_since": None, "reason": f"{type(ex).__name__}: {ex}",
-                "rate_limited": False}
+                "rate_limited": False, "budget_exceeded": False}
+        try:
+            rerun_t = capture_reruns(entry["repo"], entry["workflow_file"], entry["product"],
+                                     since, gh_token, sig_tok, deadline=deadline)
+        except Exception as ex:
+            print(f"ci-result-capture: {key}: re-run lookback: unexpected "
+                 f"failure: {type(ex).__name__}: {ex}", file=sys.stderr)
+            rerun_t = {"created": 0, "duplicate": 0, "errors": 1,
+                      "reason": f"{type(ex).__name__}: {ex}"}
+        # The forward cursor's advance gate reads `capture_workflow`'s own,
+        # pre-merge error count alone: `capture_reruns` owns no cursor of
+        # its own and runs this check fresh every pass regardless, so a
+        # re-run channel that is stuck (a sustained 429 or a rejected post)
+        # must never hold back a forward window that itself delivered
+        # cleanly — the merge below is for REPORTING only (the printed
+        # per-pair line and the grand totals), never for the advance
+        # decision.
+        forward_clean = t["errors"] == 0
+        for k in ("created", "duplicate", "errors"):
+            t[k] += rerun_t[k]
+        if rerun_t["reason"] is not None and t["reason"] is None:
+            t["reason"] = rerun_t["reason"]
         print(f"{key}: {t}")
         for k in grand:
             grand[k] += t[k]
-        # `rate_limited` is the one exception to "only a clean pair
-        # advances" — see `capture_workflow`'s own docstring and the module
-        # docstring's cursor-invariants section (CQ-455).
-        if t["errors"] == 0 or t["rate_limited"]:
+        # `rate_limited` and `budget_exceeded` are the two exceptions to
+        # "only a clean pair advances" — see `capture_workflow`'s own
+        # docstring and the module docstring's cursor-invariants section
+        # (CQ-455, and this fix's own fetch-budget addition to it).
+        if forward_clean or t["rate_limited"] or t["budget_exceeded"]:
             cursor[key] = t["next_since"]
         # Saved every iteration, not once after the loop — mirrors
         # `pr-state-capture`'s own per-repo save, for the same reason: a

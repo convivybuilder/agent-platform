@@ -100,7 +100,8 @@ def test_an_indexer_without_its_resolver_refuses_loudly(tmp_path):
     shutil.copy(ROOT / "lib" / "agent-platform" / "operator_config.py", tmp_path / "operator_config.py")
     operator_cfg = tmp_path / "operator.json"
     operator_cfg.write_text(json.dumps({"excluded_crews": [], "operator_marker": "operator",
-                                        "roster_crew": "operator-crew"}))
+                                        "roster_crew": "operator-crew",
+                                        "apps_crew": "operator-crew-apps"}))
     out = subprocess.run([sys.executable, "-c", "import indexer"], cwd=tmp_path,
                          env={"PATH": "/usr/bin:/bin", "PYTHONPATH": str(tmp_path),
                               "CONVIVY_OPERATOR_CONFIG": str(operator_cfg)},

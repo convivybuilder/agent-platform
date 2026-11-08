@@ -42,6 +42,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
@@ -56,7 +57,41 @@ GUARDS = (
 )
 TIMEOUT_S = 10
 DENIAL_LOG_ENV = "AGENTCTL_CODEX_DENIAL_LOG"
+# Names the per-model probe stamp file in CODEX_HOME (lib/agent-platform/codex_probe.py's
+# own STAMP). Duplicated as a literal, the same way DENIAL_LOG_ENV already is: this
+# script is a standalone hook executable, never importing codex_probe.
+STAMP_FILENAME = "agent-platform-codex-probe.json"
+# Set by lib/agent-platform/codex_probe.py's own probe_env on every launch today (every
+# Codex launch is a reviewer launch); duplicated here for the same reason STAMP_FILENAME
+# is. When set, apply_patch is refused unconditionally: a reviewer needs no write tool,
+# whatever the confinement stamp says about that tool.
+REVIEWER_ROLE_ENV = "AGENTCTL_CODEX_REVIEWER"
+# Set ONLY by codex_probe.probe_env's own `is_probe=True` branch, whose one caller is
+# agentctl's `codex-probe` CLI command — never the dispatched-reviewer launch path
+# (`_run_codex_review_session`, bin/agentctl), which calls the same probe_env with
+# is_probe left False. A dispatched run cannot set it either: it is part of the hook's
+# OWN process environment, inherited from `codex exec`'s launch env (fixed before any
+# model text runs, never touched by a command the model's shell executes, which is a
+# different subprocess), and probe_env's env is built from an ALLOWLIST (ENV_ALLOW)
+# that does not name this variable, so even an ambient copy in the operator's own shell
+# would be filtered out rather than passed through. When set, a file-touching
+# INERT_TOOLS call's TARGET is not judged at all — only the stamp lookup is skipped —
+# so BOTH the allowed-path and the denied-path attempt reach Codex, and the probe
+# (lib/agent-platform/codex_probe.py) observes from Codex's own event stream whether
+# Codex itself refused the denied one. Round 2 judged the target here directly against
+# the shared deny list (`_probe_denies`, since removed); the security reviewer's
+# blocking finding on that round (PR #961 comment 6308726984) was that doing so made a
+# "confined" credit measure this shim's own decision about its own probe attempt, never
+# Codex's — and the dispatched branch below then trusts that credit to mean Codex
+# refuses the tool on ANY path. Removing the judgement here is what makes the credit
+# honest: a probe pass can now only come from Codex's own engine actually refusing the
+# read, observed live, never from this shim denying itself and calling that evidence.
+PROBE_ROLE_ENV = "AGENTCTL_CODEX_PROBE"
 _COMMAND = None  # the shell command of the call being judged, for the denial record
+# {"tool": ..., "target": ...} for a denied non-shell, file-touching tool call — set
+# only when the thing being denied is one of those, so the probe can attribute the
+# record to the right attempt (lib/agent-platform/codex_probe.py's judge_tool_attempt).
+_TOOL_RECORD = None
 
 
 def record_denial(reason):
@@ -65,9 +100,11 @@ def record_denial(reason):
         path = os.environ.get(DENIAL_LOG_ENV)
         if not path:
             return
-        line = json.dumps({
-            "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "command": _COMMAND, "reason": reason}) + "\n"
+        entry = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                 "command": _COMMAND, "reason": reason}
+        if _TOOL_RECORD is not None:
+            entry.update(_TOOL_RECORD)
+        line = json.dumps(entry) + "\n"
         fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
             os.write(fd, line.encode())
@@ -75,6 +112,26 @@ def record_denial(reason):
             os.close(fd)
     except Exception:
         pass
+
+
+def _confined_tools(model):
+    """The set of FILE_TOUCHING_INERT_TOOLS members the per-model probe stamp
+    records as `confined` for `model` — empty (deny everything) when CODEX_HOME is
+    unset, the model is unknown, the stamp is missing or unreadable, or the stamp
+    names no `confined_tools` dict: a run with no confirmed confinement gets none
+    of these tools, the same fail-closed posture `codex_dispatch_refusal` takes."""
+    home = os.environ.get("CODEX_HOME")
+    if not home or not model:
+        return set()
+    try:
+        data = json.loads((Path(home) / STAMP_FILENAME).read_text())
+    except Exception:
+        return set()
+    stamp = data.get(model) if isinstance(data, dict) else None
+    confined = stamp.get("confined_tools") if isinstance(stamp, dict) else None
+    if not isinstance(confined, dict):
+        return set()
+    return {tool for tool, verdict in confined.items() if verdict == "confined"}
 
 
 def deny(reason):
@@ -136,9 +193,36 @@ def _judge():
     kind, command, cwd, why = codex_tool_shape.classify(call)
     if kind == "unnormalizable":
         deny(why)
-    global _COMMAND
+    global _COMMAND, _TOOL_RECORD
     _COMMAND = command if kind == "shell" and isinstance(command, str) else None
+    tool = call.get("tool_name") if isinstance(call, dict) else None
     if kind == "other":
+        # web_search is denied unconditionally, every run: its request leaves Codex's
+        # own process (or OpenAI's side), outside the seatbelt and the outbound guard
+        # both, so a query could carry anything the run has read to a third party
+        # (platform/specs/codex-coder-lane, slice 1).
+        if tool == "web_search":
+            deny("web search is disabled for every Codex run (no network confinement "
+                 "covers it — slice 1, read confinement)")
+        file_touching = codex_tool_shape.INERT_TOOLS - {"update_plan", "request_user_input"}
+        if tool in file_touching:
+            args = call.get("tool_input") if isinstance(call, dict) else None
+            target = codex_tool_shape.tool_target_path(tool, args)
+            if tool == "apply_patch" and os.environ.get(REVIEWER_ROLE_ENV) == "1":
+                _TOOL_RECORD = {"tool": tool, "target": target}
+                deny("apply_patch is refused on every reviewer run; a reviewer needs "
+                     "no write tool")
+            if os.environ.get(PROBE_ROLE_ENV) != "1":
+                model = call.get("model") if isinstance(call, dict) else None
+                if tool not in _confined_tools(model):
+                    _TOOL_RECORD = {"tool": tool, "target": target}
+                    deny(f"the confinement stamp does not list {tool!r} as confined for "
+                         f"model {model!r}; its calls are refused until the probe "
+                         f"confirms it (slice 1, read confinement)")
+            # else: PROBE_ROLE_ENV — only the stamp lookup is skipped. The call reaches
+            # Codex unjudged, whatever its target, so the probe's own attempt is decided
+            # by Codex's engine and observed from the event stream, never by this shim
+            # pre-judging the path (round 3, PR #961 comment 6308726984).
         sys.exit(0)
     if not SP.safe_which("jq"):
         deny("jq is not installed, and block-pr-merge.sh lets everything through without it")

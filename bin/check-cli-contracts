@@ -17,6 +17,11 @@ within the same UTC day logs nothing after that day's first signal, unless its k
 the key carries the set of unknown flags, so a return with a different set logs again.
 It never creates a work item: only a co session does (platform/decisions/0073).
 A missing sibling checkout degrades gracefully — the product is simply not checked.
+An EMPTY registry-sourced caller map (every tool's caller list empty) is not a pass —
+`main()` exits 1 rather than report 0 breaches with nothing checked. A caller name
+`valid_name()` rejects (a registry row shaped to escape convivy_root) is refused
+loudly rather than silently skipped: `main()` exits 1 for that too, even when every
+other caller came back clean.
 """
 from __future__ import annotations
 
@@ -31,20 +36,20 @@ import sys
 from typing import Any
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import builder_root as BR  # noqa: E402
+import projects  # noqa: E402
 
-# The map of shared bin/ tools to the products that call them from their
-# scripts/ directories. Declared (not discovered) so a missing checkout
-# reads as absent rather than "no problems found". When adding or removing
-# a flag from one of these tools, update this map and sweep the callers.
-# convivy-app-kit belongs here even though its --no-slack breach is already fixed.
-# So is every other entry: all five callers had that same breach repaired. Being
-# fixed is not the same as ceasing to call the tool, and this map exists to catch
-# the NEXT contract change, not the one that prompted it. Leaving it out shipped
+# The map of shared bin/ tools to the repos that call them from their
+# scripts/ directories, read from the registry's own `calls_shared_tools`
+# field (projects.tool_callers) — declared there (not discovered) so a
+# missing checkout reads as absent rather than "no problems found". When
+# adding or removing a flag from one of these tools, update the registry and
+# sweep the callers. One caller's breach being already fixed is not the same
+# as ceasing to call the tool, and this map exists to catch the NEXT contract
+# change, not the one that prompted it. Leaving a fixed caller out shipped
 # the check with a blind spot the incident table itself names.
 _TOOL_CALLERS: dict[str, list[str]] = {
-    "post-changelog": ["vivy", "constance", "selector", "selector-backend",
-                       "convivy-app-kit"],
-    "post-release-note": ["vivy"],
+    "post-changelog": projects.tool_callers("post-changelog"),
+    "post-release-note": projects.tool_callers("post-release-note"),
 }
 
 CONVIVY_ROOT = BR.root()
@@ -57,6 +62,14 @@ _IMPLICIT_FLAGS = frozenset({"-h", "--help"})
 # Track how many report attempts failed. Reset each run. Used to distinguish
 # "breaches logged OK" (exit 2) from "breaches but reporting failed" (exit 3).
 _report_failures: int = 0
+
+# Track how many registry-sourced caller names `valid_name()` rejected. Reset
+# each run. A rejected name is a corrupted or hostile registry row, not a
+# missing checkout, so it must not share the "degrades gracefully" skip that
+# applies to an absent sibling: main() fails the whole run when this is
+# nonzero, rather than silently checking fewer callers than the registry
+# declared (security-reviewer, PR #985 round 3).
+_invalid_name_failures: int = 0
 
 
 def parse_accepted_flags(help_text: str) -> frozenset[str]:
@@ -294,9 +307,15 @@ def check_tool(tool_name: str, products: list[str],
     if verbose:
         print(f"[OK] {tool_name}: {len(accepted)} option(s): {sorted(accepted)}")
 
+    global _invalid_name_failures
     products_with_breaches = 0
 
     for product in products:
+        if not projects.valid_name(product):
+            print(f"[FAIL] {product!r}: not a safe product name — refusing to "
+                  f"join it under convivy_root", file=sys.stderr)
+            _invalid_name_failures += 1
+            continue
         product_dir = convivy_root / product
         if not product_dir.is_dir():
             print(f"[SKIP] {product}: checkout not found under convivy_root",
@@ -375,11 +394,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     opts = parser.parse_args(argv)
 
-    global _report_failures
+    global _report_failures, _invalid_name_failures
     _report_failures = 0
+    _invalid_name_failures = 0
 
     convivy_root = pathlib.Path(opts.convivy_root)
     bin_dir = pathlib.Path(opts.bin_dir)
+
+    # Fail CLOSED, not clean, when the registry-sourced caller map comes back
+    # with nothing in it — a hand edit (or a future registration bug) that
+    # drops or empties every unit's `calls_shared_tools` must not read as "no
+    # breaches found", the same class of regression `check-primary-checkouts`'
+    # own completeness audit exists to catch for its declared list (reviewer,
+    # PR #985 round 2).
+    if not any(_TOOL_CALLERS.values()):
+        print("[FAIL] every tool's caller list is empty — the registry "
+              "returned nothing to check against. Refusing to report a clean "
+              "pass with nothing checked.", file=sys.stderr)
+        return 1
 
     day = _utc_today()
     total_breaches = 0
@@ -390,6 +422,19 @@ def main(argv: list[str] | None = None) -> int:
             day=day, dry_run=opts.no_report,
         )
         total_breaches += count
+
+    # A caller name `valid_name()` rejected is a corrupted or hostile
+    # registry row, not a missing checkout — it must not share the "nothing
+    # checked for this caller" silence `check_tool`'s own skip otherwise
+    # degrades gracefully with. Fail the whole run rather than let an
+    # invalid-shaped name among otherwise-valid callers, or every caller
+    # being invalid-shaped, read as a clean pass with calls unchecked
+    # (security-reviewer, PR #985 round 3).
+    if _invalid_name_failures > 0:
+        print(f"[FAIL] {_invalid_name_failures} caller name(s) rejected by "
+              "valid_name() — refusing to report a clean pass with those "
+              "calls unchecked.", file=sys.stderr)
+        return 1
 
     if total_breaches == 0:
         if opts.verbose:

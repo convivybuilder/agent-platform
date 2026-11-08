@@ -254,7 +254,6 @@ for fixed_probe in \
     "http://127.0.0.1:8000/status" \
     "http://127.0.0.1:5151/health" \
     "http://127.0.0.1:4100/health" \
-    "http://127.0.0.1:8765/health" \
     "http://127.0.0.1:8300/health" \
     "http://127.0.0.1:8080/version" \
     "http://127.0.0.1:8081/version" \

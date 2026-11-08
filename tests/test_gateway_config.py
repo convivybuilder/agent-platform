@@ -93,12 +93,12 @@ def test_database_url_is_read_from_the_environment():
 
 def test_virtual_key_procedure_names_the_mint_and_declaration_not_keychain():
     """The bootstrap comment is the procedure an operator follows. It must name the
-    mint and the consumer declaration it reads, and must not name the retired `pa`
+    mint and the consumer declaration it reads, and must not name the retired `aide`
     consumer or Keychain storage (E17·1)."""
     text = GATEWAY_CONFIG.read_text()
     assert "bin/gateway-mint-keys" in text
     assert "gateway/consumers.json" in text
-    assert "litellm-pa-virtual-key" not in text, "the pa consumer is not minted"
+    assert "litellm-aide-virtual-key" not in text, "the aide consumer is not minted"
     assert "Keychain" not in text, "virtual keys are stored in litellm-keys.json, not Keychain"
 
 
@@ -174,7 +174,7 @@ def test_mimo_routes_via_chat_completions_on_anthropic_bridge():
 
 
 def test_deepseek_has_pinned_pricing():
-    """DeepSeek's API now returns model `deepseek-v4-flash`, unmapped in LiteLLM's
+    """DeepSeek's API now returns model `deepseek-flash`, unmapped in LiteLLM's
     price map → completion_cost() errors → usd:0 in the spend log. The deepseek
     deployment must pin model_info pricing (incl. the cache-read tier) so cost is
     computed regardless of the echoed model name."""
@@ -185,6 +185,48 @@ def test_deepseek_has_pinned_pricing():
         assert isinstance(mi.get(key), (int, float)) and mi[key] > 0, (
             f"deepseek model_info.{key} must be a positive cost"
         )
+
+
+def test_deepseek_pinned_rates_are_the_peak_billed_rates():
+    """The pin must equal DeepSeek's billed peak rates (CQ·515, steward ruling
+    2026-10-19), derived from the 2026-10-18/19 per-category billing export.
+    Pinning at peak means the ledger can overcount a request billed off-peak
+    but never undercount one billed at peak."""
+    config = yaml.safe_load(GATEWAY_CONFIG.read_text())
+    deepseek = next(e for e in config["model_list"] if e["model_name"] == "deepseek")
+    mi = deepseek.get("model_info", {})
+    assert mi.get("input_cost_per_token") == pytest.approx(0.0000003)
+    assert mi.get("cache_read_input_token_cost") == pytest.approx(0.000000006)
+    assert mi.get("output_cost_per_token") == pytest.approx(0.0000012)
+
+
+def test_deepseek_pro_has_pinned_pricing():
+    """deepseek-pro (CQ·524, model trial 2's second arm) returns model
+    `deepseek-v4-pro`, unmapped in LiteLLM's price map → completion_cost()
+    errors → usd:0 in the spend log. The deployment must pin model_info
+    pricing (incl. the cache-read tier) so cost is computed regardless of
+    the echoed model name."""
+    config = yaml.safe_load(GATEWAY_CONFIG.read_text())
+    deepseek_pro = next(e for e in config["model_list"] if e["model_name"] == "deepseek-pro")
+    mi = deepseek_pro.get("model_info", {})
+    for key in ("input_cost_per_token", "output_cost_per_token", "cache_read_input_token_cost"):
+        assert isinstance(mi.get(key), (int, float)) and mi[key] > 0, (
+            f"deepseek-pro model_info.{key} must be a positive cost"
+        )
+
+
+def test_deepseek_pro_pinned_rates_are_the_peak_billed_rates():
+    """The pin must equal DeepSeek's billed peak rates for deepseek-v4-pro
+    (api-docs.deepseek.com/quick_start/pricing, read 2026-10-20): input
+    $1.32/M, cache-hit $0.044/M, output $3.96/M. A wrong or missing pin
+    bills Pro at $0 and undercounts the trial's cost-cap check, the same
+    failure mode deepseek-flash had before its own pin."""
+    config = yaml.safe_load(GATEWAY_CONFIG.read_text())
+    deepseek_pro = next(e for e in config["model_list"] if e["model_name"] == "deepseek-pro")
+    mi = deepseek_pro.get("model_info", {})
+    assert mi.get("input_cost_per_token") == pytest.approx(0.00000132)
+    assert mi.get("cache_read_input_token_cost") == pytest.approx(0.000000044)
+    assert mi.get("output_cost_per_token") == pytest.approx(0.00000396)
 
 
 def test_kimi_code_has_pinned_pricing_incl_cache_read():
@@ -207,7 +249,7 @@ def test_kimi_code_has_pinned_pricing_incl_cache_read():
 def test_trial_model_has_pinned_pricing_incl_cache_read(model_name):
     """The ARCH-201 trial models (mimo = MiMo-V2.5-Pro, glm = GLM-5.2) are absent
     from LiteLLM 1.86.2's price map, so their pricing must be pinned or
-    completion_cost() errors → usd:0 (the deepseek-v4-flash failure mode). The
+    completion_cost() errors → usd:0 (the deepseek-flash failure mode). The
     cache-read tier is required (ARCH-181): agent loops are cache-read-dominated,
     so an unset tier bills cache hits at $0 and biases the trial in the model's
     favor against the deepseek baseline it's being measured against."""
@@ -415,14 +457,19 @@ def test_router_has_no_kimi_fallback():
     400-storm) moved to the HARNESS: deepseek now fails over to sonnet
     (subscription-billed claude-direct), because the gateway has no Anthropic key
     and a gateway hop would bill the API. The `model_group_alias` is still
-    load-bearing — agentctl sends the resolved "deepseek/deepseek-v4-flash" string,
-    which LiteLLM must map onto the real "deepseek" group.
+    load-bearing — agentctl sends the resolved "deepseek/deepseek-flash" string,
+    which LiteLLM must map onto the real "deepseek" group. The legacy
+    "deepseek/deepseek-v4-flash" entry stays too, for any straggler still
+    sending that id.
     """
     config = yaml.safe_load(GATEWAY_CONFIG.read_text())
     router = config.get("router_settings", {})
     alias = router.get("model_group_alias", {})
-    assert alias.get("deepseek/deepseek-v4-flash") == "deepseek", (
+    assert alias.get("deepseek/deepseek-flash") == "deepseek", (
         "agentctl's resolved model string must still alias onto the deepseek group"
+    )
+    assert alias.get("deepseek/deepseek-v4-flash") == "deepseek", (
+        "the legacy id must still alias onto the deepseek group"
     )
     merged: dict = {}
     for entry in router.get("fallbacks", []):

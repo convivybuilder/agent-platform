@@ -23,8 +23,10 @@ from pathlib import Path
 
 import pytest
 
+import dispatch_env as DE
 import review_launch as RL
 import review_protocol as RP
+import tool_policy as TP
 
 REPO = "convivy/agent-platform"
 HEAD = "a" * 40
@@ -278,9 +280,11 @@ class FakeSession:
     def owner(self):
         return (os.getuid(), os.getgid())
 
-    def env(self, *, claude_config_dir, home):
+    def env(self, *, claude_config_dir, home, repo, review_sha, draft_dir, registry_path):
         env = RL.session_env(claude_config_dir=claude_config_dir,
-                             oauth_token="sentinel-oauth-token", home=home)
+                             oauth_token="sentinel-oauth-token", home=home,
+                             repo=repo, review_sha=review_sha, draft_dir=draft_dir,
+                             registry_path=registry_path)
         self.envs_built.append(env)
         return env
 
@@ -318,9 +322,122 @@ def test_launched_sessions_environment_has_no_key_path_and_no_write_token(tmp_pa
     # shaped variable, and the approver key is never a parameter anywhere in
     # this call chain — `main` never reads one.
     assert "GITHUB_TOKEN" not in env
+    # The GIT_CONFIG_* keys (round 3 of #925): `session_env` now applies
+    # `DE.deny_push_env` unconditionally, the same `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/
+    # `GIT_CONFIG_VALUE_n` shape `dispatch_env(deny_push=True)` produces for the direct
+    # dispatch path — see `test_session_env_carries_the_same_deny_push_pairs_dispatch_env_produces`
+    # for the shared-mechanism pin.
+    deny_push_keys = {"GIT_CONFIG_COUNT"}
+    for i in range(len(DE._PUSH_REFUSAL_PREFIXES)):
+        deny_push_keys.add(f"GIT_CONFIG_KEY_{i}")
+        deny_push_keys.add(f"GIT_CONFIG_VALUE_{i}")
     assert set(env) == {"HOME", "PATH", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
                         "GH_CONFIG_DIR", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
-                        "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT"}
+                        "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT",
+                        "AGENTCTL_REPO", "AGENTCTL_REVIEW_SHA",
+                        "AGENTCTL_REVIEW_DRAFT_DIR", "PROJECTS_JSON"} | deny_push_keys
+
+
+def test_main_builds_the_session_env_with_the_repo_and_pinned_sha(tmp_path):
+    """platform/specs/reviewers-run-under-their-allow-list Handoff: both
+    launch paths must put `AGENTCTL_REPO`/`AGENTCTL_REVIEW_SHA` in the run's
+    environment, so `agentctl review-ci` has something to read on this
+    (two-account) path too — `session_env` carries neither at head
+    77353503e. `repo` is `parsed.repo` (what this invocation was given on
+    `--repo`, already `owner/name`); `review_sha` is `record.head_sha`, the
+    commit THIS run fetched and pinned everything else to (`build_prompt`,
+    `prepare_run_dir`, the eventual check-run) — never the PR's current head
+    at post time, which a force-push between fetch and post could have
+    changed."""
+    record = RL.PRRecord(head_sha=HEAD, base_ref="main", title="t", body="b")
+    gate = FakeGate(record=record, base_at_fetch="main", base_at_post="main")
+    session = FakeSession(verdict="APPROVE", home_path=tmp_path / "home")
+
+    exit_code = RL.main(
+        ["--repo", REPO, "--pr", "5", "--role", "reviewer", "--run-id", "run-xyz"],
+        gate=gate, session=session, run_dir_for=lambda run_id: tmp_path / "runs" / run_id)
+
+    assert exit_code == 0
+    assert len(session.envs_built) == 1
+    env = session.envs_built[0]
+    assert env["AGENTCTL_REPO"] == REPO
+    assert env["AGENTCTL_REVIEW_SHA"] == HEAD
+
+
+def test_main_builds_the_session_env_with_the_same_draft_dir_the_settings_grant_write_to(tmp_path):
+    """Round 2 of #925's blocking finding: at head 33991502a `session.env` (and so
+    `session_env`) carried no `AGENTCTL_REVIEW_DRAFT_DIR` at all, so the recovery
+    instruction block's fallback (`git rev-parse --git-path review-comment.md`) named a
+    path outside both write roots this launcher's own `--settings` grants `Write` into
+    — a reviewer that crashed mid-review and tried that fallback on this (two-account)
+    launch path had nowhere to write its draft back to.
+
+    `run_dir` is the ONE value this test derives both paths from, so this cannot pass
+    with the env var pointing anywhere the settings do not grant: `draft` is `main`'s
+    own `run_dir / "draft"`, read here from `session.runs[0]["cmd"]`'s `--settings`
+    JSON (the same `allowWrite` entry `test_main_builds_the_session_under_the_review_
+    allow_list` already pins), and compared directly against `session.envs_built[0]`'s
+    `AGENTCTL_REVIEW_DRAFT_DIR` — never two independently-computed strings that could
+    agree by coincidence."""
+    record = RL.PRRecord(head_sha=HEAD, base_ref="main", title="t", body="b")
+    gate = FakeGate(record=record, base_at_fetch="main", base_at_post="main")
+    session = FakeSession(verdict="APPROVE", home_path=tmp_path / "home")
+    run_dir = tmp_path / "runs" / "run-xyz"
+
+    exit_code = RL.main(
+        ["--repo", REPO, "--pr", "5", "--role", "reviewer", "--run-id", "run-xyz"],
+        gate=gate, session=session, run_dir_for=lambda run_id: run_dir)
+
+    assert exit_code == 0
+    assert len(session.envs_built) == 1 and len(session.runs) == 1
+    env = session.envs_built[0]
+    cmd = session.runs[0]["cmd"]
+    settings = json.loads(cmd[cmd.index("--settings") + 1])
+    allow_write = settings["sandbox"]["filesystem"]["allowWrite"]
+
+    draft = str(run_dir / "draft")
+    assert draft in allow_write, "the settings grant must still Write into run_dir/draft"
+    assert env.get("AGENTCTL_REVIEW_DRAFT_DIR") == draft, (
+        "AGENTCTL_REVIEW_DRAFT_DIR must name the exact directory the settings grant "
+        f"Write to; got {env.get('AGENTCTL_REVIEW_DRAFT_DIR')!r}, settings grant {draft!r}")
+
+
+def test_main_builds_the_session_under_the_review_allow_list(tmp_path):
+    """platform/specs/reviewers-run-under-their-allow-list: every session this
+    launcher runs is review-class (`ROLES` names only `reviewer`/
+    `security-reviewer`), so `main` must build its `--settings` from the
+    resolved policy's own allow-list, never `run_sandbox.TOOL_ALLOW`'s bare
+    grant — and its `Write` must reach the run's own `draft` directory, never
+    the shared temp root.
+
+    Calibration (2026-10-17, platform/decisions/0926 proposed): the allow-list
+    alone does not bind — left unset, `sandbox.autoAllowBashIfSandboxed` auto-allows
+    any Bash command the sandbox can run no matter what `permissions` says. This
+    launcher's own `RS.settings_json` call must carry that key set to `false` too,
+    not only the allow-list."""
+    record = RL.PRRecord(head_sha=HEAD, base_ref="main", title="t", body="b")
+    gate = FakeGate(record=record, base_at_fetch="main", base_at_post="main")
+    session = FakeSession(verdict="APPROVE", home_path=tmp_path / "home")
+    run_dir = tmp_path / "runs" / "run-xyz"
+
+    exit_code = RL.main(
+        ["--repo", REPO, "--pr", "5", "--role", "reviewer", "--run-id", "run-xyz"],
+        gate=gate, session=session, run_dir_for=lambda run_id: run_dir)
+
+    assert exit_code == 0
+    assert len(session.runs) == 1
+    cmd = session.runs[0]["cmd"]
+    settings_idx = cmd.index("--settings") + 1
+    settings = json.loads(cmd[settings_idx])
+    allow = settings["permissions"]["allow"]
+    assert "Bash" not in allow
+    assert "mcp__ops" not in allow
+    assert "mcp__kb" not in allow
+    assert "Read" in allow  # the resolved policy's own read surface
+    draft = run_dir / "draft"
+    assert str(draft) in settings["sandbox"]["filesystem"]["allowWrite"]
+    assert "/tmp" not in settings["sandbox"]["filesystem"]["allowWrite"]
+    assert settings["sandbox"]["autoAllowBashIfSandboxed"] is False
 
 
 def test_session_env_redirects_the_file_based_git_and_gh_credential_route(tmp_path):
@@ -330,7 +447,9 @@ def test_session_env_redirects_the_file_based_git_and_gh_credential_route(tmp_pa
     FILE-based helper — the account-separation argument in `session_env`'s own
     docstring is about `osxkeychain` specifically, not this."""
     env = RL.session_env(claude_config_dir=tmp_path / "claude", oauth_token="sentinel-oauth",
-                         home=tmp_path / "home")
+                         home=tmp_path / "home", repo=REPO, review_sha=HEAD,
+                         draft_dir=tmp_path / "runs" / "run-xyz" / "draft",
+                         registry_path=tmp_path / "runs" / "run-xyz" / "registry.json")
     assert os.path.isdir(env["GH_CONFIG_DIR"])
     assert list(Path(env["GH_CONFIG_DIR"]).iterdir()) == []
     assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
@@ -340,17 +459,45 @@ def test_session_env_redirects_the_file_based_git_and_gh_credential_route(tmp_pa
     assert "GH_TOKEN" not in env
 
 
+def test_session_env_carries_the_same_deny_push_pairs_dispatch_env_produces(tmp_path):
+    """Round 3 of #925 (both reviewers, blocking). `bin/agentctl`'s dispatch path
+    builds every review run's environment with `DE.dispatch_env(deny_push=
+    _is_review_agent(args.agent), ...)` — a `git` that refuses to push to a network
+    remote, closing the PR #698 incident (issue_01M3MMJFKSE5ZCA5YNXCJ1YCAK). The
+    two-account launcher's `session_env` called `DE.git_credential_guard_env`
+    directly and never applied `deny_push`, so a review session on that launcher
+    had no push refusal at all — and every session that launcher runs is a review
+    role pinned to a PR (`_review_launcher_for`), so this gap applied to every one
+    of them, not a corner case.
+
+    Fixed by `session_env` calling `DE.deny_push_env` — the same builder
+    `dispatch_env(deny_push=True)` itself now calls, extracted so the two launch
+    paths cannot diverge on what a reviewer's `git` refuses to push to — rather than
+    a second copy of the `GIT_CONFIG_*` construction."""
+    env = RL.session_env(claude_config_dir=tmp_path / "claude", oauth_token="sentinel-oauth",
+                         home=tmp_path / "home", repo=REPO, review_sha=HEAD,
+                         draft_dir=tmp_path / "runs" / "run-xyz" / "draft",
+                         registry_path=tmp_path / "runs" / "run-xyz" / "registry.json")
+    reference = DE.dispatch_env({}, deny_push=True)
+    assert "GIT_CONFIG_COUNT" in env, "session_env must apply the deny_push GIT_CONFIG_* pairs"
+    count = int(env["GIT_CONFIG_COUNT"])
+    assert count == int(reference["GIT_CONFIG_COUNT"]) == len(DE._PUSH_REFUSAL_PREFIXES)
+    for i in range(count):
+        assert env[f"GIT_CONFIG_KEY_{i}"] == reference[f"GIT_CONFIG_KEY_{i}"]
+        assert env[f"GIT_CONFIG_VALUE_{i}"] == reference[f"GIT_CONFIG_VALUE_{i}"]
+
+
 # Stand-in for the value `run_sandbox.settings_json` produces; these tests check
 # how the command carries it, not what it contains (tests/test_run_sandbox.py).
 SANDBOX_JSON = '{"sandbox":{"enabled":true}}'
 
 
 def test_the_session_command_isolates_project_settings():
-    """Contrast `tests/test_agentctl.py`'s
-    `test_todays_dispatch_runs_a_prs_sessionstart_hook_without_the_launcher`:
-    today's direct dispatch carries no such flag, so a PR's own
-    `.claude/settings.json` hooks still run there. Under the launcher they
-    must not."""
+    """`bin/agentctl`'s own direct dispatch (`_spawn_claude`) now carries the
+    same `--setting-sources user` flag (CQ·551 — see
+    `tests/test_agentctl.py::test_direct_review_dispatch_loads_only_user_
+    settings_without_the_launcher`); this pins the launcher's own copy of
+    it, built independently in `session_command` rather than shared code."""
     cmd = RL.session_command(prompt="review this", settings_json=SANDBOX_JSON)
     assert "--setting-sources" in cmd
     assert cmd[cmd.index("--setting-sources") + 1] == "user"
@@ -380,6 +527,25 @@ def test_the_session_command_carries_the_prompt_as_the_final_argument():
     `session_command` took no prompt argument at all)."""
     cmd = RL.session_command(prompt="review this PR for correctness", settings_json=SANDBOX_JSON)
     assert cmd[-1] == "review this PR for correctness"
+
+
+def test_the_session_command_carries_the_same_permission_mode_dispatch_path_resolves():
+    """Round 4 of #925 (security-reviewer, blocking). `bin/agentctl`'s direct
+    dispatch path launches every review run with `--permission-mode
+    TP.MODE_ENFORCE` (`dontAsk`) — the allow-list this PR installs only binds
+    under that mode; under Claude Code's default mode a tool outside the
+    allow-list is a prompt rather than a refusal, and in `-p` mode what
+    happens to it rests on the default instead of on the policy.
+    `session_command` passed no `--permission-mode` at all, so a review
+    session on the two-account launcher ran unenforced. Fixed by reading the
+    same `TP.MODE_ENFORCE` `bin/agentctl` resolves, rather than a second
+    literal `"dontAsk"` here — one shared definition, not two copies that can
+    drift."""
+    cmd = RL.session_command(prompt="review this", settings_json=SANDBOX_JSON)
+    assert "--permission-mode" in cmd
+    idx = cmd.index("--permission-mode")
+    assert cmd[idx + 1] == TP.MODE_ENFORCE == "dontAsk"
+    assert cmd.index("--") > idx + 1, "--permission-mode must sit before the positional prompt"
 
 
 def test_the_session_command_defaults_to_the_pinned_claude_binarys_absolute_path():
@@ -628,6 +794,33 @@ def test_main_refuses_a_reused_run_id_before_reading_the_key(tmp_path):
     assert json.loads((run_dir / "pr.json").read_text())["head_sha"] == "stale"
 
 
+def test_main_refuses_when_the_registry_is_unavailable_before_minting_any_key(
+        tmp_path, monkeypatch):
+    """CQ·563: `main` reads the project registry once, right after the
+    reused-run-id check and before `gate.mint_read_token` is ever called —
+    a failed read must refuse the whole launch the same way a malformed
+    invocation or a reused run-id does, rather than start a session with no
+    registry for a process inside it to read."""
+    def _boom():
+        raise RL.projects.RegistryUnavailable("stub: the registry is unavailable")
+    monkeypatch.setattr(RL.projects, "raw_document", _boom)
+
+    class _NothingMustRun:
+        def __getattr__(self, name):
+            def _boom(*a, **kw):
+                raise AssertionError(f"{name} must not be called when the registry is unavailable")
+            return _boom
+
+    run_dir = tmp_path / "runs" / "run-xyz"
+    exit_code = RL.main(
+        ["--repo", REPO, "--pr", "5", "--role", "reviewer", "--run-id", "run-xyz"],
+        gate=_NothingMustRun(), session=_NothingMustRun(),
+        run_dir_for=lambda run_id: run_dir)
+
+    assert exit_code == 2
+    assert not run_dir.exists()
+
+
 def test_main_ignores_a_verdict_file_when_the_session_exits_nonzero(tmp_path):
     """Round 2 of #732, finding 3 (second half): a verdict is trusted only
     when the session that wrote it ALSO exited 0 — at head a3cd844c `main`
@@ -828,14 +1021,16 @@ def test_main_posts_no_passing_check_for_an_early_quoted_approve_then_final_requ
 def test_prepare_run_dir_writes_the_pr_as_files(tmp_path):
     run_dir = tmp_path / "run"
     record = RL.PRRecord(head_sha=HEAD, base_ref="main", title="t", body="b")
-    RL.prepare_run_dir(run_dir, record, "diff --git a/x b/x\n",
+    RL.prepare_run_dir(run_dir, record, "diff --git a/x b/x\n", {"widget-crew": {}},
                        owner=(os.getuid(), os.getgid()))
     written = json.loads((run_dir / "pr.json").read_text())
     assert written["head_sha"] == HEAD
     assert written["base_ref"] == "main"
     assert (run_dir / "diff.patch").read_text() == "diff --git a/x b/x\n"
+    assert json.loads((run_dir / "registry.json").read_text()) == {"widget-crew": {}}
     assert (run_dir / "worktree").is_dir()
     assert (run_dir / "claude").is_dir()
+    assert (run_dir / "draft").is_dir()
 
 
 def test_prepare_run_dir_refuses_a_run_id_already_occupied_by_a_symlink(tmp_path):
@@ -853,7 +1048,7 @@ def test_prepare_run_dir_refuses_a_run_id_already_occupied_by_a_symlink(tmp_path
 
     record = RL.PRRecord(head_sha=HEAD, base_ref="main", title="t", body="b")
     with pytest.raises(OSError):
-        RL.prepare_run_dir(runs / "run-xyz", record, "diff --git a/x b/x\n",
+        RL.prepare_run_dir(runs / "run-xyz", record, "diff --git a/x b/x\n", {},
                            owner=(os.getuid(), os.getgid()))
 
     # The symlink itself is untouched — nothing was written through it.
@@ -895,7 +1090,7 @@ def test_prepare_run_dir_never_chowns_the_run_directorys_owner(tmp_path):
     fchown = _RecordingFchown()
     owner = (12345, 501)  # a uid this test process is NOT — proves it's never used as-is
 
-    RL.prepare_run_dir(run_dir, record, "diff\n", owner=owner, fchown=fchown)
+    RL.prepare_run_dir(run_dir, record, "diff\n", {}, owner=owner, fchown=fchown)
 
     run_dir_calls = [c for c in fchown.calls
                     if (c[0].st_dev, c[0].st_ino) == (run_dir.stat().st_dev, run_dir.stat().st_ino)]
@@ -906,18 +1101,20 @@ def test_prepare_run_dir_never_chowns_the_run_directorys_owner(tmp_path):
 
 
 def test_prepare_run_dir_chowns_every_fixed_child_to_the_full_owner(tmp_path):
-    """The four children the session actually needs (two read-only files, two
-    writable directories) ARE each fully chowned to `owner` — contrast the
-    run directory itself, which is never chowned to anything but `owner`'s
-    group (previous test)."""
+    """The six children the session actually needs (three read-only files, three
+    writable directories — `draft` added for
+    platform/specs/reviewers-run-under-their-allow-list, `registry.json` for
+    CQ·563) ARE each fully chowned to `owner` — contrast the run directory
+    itself, which is never chowned to anything but `owner`'s group (previous
+    test)."""
     run_dir = tmp_path / "runs" / "run-xyz"
     record = RL.PRRecord(head_sha=HEAD, base_ref="main", title="t", body="b")
     fchown = _RecordingFchown()
     owner = (os.getuid(), os.getgid())
 
-    RL.prepare_run_dir(run_dir, record, "diff\n", owner=owner, fchown=fchown)
+    RL.prepare_run_dir(run_dir, record, "diff\n", {}, owner=owner, fchown=fchown)
 
-    for name in ("pr.json", "diff.patch", "worktree", "claude"):
+    for name in ("pr.json", "diff.patch", "registry.json", "worktree", "claude", "draft"):
         assert fchown.owner_for(run_dir / name) == owner, f"{name} must be chowned to owner"
 
 
@@ -932,7 +1129,7 @@ def test_prepare_run_dir_leaves_the_run_directory_unwritable_by_group_or_other(t
     run_dir = tmp_path / "runs" / "run-xyz"
     record = RL.PRRecord(head_sha=HEAD, base_ref="main", title="t", body="b")
 
-    RL.prepare_run_dir(run_dir, record, "diff\n", owner=(os.getuid(), os.getgid()))
+    RL.prepare_run_dir(run_dir, record, "diff\n", {}, owner=(os.getuid(), os.getgid()))
 
     mode = stat.S_IMODE(run_dir.stat().st_mode)
     assert mode == RL._RUN_DIR_MODE

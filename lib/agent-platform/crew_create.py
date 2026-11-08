@@ -94,7 +94,6 @@ class ProposeError(Exception):
 class Env:
     """Everything `create` reaches outside this module. Production passes the
     real callables; a test passes stubs and temp paths."""
-    registry_path: Path | None
     crews_dir: Path
     knowledge_ctx: Path
     knowledge_root: Path
@@ -185,26 +184,39 @@ def _session_rows(socket: str | None) -> list[tuple[str, str]] | None:
     return rows
 
 
+# Fields a rerun's built row never carries, so comparing it against the
+# already-registered unit must not flag any of them as a mismatch:
+#   - `ci_workflows` is filled from a live GitHub read at registration time
+#     (CQ·564, comment 5947) — `CR.build_row`, which built `row` in
+#     `create()` below, is a pure function of the spec and never computes it;
+#   - `slug`, `updated_at` and `updated_by` are added by the Library on
+#     write (§6.8: "201: the row, as stored, with `slug`, `updated_at` and
+#     `updated_by` added") and may come back the same way on a `GET
+#     /registry` read, which is what `existing` below is built from.
+_IDEMPOTENT_IGNORED_FIELDS = frozenset({"ci_workflows", "slug", "updated_at", "updated_by"})
+
+
 def _step_register(env: Env, crew: str, stored_spec, row: dict) -> int | None:
-    """Step 1. Returns a refusal status, or None when the row is registered."""
-    registry = CR.resolved_registry_path(env.registry_path)
-    try:
-        data = CR.load_registry(registry)
-    except CR.RegistrationRefused as exc:
-        return _refuse(env, crew, "step 1 register", str(exc))
-    if crew in data:
-        differ = sorted(k for k in set(row) | set(data[crew]) if row.get(k) != data[crew].get(k))
+    """Step 1. Returns a refusal status, or None when the row is registered.
+    Reads the registry through `projects.py` — the Library, or
+    `PROJECTS_JSON` when a test or an adopter install sets it — rather than
+    a file this module writes: `CR.register` writes none (CQ·564)."""
+    projects._load_raw.cache_clear()
+    existing = projects.get(crew)
+    if existing is not None:
+        differ = sorted(k for k in (set(row) | set(existing)) - _IDEMPOTENT_IGNORED_FIELDS
+                        if row.get(k) != existing.get(k))
         if differ:
             return _refuse(env, crew, "step 1 register",
-                           f"{crew!r} is registered in {registry} with different fields "
+                           f"{crew!r} is already registered with different fields "
                            f"({', '.join(differ)}); not overwritten")
-        _report(env, crew, "step 1 register", DONE, f"already registered in {registry}")
+        _report(env, crew, "step 1 register", DONE, "already registered")
         return None
     try:
-        path, _row = CR.register(stored_spec, registry_path=env.registry_path)
+        CR.register(stored_spec)
     except CR.RegistrationRefused as exc:
         return _refuse(env, crew, "step 1 register", str(exc))
-    _report(env, crew, "step 1 register", DONE, f"registered in {path}")
+    _report(env, crew, "step 1 register", DONE, "registered with the Library")
     return None
 
 

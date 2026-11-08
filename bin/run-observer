@@ -16,9 +16,9 @@ MEASURED BEFORE IT WAS BUILT. Across 10,965 `run-*` dispatches in July-August
 2026, twenty ended this way, and they were not trivial:
 
     run-af1adcd7  security-reviewer  agent-platform#398   444 transcript lines
-    run-0d5f1a4c  reviewer           vivy#1132            412 lines
-    run-c40227f3  reviewer           constance            110 lines
-    run-99201cd2  kb-sync-verifier   sous-chef             75 lines
+    run-0d5f1a4c  reviewer           acme#1132            412 lines
+    run-c40227f3  reviewer           acme                 110 lines
+    run-99201cd2  kb-sync-verifier   globex                75 lines
 
 Ten of the twenty are review agents. Ten PRs received substantial review work and
 no verdict, and whoever waited on them learned nothing.
@@ -118,7 +118,7 @@ _MAX_META_BYTES = 1024 * 1024
 # order, and the walk sorts day directories by name. So `mkdir
 # agent-runs/1900-01-01/run-<8hex>` sorts ahead of every real day, costs nothing,
 # and mints a fresh never-deduped key each night. Sixty of them pushed a genuine
-# `failover-refused` on vivy#1219 to position 60 of 61 and past a budget of 50 —
+# `failover-refused` on acme#1219 to position 60 of 61 and past a budget of 50 —
 # forever, since the forger renames rather than repeats. The flood merely added
 # noise a human had to sift; the cap let the forger choose WHICH real alert
 # nobody sees, including one about its own run.

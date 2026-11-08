@@ -36,9 +36,9 @@ def test_list_open_issues_builds_url_and_returns_items(monkeypatch):
         return _Resp(200, {"items": [{"id": "bug_1", "state": "open"}]})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    items = bc.list_open_issues("vivy", tok="t")
+    items = bc.list_open_issues("widget", tok="t")
     assert items == [{"id": "bug_1", "state": "open"}]
-    assert "state=open" in captured["url"] and "product=vivy" in captured["url"]
+    assert "state=open" in captured["url"] and "product=widget" in captured["url"]
 
 
 def test_list_open_issues_empty_on_error(monkeypatch):
@@ -101,6 +101,134 @@ def test_list_issues_by_state_raises_without_a_token(monkeypatch):
     monkeypatch.setattr(bc, "token", lambda: None)
     with pytest.raises(bc.IssueQueueUnavailable):
         bc.list_issues_by_state("pr-open")
+
+
+# --- deadline: the TOTAL-time bound across every page (round 1, both
+# reviewers: a per-page `_TIMEOUT` alone still leaves a 100-page call
+# unbounded overall). The clock is stubbed throughout — never a real sleep. --
+
+
+def test_deadline_in_is_an_absolute_monotonic_timestamp(monkeypatch):
+    monkeypatch.setattr(bc, "_monotonic", lambda: 100.0)
+    assert bc.deadline_in(5.0) == 105.0
+
+
+def test_list_issues_by_state_bounds_each_pages_timeout_by_the_time_left(monkeypatch):
+    """Each request's own timeout is `min(_TIMEOUT, time left to the
+    deadline)` — against code that passes `_TIMEOUT` unconditionally, this
+    page's captured timeout would be 5.0, not the shorter 2.0 the deadline
+    actually leaves."""
+    clock = [0.0]
+    monkeypatch.setattr(bc, "_monotonic", lambda: clock[0])
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(timeout)
+        return _Resp(200, {"items": [{"id": "x"}], "truncated": False})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    items = bc.list_issues_by_state("open", tok="t", deadline=bc.deadline_in(2.0))
+    assert [i["id"] for i in items] == ["x"]
+    assert captured == [2.0]
+
+
+def test_list_issues_by_state_raises_once_the_deadline_passes_without_a_further_request(
+        monkeypatch):
+    """A slow-but-reachable Library (each page actually taking longer than the
+    remaining budget) must stop BEFORE the next request, not after it, and
+    the error must name a deadline, not a transport failure — against code
+    with no deadline check at all, this would instead keep paging forever (or
+    until `_MAX_PAGES`), making the extra request below."""
+    clock = [0.0]
+    monkeypatch.setattr(bc, "_monotonic", lambda: clock[0])
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(timeout)
+        clock[0] += 10.0  # this page alone outlasts the whole deadline
+        return _Resp(200, {"items": [{"id": "x"}], "truncated": True})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    deadline = bc.deadline_in(5.0)
+    with pytest.raises(bc.IssueQueueUnavailable, match="deadline exceeded"):
+        bc.list_issues_by_state("open", tok="t", deadline=deadline)
+    assert len(calls) == 1  # the second page is never attempted
+
+
+def test_list_issues_by_state_with_no_deadline_is_unbounded_as_before(monkeypatch):
+    """`deadline=None` (every caller before this parameter existed —
+    `bin/work-item-cost`'s and the reconciler's own calls) must keep paging
+    past any budget a deadline would have imposed, each page bound only by
+    `_TIMEOUT`."""
+    clock = [0.0]
+    monkeypatch.setattr(bc, "_monotonic", lambda: clock[0])
+    pages = [
+        {"items": [{"id": "i1"}], "truncated": True},
+        {"items": [{"id": "i2"}], "truncated": False},
+    ]
+    captured = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(timeout)
+        clock[0] += 10.0
+        return _Resp(200, pages[len(captured) - 1])
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    items = bc.list_issues_by_state("open", tok="t")
+    assert [i["id"] for i in items] == ["i1", "i2"]
+    assert captured == [bc._TIMEOUT, bc._TIMEOUT]
+
+
+def test_list_all_items_passes_the_same_deadline_to_every_state(monkeypatch):
+    """The deadline must be threaded through UNCHANGED to every one of the
+    seven states — against code that gives each state a fresh deadline off
+    its own elapsed time, the states would not all see the same value."""
+    seen = []
+
+    def fake_list_issues_by_state(state, product=None, tok=None, deadline=None):
+        seen.append(deadline)
+        return []
+    monkeypatch.setattr(bc, "list_issues_by_state", fake_list_issues_by_state)
+
+    deadline = bc.deadline_in(5.0)
+    bc.list_all_items(tok="t", deadline=deadline)
+    assert seen == [deadline] * len(bc.ALL_ITEM_STATES)
+
+
+def test_list_all_items_raises_once_the_deadline_passes_across_states(monkeypatch):
+    """The deadline bounds the TOTAL read across every state, not a fresh
+    budget per state — against code with no deadline support, a slow
+    Library here would make all seven states' worth of requests instead of
+    stopping after the first."""
+    clock = [0.0]
+    monkeypatch.setattr(bc, "_monotonic", lambda: clock[0])
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append(req.full_url)
+        clock[0] += 10.0  # longer than the whole deadline, on the very first page
+        return _Resp(200, {"items": [{"id": "x"}], "truncated": False})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    deadline = bc.deadline_in(5.0)
+    with pytest.raises(bc.IssueQueueUnavailable, match="deadline exceeded"):
+        bc.list_all_items(tok="t", deadline=deadline)
+    assert len(calls) == 1  # only the first state's first page was ever attempted
+
+
+def test_list_all_items_with_no_deadline_passes_none_to_every_state(monkeypatch):
+    """A caller passing no deadline (every caller before this parameter
+    existed) must be unchanged: every state still gets `deadline=None`."""
+    seen = []
+
+    def fake_list_issues_by_state(state, product=None, tok=None, deadline=None):
+        seen.append((state, deadline))
+        return [{"id": state}]
+    monkeypatch.setattr(bc, "list_issues_by_state", fake_list_issues_by_state)
+
+    items = bc.list_all_items(tok="t")
+    assert seen == [(s, None) for s in bc.ALL_ITEM_STATES]
+    assert {i["id"] for i in items} == set(bc.ALL_ITEM_STATES)
 
 
 def test_get_item_builds_url_and_returns_the_body(monkeypatch):
@@ -280,10 +408,10 @@ def test_link_pr_posts_pr_and_url(monkeypatch):
         return _Resp(200, {"id": "bug_1", "state": "pr-open"})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    res = bc.link_pr_to_issue("bug_1", "42", url="https://github.com/convivy/vivy/pull/42", tok="t")
+    res = bc.link_pr_to_issue("bug_1", "42", url="https://github.com/convivy/widget/pull/42", tok="t")
     assert res["status"] == "ok" and res["item"]["state"] == "pr-open"
     assert captured["url"].endswith("/api/issues/bug_1/link-pr")
-    assert captured["body"] == {"pr": "42", "url": "https://github.com/convivy/vivy/pull/42"}
+    assert captured["body"] == {"pr": "42", "url": "https://github.com/convivy/widget/pull/42"}
 
 
 def test_escalate_issue_posts_decision_id(monkeypatch):
@@ -331,8 +459,10 @@ def test_reconcile_pr_posts_the_outcome(monkeypatch):
     assert captured["body"] == {"outcome": "merged"}
 
 
-@pytest.mark.parametrize("outcome", ["merged", "closed", "abandoned"])
+@pytest.mark.parametrize("outcome", ["merged", "closed", "whatever-the-caller-sends"])
 def test_reconcile_pr_carries_each_outcome_unchanged(monkeypatch, outcome):
+    """No client-side check on the value, valid ("merged"/"closed") or not — the
+    Library decides and refuses what it does not accept."""
     captured = {}
 
     def fake_urlopen(req, timeout=None):
@@ -501,10 +631,19 @@ def test_comment_without_a_token_skips(monkeypatch):
 def _server_frozenset(path: pathlib.Path, name: str, *, absent_skip: str) -> set[str]:
     """The named `frozenset({...})` of string literals, read out of the server.
 
-    Skips when the checkout is absent (CI has none). Fails LOUDLY and specifically
-    when the file is there but the constant is not — that is the server having
-    moved or renamed it, which is a different thing from client/server drift and
-    wants a different fix, so the two must not report the same way.
+    Skips when the checkout is absent (CI has none) OR present but unreadable
+    (epic E33 slice 2: a dispatched run's sandbox denies this path, which is
+    never on the read allowlist — `path.exists()` alone would not catch this,
+    since that is a metadata read the sandbox leaves open, while the actual
+    `read_text()` below is a data read it denies). Both read as "cannot see
+    the server's definition here" and skip identically; a guard that treated
+    "present but unreadable" as present-and-readable would have reported a
+    `PermissionError` instead of the skip this absence always produced.
+
+    Fails LOUDLY and specifically when the file IS read but the constant is
+    not in it — that is the server having moved or renamed it, which is a
+    different thing from client/server drift and wants a different fix, so
+    the two must not report the same way.
 
     A member may be a bare identifier rather than a literal — `ITEM_TYPES` names
     two of its five members via `ITEM_TYPE_TASK`/`ITEM_TYPE_EPIC` rather than
@@ -512,9 +651,10 @@ def _server_frozenset(path: pathlib.Path, name: str, *, absent_skip: str) -> set
     top-level `NAME = "literal"` assignment elsewhere in the same file.
     """
     import re
-    if not path.exists():
+    try:
+        text = path.read_text()
+    except OSError:
         pytest.skip(absent_skip)
-    text = path.read_text()
     m = re.search(rf"{name}\s*=\s*frozenset\(\{{([^}}]*)\}}\)", text)
     assert m, (
         f"could not find {name} in {path} — the constant has moved or been renamed. "
@@ -528,6 +668,38 @@ def _server_frozenset(path: pathlib.Path, name: str, *, absent_skip: str) -> set
         if ref:
             values.add(ref.group(1))
     return values
+
+
+def test_server_frozenset_skips_on_a_present_but_unreadable_path(tmp_path, monkeypatch):
+    """Simulates the sandbox's own split (epic E33 slice 2): the file exists
+    (`path.exists()` would say so) but reading it raises `PermissionError`,
+    which must skip exactly like an absent checkout, never surface as an
+    uncaught `PermissionError`."""
+    path = tmp_path / "store.py"
+    path.write_text('ITEM_COMMENT_KINDS = frozenset({"a"})\n')
+
+    def _denied(self, *a, **k):
+        raise PermissionError(1, "Operation not permitted", str(self))
+
+    monkeypatch.setattr(pathlib.Path, "read_text", _denied)
+    with pytest.raises(pytest.skip.Exception, match="unreadable"):
+        _server_frozenset(path, "ITEM_COMMENT_KINDS", absent_skip="unreadable")
+
+
+def test_server_frozenset_skips_on_a_missing_path(tmp_path):
+    path = tmp_path / "never-created.py"
+    with pytest.raises(pytest.skip.Exception, match="absent"):
+        _server_frozenset(path, "ITEM_COMMENT_KINDS", absent_skip="absent")
+
+
+def test_server_frozenset_raises_loudly_when_the_constant_has_moved(tmp_path):
+    """A readable file missing the named constant is a DIFFERENT fact from
+    either skip above — the server renamed or moved it — and must fail rather
+    than skip, so the two causes are never confused."""
+    path = tmp_path / "store.py"
+    path.write_text("SOME_OTHER_CONSTANT = frozenset({'a'})\n")
+    with pytest.raises(AssertionError, match="could not find"):
+        _server_frozenset(path, "ITEM_COMMENT_KINDS", absent_skip="absent")
 
 
 LIBRARY_STORE = pathlib.Path.home() / "Convivy" / "library" / "store.py"
@@ -664,7 +836,7 @@ def test_checkout_and_heartbeat_default_the_owner_to_the_session_identity(monkey
     otherwise take a lease attributable only to the shared ops token, which is
     the attribution gap `session_owner` exists to close."""
     monkeypatch.setenv("CONVIVY_SESSION_DIR",
-                       "/srv/convivy/agent-runs/2026-08-05/co-vivy-0930")
+                       "/srv/convivy/agent-runs/2026-08-05/co-widget-0930")
     bodies = []
 
     def fake_urlopen(req, timeout=None):
@@ -674,7 +846,7 @@ def test_checkout_and_heartbeat_default_the_owner_to_the_session_identity(monkey
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
     bc.checkout_issue("issue_a", tok="t")
     bc.heartbeat_issue("issue_a", tok="t")
-    assert all(b["owner"] == "2026-08-05/co-vivy-0930" for b in bodies), bodies
+    assert all(b["owner"] == "2026-08-05/co-widget-0930" for b in bodies), bodies
 
 
 def test_checkout_without_a_token_skips_rather_than_calling(monkeypatch):
@@ -822,7 +994,7 @@ def test_post_ledger_entry_sends_the_documented_fields_and_dedup_key(monkeypatch
         return _Resp(200, {"recorded": True, "id": "entry_1", "idempotent": False})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    res = bc.post_ledger_entry("vivy", 0.1234, run_id="run-abc", dedup_key="run-abc",
+    res = bc.post_ledger_entry("widget", 0.1234, run_id="run-abc", dedup_key="run-abc",
                               lane="gateway", agent="coder", model="claude-sonnet-5", tok="t")
     assert res["status"] == "recorded"
     assert res["entry"]["id"] == "entry_1"
@@ -830,7 +1002,7 @@ def test_post_ledger_entry_sends_the_documented_fields_and_dedup_key(monkeypatch
     assert captured["auth"] == "Bearer t"
     assert captured["protocol"] == "1"
     assert captured["body"] == {
-        "product": "vivy", "source": "agentctl", "usd": 0.1234,
+        "product": "widget", "source": "agentctl", "usd": 0.1234,
         "run_id": "run-abc", "dedup_key": "run-abc", "lane": "gateway",
         "agent": "coder", "model": "claude-sonnet-5",
     }
@@ -847,7 +1019,7 @@ def test_post_ledger_entry_sends_the_subscription_lane(monkeypatch):
         return _Resp(200, {"recorded": True, "id": "entry_sub"})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+    bc.post_ledger_entry("widget", 0.5, run_id="run-abc", dedup_key="run-abc",
                         lane="subscription", tok="t")
     assert captured["body"]["lane"] == "subscription"
 
@@ -860,7 +1032,7 @@ def test_post_ledger_entry_omits_agent_and_model_when_absent(monkeypatch):
         return _Resp(200, {"recorded": True, "id": "entry_2"})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+    bc.post_ledger_entry("widget", 0.5, run_id="run-abc", dedup_key="run-abc",
                         lane="subscription", tok="t")
     assert "agent" not in captured["body"]
     assert "model" not in captured["body"]
@@ -876,7 +1048,7 @@ def test_post_ledger_entry_sends_item_id_when_given(monkeypatch):
         return _Resp(200, {"recorded": True, "id": "entry_3"})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+    bc.post_ledger_entry("widget", 0.5, run_id="run-abc", dedup_key="run-abc",
                         lane="subscription", item_id="issue_E16_5", tok="t")
     assert captured["body"]["item_id"] == "issue_E16_5"
 
@@ -889,9 +1061,41 @@ def test_post_ledger_entry_omits_item_id_when_absent(monkeypatch):
         return _Resp(200, {"recorded": True, "id": "entry_4"})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+    bc.post_ledger_entry("widget", 0.5, run_id="run-abc", dedup_key="run-abc",
                         lane="subscription", tok="t")
     assert "item_id" not in captured["body"]
+
+
+def test_post_ledger_entry_sends_day_when_given(monkeypatch):
+    """`day` is the caller's own bucketing of the run's finish instant
+    (`telemetry.platform_day`/`platform_day_for`) — sent verbatim, this
+    client has no opinion on how it was computed."""
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp(200, {"recorded": True, "id": "entry_5"})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    bc.post_ledger_entry("widget", 0.5, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", day="2026-10-20", tok="t")
+    assert captured["body"]["day"] == "2026-10-20"
+
+
+def test_post_ledger_entry_omits_day_when_absent(monkeypatch):
+    """No `day` argument means no `day` key in the body — the Library books
+    the entry to its own local date on arrival instead (its route's
+    documented `day = payload.get("day") or local_day()` fallback)."""
+    captured = {}
+
+    def fake_urlopen(req, timeout=None):
+        captured["body"] = json.loads(req.data)
+        return _Resp(200, {"recorded": True, "id": "entry_6"})
+
+    monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
+    bc.post_ledger_entry("widget", 0.5, run_id="run-abc", dedup_key="run-abc",
+                        lane="subscription", tok="t")
+    assert "day" not in captured["body"]
 
 
 def test_post_ledger_entry_a_rerun_sends_the_same_dedup_key(monkeypatch):
@@ -902,9 +1106,9 @@ def test_post_ledger_entry_a_rerun_sends_the_same_dedup_key(monkeypatch):
         return _Resp(200, {"recorded": True, "id": "entry_1", "idempotent": len(seen) > 1})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+    bc.post_ledger_entry("widget", 0.1, run_id="run-abc", dedup_key="run-abc",
                         lane="subscription", tok="t")
-    bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+    bc.post_ledger_entry("widget", 0.1, run_id="run-abc", dedup_key="run-abc",
                         lane="subscription", tok="t")
     assert seen == ["run-abc", "run-abc"]
 
@@ -914,7 +1118,7 @@ def test_post_ledger_entry_recorded_false_is_not_recorded_not_an_error(monkeypat
         bc.urllib.request, "urlopen",
         lambda *_a, **_k: _Resp(200, {"recorded": False,
                                       "reason": "no live ledger for this scope"}))
-    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+    res = bc.post_ledger_entry("widget", 0.1, run_id="run-abc", dedup_key="run-abc",
                               lane="subscription", tok="t")
     assert res["status"] == "not-recorded"
 
@@ -929,7 +1133,7 @@ def test_post_ledger_entry_a_disproportionate_refusal_is_reported_not_retried(mo
         raise bc.urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {}, io.BytesIO(body))
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", raise_422)
-    res = bc.post_ledger_entry("vivy", 999.0, run_id="run-abc", dedup_key="run-abc",
+    res = bc.post_ledger_entry("widget", 999.0, run_id="run-abc", dedup_key="run-abc",
                               lane="subscription", tok="t")
     assert res["status"] == "disproportionate"
     assert "soft cap" in res["error"]
@@ -949,7 +1153,7 @@ def test_post_ledger_entry_a_different_422_stays_error_422(monkeypatch):
         raise bc.urllib.error.HTTPError(req.full_url, 422, "Unprocessable", {}, io.BytesIO(body))
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", raise_422)
-    res = bc.post_ledger_entry("vivy", 0.5, run_id="run-abc", dedup_key="run-abc",
+    res = bc.post_ledger_entry("widget", 0.5, run_id="run-abc", dedup_key="run-abc",
                               lane="subscription", tok="t")
     assert res["status"] == "error:422"
     assert "day is too far" in res["error"]
@@ -958,7 +1162,7 @@ def test_post_ledger_entry_a_different_422_stays_error_422(monkeypatch):
 def test_post_ledger_entry_an_unreachable_library_is_an_error_status(monkeypatch):
     monkeypatch.setattr(bc.urllib.request, "urlopen",
                         lambda *_a, **_k: (_ for _ in ()).throw(OSError("down")))
-    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+    res = bc.post_ledger_entry("widget", 0.1, run_id="run-abc", dedup_key="run-abc",
                               lane="subscription", tok="t")
     assert res["status"].startswith("error:")
 
@@ -979,7 +1183,7 @@ def test_post_ledger_entry_reads_the_ledger_reporter_token_file(monkeypatch, tmp
         return _Resp(200, {"recorded": True, "id": "entry_5"})
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
-    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+    res = bc.post_ledger_entry("widget", 0.1, run_id="run-abc", dedup_key="run-abc",
                               lane="subscription")
     assert res["status"] == "recorded"
     assert captured["auth"] == "Bearer real-ledger-token"
@@ -996,7 +1200,7 @@ def test_post_ledger_entry_skips_without_a_token_file(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(bc.urllib.request, "urlopen",
                         lambda *a, **k: calls.append(1))
-    res = bc.post_ledger_entry("vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+    res = bc.post_ledger_entry("widget", 0.1, run_id="run-abc", dedup_key="run-abc",
                               lane="subscription")
     assert res["status"] == "skip"
     assert calls == []
@@ -1008,7 +1212,7 @@ def test_post_ledger_entry_skips_on_an_empty_token_file(monkeypatch, tmp_path):
     monkeypatch.setattr(bc, "LEDGER_TOKEN_PATH", empty)
     monkeypatch.setattr(bc, "token", lambda: "general-token-should-not-be-used")
     assert bc.post_ledger_entry(
-        "vivy", 0.1, run_id="run-abc", dedup_key="run-abc",
+        "widget", 0.1, run_id="run-abc", dedup_key="run-abc",
         lane="subscription")["status"] == "skip"
 
 
@@ -1024,11 +1228,11 @@ def test_list_ledger_entries_builds_the_url_from_every_filter(monkeypatch):
 
     monkeypatch.setattr(bc.urllib.request, "urlopen", fake_urlopen)
     bc.list_ledger_entries(epic_id="issue_E", item_id="issue_C", run_id="run-1",
-                           product="vivy", source="agentctl", day="2026-10-01", tok="t")
+                           product="widget", source="agentctl", day="2026-10-01", tok="t")
     url = captured["url"]
     assert "/ledger-entries?" in url
     for pair in ("epic_id=issue_E", "item_id=issue_C", "run_id=run-1",
-                "product=vivy", "source=agentctl", "day=2026-10-01"):
+                "product=widget", "source=agentctl", "day=2026-10-01"):
         assert pair in url
 
 
@@ -1080,3 +1284,117 @@ def test_list_ledger_entries_raises_without_a_token(monkeypatch):
     monkeypatch.setattr(bc, "token", lambda: None)
     with pytest.raises(bc.IssueQueueUnavailable):
         bc.list_ledger_entries(epic_id="issue_E")
+
+
+# --- check_merge_admission: POST /merge/admission (CQ·534, library-protocol §6.7) ---
+#
+# Runs through pinned_opener() against the Library's FIXED default address, the
+# same as get_item_from_default_library/post_review_record, and for the same
+# reason: the answer AUTHORISES a merge, so nothing the caller's environment
+# controls may steer it. Stubbed here at the opener, never at urllib.request.
+# urlopen — conftest's `_no_live_pinned_opener_calls` guard fails loudly on an
+# unpatched pinned_opener() reaching a live Library, which an urlopen-only stub
+# would leave unpatched.
+
+
+class _StubOpener:
+    """Stands in for `issue_client.pinned_opener()`: records every request
+    passed to `.open()` and answers (or raises) via `handler`."""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.requests: list = []
+
+    def open(self, req, timeout=None):
+        self.requests.append(req)
+        return self._handler(req, timeout)
+
+
+def test_check_merge_admission_sends_the_documented_fields(monkeypatch):
+    captured = {}
+
+    def handler(req, timeout):
+        captured["url"] = req.full_url
+        captured["auth"] = req.headers.get("Authorization")
+        captured["protocol"] = req.headers.get("Library-protocol")
+        captured["body"] = json.loads(req.data)
+        return _Resp(200, {"approved": True, "reason": "", "head_sha": "a" * 40,
+                           "enforced": True, "missing": []})
+
+    monkeypatch.setattr(bc, "pinned_opener", lambda: _StubOpener(handler))
+    res = bc.check_merge_admission("convivy/knowledge", 7, "a" * 40,
+                                   "agentctl kb merge", tok="t")
+    assert res == {"approved": True, "reason": "", "head_sha": "a" * 40,
+                   "enforced": True, "missing": []}
+    assert captured["url"] == bc.vault_plane.fixed_library_url("/merge/admission")
+    assert captured["auth"] == "Bearer t"
+    assert captured["protocol"] == "1"
+    assert captured["body"] == {"repo": "convivy/knowledge", "pr": 7,
+                                "head_sha": "a" * 40, "requester": "agentctl kb merge"}
+
+
+def test_check_merge_admission_returns_a_refusal_body_rather_than_raising(monkeypatch):
+    """`approved: false` is a well-formed 200 answer, not a failure of the ask
+    itself — the CALLER decides whether to merge; this client only carries
+    the answer."""
+    monkeypatch.setattr(
+        bc, "pinned_opener",
+        lambda: _StubOpener(lambda req, timeout: _Resp(200, {
+            "approved": False, "reason": "round cap exceeded", "head_sha": "a" * 40,
+            "enforced": True,
+            "missing": [{"kind": "stamp", "role": "security-reviewer", "workflow": None,
+                        "detail": "no APPROVE at this head", "retryable": True}]})))
+    res = bc.check_merge_admission("convivy/knowledge", 7, "a" * 40,
+                                   "agentctl kb merge", tok="t")
+    assert res["approved"] is False
+    assert res["reason"] == "round cap exceeded"
+    assert res["missing"][0]["role"] == "security-reviewer"
+
+
+@pytest.mark.parametrize("code, error_text", [
+    (401, "no identity resolves"),
+    (403, "this identity lacks 'merge.admit'"),
+    (404, "convivy/knowledge is not a registered project"),
+    (500, "internal error"),
+])
+def test_check_merge_admission_raises_on_a_refusal_status(monkeypatch, code, error_text):
+    def handler(req, timeout):
+        body = json.dumps({"error": error_text}).encode()
+        raise bc.urllib.error.HTTPError(req.full_url, code, "refused", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(bc, "pinned_opener", lambda: _StubOpener(handler))
+    with pytest.raises(bc.MergeAdmissionError) as excinfo:
+        bc.check_merge_admission("convivy/knowledge", 7, "a" * 40, "agentctl kb merge", tok="t")
+    assert excinfo.value.status == str(code)
+    assert excinfo.value.text == error_text
+
+
+def test_check_merge_admission_raises_on_a_timeout(monkeypatch):
+    def handler(req, timeout):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(bc, "pinned_opener", lambda: _StubOpener(handler))
+    with pytest.raises(bc.MergeAdmissionError) as excinfo:
+        bc.check_merge_admission("convivy/knowledge", 7, "a" * 40, "agentctl kb merge", tok="t")
+    assert excinfo.value.status == "transport:TimeoutError"
+
+
+def test_check_merge_admission_raises_on_a_malformed_body(monkeypatch):
+    """A 200 whose body has no `approved` field is not a well-formed answer —
+    there is no reading it as either approved or refused."""
+    monkeypatch.setattr(
+        bc, "pinned_opener",
+        lambda: _StubOpener(lambda req, timeout: _Resp(200, {"reason": "no approved field at all"})))
+    with pytest.raises(bc.MergeAdmissionError) as excinfo:
+        bc.check_merge_admission("convivy/knowledge", 7, "a" * 40, "agentctl kb merge", tok="t")
+    assert excinfo.value.status == "bad-body"
+
+
+def test_check_merge_admission_raises_without_a_token(monkeypatch):
+    monkeypatch.setattr(bc, "token", lambda: None)
+    calls = []
+    monkeypatch.setattr(bc, "pinned_opener", lambda: calls.append(1))
+    with pytest.raises(bc.MergeAdmissionError) as excinfo:
+        bc.check_merge_admission("convivy/knowledge", 7, "a" * 40, "agentctl kb merge")
+    assert excinfo.value.status == "no-token"
+    assert calls == []

@@ -34,13 +34,13 @@ def _render(knowledge_ctx, kind: str, row: dict, src: pathlib.Path) -> str:
 def test_trigger_becomes_the_description(knowledge_ctx, tmp_path):
     src = _write(
         tmp_path,
-        "id: cfo/agents/cfo-ingest\n"
+        "id: ledger/agents/ledger-ingest\n"
         "kind: agent\n"
         "trigger: use when the operator has a downloaded bank or card statement to load",
-        "You load a single statement file into the CFO database.\n",
+        "You load a single statement file into the LEDGER database.\n",
     )
-    out = _render(knowledge_ctx, "agent", {"id": "cfo/agents/cfo-ingest",
-                                         "title": "CFO Ingest"}, src)
+    out = _render(knowledge_ctx, "agent", {"id": "ledger/agents/ledger-ingest",
+                                         "title": "Ledger Ingest"}, src)
     assert "description: use when the operator has a downloaded bank or card statement to load" in out
     assert "You load a single statement file" not in out.split("---")[1]
 

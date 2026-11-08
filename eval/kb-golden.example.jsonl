@@ -1,0 +1,13 @@
+# --- SYNTHETIC EXAMPLE SET. Invented product names ("porchlight", "kelpline")
+# --- and invented document ids throughout — none of this is real traffic or a
+# --- real document. kb-eval scores this only when the install has no golden set
+# --- of its own at <builder root>/install/kb-golden.jsonl; its score is a smoke
+# --- test of the scoring code, not a measurement of any real knowledge index.
+{"id": "ex-deploy-kw", "query": "deploy runbook", "style": "keyword", "expect": ["shared/runbooks/example-deploy-runbook"], "note": "example: deploy runbook lookup"}
+{"id": "ex-deploy-nl", "query": "how do I deploy the example service", "style": "nl", "expect": ["shared/runbooks/example-deploy-runbook"], "note": "NL form of ex-deploy-kw"}
+{"id": "ex-webhook-kw", "query": "webhook setup", "style": "keyword", "expect": ["shared/runbooks/example-webhook-setup"], "note": "example: webhook provisioning"}
+{"id": "ex-reviewer-kw", "query": "security reviewer agent", "style": "keyword", "expect": ["shared/agents/example-security-reviewer", "shared/agents/example-security-auditor"], "note": "example: either agent counts as a hit"}
+{"id": "ex-reviewer-nl", "query": "which agent reviews code for security problems", "style": "nl", "expect": ["shared/agents/example-security-reviewer", "shared/agents/example-security-auditor"], "note": "NL form of ex-reviewer-kw"}
+{"id": "ex-porchlight-kw", "query": "porchlight checkout flow", "style": "keyword", "filters": {"project": "porchlight"}, "expect": ["porchlight/decisions/0001-example-checkout-flow"], "note": "example: filtered project decision"}
+{"id": "ex-kelpline-nl", "query": "how does kelpline retire old ledger entries", "style": "nl", "filters": {"project": "kelpline"}, "expect": ["kelpline/decisions/0004-example-ledger-retirement"], "note": "NL example with project filter"}
+{"id": "ex-kelpline-cheatsheet-kw", "query": "ops cheat sheet", "style": "keyword", "filters": {"project": "kelpline"}, "expect": ["kelpline/runbooks/example-ops-cheat-sheet"], "note": "example: project-scoped runbook"}

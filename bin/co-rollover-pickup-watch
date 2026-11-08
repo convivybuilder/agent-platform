@@ -1,0 +1,74 @@
+#!/usr/bin/env python3.11
+"""co-rollover-pickup-watch — record a rollover successor's pickup, detached.
+
+`bin/co` starts this, detached, for every rollover-successor launch, right
+before it `exec`s claude (see that file's `_co_exec_claude`) — so the pickup
+is recorded by the launcher rather than depending on the successor's MODEL
+choosing to run `/handoff-pickup`'s own `co-rollover --picked-up`, which
+twice it did not (2026-10-01, 2026-10-24), leaving the predecessor's pane
+fenced and alive until the operator ran the command by hand.
+
+Waits, bounded, for proof the successor actually came up — the side channel
+AND the exec'd pid running claude (`co_rollover.wait_for_pickup_ready`) —
+then runs `co-rollover --picked-up <handoff-path>` itself, with
+`CLAUDE_CODE_SESSION_ID` set to the id `bin/co` generated and handed `claude
+--session-id` (co runs before claude exists, so it has no session id of its
+own to use — see `bin/co`'s own comment at the call site).
+
+A model that also runs `/handoff-pickup`'s `co-rollover --picked-up` stays
+harmless: that command is idempotent (`co_rollover.mark_picked_up`), so
+whichever of the two calls lands first is the one that counts.
+
+Exits 0 once pickup is recorded (by this call or an idempotent no-op); 1 on
+a timeout or a non-zero `co-rollover` exit, both logged to
+`co_rollover.CLOSE_OUT_LOG_NAME` under `rollover_policy.CACHE_DIR` — this
+script's own stdout/stderr are closed by `bin/co` before it `exec`s claude,
+so that log is the only place either failure can ever be read.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+_SELF = Path(__file__).resolve()
+_LIB_DIR = _SELF.parent.parent / "lib" / "agent-platform"
+sys.path.insert(0, str(_LIB_DIR))
+import co_rollover as CR  # noqa: E402
+
+# Beside THIS file, the same reasoning as `bin/co-rollover`'s own
+# `_AGENTCTL` (ARCH-229): a worktree's own copy of this script must record
+# the pickup through ITS OWN worktree's co-rollover, never whatever the
+# primary checkout happens to have.
+_CO_ROLLOVER = _SELF.parent / "co-rollover"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--handoff-path", required=True, metavar="PATH",
+                     help="the handoff path co_rollover.spawn_successor's prompt named")
+    ap.add_argument("--claude-pid", required=True, type=int,
+                     help="bin/co's own pid -- the pid claude runs as once co execs it")
+    ap.add_argument("--session-id", required=True,
+                     help="the uuid bin/co generated and gave claude --session-id")
+    ap.add_argument("--timeout", type=float, default=120.0)
+    args = ap.parse_args()
+    return CR.run_pickup_watch(
+        args.handoff_path, args.claude_pid, args.session_id,
+        timeout=args.timeout, picked_up_argv=[str(_CO_ROLLOVER)])
+
+
+if __name__ == "__main__":
+    # Detach into a new session, best-effort. `bin/co` backgrounds this
+    # script and redirects its stdin/stdout/stderr before it `exec`s claude,
+    # but the process itself still shares `co`'s process group until it
+    # leaves it. A process that is already a process-group leader (job
+    # control disabled, the common case for a backgrounded script) cannot
+    # call `setsid` at all (`OSError`), and that is not a reason to fail a
+    # watch whose only job is to outlive the exec.
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    sys.exit(main())

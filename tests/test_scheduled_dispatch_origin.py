@@ -8,9 +8,17 @@ AGENT_RUN_ORIGIN. `interactive` is deliberately absent from
 budget.CAPPED_ORIGINS (it's the operator's uncapped in-the-loop work), so the
 overnight pool's soft/hard caps never applied to any of it.
 
-Every OTHER scheduled dispatcher goes through a shell launcher that exports
-the origin before calling `agentctl spawn` (launch-overnight, launch-
-overnight-hollis, launch-weekly-curation, launch-weekly-consulting).
+Every OTHER scheduled dispatcher, at the time, went through a shell launcher
+that exported the origin before calling `agentctl spawn` (launch-overnight,
+launch-overnight-galley, launch-weekly-curation, launch-weekly-consulting).
+The two overnight launchers were deleted by commit b23cf33e7 on 2026-09-14;
+launch-weekly-consulting was retired by platform/decisions/0103.
+launch-weekly-curation still calls `agentctl spawn`, but no plist in launchd/
+points at it, so the sweep below never resolves it. The real plists the sweep
+finds dispatching agents today are changelog-drain and dependabot-review,
+both in KNOWN_UNFIXED below because neither sets AGENT_RUN_ORIGIN yet. The
+committed fixture dispatcher under tests/fixtures/scheduled_dispatch/ is what
+the runtime check near the bottom of this file runs.
 issue-queue-drain is a Python program its plist invokes directly, with no
 launcher, so it never picked up the convention — fixed by giving it its own
 `os.environ.setdefault("AGENT_RUN_ORIGIN", "scheduled")`.
@@ -39,6 +47,16 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 LAUNCHD = REPO / "launchd"
 BIN = REPO / "bin"
+
+# A committed, always-present stand-in for a real scheduled dispatcher, so
+# _dispatchers_with_sources() below never empties out just because every real
+# plist outside KNOWN_UNFIXED has been retired (security review, round 1, on
+# the PR that removed com.convivy.weekly-consulting.plist — the one plist
+# that used to be that list's sole non-excluded member). See
+# tests/fixtures/scheduled_dispatch/bin/fixture-dispatcher for why.
+FIXTURE_DIR = REPO / "tests" / "fixtures" / "scheduled_dispatch"
+FIXTURE_LAUNCHD = FIXTURE_DIR / "launchd"
+FIXTURE_BIN = FIXTURE_DIR / "bin"
 
 # The budget gate's OWN capped set rather than a copy restated here. A
 # hardcoded list would keep passing after someone changed which origins are
@@ -143,7 +161,7 @@ def _code_lines(source: Path) -> list[str]:
     expression, and BOTH halves are load-bearing:
 
     Dropping docstrings is what the round-1 review's widened resolver forced.
-    `bin/run-register-api` discusses `agentctl spawn <cfo-agent>` in its module
+    `bin/run-register-api` discusses `agentctl spawn <ledger-agent>` in its module
     docstring, which opens with a quote rather than a `#`, so `#`-stripping
     alone read a file that TALKS about a call as one that MAKES one.
 
@@ -454,7 +472,7 @@ def test_the_resolver_sees_a_program_under_ANY_deploy_root():
 
 
 def test_prose_about_agentctl_spawn_is_not_a_dispatch():
-    """bin/run-register-api discusses `agentctl spawn <cfo-agent>` in its module
+    """bin/run-register-api discusses `agentctl spawn <ledger-agent>` in its module
     docstring and calls nothing. Stripping only `#` lines counted it as a
     dispatcher, which the widened resolver surfaced. Pins the fix, and pins the
     other half too — bin/changelog-drain's real dispatch (`cmd = [str(AGENTCTL),
@@ -733,6 +751,31 @@ def _prelude_through_origin(source: Path) -> str | None:
     return None
 
 
+def _resolve_fixture_program(argv: list[str]) -> Path | None:
+    """The same by-basename resolution rule as `_resolve_program`, aimed at
+    the fixture's own bin/ directory instead of the repo's, so the committed
+    synthetic dispatcher below is resolved by the identical rule a real
+    plist's program gets."""
+    for entry in argv:
+        if entry in _INTERPRETERS:
+            continue
+        if not (entry.startswith("/") or entry.startswith("__HOME__")):
+            continue
+        candidate = FIXTURE_BIN / Path(entry).name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _fixture_dispatchers_with_sources() -> list[tuple[str, Path]]:
+    out = []
+    for pl in sorted(FIXTURE_LAUNCHD.glob("*.plist")):
+        src = _resolve_fixture_program(_argv(pl))
+        if src is not None and _dispatches_agents(src):
+            out.append((pl.name, src))
+    return out
+
+
 def _dispatchers_with_sources() -> list[tuple[str, Path]]:
     out = []
     for pl in _plists():
@@ -741,13 +784,64 @@ def _dispatchers_with_sources() -> list[tuple[str, Path]]:
         src = _resolve_program(_argv(pl))
         if src is not None and _dispatches_agents(src):
             out.append((pl.name, src))
+    # The committed fixture dispatcher, always appended, so this list is
+    # never solely at the mercy of which real plists remain outside
+    # KNOWN_UNFIXED.
+    out.extend(_fixture_dispatchers_with_sources())
     return out
+
+
+def test_the_fixture_dispatcher_is_found_and_classified():
+    """Pins that the committed fixture resolves and is classified as
+    dispatching, so a broken fixture fails here with a clear name rather than
+    showing up as an empty parametrize two tests down."""
+    found = _fixture_dispatchers_with_sources()
+    assert found, (
+        "tests/fixtures/scheduled_dispatch/ did not yield a resolved, "
+        "dispatching program — check the fixture plist's ProgramArguments "
+        "basename matches tests/fixtures/scheduled_dispatch/bin/, and that "
+        "the fixture script's own code (not a comment) still calls "
+        "`agentctl spawn`"
+    )
+
+
+def test_the_real_dispatcher_runtime_coverage_is_not_empty():
+    """`_dispatchers_with_sources()` feeding an empty list into
+    `test_a_real_dispatchers_origin_reaches_a_child_process`'s parametrize
+    makes pytest emit one silent SKIPPED item, not a failure — the exact
+    hazard this file's module docstring warns about, applied to this file's
+    own runtime check (security review, round 1: this is what let
+    com.convivy.weekly-consulting.plist's retirement empty the list
+    unnoticed). This fails loudly instead, independently of the fixture
+    added above, so a future change that broke BOTH the fixture and every
+    real dispatcher still gets a failure rather than a skip."""
+    assert _dispatchers_with_sources(), (
+        "_dispatchers_with_sources() returned nothing — "
+        "test_a_real_dispatchers_origin_reaches_a_child_process below would "
+        "silently SKIP instead of verifying anything, which is a failure, "
+        "not a skip"
+    )
 
 
 def test_there_are_dispatchers_to_run():
     """A discovery step that silently found none would make the test below
-    vacuous — the failure mode this whole file is about."""
-    assert _dispatchers_with_sources(), "no agent-dispatching plists resolved"
+    vacuous — the failure mode this whole file is about.
+
+    Checked against EVERY plist that resolves and dispatches agents, not
+    `_dispatchers_with_sources()`'s filtered list: `changelog-drain` and
+    `dependabot-review` (KNOWN_UNFIXED) genuinely dispatch agents today, so
+    their exclusion from the parametrized runtime test below — correct, since
+    neither sets AGENT_RUN_ORIGIN yet — must not also read as "the detector
+    itself is broken" once `com.convivy.weekly-consulting.plist`, the one
+    non-excluded dispatcher this file's sweep used to find, was retired
+    (platform/decisions/0102, 0103). This is the same detector either way
+    (`_resolve_program` + `_dispatches_agents`); only the exclusion differs."""
+    assert any(
+        _dispatches_agents(src)
+        for pl in _plists()
+        for src in (_resolve_program(_argv(pl)),)
+        if src is not None
+    ), "no agent-dispatching plist resolves anywhere in launchd/ — the detector itself looks broken"
 
 
 @pytest.mark.parametrize(

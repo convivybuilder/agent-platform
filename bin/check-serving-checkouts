@@ -51,28 +51,28 @@ dirty file only counts as a finding when BOTH:
   - it is TRACKED and changed (`git status --porcelain` reports anything other
     than `??`) — an untracked file is something nobody committed yet, which is
     a different situation from a committed file whose content on disk has
-    silently drifted from the commit a review approved. `com.convivy.cfo-review`
-    serving from a checkout with untracked `agent-runs/`/`hook-log/`/`webapp/`
-    directories alongside four MODIFIED tracked files (`schema.sql` and three
-    scripts) is exactly this split: the modified files are the finding, the
-    untracked directories are operational data this rule correctly ignores.
+    silently drifted from the commit a review approved. A black-box crew's own
+    service, found serving from a checkout with untracked operational-data
+    directories alongside several MODIFIED tracked files, is exactly this
+    split: the modified files are the finding, the untracked directories are
+    operational data this rule correctly ignores.
 
-BLACK-BOX CREWS. CFO is a black-box crew (`platform/decisions/0043`) — this
+BLACK-BOX CREWS. A registered black-box crew (`platform/decisions/0043`) — this
 check must never read a served file's CONTENT, only THAT it changed. Every
 signal here comes from `git branch --show-current`/`git status --porcelain`:
 a branch name, a path, a one-letter status code. Nothing here runs `git
 diff`, `git show`, `git log -p`, or opens a file. That is not a carve-out
-for CFO specifically — it is the design, so the same check is safe to run
-against any black-box crew added later without anyone having to remember to
-exempt it.
+for one black-box crew specifically — it is the design, so the same check is
+safe to run against any black-box crew added later without anyone having to
+remember to exempt it.
 
 CONTENT SAFETY IS NOT THE WHOLE CONSTRAINT, and this file's first draft
 missed the other half (security-reviewer, PR #423, run-0d72a1e3): a
 finding's own EXISTENCE in the shared, multi-reader signal store is itself a
-leak, independent of how little it says. Logging "CFO is on branch `x` with
+leak, independent of how little it says. Logging "<crew> is on branch `x` with
 these changed files" is exactly what ADR-0043 forbids — "a black box crew
 files no issues and logs no signals" — even though the finding never quotes
-a line of CFO's own code. `main()` checks `_is_private_checkout` once per
+a line of that crew's own code. `main()` checks `_is_private_checkout` once per
 checkout, via the SAME registry lookup `session_state.py`/`tmux_transcript.py`
 already use (`private_crew.private_home_for`, not a second implementation
 that could drift), and a private crew's findings print to this process's own
@@ -181,7 +181,7 @@ class HostForkExhausted(Exception):
     call this script makes failed with `EAGAIN` (errno 35). This script read
     that the same way it reads a genuinely broken checkout — an `unreadable`
     finding against each repository it happened to be checking — and the
-    selector crew had to close those findings by hand. Raised instead of
+    affected crews had to close those findings by hand. Raised instead of
     returned, so one subprocess call that cannot even start aborts the whole
     pass (see `main`'s fork-exhaustion handling) rather than being
     misattributed to a repository that was never the problem.
@@ -300,8 +300,8 @@ def _is_private_checkout(repo_dir: pathlib.Path) -> bool:
 
     THE BUG THIS CLOSES (security-reviewer, PR #423, run-0d72a1e3). This
     check's findings used to be written to the shared, multi-reader store for
-    every checkout, CFO included — a signal there names CFO's branch and
-    changed file paths, which is exactly what
+    every checkout, a black-box crew's included — a signal there names that
+    crew's branch and changed file paths, which is exactly what
     the ADR says must never happen: "A black box crew files no issues and
     logs no signals... so the queue and the issue-derived views will not see
     it, and should not." Never reading file CONTENT (this script's other,
@@ -320,9 +320,10 @@ def _is_private_checkout(repo_dir: pathlib.Path) -> bool:
     and inode-based comparison `session_state.py`/`tmux_transcript.py`
     already use — not a second implementation of "which crew owns this
     directory" that could drift from theirs. Reusing it here also closes the
-    case-sensitivity trap a naive fix would walk straight into: CFO's
-    checkout directory is capital-`CFO` on disk while the registry's slug is
-    lower-case `cfo`, so a bare string comparison against a slug set would
+    case-sensitivity trap a naive fix would walk straight into: a black-box
+    crew's checkout directory does not always match the registry slug's
+    exact case (one registered crew's is capitalized on disk while its slug
+    is lower-case), so a bare string comparison against a slug set would
     silently never match; `private_home_for` compares real paths via
     `os.path.samefile`, not names.
     """
@@ -376,7 +377,7 @@ def _plist_fields(path: pathlib.Path) -> tuple[dict[str, str], str]:
     real plists here carry in their own header comments (documentation, not
     the directive). macOS's own `plutil` accepts them without complaint, and
     launchd itself clearly does too, since it runs these jobs.
-    `com.selector-backend.api` is the ONLY plist naming that checkout, so
+    One real plist is the ONLY one naming its checkout, so
     `plistlib` alone would make an entire real, currently-running service
     invisible to this check, not merely undercounted.
 
@@ -748,7 +749,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[OK] {repo_dir}: on main, clean ({len(labels)} service(s))")
                 continue
             services = ", ".join(labels)
-            # CFO (and any future black-box crew) never reaches _post_signal — a
+            # A black-box crew's checkout never reaches _post_signal — a
             # finding's own EXISTENCE in the shared signal store is the leak
             # ADR-0043 forbids, independent of the fact that this check never
             # reads file content (security-reviewer, PR #423, run-0d72a1e3). The
@@ -781,9 +782,9 @@ def main(argv: list[str] | None = None) -> int:
         # so there is no partial read to resolve a crew from. Building a
         # SECOND privacy resolution for "which crew does this filename
         # belong to" would be worse than the exposure it closes (steward,
-        # 2026-08-21) — a plist filename can itself name a crew
-        # (`com.convivy.cfo-review.plist` genuinely contains "cfo"), so the
-        # shared signal reports only a COUNT; the actual filenames go to this
+        # 2026-08-21) — a plist filename can itself name a crew (one
+        # black-box crew's own job label genuinely contains its crew name),
+        # so the shared signal reports only a COUNT; the actual filenames go to this
         # process's own local stderr log only, same as a private checkout's
         # finding already does.
         findings += 1

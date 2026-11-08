@@ -900,3 +900,92 @@ def test_a_reading_just_outside_the_per_file_cap_is_not_found(tmp_path, monkeypa
     _make_run_with_raw_transcript(runs_root, "run-a", data)
     got = UW.read_five_hour_window(runs_root, now=0)
     assert got is None
+
+
+# --- which account wrote a reading (CQ·517) -----------------------------------
+# Synthetic addresses only; the real ~/.claude.json and claude-sub are never
+# touched (tests/conftest.py points both seams at nothing by default).
+
+_SLOT_EMAIL = "slot-owner@example.invalid"
+_CACHED_EMAIL = "cached-owner@example.invalid"
+
+
+def _stub_claude_sub(tmp_path, monkeypatch, *, current, slots, sleep=0):
+    """A stand-in `claude-sub`: `current` prints *current*, `list` prints one
+    tab-separated line per (slot id, email) pair in *slots*."""
+    listing = tmp_path / "claude-sub-list.txt"
+    listing.write_text("".join(f"{sid}\t{email}\n" for sid, email in slots))
+    stub = tmp_path / "claude-sub"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"sleep {sleep}\n"
+        'case "$1" in\n'
+        f"  current) printf '%s' '{current}' ;;\n"
+        f"  list) cat '{listing}' ;;\n"
+        "  *) exit 2 ;;\n"
+        "esac\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr(UW, "CLAUDE_SUB_CMD", str(stub))
+
+
+def _cached_account(tmp_path, monkeypatch, email):
+    path = tmp_path / ".claude.json"
+    path.write_text(json.dumps({"oauthAccount": {"emailAddress": email,
+                                                 "displayName": "synthetic"}}))
+    monkeypatch.setattr(UW, "CLAUDE_JSON_PATH", path)
+
+
+def test_live_account_is_unknown_with_neither_source():
+    assert UW._resolve_live_account() is None
+
+
+def test_live_account_prefers_the_claude_sub_slot_over_the_cached_block(tmp_path, monkeypatch):
+    # A `claude-sub use` swap: the cached oauthAccount still names the old account.
+    _stub_claude_sub(tmp_path, monkeypatch, current="2",
+                     slots=[("1", _CACHED_EMAIL), ("2", _SLOT_EMAIL)])
+    _cached_account(tmp_path, monkeypatch, _CACHED_EMAIL)
+    assert UW._resolve_live_account() == UW._account_digest(_SLOT_EMAIL)
+    assert UW._resolve_live_account() != UW._account_digest(_CACHED_EMAIL)
+
+
+def test_live_account_falls_back_to_the_cached_block_when_no_slot_matches(tmp_path, monkeypatch):
+    # A `/login` to an account with no saved slot: `current` prints nothing.
+    _stub_claude_sub(tmp_path, monkeypatch, current="", slots=[("1", _SLOT_EMAIL)])
+    _cached_account(tmp_path, monkeypatch, _CACHED_EMAIL)
+    assert UW._resolve_live_account() == UW._account_digest(_CACHED_EMAIL)
+
+
+def test_live_account_does_not_wait_on_a_hanging_claude_sub(tmp_path, monkeypatch):
+    _stub_claude_sub(tmp_path, monkeypatch, current="2", slots=[], sleep=30)
+    monkeypatch.setattr(UW, "CLAUDE_SUB_TIMEOUT_SECONDS", 0.5)
+    _cached_account(tmp_path, monkeypatch, _CACHED_EMAIL)
+    started = time.monotonic()
+    assert UW._resolve_live_account() == UW._account_digest(_CACHED_EMAIL)
+    assert time.monotonic() - started < 5
+
+
+def test_the_digest_is_not_the_address(tmp_path):
+    digest = UW._account_digest(" Slot-Owner@Example.invalid ")
+    assert digest == UW._account_digest(_SLOT_EMAIL)
+    assert "@" not in digest and len(digest) == 64
+    UW.record_account(tmp_path, digest)
+    assert (tmp_path / UW.ACCOUNT_FILE).read_text() == digest + "\n"
+
+
+def test_record_account_writes_nothing_for_an_unknown_account(tmp_path):
+    UW.record_account(tmp_path, None)
+    assert not (tmp_path / UW.ACCOUNT_FILE).exists()
+
+
+def test_the_seven_day_reader_skips_another_accounts_reading(tmp_path):
+    runs_root = tmp_path / "agent-runs"
+    now = time.time()
+    for run_id, account, util, age in (("run-new", "b" * 64, 0.10, 600),
+                                       ("run-old", "a" * 64, 0.99, 60)):
+        line = json.dumps({"type": "rate_limit_event", "rate_limit_info": {
+            "status": "allowed", "unifiedWindows": {"seven_day": {
+                "utilization": util, "resetsAt": int(now + 3600)}}}})
+        t = _make_run(runs_root, run_id, lines=[line], mtime=now - age)
+        (t.parent / UW.ACCOUNT_FILE).write_text(account + "\n")
+    assert UW.read_seven_day_window(runs_root, now=now)["utilization"] == 0.99
+    assert UW.read_seven_day_window(runs_root, now=now, account="b" * 64)["utilization"] == 0.10

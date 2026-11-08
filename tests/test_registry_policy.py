@@ -73,7 +73,7 @@ def _entry(run_id, *, parent=None, agent="coder"):
         "agent": agent,
         "task": "t",
         "started_at": "2026-05-31T00:00:00Z",
-        "repo": "constance",
+        "repo": "globex",
         "worktree": "/tmp/wt",
         "pid": __import__("os").getpid(),
         "parent_run": parent,

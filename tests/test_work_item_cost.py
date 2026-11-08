@@ -18,7 +18,7 @@ import issue_client as IC
 
 
 def _item(item_id, state="open"):
-    return {"id": item_id, "product": "vivy", "state": state, "title": item_id}
+    return {"id": item_id, "product": "widget", "state": state, "title": item_id}
 
 
 def test_every_item_state_the_queue_holds_is_fetched_once_per_item(work_item_cost, monkeypatch):
@@ -48,7 +48,7 @@ def test_a_redirected_item_is_fetched_and_counted_as_abandoned(work_item_cost, m
     monkeypatch.setattr(cj, "RUNS_ROOT", runs)
     d = runs / "2026-06-10" / "run-a"
     d.mkdir(parents=True)
-    meta = {"run_id": "run-a", "agent": "coder", "model": "claude-sonnet-4-6", "repo": "vivy",
+    meta = {"run_id": "run-a", "agent": "coder", "model": "claude-sonnet-4-6", "repo": "widget",
             "task": "", "parent_run": None, "profile": "", "started_at": "2026-06-10T08:00:00Z",
             "billing_source": "subscription_credit", "issue": "issue_A"}
     (d / "meta.json").write_text(json.dumps(meta))
@@ -57,7 +57,7 @@ def test_a_redirected_item_is_fetched_and_counted_as_abandoned(work_item_cost, m
 
     def fake_list(state, *args, **kwargs):
         if state == "redirected":
-            return [{"id": "issue_A", "product": "vivy", "state": "redirected",
+            return [{"id": "issue_A", "product": "widget", "state": "redirected",
                      "title": "issue_A", "type": "bug", "parent_id": None}]
         return []
 
@@ -127,7 +127,7 @@ def _lane(**overrides):
 def test_a_filer_written_title_cannot_forge_a_line_of_the_table(work_item_cost):
     """A title is written by whoever filed the item. Its line break and escape sequence
     stay on the item's own row, so the summary line is printed only by the report."""
-    row = {"id": "issue_A", "product": "vivy", "state": "open", "run_count": 1,
+    row = {"id": "issue_A", "product": "widget", "state": "open", "run_count": 1,
            "run_ids": ["run-a"], "attribution": {"meta.issue": 1, "pr": 0},
            "title": "Fix login\nUnattributed runs: 0 (none).\x1b[2J",
            "by_billing_source": {"subscription_credit": _lane()}}
@@ -145,7 +145,7 @@ SUMMARY = "Unattributed runs: 0 (none)."
 def _row_printing(where, forged):
     """An item row with `forged` in the field `where` names: its title, its product, its
     billing lane, or a model the lane could not price."""
-    row = {"id": "issue_A", "product": "vivy", "state": "open", "title": "Fix login",
+    row = {"id": "issue_A", "product": "widget", "state": "open", "title": "Fix login",
            "run_count": 1, "run_ids": ["run-a"], "attribution": {"meta.issue": 1, "pr": 0},
            "by_billing_source": {"subscription_credit": _lane()}}
     if where == "title":
@@ -179,7 +179,7 @@ def test_a_line_break_in_a_product_cannot_split_the_item_row(work_item_cost):
     """The label is cut to 26 characters, so a product's forged summary line would be cut
     too. What a product's line break can still do is split the row, which leaves the lane
     off the line that names the item."""
-    row = _row_printing("product", "vivy\nx")
+    row = _row_printing("product", "widget\nx")
     text = work_item_cost.render(_report(items=[row]))
     [item_line] = [line for line in text.splitlines() if line.startswith("issue_A")]
     assert "subscription_credit" in item_line
@@ -242,7 +242,7 @@ def _stub_item_fetch(monkeypatch):
 
 def test_fetch_queue_ids_returns_the_ids_the_library_lists(work_item_cost, monkeypatch):
     monkeypatch.setattr(IC, "list_corrections_queues",
-                        lambda *a, **k: [{"id": "cq_A", "product": "vivy"},
+                        lambda *a, **k: [{"id": "cq_A", "product": "widget"},
                                          {"id": "cq_B", "product": "bosun"}])
     assert work_item_cost.fetch_queue_ids() == {"cq_A", "cq_B"}
 
@@ -361,13 +361,13 @@ def test_the_course_cli_resolves_by_product_and_prints_the_course_report(
     monkeypatch.setattr(IC, "get_item",
                         lambda item_id, *a, **k: {"progress": {"children": 1}})
     monkeypatch.setattr(IC, "list_corrections_queues",
-                        lambda *a, **k: [{"id": "cq_vivy", "product": "vivy"}])
+                        lambda *a, **k: [{"id": "cq_widget", "product": "widget"}])
     monkeypatch.setattr(IC, "list_ledger_entries", lambda **k: [])
 
     def fake_course_costs(start, end, items, course, epic_progress, queue_ids):
         assert course["id"] == "course_1"
         assert epic_progress == {"issue_E": {"children": 1}}
-        assert queue_ids == {"cq_vivy"}
+        assert queue_ids == {"cq_widget"}
         return {"window": {"start": start.isoformat(), "end": end.isoformat()},
                 "epics": [{"id": "issue_E", "title": "E", "state": "open",
                           "position": "remaining", "progress": {"children": 1},
@@ -415,7 +415,7 @@ def test_the_course_cli_json_mode_prints_both_reports(
 # --- --outcomes (E16·3) -------------------------------------------------------
 
 
-@pytest.mark.parametrize("extra", [["--course", "course_1"], ["--product", "vivy"]])
+@pytest.mark.parametrize("extra", [["--course", "course_1"], ["--product", "widget"]])
 def test_outcomes_combined_with_course_or_product_exits_1_with_no_output(
         work_item_cost, monkeypatch, capsys, extra):
     """--outcomes already prints its own outcome table; combined with --course or
@@ -488,7 +488,7 @@ def test_the_outcomes_cli_json_mode_prints_the_full_structure(
     monkeypatch.setattr(IC, "list_issues_by_state",
                         lambda state, *a, **k: [_item("issue_A")] if state == "open" else [])
     monkeypatch.setattr(IC, "list_corrections_queues",
-                        lambda *a, **k: [{"id": "cq_vivy", "product": "vivy"}])
+                        lambda *a, **k: [{"id": "cq_widget", "product": "widget"}])
 
     outcome = {
         "window": {"start": "2026-06-01T00:00:00+00:00", "end": "2026-06-30T00:00:00+00:00"},
@@ -505,7 +505,7 @@ def test_the_outcomes_cli_json_mode_prints_the_full_structure(
     }
 
     def fake_build(start, end, items, queue_ids):
-        assert queue_ids == {"cq_vivy"}
+        assert queue_ids == {"cq_widget"}
         return outcome
 
     monkeypatch.setattr(cj, "build_outcome_table", fake_build)
@@ -521,7 +521,7 @@ def _mk_issue_run(runs_root, date, run_id, *, issue, usd=1.0,
                   billing_source="provider_api:openai"):
     d = runs_root / date / run_id
     d.mkdir(parents=True)
-    meta = {"run_id": run_id, "agent": "coder", "model": "claude-sonnet-4-6", "repo": "vivy",
+    meta = {"run_id": run_id, "agent": "coder", "model": "claude-sonnet-4-6", "repo": "widget",
             "task": "", "parent_run": None, "profile": "", "started_at": f"{date}T08:00:00Z",
             "billing_source": billing_source, "issue": issue}
     (d / "meta.json").write_text(json.dumps(meta))
@@ -532,16 +532,16 @@ def _mk_issue_run(runs_root, date, run_id, *, issue, usd=1.0,
 
 def _stub_one_epic_course(monkeypatch, tmp_path):
     """One epic (issue_E) with one child task (issue_C), the Course that orders it,
-    and an empty corrections-queue list — everything `--product vivy` needs besides
+    and an empty corrections-queue list — everything `--product widget` needs besides
     the run directory and the ledger stub each test supplies itself."""
     monkeypatch.setattr(cj, "RUNS_ROOT", tmp_path / "agent-runs")
     (tmp_path / "agent-runs").mkdir()
     monkeypatch.setattr(
         IC, "list_issues_by_state",
         lambda state, *a, **k: [
-            {"id": "issue_E", "product": "vivy", "state": "open", "title": "E",
+            {"id": "issue_E", "product": "widget", "state": "open", "title": "E",
              "type": "epic", "parent_id": None},
-            {"id": "issue_C", "product": "vivy", "state": "open", "title": "C",
+            {"id": "issue_C", "product": "widget", "state": "open", "title": "C",
              "type": "task", "parent_id": "issue_E"},
         ] if state == "open" else [])
     monkeypatch.setattr(IC, "list_courses", lambda product, *a, **k: [{"id": "course_1"}])
@@ -568,7 +568,7 @@ def test_a_planted_ledger_divergence_is_caught_and_exits_nonzero(
         lambda *, epic_id, **k: [{"run_id": "run-a", "usd": 9.99, "lane": "gateway",
                                   "item_id": "issue_C", "epic_id": "issue_E",
                                   "voided_at": None}] if epic_id == "issue_E" else [])
-    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    rc = work_item_cost.main(["--product", "widget", "--days", "9999"])
     out = capsys.readouterr().out
     assert rc == 1
     assert "MISMATCH run run-a" in out
@@ -584,7 +584,7 @@ def test_a_matching_ledger_entry_exits_zero(
         lambda *, epic_id, **k: [{"run_id": "run-a", "usd": 2.0, "lane": "gateway",
                                   "item_id": "issue_C", "epic_id": "issue_E",
                                   "voided_at": None}] if epic_id == "issue_E" else [])
-    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    rc = work_item_cost.main(["--product", "widget", "--days", "9999"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "Ledger reconciliation" in out
@@ -599,7 +599,7 @@ def test_a_run_posted_before_e16_5_has_no_ledger_item_and_is_not_a_mismatch(
     _stub_one_epic_course(monkeypatch, tmp_path)
     _mk_issue_run(tmp_path / "agent-runs", "2026-06-10", "run-a", issue="issue_C", usd=2.0)
     monkeypatch.setattr(IC, "list_ledger_entries", lambda **k: [])
-    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    rc = work_item_cost.main(["--product", "widget", "--days", "9999"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "run-only 1" in out
@@ -616,7 +616,7 @@ def test_an_unreadable_ledger_reads_unavailable_and_exits_nonzero(
         raise IC.IssueQueueUnavailable("connection refused")
 
     monkeypatch.setattr(IC, "list_ledger_entries", unreachable)
-    rc = work_item_cost.main(["--product", "vivy", "--days", "9999"])
+    rc = work_item_cost.main(["--product", "widget", "--days", "9999"])
     out = capsys.readouterr().out
     assert rc == 1
     assert "unavailable" in out

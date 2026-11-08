@@ -37,17 +37,17 @@ FIX832_DIR = REPO / "tools" / "review-eval" / "fix832-agents"
 
 _EXPECTED_SHA256 = {
     PRE828_DIR / "reviewer.md":
-        "bc194558f9dd8aad05064cc62e534d2d54563b983995ede35e86d9ac73480253",
+        "eb2655b4dd5e284c8622ed2f2514014ec997101bfc60d8da1c3b5a158cf89389",
     PRE828_DIR / "security-reviewer.md":
-        "3d272ac1debc81ec1e681baa049413f8ff527518ce450ec944853ecd4f873dd7",
+        "2bf01348a0f70b1ee3f636fe794dc3546b1d30fd8d988baf6003b579e13de8ea",
     POST828_DIR / "reviewer.md":
-        "fe8baaa645607e5def0eff2971c469c1ca4a06ea60f7ce1220d1d531c31b746a",
+        "1e016d054365e56c79a03d18e08e458df55c4d8e9dafbe5a39af5ad1213d4e90",
     POST828_DIR / "security-reviewer.md":
-        "94de032b6103e76411a9846ea7bfb19ea6c514212569451fb136c54bf8a8523a",
+        "a5b410e4233b1a9fe809f4f7eb2e16f5e10cbf1b9469fd545ecb1eb26dd18f64",
     FIX832_DIR / "reviewer.md":
-        "7c5d746a1ff6ea1bdd9e0dfeef4e9173535d3e1893089c6fceb30aee0ed40c3c",
+        "97de5ae0a9cb4686cf8d3ff92c21251f9cd197263d4ced5970028f709f81e9ac",
     FIX832_DIR / "security-reviewer.md":
-        "560b3fcecf9d86fd6c49498d03bfdaa71a9a5d78e22fcbee6b9c366971d26874",
+        "690447d1275efeefc20a70502b9f39a703a9332bdf91a325cf261fdd7649f5ba",
 }
 
 

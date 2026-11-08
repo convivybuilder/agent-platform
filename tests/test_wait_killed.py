@@ -7,7 +7,7 @@ the waiter printed nothing, so its death looked exactly like a finished dispatch
 
 That silence is dangerous rather than merely confusing: the intuitive recovery is to
 redispatch, which puts a second worker into the same worktree on the same branch,
-racing the first. Five instances in one vivy co session across 2026-07-21/22.
+racing the first. Five instances in one widget co session across 2026-07-21/22.
 
 These tests drive the REAL binary as a subprocess and send it a real signal, because
 the thing under test is what a dying process manages to emit. A mocked signal proves

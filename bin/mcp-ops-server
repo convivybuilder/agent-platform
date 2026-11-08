@@ -12,7 +12,7 @@ once (reviewer, PR #522).
 - signal_list:      records of one kind for one product, newest first (GET /api/signals)
 - signal_log:       capture a new internal signal (POST /api/signals)
 - issue_create:     file an issue into the in-box queue (POST /api/issues)
-- issue_list:       list issues to drain in a sweep (GET /api/issues)
+- issue_list:       list issues for an interactive session to work (GET /api/issues)
 - issue_get:        one issue, full body + comment thread (GET /api/issues/{id})
 - issue_checkout:   take an issue, the lease on its epic, and its near-duplicate briefing (POST /api/issues/{id}/checkout)
 - issue_release:    hand back an issue and its lease (POST /api/issues/{id}/release)
@@ -23,10 +23,10 @@ once (reviewer, PR #522).
 - issue_link_pr:    record a fix PR on an issue → pr-open (POST /api/issues/{id}/link-pr)
 - issue_escalate:   escalate an issue to the decision queue → awaiting-decision (POST /api/issues/{id}/escalate)
 - issue_resolve:    resolve an issue with its outcome (POST /api/issues/{id}/resolve)
-- issue_reconcile_pr: end a pr-open item's wait on its linked PR once it merged, closed, or looks abandoned — the caller decides which (POST /api/issues/{id}/reconcile-pr)
+- issue_reconcile_pr: end a pr-open item's wait on its linked PR once it merged or closed — the caller decides which (POST /api/issues/{id}/reconcile-pr)
 - issue_revise:     revise a held item's own content — title, body, spec, DoD, maturity (POST /api/issues/{id}/revision)
 - issue_prerequisite_verdict: record whether a text prerequisite is met (POST /api/issues/{id}/prerequisites/verdict)
-- issue_correct:    correct a misfiled field — type, severity, maturity, parent_id, spec, DoD (POST /api/issues/{id}/correct)
+- issue_correct:    correct a misfiled field — type, severity, needs, maturity, parent_id, spec, DoD (POST /api/issues/{id}/correct)
 - issue_move_product: move a work item and its whole subtree to another product (POST /api/issues/{id}/product)
 - course_list:      the plan for a project, as an ordered list of epics (GET /api/courses)
 - course_get:       one plan, entries expanded, plus its reorder history (GET /api/courses/{id})
@@ -54,27 +54,33 @@ agent role holds no signal_customer capability, so customer-class content
 search and lists, 404 on direct get (ARCH-349's no-PII-to-automation
 posture).
 
-Token: $ORIENT_OPS_TOKEN, or ~/.orient-control/ops-mcp-token (0600; never
-committed). Minted into the Library's own token store, not Orient's, with
-`mint_credential.py --file agents --name <name>` from the Library's repo —
-see that script's docstring for the exact invocation. Same pattern as the
-GitHub capture poller's token.
+Token: $ORIENT_OPS_CREW_TOKEN_FILE must name the one file this server presents on
+every call it makes, read and write alike — there is no second token, and no
+shared fallback file (platform/contracts/library-protocol §2.5). Each crew holds
+two such files, both minted into the Library's own token store with
+`mint_credential.py --file agents --name <name>` from the Library's repo: an
+ordinary session's `~/.orient-control/ops-<slug>-token`, and a crew's own co's
+`~/.orient-control/ops-co-<slug>-token`, whose only extra grant is `item.create` —
+this server does not tell the two apart; the file's own grant is what lets
+`issue_create` succeed or refuses it, the same way every other tool's request does.
+`bin/co` and `bin/agentctl` each name the right file for the session or run they
+launch, in the `--mcp-config` they pass; that config replaces the user-scope `ops`
+entry, so this is the only credential source a launch gets. The variable reaches
+this server's environment and the claude argv that carries the config, which `ps`
+shows — the path is not a secret.
 
-Co credential: `bin/co` names ORIENT_OPS_CO_TOKEN_FILE in the --mcp-config it passes a
-crew co's claude. That config replaces the user-scope ops entry. The variable reaches this
-server's environment and the claude argv that carries the config, which `ps` shows; the
-path is not a secret. bin/co exports the variable nowhere, but a crew or generic-tail launch
-does not unset a value the shell exported by hand, so claude's environment carries it then.
-The variable names a second token file the Library issues. Inside a crew co
-session, issue_create (item creation, a grant only a co holds) presents that
-file's token. A variable set to a missing, empty or blank file refuses the write
-and names the path; it never falls back to the agent token. On the Orient plane
-(VAULTS_ON_LIBRARY=0) every write presents the agent token, because Orient holds no
-co grant. Every other tool keeps the agent token. Ask, a black box, and a private
-crew get no config and no variable. lib/agent-platform/dispatch_env.py strips the
-variable from every spawn. The dispatch sandbox (agent-platform#793) denies a
-dispatched run read access to the whole `.orient-control` directory the file
-lives in, so a dispatched run cannot read the file either.
+The variable unset, or naming a file that is missing, empty, blank or unreadable,
+each refuse the call outright and name the path (an unset variable names none);
+no request reaches the control plane either way. The walled-off crew, a
+black-box crew by role, and a private crew's co get no config and no variable,
+so every ops call they make refuses the same way. lib/agent-platform/dispatch_env.py strips the renamed
+variable from every spawn's inherited environment, so a dispatched run never
+carries a co's path through it — `bin/agentctl` names only the run's own crew's
+non-co file. The dispatch sandbox (agent-platform#793) denies a dispatched run's
+own tool calls (Bash, Read, Grep, Glob) read access to the whole
+`.orient-control` directory the file lives in; this server's own process, started
+by `--mcp-config` outside that tool sandbox, is the one reader of the file's
+bytes on the model's behalf.
 """
 from __future__ import annotations
 
@@ -113,11 +119,10 @@ import builder_root as BR  # noqa: E402
 import co_rollover as CRO  # noqa: E402
 import slate  # noqa: E402
 
-TOKEN_FILE = Path.home() / ".orient-control" / "ops-mcp-token"
-
-# Set by bin/co in the --mcp-config of a crew co launch; names the co-only credential file.
-# Ask, a private crew and a dispatched run carry no variable.
-CO_TOKEN_FILE_ENV = "ORIENT_OPS_CO_TOKEN_FILE"
+# Set by bin/co and bin/agentctl in the --mcp-config of every launch they give this
+# server; names the one file this server presents on every call. The walled-off
+# crew's ordinary launch, and a private crew's co, carry no variable.
+CREW_TOKEN_FILE_ENV = "ORIENT_OPS_CREW_TOKEN_FILE"
 
 # Search snippets are clipped so a 20-result page can't flood an agent's
 # context; signal_get returns the full stored body.
@@ -131,49 +136,35 @@ SIGNAL_LIST_MAX = 200
 mcp = FastMCP("ops")
 
 
-def _token() -> str | None:
-    tok = os.environ.get("ORIENT_OPS_TOKEN", "").strip()
-    if tok:
-        return tok
+def _token() -> tuple[str | None, dict | None]:
+    """The credential this server presents on EVERY call, read and write alike.
+    Returns (token, None) or (None, error).
+
+    There is no second token and no shared fallback file: the launch that started
+    this server named the one file to read in `CREW_TOKEN_FILE_ENV`, and an unset
+    variable, or a file that is missing, empty, blank or unreadable, each refuse
+    here — naming the path, except when there was none to name — before any
+    request is built."""
+    if CREW_TOKEN_FILE_ENV not in os.environ:
+        return None, {"error": f"no crew credential named: {CREW_TOKEN_FILE_ENV} is "
+                               "unset, so this session has no ops token to present"}
+    path = os.environ[CREW_TOKEN_FILE_ENV]
     try:
-        return TOKEN_FILE.read_text().strip() or None
+        tok = Path(path).read_text().strip()
     except OSError:
-        return None
-
-
-def _grant_token() -> tuple[str | None, dict | None]:
-    """The token a grant-only write presents: the co credential inside a co
-    session on the Library plane, the agent token everywhere else. Returns
-    (token, None) or (None, error).
-
-    Once the variable is set, an empty, blank or unreadable credential file is an
-    error that names the file, and it never becomes the agent token. A fallback
-    would let a co believe its item was filed under its own grant when the write
-    went out under the agent's. On the Orient plane the agent token is presented,
-    because Orient has no grant model and this plane is the operator's rollback.
-    """
-    if not vault_plane.on_library() or CO_TOKEN_FILE_ENV not in os.environ:
-        return _token(), None
-    path = os.environ[CO_TOKEN_FILE_ENV].strip()
-    try:
-        tok = Path(path).read_text().strip() if path else ""
-    except OSError:
-        tok = ""
+        return None, {"error": f"the crew credential is missing or unreadable at {path}"}
     if not tok:
-        return None, {"error": f"the co credential is missing or unreadable at "
-                               f"{path or '(an empty path)'}; this co session cannot "
-                               "create a work item until it is issued. Nothing was filed."}
+        return None, {"error": f"the crew credential at {path} is empty or blank"}
     return tok, None
 
 
 def _call(method: str, path: str, params: dict | None = None,
-          body: dict | None = None, token: str | None = None) -> dict:
+          body: dict | None = None) -> dict:
     """One API call → parsed JSON. Errors come back as {"error": ...} so the
-    calling agent gets a readable message instead of a protocol failure.
-    `token` overrides the agent token for this one call (see _grant_token)."""
-    tok = _token() if token is None else token
-    if not tok:
-        return {"error": f"no ops token: set ORIENT_OPS_TOKEN or create {TOKEN_FILE}"}
+    calling agent gets a readable message instead of a protocol failure."""
+    tok, err = _token()
+    if err:
+        return err
     url = vault_plane.url(path)
     if params:
         url += "?" + urllib.parse.urlencode(
@@ -291,9 +282,16 @@ def _rows(res: dict, key: str):
     return rows, None
 
 
-def _shape_item(item: dict, *, full_body: bool = False) -> dict:
+def _shape_item(item: dict, *, full_body: bool = False, with_meta: bool = False) -> dict:
     """The agent-facing view of a signal: the fields that identify, locate, and
-    summarize it. Search snippets are clipped (full text via signal_get)."""
+    summarize it. Search snippets are clipped (full text via signal_get).
+
+    `with_meta` carries the Library's `meta` object through verbatim, under the
+    key `meta`, when the Library sent one — a search snippet omits it so a
+    50-row page does not grow; `signal_get` and `signal_list` pass full_body=True
+    and want it, since a capture job's structured fields (a pr_state row's
+    `mergeable`/`review_decision`) live there and nowhere else a caller can read
+    them back from."""
     body = item.get("body") or ""
     if not full_body and len(body) > SNIPPET_CHARS:
         body = body[:SNIPPET_CHARS].rstrip() + " …"
@@ -316,6 +314,8 @@ def _shape_item(item: dict, *, full_body: bool = False) -> dict:
         out["url"] = url
     if "distance" in item:
         out["distance"] = item["distance"]
+    if with_meta and "meta" in item:
+        out["meta"] = item["meta"]
     return out
 
 
@@ -382,22 +382,26 @@ def signal_search(query: str, limit: int = 10, product: str | None = None,
 
 @mcp.tool()
 def signal_get(signal_id: str) -> str:
-    """Fetch one signal by id, with its full stored body."""
+    """Fetch one signal by id, with its full stored body and `meta` (a capture
+    job's structured fields, e.g. a pr_state row's `mergeable`/`review_decision`),
+    when the Library sent one; the key is absent when it did not."""
     res = _call("GET", f"/api/signals/{urllib.parse.quote(signal_id, safe='')}")
     if "error" in res:
         return json.dumps(res)
-    return json.dumps(_shape_item(res, full_body=True), ensure_ascii=False)
+    return json.dumps(_shape_item(res, full_body=True, with_meta=True), ensure_ascii=False)
 
 
 @mcp.tool()
 def signal_list(kind: str, product: str, limit: int = 5) -> str:
     """List the Archive records of one `kind` for one `product`, newest first
     (the Library orders them by ingestion time). Each item carries its full
-    body, `ingested_at` and `produced_at`. `limit` is clamped to 1-200, the most
-    the Library returns in one page; `truncated` is true when more records exist
-    past this page. `product` is required and may not be empty or whitespace —
-    an empty value would list every product's records of this kind, which a
-    caller of this tool never means.
+    body, `ingested_at`, `produced_at`, and `meta` (a capture job's structured
+    fields, e.g. a pr_state row's `mergeable`/`review_decision`) when the
+    Library sent one. `limit` is clamped to 1-200, the most the Library returns
+    in one page; `truncated` is true when more records exist past this page.
+    `product` is required and may not be empty or whitespace — an empty value
+    would list every product's records of this kind, which a caller of this
+    tool never means.
 
     An empty `items` list means no record was found. A private crew's
     handoffs are never served on this route, by design: the Library hides
@@ -414,7 +418,7 @@ def signal_list(kind: str, product: str, limit: int = 5) -> str:
     rows, err = _rows(res, "signals")
     if err:
         return json.dumps(err)
-    items = [_shape_item(x, full_body=True) for x in rows]
+    items = [_shape_item(x, full_body=True, with_meta=True) for x in rows]
     out = {"count": len(items), "items": items}
     if "truncated" in res:
         out["truncated"] = res["truncated"]
@@ -604,8 +608,8 @@ def _shape_issue(item: dict) -> dict:
         out["pr"] = refs["pr"]
     # pr_url and pr_repo are the SAFE references for PR reconciliation.
     # Use (pr_repo, pr) or pr_url to check merged state — never (product, pr).
-    # A product can span multiple repos (e.g. 'selector' covers both
-    # convivy/selector and convivy/selector-backend), so product+pr resolves
+    # A product can span multiple repos (its backend service living in a
+    # second repo), so product+pr resolves
     # to the wrong repo and can mark live work fixed. If pr_url and pr_repo are
     # both absent, the reference is unresolvable — SKIP, do not fall back to product.
     if refs.get("url"):
@@ -637,7 +641,9 @@ def issue_create(product: str, title: str, severity: str, body: str = "",
     `issue_prerequisite_verdict`. Any other key is refused before the call is
     made, `met` and `judged_by` included: a verdict is recorded only by that
     tool, which attributes it. An item filed with prerequisites reads
-    `blocked` until they are met, and checkout and claim refuse it meanwhile.
+    `blocked` until they are met; checkout can still take the lease on it
+    without claiming (`claimed: false`), but claim refuses it with a 409
+    meanwhile.
 
     `product` IS RESOLVED ON THE WRITE AND MATCHED EXACTLY ON THE READ, and the
     asymmetry is the whole gotcha. The Library resolves what you pass through
@@ -713,10 +719,11 @@ def issue_create(product: str, title: str, severity: str, body: str = "",
     - `agent` (default): a dispatched worker can complete it. Nearly everything.
     - `operator`: a specific credential or physical act is missing that no agent
       has — a vendor agreement, a physical device, a browser session, a key only
-      the operator holds. An `operator` issue is EXCLUDED from the drain's queue, so
-      nothing will ever claim it.
+      the operator holds. An `operator` issue is EXCLUDED from the claimable view
+      (`issue_list(..., state="claimable")`), so an interactive session never
+      claims it; it waits on the operator.
     - `either`: an agent can do useful work but cannot finish, e.g. prepare a
-      change for a human to apply. Stays drainable.
+      change for a human to apply. Stays claimable.
 
     NAME THE MISSING CAPABILITY, NOT THE VENUE. To file `operator` you must be able
     to say WHAT an agent lacks. "It is in the Render dashboard" is a venue and is
@@ -729,23 +736,23 @@ def issue_create(product: str, title: str, severity: str, body: str = "",
     services") was declined as `operator` on the grounds that it "needs an operator
     action in the Render dashboard". True of the dashboard, false of the API — the
     work was done by an agent through the Render API two days later, having sat
-    undrainable in between. This tool description's own examples taught that
+    unclaimable in between. This tool description's own examples taught that
     mistake by naming a cloud console as the canonical case.
 
-    WHEN UNSURE, USE `either`, NEVER `operator`. `either` stays drainable, so an
+    WHEN UNSURE, USE `either`, NEVER `operator`. `either` stays claimable, so an
     agent does the reachable part and stops; the worst case is visible partial
     progress. `operator` is the classification you must justify, not the safe
     fallback.
 
     THE COST IS ASYMMETRIC, AND BOTH DIRECTIONS MATTER. Filing agent-impossible work
-    as `agent` is bad: a drain claims it, fails, and it sits claimed with no outcome,
-    invisible for 24h, then claimed and abandoned again. But that failure is LOUD and
-    self-correcting — it is why issue_01KYN163D85VMWHF66JXAFAEP0 got re-filed as
-    `operator` after a drain kept failing on it. Filing agent-possible work as
-    `operator` is worse, because nothing ever looks again: no drain sees it, no
-    failure fires, and the item waits on a human who is waiting on the queue. There
-    is no symmetric correction; the only thing that catches it is a deliberate
-    re-check."""
+    as `agent` is bad: an interactive session claims it, fails, and it sits claimed
+    with no outcome, invisible for 24h, then claimed and abandoned again. But that
+    failure is LOUD and self-correcting — it is why issue_01KYN163D85VMWHF66JXAFAEP0
+    got re-filed as `operator` after it kept failing. Filing agent-possible work as
+    `operator` is worse, because nothing ever looks again: it never surfaces as
+    claimable, no failure fires, and the item waits on a human who is waiting on
+    the queue. There is no symmetric correction; the only thing that catches it is
+    a deliberate re-check."""
     if type is not None and type != "epic":
         return json.dumps({"error": f"type must be 'epic' or omitted — work "
                            f"items are not typed (got {type!r})"})
@@ -770,11 +777,11 @@ def issue_create(product: str, title: str, severity: str, body: str = "",
         if err:
             return json.dumps({"error": err})
         payload["prerequisites"] = cleaned
-    # Item creation is the grant-only write: a co session presents its own credential.
-    tok, err = _grant_token()
-    if err:
-        return json.dumps(err)
-    res = _call("POST", "/api/issues", body=payload, token=tok)
+    # Item creation is the one write `item.create` gates: whichever file this
+    # server was launched with — a crew's own, or a crew co's — presents its
+    # token here exactly as it does for every other call; the grant lives in the
+    # file, not in anything this server branches on.
+    res = _call("POST", "/api/issues", body=payload)
     if "error" in res:
         return json.dumps(res)
     return json.dumps({"id": res.get("id"), "url": res.get("url"),
@@ -791,19 +798,20 @@ def issue_list(product: str | None = None, state: str = "open",
     claimed | fixed | wontfix | duplicate); pass "" for all states. `product`
     narrows scope. `type` filters to epic items when set to `epic` — it is the
     only value, since work items are not typed; omit it to see every item. Use
-    it to find open issues to drain in a sweep.
+    it to find open issues for an interactive session to work.
 
     `blocked` AND `prerequisites` ARE ON EVERY ITEM. A blocked item is excluded
-    from claimable, and checkout and claim refuse it with a 409 — so reading a
-    page and taking the first open item without checking `blocked` spends a call
-    to learn what the page already said. `prerequisites` says what it waits on:
+    from claimable; checkout still takes the lease on it without claiming, and
+    claim refuses it with a 409 — so reading a page and taking the first open
+    item without checking `blocked` spends a call to learn what the page
+    already said. `prerequisites` says what it waits on:
     {item: <id>} entries the Library tracks itself, and {text: <condition>}
     entries a human or agent judges with `issue_prerequisite_verdict`.
 
     A HIGH SEVERITY DOES NOT MEAN ANYONE IS MEANT TO BE ACTING ON IT. `severity`
     describes the defect; `blocked` and `park_reason` say whether the item is
     waiting on purpose — denied pending some future condition, or sequenced
-    behind another epic so no drain takes it early. Counting severities and
+    behind another epic so nothing takes it early. Counting severities and
     calling the total "live bugs" reads the wrong field, and it is the field
     that argues loudest.
 
@@ -856,8 +864,8 @@ def issue_list(product: str | None = None, state: str = "open",
     field; do NOT infer origin from any other value.
 
     Each item also carries `needs` — who can execute it (agent | operator |
-    either). `state="claimable"` already excludes `operator` server-side, so a
-    drain never sees one. If you are listing a WIDER state and find `operator`,
+    either). `state="claimable"` already excludes `operator` server-side, so an
+    interactive session never sees one there. If you are listing a WIDER state and find `operator`,
     do NOT claim it: no agent can finish it, and a claimed issue with no outcome
     is invisible to the next pass for 24h. Pass `needs="operator"` to ask the one
     question this field exists for — what on this product is waiting on a
@@ -870,8 +878,8 @@ def issue_list(product: str | None = None, state: str = "open",
 
     For `state="pr-open"` items: to check whether a PR has merged, use `pr_url`
     (the full GitHub URL) or `pr_repo + pr` (owner/repo string + PR number). Do NOT
-    derive the repo from `product` — a product can cover multiple repos (e.g.
-    'selector' covers convivy/selector and convivy/selector-backend), so product+pr
+    derive the repo from `product` — a product can cover multiple repos (its
+    backend service living in a second repo), so product+pr
     can resolve to an unrelated, already-merged PR and falsely close live work. When
     both `pr_url` and `pr_repo` are absent on an item, the reference is
     unresolvable — skip the issue rather than falling back to product."""
@@ -991,15 +999,22 @@ def _shape_lease(lease: dict) -> dict:
 @mcp.tool()
 def issue_checkout(issue_id: str, owner: str, run_id: str | None = None) -> str:
     """Check out a work item before you work on it — the protocol every run begins
-    with (Keel Phase 2, ARCH-424). Claims the issue AND takes the lease on the
-    epic it belongs to, so no other worker is handed a sibling under that epic
-    while you hold it.
+    with (Keel Phase 2, ARCH-424). Takes the lease on the issue and on the epic
+    it belongs to, and claims the issue unless it is blocked, so no other worker
+    is handed a sibling under that epic while you hold it.
 
-    CHECK `blocked` BEFORE YOU CALL THIS. A blocked item refuses checkout and
-    claim with a 409, and the reason is on the item rather than in the error:
+    CHECK `blocked` BEFORE YOU CALL THIS — not because it refuses, but because
+    what you get back differs. On a blocked item this still takes the lease,
+    but does not claim it: the response carries `claimed: false` and
+    `unmet_count`, and the item stays `open`, out of the claimable pool.
     `prerequisites` names what it is waiting on. Both fields are on every item
-    `issue_list` and `issue_get` return. Calling without looking is how a 409
-    becomes unexplainable, which is the failure this pair was added to end.
+    `issue_list` and `issue_get` return.
+
+    THIS IS HOW THE OWNING CREW'S CO TAKES ITS OWN BLOCKED ITEM to judge a
+    prerequisite (`issue_prerequisite_verdict`) or correct it (`issue_correct`)
+    under the lease, then release it (`issue_release`). A DISPATCHED WORKER
+    MUST NOT treat a lease-only checkout as permission to start the work —
+    check `claimed` on the response before acting on it.
 
     USE THIS RATHER THAN `issue_claim`. Both take the lease, so neither is a hole
     in the fence, but only this one tells you what you hold — the lease's expiry
@@ -1012,7 +1027,10 @@ def issue_checkout(issue_id: str, owner: str, run_id: str | None = None) -> str:
     abandoned one.
 
     Pass `run_id` when you have one. It is provenance, so a reaper can later
-    cross-check whether the run behind a lease is still alive.
+    cross-check whether the run behind a lease is still alive. A dispatched
+    run's id is stamped automatically, from its own `AGENTCTL_RUN_ID`
+    environment, when the caller passes none; an explicit `run_id` argument
+    still wins.
 
     ON A 409 THE SUBTREE IS HELD, AND THE ERROR NAMES THE HOLDER AND THE EXPIRY.
     Route to work outside that subtree and come back after the expiry; do not
@@ -1058,6 +1076,13 @@ def issue_checkout(issue_id: str, owner: str, run_id: str | None = None) -> str:
     product's vocabulary — a real three-product case sat at 0.8975 and 0.8767,
     below the cut, and the briefing would have been silent. An empty list is
     evidence, not proof."""
+    # A dispatched run's MCP servers inherit AGENTCTL_RUN_ID from the run's own
+    # environment (bin/agentctl sets it at spawn time) — stamped here rather than
+    # left to the caller, because the model chooses `owner` freely and a run that
+    # forgets to pass its own id leaves a lease nothing can later tie back to it
+    # (CQ·519, issue_01M5BW8G53V9SPK7A6B3BBKPD8). An explicit argument still wins.
+    if run_id is None:
+        run_id = os.environ.get("AGENTCTL_RUN_ID") or None
     res = _call("POST", f"/api/issues/{urllib.parse.quote(issue_id, safe='')}/checkout",
                 body={"owner": owner, **({"run_id": run_id} if run_id else {})})
     if "error" in res:
@@ -1101,7 +1126,8 @@ def issue_checkout(issue_id: str, owner: str, run_id: str | None = None) -> str:
 
 @mcp.tool()
 def issue_release(issue_id: str, owner: str) -> str:
-    """Hand back an issue you checked out (claimed → open), releasing the lease it
+    """Hand back an issue you checked out — claimed → open, or open → open when
+    checkout left it unclaimed because it was blocked — releasing the lease it
     took if that lease was taken for this issue.
 
     Call it when you finish with an issue without resolving it, and at session
@@ -1322,14 +1348,15 @@ def course_supersede(course_id: str, note: str | None = None) -> str:
 
 @mcp.tool()
 def issue_claim(issue_id: str) -> str:
-    """Claim an open issue for a sweep (open → claimed). Superseded by
+    """Claim an open issue (open → claimed). Superseded by
     `issue_checkout` — prefer that.
 
-    CHECK `blocked` BEFORE YOU CALL THIS. A blocked item refuses checkout and
-    claim with a 409, and the reason is on the item rather than in the error:
-    `prerequisites` names what it is waiting on. Both fields are on every item
-    `issue_list` and `issue_get` return. Calling without looking is how a 409
-    becomes unexplainable, which is the failure this pair was added to end.
+    CHECK `blocked` BEFORE YOU CALL THIS. A blocked item refuses claim with a
+    409 — `issue_checkout` does not: it takes the lease without claiming. The
+    reason is on the item rather than in the error: `prerequisites` names what
+    it is waiting on. Both fields are on every item `issue_list` and
+    `issue_get` return. Calling without looking is how a 409 becomes
+    unexplainable, which is the failure this pair was added to end.
 
     It takes the same epic lease `issue_checkout` does, so it is not a way around
     the fence; it just cannot tell you what you hold, and it cannot name you, so
@@ -1435,15 +1462,10 @@ def issue_reconcile_pr(issue_id: str, outcome: str, owner: str | None = None) ->
     - `"closed"` — the PR closed without merging. The same return to `open`:
       from the item's side, a closed-unmerged PR and a merged one both mean
       nothing is still open on it.
-    - `"abandoned"` — the PR is STILL OPEN. This NEVER returns the item to
-      `open` on its own: an open PR looks exactly like one still being worked,
-      and freeing the item would put a second worker on a live branch. It only
-      raises `needs` to `"operator"` so a human sees it; the item stays
-      `pr-open`.
 
-    Neither `"merged"` nor `"closed"` is a resolution — the item does not become
-    `fixed`, `wontfix` or `duplicate`, only unstuck from `pr-open` and claimable
-    again. `refs` (`pr`, `url`) survives every outcome as history.
+    Neither outcome is a resolution — the item does not become `fixed`,
+    `wontfix` or `duplicate`, only unstuck from `pr-open` and claimable again.
+    `refs` (`pr`, `url`) survives every outcome as history.
 
     Pass `owner` when you hold this item's lease under a session name (from
     `issue_checkout`), the same identity you checked out with. Every session's
@@ -1482,7 +1504,7 @@ def issue_link_pr(issue_id: str, pr: str, url: str = "", owner: str | None = Non
 
     A reconciliation sweep MUST use `pr_url` or `pr_repo + pr`
     to check merged state — never `product + pr`. A product can span multiple repos
-    (e.g. 'selector' covers convivy/selector and convivy/selector-backend), so
+    (its backend service living in a second repo), so
     product+pr resolves to the wrong repo and falsely closes live issues. When
     `pr_url` and `pr_repo` are both absent, the reference is unresolvable; skip the
     issue rather than falling back to product.
@@ -1518,8 +1540,8 @@ def issue_escalate(issue_id: str, decision_id: str, url: str = "") -> str:
 
     When an issue needs the operator's call rather than a fix: record the blocker with
     `signal_log`, note it on the issue with `issue_comment`, and `issue_release`
-    it so it returns to `open` and the next drain sees it. Do not leave it
-    claimed with no outcome — a claimed issue with no PR is invisible to the
+    it so it returns to `open` and the next interactive session sees it. Do not leave
+    it claimed with no outcome — a claimed issue with no PR is invisible to the
     next pass.
 
     Historical behaviour, for reading old records: recorded that a sweep
@@ -1759,7 +1781,8 @@ def issue_prerequisite_verdict(issue_id: str, text: str, met: bool,
 
 @mcp.tool()
 def issue_correct(issue_id: str, type: str | None = None,
-                  severity: str | None = None, maturity: str | None = None,
+                  severity: str | None = None, needs: str | None = None,
+                  maturity: str | None = None,
                   parent_id: str | None = None, specification: str | None = None,
                   definition_of_done: str | None = None,
                   topics: list[str] | None = None,
@@ -1767,10 +1790,10 @@ def issue_correct(issue_id: str, type: str | None = None,
                   clear: list[str] | None = None,
                   end_state_unchanged: bool = False,
                   owner: str | None = None) -> str:
-    """Correct a misfiled field: `type`, `severity`, `maturity`, `parent_id`,
-    `topics`, `prerequisites`, `specification` or `definition_of_done`. AT LEAST
-    ONE IS REQUIRED;
-    sending none is refused (400).
+    """Correct a misfiled field: `type`, `severity`, `needs`, `maturity`,
+    `parent_id`, `topics`, `prerequisites`, `specification` or
+    `definition_of_done`. AT LEAST ONE IS REQUIRED; sending none is refused
+    (400).
 
     `topics` ARE AN ITEM'S GROUPING LABELS — which area of a product it belongs
     to — and they are the axis `issue_list(topics=...)` and `sort="topic"` read
@@ -1807,10 +1830,19 @@ def issue_correct(issue_id: str, type: str | None = None,
     its whole subtree to another product in one transaction.
 
     `type` and `severity` correct a MISFILING and take no null — send the
-    value or omit the parameter. `maturity` and `parent_id` record a fact that
-    becomes known LATE rather than a misfiling, and both accept an explicit
-    clear: pass `""` for `maturity` to reset it to "not yet assessed". Pass
-    `""` for `parent_id` on a WORK ITEM to make it a correction: it leaves its
+    value or omit the parameter.
+
+    `needs` corrects WHO CAN EXECUTE THE ITEM — see `issue_create`'s
+    description for the classification rule (`agent` | `operator` | `either`);
+    it is not restated here. It takes no null, same as `type` and `severity`,
+    and this call is accepted or refused under the same hold rule as every
+    other field on this route: under your own live lease or under none,
+    refused (409, `reason: "held"`) under another holder's.
+
+    `maturity` and `parent_id` record a fact that becomes known LATE rather
+    than a misfiling, and both accept an explicit clear: pass `""` for
+    `maturity` to reset it to "not yet assessed". Pass `""` for `parent_id`
+    on a WORK ITEM to make it a correction: it leaves its
     epic and joins its product's corrections queue, which the Library records
     as a null parent today and will record as the queue's own id once
     corrections queues are backfilled. On an EPIC, clearing `parent_id`
@@ -1941,6 +1973,8 @@ def issue_correct(issue_id: str, type: str | None = None,
         payload["type"] = type
     if severity is not None:
         payload["severity"] = severity
+    if needs is not None:
+        payload["needs"] = needs
     cleared, err = _clearable_payload(
         clear, (("maturity", maturity), ("parent_id", parent_id),
                 ("specification", specification), ("definition_of_done", definition_of_done)))

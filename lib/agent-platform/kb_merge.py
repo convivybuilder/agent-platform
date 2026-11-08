@@ -66,6 +66,9 @@ A merge is refused unless ALL of these hold at the moment it is made:
   every one is a knowledge document under `projects/`; and the policy permits it:
   `agents_may_merge_knowledge_instructions` when any file is an instruction,
   `agents_may_merge_knowledge` otherwise;
+- every path a changed file ADDS under `projects/`, on either side of a rename
+  or copy, names a project `legal_kb_projects()` admits (platform/decisions/0097);
+  a registry that cannot be read refuses the same way;
 - the PR head contains the freshly fetched `origin/main`
   (`git merge-base --is-ancestor`), so the required checks the gate read ran on a
   tree that already held everything on `main`. knowledge#699 merged on a PASS
@@ -143,6 +146,7 @@ import agent_policy as AP
 import builder_root as BR
 import github_app as GA
 import kb_writes as KW
+import projects
 import review_protocol as RP
 from github_app import Unreadable
 
@@ -376,8 +380,28 @@ def _under_projects(path: str | None) -> bool:
     return AP.under_projects(path)
 
 
-def _policy_refusals(f: Facts) -> list[str]:
-    """The refusals that read the policy file and the PR's changed files."""
+def _added_project_dir(path_before: str | None, path_after: str | None) -> str | None:
+    """The project directory name a changed file ADDS under `projects/`, read
+    from its after-side path, or `None` when the change adds nothing there: a
+    pure deletion, a path unchanged by a rename or copy (so already present
+    before this PR), or a path with no directory segment under `projects/`
+    (`projects/README.md`, which names no project to check)."""
+    if path_after is None or path_after == path_before:
+        return None
+    if not AP.under_projects(path_after):
+        return None
+    _first, _, rest = path_after.partition("/")
+    name, sep, _tail = rest.partition("/")
+    return name if sep else None
+
+
+def _policy_refusals(f: Facts, legal_projects: "set[str] | None") -> list[str]:
+    """The refusals that read the policy file and the PR's changed files.
+
+    `legal_projects` is `legal_kb_projects()`'s answer, read once by the
+    caller (`refusals()`), or `None` when it could not be read — in which case
+    no path here is checked against it, since that refusal is already reported
+    on its own."""
     out: list[str] = []
     policy = f.policy
     if isinstance(policy, AP.Fallback):
@@ -393,6 +417,11 @@ def _policy_refusals(f: Facts) -> list[str]:
         if AP.touches_policy(c.path_before, c.path_after):
             out.append(f"{c.label} is under {AP.POLICY_DIR}/, and no agent merges a "
                        f"change there, whatever the policy says")
+        if legal_projects is not None:
+            added_dir = _added_project_dir(c.path_before, c.path_after)
+            if added_dir is not None and added_dir not in legal_projects:
+                out.append(f"{c.label} adds a path under projects/{added_dir}/, which "
+                           f"is not a registered project in the project registry")
         got = AP.classify(c.path_before, c.text_before, c.path_after, c.text_after,
                           mode_before=c.mode_before, mode_after=c.mode_after)
         if got.unclassifiable:
@@ -482,6 +511,11 @@ def refusals(f: Facts, config: LibraryConfig | None = None) -> list[str]:
         except Unreadable as e:
             out.append(f"the Library config could not be read: {e}")
             config = None
+    try:
+        legal_projects = projects.legal_kb_projects()
+    except Exception as e:
+        out.append(f"the project registry could not be read: {e}")
+        legal_projects = None
     if config is not None:
         # GitHub names repositories case-insensitively, so `Convivy/Knowledge` is
         # the same repository. Merging always targets the configured repository
@@ -508,7 +542,7 @@ def refusals(f: Facts, config: LibraryConfig | None = None) -> list[str]:
     if f.git_problem:
         out.append(f"the knowledge checkout could not be read: {f.git_problem}")
     else:
-        out.extend(_policy_refusals(f))
+        out.extend(_policy_refusals(f, legal_projects))
         if f.head_contains_base is None:
             out.append(f"the branch's ancestry against {BASE!r} was never read")
         elif f.head_contains_base is False:

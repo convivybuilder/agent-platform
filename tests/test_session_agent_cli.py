@@ -197,6 +197,47 @@ def test_ensure_server_refusal_exits_1_with_the_reason_on_stderr(
     assert "did not appear" in capsys.readouterr().err
 
 
+def test_ensure_server_exits_0_off_macos_with_the_real_helper(
+        session_agent_cli, emitted, monkeypatch, tmp_path):
+    """The ssh aliases chain `attach || new` after this verb's exit status, so
+    a real off-macOS run reaching rc 0 — through the real `ensure_default_
+    server`, with no `launchctl` on PATH at all — is what keeps them working
+    on a Linux server. `_host_platform` is the real helper's own; the other
+    `ensure-server` tests above stub it out entirely and so cannot see this."""
+    SL = session_agent_cli.SL
+    monkeypatch.setattr(SL, "_host_platform", lambda: "linux")
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    state = tmp_path / "state"
+    state.mkdir()
+    tmux_stub = bin_dir / "tmux"
+    tmux_stub.write_text(f"""#!/bin/sh
+case "$1" in
+  list-sessions)
+    if [ -f "{state}/sessions" ]; then cat "{state}/sessions"; exit 0; fi
+    echo "no server running" >&2
+    exit 1 ;;
+  new-session)
+    echo keeper >> "{state}/sessions"
+    exit 0 ;;
+esac
+exit 0
+""")
+    tmux_stub.chmod(0o755)
+    # /usr/bin:/bin stay on PATH, same as the stub PATH in test_session_
+    # lifecycle.py's `stubs` fixture: the stub script's own `cat` needs to
+    # resolve too, not just `tmux` itself.
+    monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.setattr(session_agent_cli.sys, "argv", ["session-agent", "ensure-server"])
+
+    rc = session_agent_cli.main()
+
+    assert rc == 0
+    assert emitted == [{"ok": True}]
+
+
 # MARK: - `start`'s --create-dir wiring
 
 
@@ -209,7 +250,7 @@ def test_create_dir_flag_reaches_session_lifecycle_start(session_agent_cli, monk
                          lambda *a, **kw: calls.append(kw) or {"ok": True})
     monkeypatch.setattr(session_agent_cli, "_emit", lambda obj: None)
     monkeypatch.setattr(session_agent_cli.sys, "argv",
-                         ["session-agent", "start", "nyh", "--dir", "/tmp/x",
+                         ["session-agent", "start", "oak", "--dir", "/tmp/x",
                           "--create-dir"])
 
     rc = session_agent_cli.main()
@@ -224,7 +265,7 @@ def test_without_the_flag_create_dir_defaults_false(session_agent_cli, monkeypat
                          lambda *a, **kw: calls.append(kw) or {"ok": True})
     monkeypatch.setattr(session_agent_cli, "_emit", lambda obj: None)
     monkeypatch.setattr(session_agent_cli.sys, "argv",
-                         ["session-agent", "start", "nyh", "--dir", "/tmp/x"])
+                         ["session-agent", "start", "oak", "--dir", "/tmp/x"])
 
     session_agent_cli.main()
 
@@ -327,13 +368,13 @@ def test_crews_emits_the_envelope_the_module_builds(session_agent_cli, emitted, 
     as `sessions` and `crews-root`; the CLI's only job is to emit what
     session_crews.crews() returns, once, as the envelope Deck decodes."""
     monkeypatch.setattr(session_agent_cli.SCR, "crews",
-                        lambda: {"crews": [{"id": "placard"}]})
+                        lambda: {"crews": [{"id": "signpost"}]})
     monkeypatch.setattr(session_agent_cli.sys, "argv", ["session-agent", "crews"])
 
     rc = session_agent_cli.main()
 
     assert rc == 0
-    assert emitted == [{"crews": [{"id": "placard"}]}]
+    assert emitted == [{"crews": [{"id": "signpost"}]}]
 
 
 # MARK: - `documents`

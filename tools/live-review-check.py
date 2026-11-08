@@ -25,7 +25,7 @@ REVIEW_AGENTS = ("reviewer", "security-reviewer")
 
 def is_review_agent(agent: str) -> bool:
     """True for `reviewer`, `security-reviewer`, and their app-prefixed forms
-    (`hollis-reviewer`, `svc-security-reviewer`) — the same shape agentctl's
+    (`acme-reviewer`, `globex-security-reviewer`) — the same shape agentctl's
     _strip_app_prefix handles."""
     return any(agent == r or agent.endswith("-" + r) for r in REVIEW_AGENTS)
 

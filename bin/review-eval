@@ -50,6 +50,7 @@ if __name__ == "__main__":
     venv_bootstrap.ensure(__file__, requires=("yaml",))
 import builder_root as BR  # noqa: E402
 import dispatch_env as DE  # noqa: E402
+import github_app as GA  # noqa: E402
 import projects  # noqa: E402
 import review_eval_corpus as REC  # noqa: E402
 import review_eval_replay as RER  # noqa: E402
@@ -107,30 +108,45 @@ SUBSET_DEFAULT_KEYS = {"kimi", "kimi-code", "glm", "sonnet-noise-a", "sonnet-noi
                        "sonnet-pre828", "sonnet-post828", "sonnet-fix832"}
 
 
-def _merged_head_via_gh(repo: str, pr: str) -> str | None:
-    slug = projects.repo_github_slug(repo)
-    try:
-        out = subprocess.run(
-            ["gh", "pr", "view", pr, "--repo", slug, "--json", "state,headRefOid"],
-            capture_output=True, text=True, timeout=30)
-    except (subprocess.SubprocessError, OSError):
-        return None
-    if out.returncode != 0:
-        return None
-    try:
-        data = json.loads(out.stdout)
-    except json.JSONDecodeError:
-        return None
-    if (data.get("state") or "").upper() != "MERGED":
-        return None
-    return data.get("headRefOid") or None
+def _make_merged_head_via_gh(gh_env_for):
+    """Bind `REC.build_corpus`'s `merged_head(repo, pr)` callback to one
+    `GA.read_token_pool`'s `env_for` (company/decisions/0027): `build_corpus`
+    calls it once per (repo, pr) pair as it walks `find_clean_rounds`'s
+    records, which are scanned date-first rather than grouped by repo, so a
+    pool that mints at most once per repo — however many pairs revisit it —
+    replaces what would otherwise be a mint per call."""
+    def _merged_head_via_gh(repo: str, pr: str) -> str | None:
+        slug = projects.repo_github_slug(repo)
+        try:
+            env = gh_env_for(slug)
+        except GA.Unreadable as e:
+            print(f"corpus: cannot mint a GitHub token for {slug} ({e}); "
+                  f"{repo}#{pr}'s merge state is unresolved this pass.", file=sys.stderr)
+            return None
+        try:
+            out = subprocess.run(
+                ["gh", "pr", "view", pr, "--repo", slug, "--json", "state,headRefOid"],
+                capture_output=True, text=True, timeout=30, env=env)
+        except (subprocess.SubprocessError, OSError):
+            return None
+        if out.returncode != 0:
+            return None
+        try:
+            data = json.loads(out.stdout)
+        except json.JSONDecodeError:
+            return None
+        if (data.get("state") or "").upper() != "MERGED":
+            return None
+        return data.get("headRefOid") or None
+    return _merged_head_via_gh
 
 
 def cmd_corpus_build(args: argparse.Namespace) -> int:
     runs_root = Path(args.runs_root) if args.runs_root else BR.runs_root()
-    corpus = REC.build_corpus(
-        runs_root, since_date=args.since, sample_size=args.sample_size,
-        seed=args.seed, merged_head=_merged_head_via_gh)
+    with GA.read_token_pool() as gh_env_for:
+        corpus = REC.build_corpus(
+            runs_root, since_date=args.since, sample_size=args.sample_size,
+            seed=args.seed, merged_head=_make_merged_head_via_gh(gh_env_for))
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(corpus, indent=2) + "\n")
@@ -210,25 +226,29 @@ def cmd_replay_run(args: argparse.Namespace) -> int:
     cap_tracker = RES.CapTracker(total_cap=args.total_cap, per_model_cap=per_model_cap,
                                  already_spent=already_spent)
 
-    for kind in ("confirmed", "clean"):
-        entries = corpus.get(kind) or []
-        if not args.full_corpus:
-            subset_arms = [a for a in arms if a.key in SUBSET_DEFAULT_KEYS]
-            full_arms = [a for a in arms if a.key not in SUBSET_DEFAULT_KEYS]
-        else:
-            subset_arms, full_arms = [], arms
-        if full_arms:
-            RER.run_batch(entries, full_arms, results_dir=results_dir,
-                          runs_root=BR.runs_root(), concurrency=args.concurrency,
-                          cap_tracker=cap_tracker, wait_timeout=args.wait_timeout)
-        if subset_arms:
-            subset = REC.select_baseline_subset(
-                {"confirmed": corpus.get("confirmed") or [],
-                 "clean": corpus.get("clean") or []},
-                seed=corpus.get("seed", 0)).get(kind) or []
-            RER.run_batch(subset, subset_arms, results_dir=results_dir,
-                          runs_root=BR.runs_root(), concurrency=args.concurrency,
-                          cap_tracker=cap_tracker, wait_timeout=args.wait_timeout)
+    try:
+        for kind in ("confirmed", "clean"):
+            entries = corpus.get(kind) or []
+            if not args.full_corpus:
+                subset_arms = [a for a in arms if a.key in SUBSET_DEFAULT_KEYS]
+                full_arms = [a for a in arms if a.key not in SUBSET_DEFAULT_KEYS]
+            else:
+                subset_arms, full_arms = [], arms
+            if full_arms:
+                RER.run_batch(entries, full_arms, results_dir=results_dir,
+                              runs_root=BR.runs_root(), concurrency=args.concurrency,
+                              cap_tracker=cap_tracker, wait_timeout=args.wait_timeout)
+            if subset_arms:
+                subset = REC.select_baseline_subset(
+                    {"confirmed": corpus.get("confirmed") or [],
+                     "clean": corpus.get("clean") or []},
+                    seed=corpus.get("seed", 0)).get(kind) or []
+                RER.run_batch(subset, subset_arms, results_dir=results_dir,
+                              runs_root=BR.runs_root(), concurrency=args.concurrency,
+                              cap_tracker=cap_tracker, wait_timeout=args.wait_timeout)
+    except RER.LiveEvalRunsError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 2
     print(f"replay: results under {results_dir}; gateway spend "
          f"${cap_tracker.total_spent:.2f} of ${cap_tracker.total_cap:.2f}")
     return 0

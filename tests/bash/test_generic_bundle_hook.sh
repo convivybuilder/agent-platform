@@ -87,6 +87,9 @@ run_hook_part() { # <cwd> <stub> <part>
 run_hook_part "$WS" "$ARGS" write-better
 assert_rc 0 "$RC" "part: exit 0"
 assert_contains "$OUT" 'bundle|--generic|--part|write-better|' "part: knowledge-ctx got --generic --part write-better"
+run_hook_part "$WS" "$ARGS" blocks-2
+assert_rc 0 "$RC" "blocks-2: exit 0"
+assert_contains "$OUT" 'bundle|--generic|--part|blocks-2|' "blocks-2: the hook passes it through like any other part, with no special-casing"
 run_hook "$WS" "$ARGS"
 assert_contains "$OUT" 'bundle|--generic|' "no part: knowledge-ctx got no --part"
 assert_eq "0" "$(printf '%s' "$OUT" | grep -c -- '--part')" "no part: --part is not passed"

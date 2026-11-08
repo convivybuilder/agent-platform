@@ -24,7 +24,7 @@ import pytest
 def _build(acr, anthropic, gateway, monkeypatch, apps=None):
     monkeypatch.setattr(acr, "ccusage_by_model", lambda day: anthropic)
     monkeypatch.setattr(acr, "gateway_by_model", lambda day: gateway)
-    # PA's real ledger exists on the dev box, so the app lane must be stubbed too
+    # demo-assistant's real ledger exists on the dev box, so the app lane must be stubbed too
     # or it would leak real spend into the pinned-math tests (ARCH-147).
     monkeypatch.setattr(acr, "apps_by_app", lambda day: apps or {})
     # build_report returns (total, plain, snapshot); the snapshot is exercised
@@ -364,31 +364,31 @@ def test_gateway_by_model_empty_when_no_logs(agent_cost_report, monkeypatch, tmp
 # --- ARCH-147: direct-API app spend, the third cost lane ---
 
 def test_app_spend_is_a_third_lane_in_total_and_summary(agent_cost_report, monkeypatch):
-    # PA + cookbook out-of-pocket spend adds to the total as its own lane,
+    # demo-assistant + cookbook out-of-pocket spend adds to the total as its own lane,
     # distinct from the Anthropic estimate and the gateway actual.
     total, text = _build(
         agent_cost_report,
         {"claude-opus-4-8": 100.0},
         {"deepseek-v4-flash": 2.0},
         monkeypatch,
-        apps={"personal-assistant": 0.5, "cookbook": 0.25},
+        apps={"demo-assistant": 0.5, "cookbook": 0.25},
     )
     assert total == 102.75  # 100 anthropic + 2 gateway + 0.75 apps
     assert "Direct-API apps (out-of-pocket): $0.75" in text
     # each app surfaces as its own row, tagged as direct-API (not est/actual)
-    assert "`personal-assistant" in text and "direct API" in text
+    assert "`demo-assistant" in text and "direct API" in text
 
 
 def test_app_spend_snapshot_and_history_carry_apps_total(agent_cost_report, monkeypatch, tmp_path):
     acr = agent_cost_report
     monkeypatch.setattr(acr, "ccusage_by_model", lambda day: {"claude-opus-4-8": 10.0})
     monkeypatch.setattr(acr, "gateway_by_model", lambda day: {})
-    monkeypatch.setattr(acr, "apps_by_app", lambda day: {"personal-assistant": 0.40})
+    monkeypatch.setattr(acr, "apps_by_app", lambda day: {"demo-assistant": 0.40})
     monkeypatch.setattr(acr, "COST_DIR", tmp_path / "cost-report")
     _, _, snap = acr.build_report(date(2026, 6, 13), "2026-06-13T15:30:00")
     assert snap["apps_total"] == 0.40
-    pa = next(r for r in snap["by_model"] if r["model"] == "personal-assistant")
-    assert pa["kind"] == "api" and pa["cost"] == 0.40
+    demo = next(r for r in snap["by_model"] if r["model"] == "demo-assistant")
+    assert demo["kind"] == "api" and demo["cost"] == 0.40
     # write_snapshot persists apps_total into both latest.json and the history row
     acr.write_snapshot(snap)
     latest = json.loads((tmp_path / "cost-report" / "latest.json").read_text())
@@ -421,48 +421,56 @@ def test_apps_by_app_sums_per_app_filtered_by_day(agent_cost_report, monkeypatch
     # convention as gateway); other-day rows excluded, a missing ledger = $0, and
     # an app that nets $0 today is dropped from the result.
     acr = agent_cost_report
-    pa = tmp_path / "pa" / "llm-spend.jsonl"
+    demo_ledger = tmp_path / "demo-assistant" / "llm-spend.jsonl"
     cookbook = tmp_path / "cookbook" / "llm-spend.jsonl"  # never created → missing
-    pa.parent.mkdir(parents=True, exist_ok=True)
-    pa.write_text("".join(json.dumps(r) + "\n" for r in [
+    demo_ledger.parent.mkdir(parents=True, exist_ok=True)
+    demo_ledger.write_text("".join(json.dumps(r) + "\n" for r in [
         {"ts": "2026-06-13T13:30:25Z", "model": "claude-sonnet-4-6", "usd": 0.032},
         {"ts": "2026-06-13T15:00:00Z", "model": "claude-sonnet-4-6", "usd": 0.018},
         {"ts": "2026-06-12T23:59:00Z", "model": "claude-sonnet-4-6", "usd": 9.99},  # other day
         {"ts": "2026-06-13T16:00:00Z", "model": "claude-sonnet-4-6"},               # no usd → 0
     ]))
-    monkeypatch.setattr(acr, "APP_LEDGERS", {"personal-assistant": pa, "cookbook": cookbook})
+    monkeypatch.setattr(acr, "APP_LEDGERS", {"demo-assistant": demo_ledger, "cookbook": cookbook})
     monkeypatch.setattr(acr, "APP_LEDGER_DIR", tmp_path / "no-collected")
     got = acr.apps_by_app(date(2026, 6, 13))
-    assert got == {"personal-assistant": pytest.approx(0.050)}  # 0.032 + 0.018; cookbook absent (missing ledger)
+    assert got == {"demo-assistant": pytest.approx(0.050)}  # 0.032 + 0.018; cookbook absent (missing ledger)
+
+
+@pytest.mark.rich_registry
+def test_app_ledgers_matches_the_registrys_own_ledger_paths(agent_cost_report):
+    """Pinned against the registry's own accessor, not a copy of the slugs —
+    fails red if APP_LEDGERS drifts back to a hardcoded dict."""
+    import projects
+    assert agent_cost_report.APP_LEDGERS == projects.own_ledger_paths()
 
 
 def test_apps_by_app_empty_when_no_ledgers(agent_cost_report, monkeypatch, tmp_path):
     acr = agent_cost_report
-    monkeypatch.setattr(acr, "APP_LEDGERS", {"personal-assistant": tmp_path / "nope.jsonl"})
+    monkeypatch.setattr(acr, "APP_LEDGERS", {"demo-assistant": tmp_path / "nope.jsonl"})
     monkeypatch.setattr(acr, "APP_LEDGER_DIR", tmp_path / "no-collected")
     assert acr.apps_by_app(date(2026, 6, 13)) == {}
 
 
 def test_apps_by_app_merges_collected_dir_for_cloud_apps(agent_cost_report, monkeypatch, tmp_path):
-    # ARCH-152: cloud apps (vivy, constance) can't write the mini's disk, so the
+    # ARCH-152: cloud apps (widget, globex) can't write the mini's disk, so the
     # ingest endpoint drops their events in APP_LEDGER_DIR/<app>.jsonl. apps_by_app
     # scans that dir too, keying the app off the filename stem, and merges it with
     # the mini-local APP_LEDGERS sources.
     acr = agent_cost_report
-    pa = tmp_path / "pa.jsonl"
-    pa.write_text(json.dumps({"ts": "2026-06-13T10:00:00Z", "usd": 0.10}) + "\n")
+    demo_ledger = tmp_path / "demo-assistant.jsonl"
+    demo_ledger.write_text(json.dumps({"ts": "2026-06-13T10:00:00Z", "usd": 0.10}) + "\n")
     collected = tmp_path / "llm-spend"
     collected.mkdir()
-    (collected / "vivy.jsonl").write_text(
-        json.dumps({"ts": "2026-06-13T11:00:00Z", "app": "vivy", "usd": 0.30}) + "\n"
-        + json.dumps({"ts": "2026-06-12T11:00:00Z", "app": "vivy", "usd": 9.99}) + "\n")  # other day
-    (collected / "constance.jsonl").write_text(
-        json.dumps({"ts": "2026-06-13T12:00:00Z", "app": "constance", "usd": 0.05}) + "\n")
-    monkeypatch.setattr(acr, "APP_LEDGERS", {"personal-assistant": pa})
+    (collected / "widget.jsonl").write_text(
+        json.dumps({"ts": "2026-06-13T11:00:00Z", "app": "widget", "usd": 0.30}) + "\n"
+        + json.dumps({"ts": "2026-06-12T11:00:00Z", "app": "widget", "usd": 9.99}) + "\n")  # other day
+    (collected / "globex.jsonl").write_text(
+        json.dumps({"ts": "2026-06-13T12:00:00Z", "app": "globex", "usd": 0.05}) + "\n")
+    monkeypatch.setattr(acr, "APP_LEDGERS", {"demo-assistant": demo_ledger})
     monkeypatch.setattr(acr, "APP_LEDGER_DIR", collected)
     got = acr.apps_by_app(date(2026, 6, 13))
-    assert got == {"personal-assistant": pytest.approx(0.10),
-                   "vivy": pytest.approx(0.30), "constance": pytest.approx(0.05)}
+    assert got == {"demo-assistant": pytest.approx(0.10),
+                   "widget": pytest.approx(0.30), "globex": pytest.approx(0.05)}
 
 
 def test_apps_by_app_no_collected_dir_is_fine(agent_cost_report, monkeypatch, tmp_path):
@@ -473,7 +481,7 @@ def test_apps_by_app_no_collected_dir_is_fine(agent_cost_report, monkeypatch, tm
 
 
 def test_apps_by_app_reads_cookbook_cost_field(agent_cost_report, monkeypatch, tmp_path):
-    # cookbook's ledger uses `cost` (and local-time ts, no Z); PA uses `usd`.
+    # cookbook's ledger uses `cost` (and local-time ts, no Z); demo-assistant uses `usd`.
     # apps_by_app must sum whichever dollar field is present, across providers.
     acr = agent_cost_report
     cb = tmp_path / "usage.jsonl"

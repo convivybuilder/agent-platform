@@ -19,6 +19,13 @@ unless the run is a review-class dispatch pinned to a PR. A verdict argument tha
 another PR, repository or commit is refused as well. The posting itself is
 `agentctl review-post`, pinned to the run's commit, so every check that command makes
 still applies, including the APPROVE gate on CI.
+
+A private crew's own reviewer gets this same server (CQ·557, library#323): a black
+box's dispatch carries no `kb`/`ops` server at all (ADR-0043), but `mcp_config` below
+is already the minimal `{"verdict": ...}` shape, so the spawn site hands it out
+unchanged. `cmd_review_post` is what tells the two cases apart — it sends the Library
+only the six fields a private record accepts, and reads `private_review_token_path`'s
+file instead of `signal_client.TOKEN_FILE` — never this module.
 """
 
 from __future__ import annotations
@@ -42,6 +49,30 @@ import review_protocol as RP
 RECORD_URL_ENV = "AGENTCTL_REVIEW_RECORD_URL"
 
 SERVER_NAME = "verdict"
+
+# CQ·557: the per-product `review_record_writer` token a private crew's own reviewer
+# posts its verdict-only record with (library#323). Lives in the SAME directory as
+# `signal_client.TOKEN_FILE` (~/.orient-control/agent-platform-token) — the general,
+# prose-capable review-record credential — because that directory is already outside
+# every dispatched run's own sandboxed Bash: `run_sandbox.DENIED_DIRS` names
+# `.orient-control` precisely so a run cannot read the grant that lets it post a
+# review, and this reuses that wall rather than opening a second one. The verdict
+# server (`bin/mcp-verdict-server`) that reads this file runs the same way the
+# general one does — started by Claude OUTSIDE the dispatched run's sandbox, with
+# only the run id in its launch environment — so it can open a path the run itself
+# never could.
+PRIVATE_REVIEW_TOKEN_DIR = Path.home() / ".orient-control"
+
+
+def private_review_token_path(product: str) -> Path:
+    """The one `review_record_writer` token for PRODUCT's private crew — one file
+    per private product, mode 0600, minted by the operator with `mint_credential.py
+    --file agents --kind review_record_writer --products <product> --name <name>
+    --out <this path>`. `cmd_review_post` reads it directly when the target
+    repository resolves to a private product, and never falls back to
+    `signal_client.TOKEN_FILE` (the general token, which can write prose) when this
+    file is missing or unreadable."""
+    return PRIVATE_REVIEW_TOKEN_DIR / f"review-record-writer-{product}-token"
 
 
 class Refused(Exception):
@@ -74,9 +105,9 @@ def target_for(run_id: str, *, pr: str | None = None, repo: str | None = None,
     facts = RP.resolve_run_facts(run_id, runs_root)
     if not facts.found:
         raise Refused(f"run {run_id!r} has no readable run record, so there is no PR to post to")
-    if not RP.is_review_class(facts.agent, RP.REVIEW_AGENTS):
-        raise Refused(f"{facts.agent} is not a reviewer. Only reviewer and security-reviewer "
-                      f"post a verdict.")
+    if not RP.is_review_class(facts.agent, RP.REVIEW_AGENTS + RP.SHADOW_REVIEW_AGENTS):
+        raise Refused(f"{facts.agent} is not a reviewer. Only reviewer, security-reviewer "
+                      f"and shadow-reviewer post a verdict.")
     if facts.pr in (None, "", 0):
         raise Refused("this run was not dispatched with --pr, so no PR is pinned to post to")
     if not re.fullmatch(r"[0-9a-f]{40}", facts.review_sha or ""):

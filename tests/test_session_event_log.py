@@ -14,6 +14,7 @@ so one pathological message cannot write an unbounded line.
 from __future__ import annotations
 
 import ast
+import datetime
 import importlib.util
 import json
 import os
@@ -66,8 +67,14 @@ def _run(payload, tmp_home, event="Stop", extra_env=None):
         (alt / "Convivy").mkdir()
         cfg = alt / "session-agent.env"
         cfg.write_text(f"CREWS_ROOT={alt / 'Convivy'}\n")
+    # `private_crew.py`'s own default (no `_REGISTRY` override) now reads
+    # through `projects.py` (CQ·565) rather than a hardcoded live-checkout
+    # path, so this hook subprocess needs `PROJECTS_JSON` pointed at the same
+    # file `_registry()` below writes to, or an unset `PROJECTS_JSON` would
+    # reach the Library instead of this test's own fixture registry.
     env = {"HOME": str(tmp_home), "BUILDER_ROOT": str(tmp_home / "Convivy"),
-           "PATH": "/usr/bin:/bin"}
+           "PATH": "/usr/bin:/bin",
+           "PROJECTS_JSON": str(tmp_home / "Convivy" / "agent-platform" / "config" / "projects.json")}
     env.update(extra_env or {})
     return subprocess.run(
         [sys.executable, str(HOOK), event, "--root-config", str(cfg)],
@@ -399,12 +406,12 @@ def _registry(tmp_home, entries):
 
 
 def _private_registry(tmp_home):
-    crew = tmp_home / "Convivy" / "CFO"
+    crew = tmp_home / "Convivy" / "TREASURY"
     crew.mkdir(parents=True, exist_ok=True)
     _registry(tmp_home, {
         "_meta": {"note": "underscore keys are metadata, not projects"},
-        "cfo": {"home_dir": "~/Convivy/CFO", "private": True},
-        "vivy": {"home_dir": "~/Convivy/vivy"},
+        "treasury": {"home_dir": "~/Convivy/TREASURY", "private": True},
+        "finch": {"home_dir": "~/Convivy/finch"},
     })
     return crew
 
@@ -422,7 +429,7 @@ def _shared_root(tmp_home):
 
 
 def test_a_private_crews_prompt_never_reaches_the_shared_root(tmp_path):
-    """The measured leak: 14 CFO sessions holding 147,005 characters of verbatim
+    """The measured leak: 14 TREASURY sessions holding 147,005 characters of verbatim
     prompt and assistant text in the shared run root, outside every ADR-0043 layer.
 
     The record is REDIRECTED rather than dropped — the operator's ledger-split rule puts a
@@ -439,6 +446,150 @@ def test_a_private_crews_prompt_never_reaches_the_shared_root(tmp_path):
     spilled = "".join(p.read_text(encoding="utf-8")
                       for p in root.rglob("*.jsonl")) if root.exists() else ""
     assert secret not in spilled, "private content reached the shared root"
+
+
+def test_a_private_crews_hook_log_ignores_itself_in_git(tmp_path):
+    """The task text a live dispatch leaves in `<crew home>/hook-log/<day>/
+    <session>.jsonl` must not be stageable by the crew's own `git add -A`
+    (the leak this work item closes, one directory over from PR #1100's
+    identical `.gitignore` write for `<crew home>/agent-runs`).
+
+    Checked against a real git repository, not a string match on the
+    written file: `git add -A` is the actual mechanism that leaked the
+    transcript fragment, so the assertion is that it stages nothing."""
+    crew = _private_registry(tmp_path)
+    subprocess.run(["git", "init", "-q"], cwd=crew, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=crew, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=crew, check=True)
+
+    secret = "ACCOUNT 99999999 ROUTING 11111111"
+    _run(json.dumps({"session_id": "s9", "hook_event_name": "UserPromptSubmit",
+                     "cwd": str(crew), "prompt": secret}), tmp_path,
+         event="UserPromptSubmit")
+
+    assert (crew / "hook-log" / ".gitignore").read_text(encoding="utf-8") == "*\n"
+    assert secret in _crew_log_lines(crew), "the crew must still keep its own record"
+
+    subprocess.run(["git", "add", "-A"], cwd=crew, check=True)
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only"],
+                            cwd=crew, capture_output=True, text=True, check=True).stdout
+    assert "hook-log" not in staged, f"git add -A staged the hook log: {staged!r}"
+
+    # A public (non-private) crew's shared log location is untouched by the
+    # redirect above — it never gets a .gitignore, since LOG_ROOT lives
+    # outside any tree agentctl dispatches into and no `git add -A` reaches it.
+    shared = _shared_root(tmp_path)
+    _run(json.dumps({"session_id": "s10", "hook_event_name": "UserPromptSubmit",
+                     "cwd": str(tmp_path / "Convivy" / "finch"), "prompt": "not secret"}), tmp_path,
+         event="UserPromptSubmit")
+    assert not (shared / ".gitignore").exists(), "the shared hook-log root must never get one"
+
+
+def test_a_private_crews_hook_log_gitignore_is_written_when_the_dir_already_exists(tmp_path):
+    """A crew dispatched before this fix shipped already has a `hook-log/`
+    directory with no `.gitignore` in it. The write must not be gated on
+    `os.makedirs` actually creating the directory."""
+    crew = _private_registry(tmp_path)
+    (crew / "hook-log").mkdir(parents=True)
+
+    _run(json.dumps({"session_id": "s11", "hook_event_name": "UserPromptSubmit",
+                     "cwd": str(crew), "prompt": "x"}), tmp_path,
+         event="UserPromptSubmit")
+
+    assert (crew / "hook-log" / ".gitignore").read_text(encoding="utf-8") == "*\n"
+    # The crew's own top-level .gitignore is never touched by this write.
+    assert not (crew / ".gitignore").exists()
+
+
+def _utc_today_str():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+
+def test_a_symlinked_hook_log_leaves_the_link_target_untouched(tmp_path):
+    """The concrete path security-reviewer named on PR #1101 round 2: a private
+    crew's own earlier, sandboxed dispatch can replace `<crew home>/hook-log`
+    with a symlink before this hook (which runs unsandboxed) ever fires. The
+    hook must refuse to follow it rather than writing into wherever it points,
+    and must still exit 0 (the Stop-hook contract this file leads with)."""
+    crew = _private_registry(tmp_path)
+    outside = tmp_path / "outside-hook-log"
+    outside.mkdir()
+    (crew / "hook-log").symlink_to(outside)
+
+    secret = "ACCOUNT 55554444 ROUTING 33332222"
+    r = _run(json.dumps({"session_id": "s20", "hook_event_name": "UserPromptSubmit",
+                        "cwd": str(crew), "prompt": secret}), tmp_path,
+            event="UserPromptSubmit")
+
+    assert r.returncode == 0
+    assert list(outside.iterdir()) == [], "the symlink target must not have been written into"
+    assert (crew / "hook-log").is_symlink(), "the planted symlink itself is left alone"
+
+
+def test_a_symlinked_day_directory_leaves_the_link_target_untouched(tmp_path):
+    """`hook-log` itself is real, but its day directory — equally predictable,
+    today's UTC date — was replaced with a symlink. Same refusal as the
+    top-level directory."""
+    crew = _private_registry(tmp_path)
+    (crew / "hook-log").mkdir(parents=True)
+    outside = tmp_path / "outside-day-dir"
+    outside.mkdir()
+    (crew / "hook-log" / _utc_today_str()).symlink_to(outside)
+
+    secret = "ACCOUNT 11112222 ROUTING 99998888"
+    r = _run(json.dumps({"session_id": "s21", "hook_event_name": "UserPromptSubmit",
+                        "cwd": str(crew), "prompt": secret}), tmp_path,
+            event="UserPromptSubmit")
+
+    assert r.returncode == 0
+    assert list(outside.iterdir()) == [], "the symlink target must not have been written into"
+    assert (crew / "hook-log" / _utc_today_str()).is_symlink(), "the planted symlink is left alone"
+    # hook-log itself is real, so the directory-level write that IS safe
+    # still happens.
+    assert (crew / "hook-log" / ".gitignore").read_text(encoding="utf-8") == "*\n"
+
+
+def test_a_dangling_gitignore_symlink_is_left_alone(tmp_path):
+    """`hook-log` and its day directory are both real; only `.gitignore`
+    itself was pre-planted as a symlink, dangling (pointing nowhere). The
+    write must refuse rather than create the target through it, and the
+    record itself — a write this symlink does not touch — still lands."""
+    crew = _private_registry(tmp_path)
+    (crew / "hook-log").mkdir(parents=True)
+    dangling_target = tmp_path / "never-created.gitignore"
+    (crew / "hook-log" / ".gitignore").symlink_to(dangling_target)
+
+    secret = "ACCOUNT 77776666 ROUTING 55554444"
+    r = _run(json.dumps({"session_id": "s22", "hook_event_name": "UserPromptSubmit",
+                        "cwd": str(crew), "prompt": secret}), tmp_path,
+            event="UserPromptSubmit")
+
+    assert r.returncode == 0
+    assert not dangling_target.exists(), "the dangling symlink's target must not have been created"
+    assert (crew / "hook-log" / ".gitignore").is_symlink(), "the planted symlink is left alone"
+    assert secret in _crew_log_lines(crew), "the record itself must still land"
+
+
+def test_a_symlinked_day_jsonl_leaves_the_link_target_untouched(tmp_path):
+    """The day directory is real, but the session's own `.jsonl` was
+    pre-planted as a symlink to an existing file elsewhere. The append must
+    refuse to follow it rather than writing this crew's content into
+    whatever that file actually is."""
+    crew = _private_registry(tmp_path)
+    day_dir = crew / "hook-log" / _utc_today_str()
+    day_dir.mkdir(parents=True)
+    outside_file = tmp_path / "outside.jsonl"
+    outside_file.write_text("untouched\n", encoding="utf-8")
+    (day_dir / "s23.jsonl").symlink_to(outside_file)
+
+    secret = "ACCOUNT 33334444 ROUTING 66667777"
+    r = _run(json.dumps({"session_id": "s23", "hook_event_name": "UserPromptSubmit",
+                        "cwd": str(crew), "prompt": secret}), tmp_path,
+            event="UserPromptSubmit")
+
+    assert r.returncode == 0
+    assert outside_file.read_text(encoding="utf-8") == "untouched\n"
+    assert (day_dir / "s23.jsonl").is_symlink(), "the planted symlink is left alone"
 
 
 def test_a_symlinked_path_into_a_private_crew_is_still_private(tmp_path):
@@ -467,9 +618,9 @@ def test_a_differently_cased_path_into_a_private_crew_is_still_private(tmp_path)
     """The case this suite was missing, and the reason the comparison is by inode.
 
     `os.path.realpath` resolves symlinks but does NOT canonicalise case on macOS,
-    whose boot volume is case-insensitive by default. So `cd ~/convivy/cfo` lands in
+    whose boot volume is case-insensitive by default. So `cd ~/convivy/treasury` lands in
     the real directory with the typed case surviving into the resolved path, and a
-    string comparison against the registry's `~/Convivy/CFO` fails while the session
+    string comparison against the registry's `~/Convivy/TREASURY` fails while the session
     sits in the crew.
 
     Found by mutation-testing: replacing `os.path.samefile` with `==` left every
@@ -477,7 +628,7 @@ def test_a_differently_cased_path_into_a_private_crew_is_still_private(tmp_path)
     and could have been "simplified" away by anyone who tried.
     """
     crew = _private_registry(tmp_path)
-    miscased = tmp_path / "Convivy" / "cfo"
+    miscased = tmp_path / "Convivy" / "treasury"
     if not miscased.is_dir():
         pytest.skip("case-sensitive filesystem: the lowercase path is a different dir")
     secret = "BSB 062-000 ACCT 12345678"
@@ -518,7 +669,7 @@ def test_a_root_config_that_names_no_root_makes_every_answer_unknown(tmp_path):
     On a machine whose real root holds no registry, as on the CI runner, the
     fallback is UNKNOWN anyway, so this discriminates only where the real
     registry exists."""
-    ordinary = tmp_path / "Convivy" / "vivy"
+    ordinary = tmp_path / "Convivy" / "finch"
     ordinary.mkdir(parents=True)
     a_file = tmp_path / "not-a-dir"
     a_file.write_text("x")
@@ -551,7 +702,7 @@ def test_a_root_config_that_names_no_root_makes_every_answer_unknown(tmp_path):
 def test_an_ordinary_crew_still_writes_to_the_shared_root(tmp_path):
     """The redirect must not swallow everyone else's instrumentation."""
     _private_registry(tmp_path)
-    ordinary = tmp_path / "Convivy" / "vivy"
+    ordinary = tmp_path / "Convivy" / "finch"
     ordinary.mkdir(parents=True)
     _run(json.dumps({"session_id": "s4", "hook_event_name": "UserPromptSubmit",
                      "cwd": str(ordinary), "prompt": "ordinary work"}), tmp_path,
@@ -570,7 +721,7 @@ def test_an_unreadable_registry_strips_content_rather_than_guessing(tmp_path):
     availability one across the whole fleet, so the event lands and its content
     does not.
     """
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "TREASURY"
     crew.mkdir(parents=True)
     secret = "IBAN GB00BARC00000000000000"
     _run(json.dumps({"session_id": "s5", "hook_event_name": "UserPromptSubmit",
@@ -624,7 +775,7 @@ def test_tool_input_is_redacted_when_the_registry_is_unreadable(tmp_path):
     in `tool_input` instead. An unreadable registry at exactly one of those events
     used to leave `tool_input` unredacted in the shared root.
     """
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "TREASURY"
     crew.mkdir(parents=True)  # crew home exists, but no projects.json — unreadable registry
     secret = "SHOULD WE WIRE $50,000 TO ACCOUNT 999888?"
     payload = {
@@ -652,7 +803,7 @@ def test_cwd_is_redacted_in_the_primary_write_when_the_registry_is_unreadable(tm
     used to write the crew's real `cwd` straight into the shared root even
     though its content fields read `[redacted: ...]` right next to it.
     """
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "TREASURY"
     crew.mkdir(parents=True)  # crew home exists, but no projects.json: unreadable registry
     payload = {
         "session_id": "s10",
@@ -677,28 +828,29 @@ def test_transcript_path_is_redacted_in_the_primary_write_when_the_registry_is_u
     information alongside `cwd`. It was never in `_CONTENT_FIELDS` either, so it
     also survived unredacted in the primary write on the identical `_UNKNOWN` path.
     """
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "TREASURY"
     crew.mkdir(parents=True)  # crew home exists, but no projects.json: unreadable registry
     payload = {
         "session_id": "s11",
         "hook_event_name": "Stop",
         "cwd": str(crew),
-        "transcript_path": "/srv/convivy/CFO/transcript.jsonl",
+        "transcript_path": "/srv/convivy/TREASURY/transcript.jsonl",
         "last_assistant_message": "irrelevant",
     }
     _run(json.dumps(payload), tmp_path, event="Stop")
 
     written = "".join(p.read_text(encoding="utf-8")
                       for p in _shared_root(tmp_path).rglob("*.jsonl"))
-    assert "/srv/convivy/CFO/transcript.jsonl" not in written
+    assert "/srv/convivy/TREASURY/transcript.jsonl" not in written
     record = json.loads(written)
     assert record["payload"]["transcript_path"] == "[redacted: crew privacy could not be determined]"
 
 
 def test_a_private_crews_identity_record_never_reaches_the_shared_runs_root(tmp_path):
     """The blocking finding on PR #413 (run-73e19889): `_co_record` wrote straight
-    to `RUNS_ROOT` for every session regardless of crew, so a CFO or Ask session's
-    cwd, product, model, and transcript_path — a live pointer at that session's
+    to `RUNS_ROOT` for every session regardless of crew, so a TREASURY or the
+    walled-off crew's session's cwd, product, model, and transcript_path — a
+    live pointer at that session's
     full verbatim transcript — landed on the shared dashboard surface ADR-0043
     says a black box crew must not appear on. Same redirect as the primary write:
     the record belongs inside the crew's own directory, not the shared root.
@@ -725,6 +877,113 @@ def test_a_private_crews_identity_record_never_reaches_the_shared_runs_root(tmp_
     assert after["heartbeat_at"] >= meta["heartbeat_at"]
 
 
+def test_a_symlinked_private_agent_runs_leaves_the_link_target_untouched(tmp_path):
+    """Same symlink-planting threat as the hook-log tests above, one directory
+    over: `<crew home>/agent-runs` is as predictable as `<crew home>/hook-log`,
+    and `_co_record` writes there unsandboxed for exactly the same reason."""
+    crew = _private_registry(tmp_path)
+    outside = tmp_path / "outside-agent-runs"
+    outside.mkdir()
+    (crew / "agent-runs").symlink_to(outside)
+
+    sid = "0199c7de-1234-4abc-8def-0123456789ab"
+    r = _run(json.dumps({"session_id": sid, "cwd": str(crew), "model": "m"}),
+             tmp_path, event="SessionStart")
+
+    assert r.returncode == 0
+    assert list(outside.iterdir()) == [], "the symlink target must not have been written into"
+    assert (crew / "agent-runs").is_symlink(), "the planted symlink itself is left alone"
+
+
+def test_a_symlinked_private_co_meta_json_leaves_the_link_target_untouched(tmp_path):
+    """The day and `co-<sid>` directories are real, but `meta.json` itself was
+    pre-planted as a symlink to an existing file elsewhere."""
+    crew = _private_registry(tmp_path)
+    sid = "0199c7de-1234-4abc-8def-0123456789ab"
+    day_dir = crew / "agent-runs" / datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
+    co_dir = day_dir / f"co-{sid}"
+    co_dir.mkdir(parents=True)
+    outside_file = tmp_path / "outside-meta.json"
+    outside_file.write_text("untouched\n", encoding="utf-8")
+    (co_dir / "meta.json").symlink_to(outside_file)
+
+    r = _run(json.dumps({"session_id": sid, "cwd": str(crew), "model": "m"}),
+             tmp_path, event="SessionStart")
+
+    assert r.returncode == 0
+    assert outside_file.read_text(encoding="utf-8") == "untouched\n"
+    assert (co_dir / "meta.json").is_symlink(), "the planted symlink is left alone"
+
+
+def test_stop_with_a_symlinked_private_day_directory_writes_nothing(tmp_path):
+    """The concrete path reviewer named on PR #1101 round 3: `agent-runs`
+    itself is real, but ITS day directory — exactly as predictable as
+    `agent-runs` (today's local date) — was replaced with a symlink to a
+    directory that already holds a `co-<this session's sid>/meta.json` an
+    attacker could read. SessionStart already refuses to CREATE under such
+    a symlink; Stop must refuse to read or write through one too, rather
+    than silently following it because it does not need to create
+    anything (ARCH-322 round 3)."""
+    crew = _private_registry(tmp_path)
+    sid = "0199c7de-1234-4abc-8def-0123456789ab"
+    outside = tmp_path / "outside-day-dir"
+    outside_co = outside / f"co-{sid}"
+    outside_co.mkdir(parents=True)
+    outside_meta = outside_co / "meta.json"
+    planted = json.dumps({"kind": "co-session", "session_id": sid,
+                          "started_at": "2001-01-01T00:00:00+00:00",
+                          "heartbeat_at": "2001-01-01T00:00:00+00:00",
+                          "cwd": "/elsewhere", "model": "m"})
+    outside_meta.write_text(planted, encoding="utf-8")
+
+    runs_dir = crew / "agent-runs"
+    runs_dir.mkdir(parents=True)
+    today = datetime.datetime.now().astimezone().strftime("%Y-%m-%d")
+    (runs_dir / today).symlink_to(outside)
+
+    r = _run(json.dumps({"session_id": sid, "cwd": str(crew), "model": "m"}),
+             tmp_path, event="Stop")
+
+    assert r.returncode == 0
+    assert outside_meta.read_text(encoding="utf-8") == planted, (
+        "the symlink target's content must not have been read or rewritten")
+    assert (runs_dir / today).is_symlink(), "the planted symlink itself is left alone"
+
+
+def test_stop_glob_fallback_filters_a_symlinked_day_segment(tmp_path):
+    """The midnight-bug glob fallback's own filter line (`found = [p for p in
+    found if _is_safe_co_meta_path(p)]`), reached only when TODAY's day
+    directory does not exist at all — unlike the test above, where today's
+    day dir IS the symlink and the earlier direct-guess check at
+    `os.path.exists(meta_path)` catches it before the glob ever runs. Here
+    the symlinked day segment is a PAST date, found only by the glob, so
+    this is the first test to exercise the filter line itself rather than
+    the `_is_safe_co_meta_path` helper it shares with the direct check."""
+    crew = _private_registry(tmp_path)
+    sid = "0199c7de-1234-4abc-8def-0123456789ab"
+    outside = tmp_path / "outside-day-dir"
+    outside_co = outside / f"co-{sid}"
+    outside_co.mkdir(parents=True)
+    outside_meta = outside_co / "meta.json"
+    planted = json.dumps({"kind": "co-session", "session_id": sid,
+                          "started_at": "2001-01-01T00:00:00+00:00",
+                          "heartbeat_at": "2001-01-01T00:00:00+00:00",
+                          "cwd": "/elsewhere", "model": "m"})
+    outside_meta.write_text(planted, encoding="utf-8")
+
+    runs_dir = crew / "agent-runs"
+    runs_dir.mkdir(parents=True)
+    (runs_dir / "2001-01-01").symlink_to(outside)   # a past date, not today's
+
+    r = _run(json.dumps({"session_id": sid, "cwd": str(crew), "model": "m"}),
+             tmp_path, event="Stop")
+
+    assert r.returncode == 0
+    assert outside_meta.read_text(encoding="utf-8") == planted, (
+        "the symlink target's content must not have been read or rewritten")
+    assert (runs_dir / "2001-01-01").is_symlink(), "the planted symlink itself is left alone"
+
+
 @pytest.mark.parametrize(
     "setup",
     [
@@ -743,7 +1002,7 @@ def test_sessionstart_identity_record_is_redacted_when_private_home_is_unknown(s
     into the shared root; reviewer reproduced this directly.
     """
     if setup == "unreadable_registry":
-        crew = tmp_path / "Convivy" / "CFO"
+        crew = tmp_path / "Convivy" / "TREASURY"
         crew.mkdir(parents=True)  # crew home exists, but no projects.json: unreadable registry
         cwd = str(crew)
     else:
@@ -774,7 +1033,7 @@ def test_stop_does_not_reveal_a_cwd_redacted_at_sessionstart(tmp_path):
     redacted at SessionStart because `private_home` was `_UNKNOWN` must still read
     redacted after a Stop with the same undeterminable crew.
     """
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "TREASURY"
     crew.mkdir(parents=True)  # no projects.json: unreadable registry for both events
     sid = "0199c7de-1234-4abc-8def-0123456789ab"
     _run(json.dumps({"session_id": sid, "cwd": str(crew), "model": "m"}),
@@ -809,7 +1068,7 @@ def test_unparsed_payload_is_redacted_when_the_registry_is_unreadable(raw, tmp_p
     this case. `test_exit_zero_on_malformed_input` covers these same input
     shapes but only asserts exit code, which the pre-fix leak also satisfied.
     """
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "TREASURY"
     crew.mkdir(parents=True)  # crew home exists, but no projects.json: unreadable registry
     secret = "SECRET ACCOUNT 999888"
     payload = raw.replace("CREW_HOME", str(crew)).replace("SECRET", secret)
@@ -913,7 +1172,7 @@ def test_a_private_crews_tmux_session_is_written_to_its_own_record(pane, tmp_pat
 
 def test_the_tmux_session_is_redacted_when_the_crew_cannot_be_determined(pane, tmp_path):
     """On the unknown-crew path the name is blanked like cwd, so the crew's pane is not shown."""
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "TREASURY"
     crew.mkdir(parents=True)  # no projects.json: unreadable registry
     r = _run(json.dumps({"session_id": TMUX_SID, "cwd": str(crew)}), tmp_path,
              event="SessionStart", extra_env=pane("crew_ok"))

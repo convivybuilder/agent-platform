@@ -1,6 +1,6 @@
 #!/bin/bash
 # Tests for the $0 symlink-resolution hop cap duplicated across
-# bin/appkit-autoupdate, bin/knowledge-autopull, bin/launch-weekly-curation,
+# bin/primary-checkout-autoupdate, bin/knowledge-autopull, bin/launch-weekly-curation,
 # bin/launch-weekly-kb-audit and bin/arch129-remeasure (round 7, both
 # reviewers). The cap stops the readlink loop that resolves each script's own
 # location from spinning forever when $0's symlink chain cycles. Nothing
@@ -29,7 +29,7 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=/dev/null
 . "$HERE/lib.sh"
 
-SCRIPTS="appkit-autoupdate knowledge-autopull launch-weekly-curation launch-weekly-kb-audit arch129-remeasure"
+SCRIPTS="primary-checkout-autoupdate knowledge-autopull launch-weekly-curation launch-weekly-kb-audit arch129-remeasure"
 
 # Run "$@" in the background, bounded to <secs>, output captured to <outfile>.
 # Echoes the child's exit code. No dependency on GNU coreutils' `timeout`,

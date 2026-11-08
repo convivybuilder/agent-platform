@@ -152,9 +152,9 @@ def _verbs(calls):
 
 
 def test_a_session_is_created_detached_in_its_directory(SL, tmux, tmp_path):
-    result = SL.start("nyh", directory=str(tmp_path), command="co")
+    result = SL.start("oak", directory=str(tmp_path), command="co")
 
-    assert ("tmux", "new-session", "-d", "-s", "nyh", "-c", str(tmp_path)) in tmux
+    assert ("tmux", "new-session", "-d", "-s", "oak", "-c", str(tmp_path)) in tmux
     assert result["created"] is True
     assert result["directory"] == str(tmp_path)
 
@@ -162,7 +162,7 @@ def test_a_session_is_created_detached_in_its_directory(SL, tmux, tmp_path):
 def test_detached_is_not_optional(SL, tmux, tmp_path):
     """Deck attaches over its own ssh connection. A session created attached
     would tie its life to a call that is meant to return."""
-    SL.start("nyh", directory=str(tmp_path))
+    SL.start("oak", directory=str(tmp_path))
     create = next(c for c in tmux if c[1] == "new-session")
     assert "-d" in create
 
@@ -171,17 +171,17 @@ def test_the_command_is_typed_rather_than_being_the_pane_process(SL, tmux, tmp_p
     """A command given to `new-session` BECOMES the pane's process, so the
     session dies when it exits — an agent that finished would take its own
     terminal away and leave nowhere to start another."""
-    SL.start("nyh", directory=str(tmp_path), command="co -r")
+    SL.start("oak", directory=str(tmp_path), command="co -r")
 
     create = next(c for c in tmux if c[1] == "new-session")
     assert "co -r" not in create
-    assert ("tmux", "send-keys", "-l", "-t", "nyh", "co -r") in tmux
-    assert ("tmux", "send-keys", "-t", "nyh", "Enter") in tmux
+    assert ("tmux", "send-keys", "-l", "-t", "oak", "co -r") in tmux
+    assert ("tmux", "send-keys", "-t", "oak", "Enter") in tmux
 
 
 def test_the_default_command_is_co(SL, tmux, tmp_path):
-    SL.start("nyh", directory=str(tmp_path))
-    assert ("tmux", "send-keys", "-l", "-t", "nyh", "co") in tmux
+    SL.start("oak", directory=str(tmp_path))
+    assert ("tmux", "send-keys", "-l", "-t", "oak", "co") in tmux
 
 
 def test_a_home_relative_directory_is_expanded(SL, tmux, monkeypatch, tmp_path):
@@ -192,7 +192,7 @@ def test_a_home_relative_directory_is_expanded(SL, tmux, monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     (tmp_path / "work").mkdir()
 
-    result = SL.start("nyh", directory="~/work")
+    result = SL.start("oak", directory="~/work")
     assert result["directory"] == str(tmp_path / "work")
     assert "~" not in result["directory"]
 
@@ -201,13 +201,13 @@ def test_a_missing_directory_is_refused_before_tmux_is_touched(SL, tmux):
     """`tmux new-session -c` on a missing path fails with a message about the
     session, and the reader goes looking at the wrong thing."""
     with pytest.raises(SL.LifecycleError, match="no such directory"):
-        SL.start("nyh", directory="/no/such/place")
+        SL.start("oak", directory="/no/such/place")
     assert not tmux
 
 
 def test_a_relative_directory_is_refused(SL, tmux):
     with pytest.raises(SL.LifecycleError, match="must be absolute"):
-        SL.start("nyh", directory="relative/path")
+        SL.start("oak", directory="relative/path")
 
 
 def test_create_dir_makes_a_missing_directory_and_proceeds(SL, tmux, tmp_path, monkeypatch):
@@ -218,11 +218,11 @@ def test_create_dir_makes_a_missing_directory_and_proceeds(SL, tmux, tmp_path, m
     target = tmp_path / "brand-new" / "project"
     assert not target.exists()
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert target.is_dir()
     assert result["directory"] == str(target)
-    assert ("tmux", "new-session", "-d", "-s", "nyh", "-c", str(target)) in tmux
+    assert ("tmux", "new-session", "-d", "-s", "oak", "-c", str(target)) in tmux
 
 
 def test_without_create_dir_a_missing_directory_still_raises_the_same_message(
@@ -232,7 +232,7 @@ def test_without_create_dir_a_missing_directory_still_raises_the_same_message(
     manufacturing a directory."""
     target = tmp_path / "does-not-exist"
     with pytest.raises(SL.LifecycleError, match=f"no such directory: {target}"):
-        SL.start("nyh", directory=str(target))
+        SL.start("oak", directory=str(target))
     assert not target.exists()
     assert not tmux
 
@@ -245,7 +245,7 @@ def test_create_dir_rejects_a_path_outside_the_root(SL, tmux, tmp_path, monkeypa
     target = tmp_path / "elsewhere" / "project"
 
     with pytest.raises(SL.LifecycleError, match="must be under"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
     assert not tmux
 
@@ -260,7 +260,7 @@ def test_create_dir_rejects_a_dotdot_escape(SL, tmux, tmp_path, monkeypatch):
     escaped = tmp_path / "escaped" / "project"
 
     with pytest.raises(SL.LifecycleError, match="must be under"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not escaped.exists()
     assert not tmux
 
@@ -279,7 +279,7 @@ def test_create_dir_rejects_a_symlink_escape(SL, tmux, tmp_path, monkeypatch):
     target = link / "project"
 
     with pytest.raises(SL.LifecycleError, match="must be under"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not (outside / "project").exists()
     assert not tmux
 
@@ -312,7 +312,7 @@ def test_a_racing_creator_wins_the_mkdir_and_the_directory_is_adopted_not_truste
 
     monkeypatch.setattr(SL.Path, "mkdir", racing_mkdir)
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert target.is_dir()
     assert result["ok"] is True
@@ -337,7 +337,7 @@ def test_create_dir_at_a_path_occupied_by_a_regular_file_raises_loudly(
     target.write_text("not a directory")
 
     with pytest.raises(SL.LifecycleError, match="not a directory"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not tmux
 
 
@@ -358,7 +358,7 @@ def test_no_config_file_the_floor_is_convivy_root_byte_identical(
     monkeypatch.setattr(SL, "CONVIVY_ROOT", tmp_path / "Convivy")
     target = tmp_path / "Convivy" / "brand-new"
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert target.is_dir()
     assert result["directory"] == str(target)
@@ -370,7 +370,7 @@ def test_a_configured_root_permits_a_directory_under_it(SL, tmux, tmp_path, monk
     _write_crews_root_config(SL, monkeypatch, tmp_path, f"CREWS_ROOT={root}\n")
     target = root / "brand-new" / "crew"
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert target.is_dir()
     assert result["directory"] == str(target)
@@ -383,7 +383,7 @@ def test_a_configured_root_refuses_a_directory_outside_it(SL, tmux, tmp_path, mo
     target = tmp_path / "not-under-root" / "crew"
 
     with pytest.raises(SL.LifecycleError, match="must be under"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
     assert not tmux
 
@@ -397,7 +397,7 @@ def test_the_refusal_names_the_configured_root(SL, tmux, tmp_path, monkeypatch):
     target = tmp_path / "elsewhere" / "crew"
 
     with pytest.raises(SL.LifecycleError, match=re.escape(str(root))):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
 
 
 # MARK: - `creatable_root()`, the public read the `crews-root` verb uses
@@ -431,7 +431,7 @@ def test_creatable_root_matches_what_the_refusal_message_would_name(
     target = tmp_path / "elsewhere" / "crew"
 
     with pytest.raises(SL.LifecycleError) as excinfo:
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
 
     assert SL.creatable_root() in str(excinfo.value)
 
@@ -451,7 +451,7 @@ def test_a_configured_root_still_rejects_a_dotdot_escape(SL, tmux, tmp_path, mon
     escaped = tmp_path / "escaped" / "crew"
 
     with pytest.raises(SL.LifecycleError, match="must be under"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not escaped.exists()
     assert not tmux
 
@@ -471,7 +471,7 @@ def test_a_configured_root_still_rejects_a_symlink_escape(SL, tmux, tmp_path, mo
     target = link / "crew"
 
     with pytest.raises(SL.LifecycleError, match="must be under"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not (outside / "crew").exists()
     assert not tmux
 
@@ -486,7 +486,7 @@ def test_an_existing_directory_outside_the_configured_root_is_still_adopted(
     existing = tmp_path / "some-old-folder"
     existing.mkdir()
 
-    result = SL.start("nyh", directory=str(existing), create_dir=True)
+    result = SL.start("oak", directory=str(existing), create_dir=True)
 
     assert result["directory"] == str(existing)
 
@@ -498,14 +498,14 @@ def test_a_nonsense_configured_root_falls_back_to_convivy_root(
     _write_crews_root_config(SL, monkeypatch, tmp_path, f"CREWS_ROOT={bad_value}\n")
     target = tmp_path / "Convivy" / "brand-new"
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
     assert target.is_dir()
     assert result["directory"] == str(target)
 
     # And it still refuses what the default would refuse.
     outside = tmp_path / "elsewhere" / "crew"
     with pytest.raises(SL.LifecycleError, match="must be under"):
-        SL.start("nyh2", directory=str(outside), create_dir=True)
+        SL.start("oak2", directory=str(outside), create_dir=True)
 
 
 def test_a_root_of_the_filesystem_root_falls_back_to_convivy_root(
@@ -526,7 +526,7 @@ def test_a_root_of_the_filesystem_root_falls_back_to_convivy_root(
 
     with pytest.raises(SL.LifecycleError,
                         match=f"must be under {re.escape(str(convivy_root))}"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
     assert not tmux
 
@@ -548,7 +548,7 @@ def test_a_root_of_home_falls_back_to_convivy_root(SL, tmux, tmp_path, monkeypat
 
     with pytest.raises(SL.LifecycleError,
                         match=f"must be under {re.escape(str(convivy_root))}"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
     assert not tmux
 
@@ -565,7 +565,7 @@ def test_a_root_of_home_spelled_absolutely_falls_back_to_convivy_root(
 
     with pytest.raises(SL.LifecycleError,
                         match=f"must be under {re.escape(str(convivy_root))}"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
     assert not tmux
 
@@ -583,7 +583,7 @@ def test_a_root_that_is_an_ancestor_of_home_falls_back_to_convivy_root(
 
     with pytest.raises(SL.LifecycleError,
                         match=f"must be under {re.escape(str(convivy_root))}"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
     assert not tmux
 
@@ -602,7 +602,7 @@ def test_a_symlink_resolving_to_the_filesystem_root_falls_back_to_convivy_root(
 
     with pytest.raises(SL.LifecycleError,
                         match=f"must be under {re.escape(str(convivy_root))}"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
     assert not tmux
 
@@ -660,7 +660,7 @@ def test_a_configured_tilde_root_expands_against_the_passwd_home(
     target = spoofed_home / "attacker-named-crew"
     with pytest.raises(module.LifecycleError,
                         match=f"must be under {re.escape(str(passwd_home / 'builder'))}"):
-        module.start("nyh", directory=str(target), create_dir=True)
+        module.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
 
 
@@ -720,7 +720,7 @@ def test_the_trust_anchor_is_the_passwd_home_not_a_spoofed_home_env(
 
     with pytest.raises(module.LifecycleError,
                         match=f"must be under {re.escape(str(passwd_home / 'builder'))}"):
-        module.start("nyh", directory=str(target), create_dir=True)
+        module.start("oak", directory=str(target), create_dir=True)
     assert not target.exists()
 
 
@@ -734,7 +734,7 @@ def test_a_configured_root_pointing_at_a_file_falls_back_to_convivy_root(
     _write_crews_root_config(SL, monkeypatch, tmp_path, f"CREWS_ROOT={not_a_dir}\n")
     target = tmp_path / "Convivy" / "brand-new"
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert target.is_dir()
     assert result["directory"] == str(target)
@@ -748,7 +748,7 @@ def test_an_unset_key_in_the_config_file_falls_back_to_convivy_root(
     _write_crews_root_config(SL, monkeypatch, tmp_path, "SOME_OTHER_KEY=nope\n")
     target = tmp_path / "Convivy" / "brand-new"
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert target.is_dir()
     assert result["directory"] == str(target)
@@ -756,18 +756,18 @@ def test_an_unset_key_in_the_config_file_falls_back_to_convivy_root(
 
 @pytest.mark.parametrize("create_dir", [True, False])
 def test_an_existing_directory_is_unaffected_either_way(SL, tmux, tmp_path, create_dir):
-    result = SL.start("nyh", directory=str(tmp_path), create_dir=create_dir)
+    result = SL.start("oak", directory=str(tmp_path), create_dir=create_dir)
     assert result["directory"] == str(tmp_path)
-    assert ("tmux", "new-session", "-d", "-s", "nyh", "-c", str(tmp_path)) in tmux
+    assert ("tmux", "new-session", "-d", "-s", "oak", "-c", str(tmp_path)) in tmux
 
 
 def test_starting_a_session_that_already_has_an_agent_is_refused(SL, tmux, tmp_path):
     """Two agents in one pane is not a state anything downstream can read —
     `claude_pane` would return whichever it found first."""
-    tmux.existing.add("nyh")
-    tmux.with_agent.add("nyh")
+    tmux.existing.add("oak")
+    tmux.with_agent.add("oak")
     with pytest.raises(SL.LifecycleError, match="already has an agent"):
-        SL.start("nyh", directory=str(tmp_path))
+        SL.start("oak", directory=str(tmp_path))
     assert "new-session" not in _verbs(tmux)
     assert "send-keys" not in _verbs(tmux)
 
@@ -838,7 +838,7 @@ def test_a_session_whose_pane_is_busy_is_refused(SL, tmux, tmp_path):
 
 def test_an_invalid_session_name_never_reaches_tmux(SL, tmux):
     with pytest.raises(SL.TT.JoinError):
-        SL.start("nyh; rm -rf /", directory="/tmp")
+        SL.start("oak; rm -rf /", directory="/tmp")
     assert not tmux
 
 
@@ -854,7 +854,7 @@ def test_a_freshly_created_directory_is_offered_to_claude_trust(
     monkeypatch.setattr(SL, "CONVIVY_ROOT", tmp_path)
     target = tmp_path / "brand-new" / "project"
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert tmux.trust_calls == [(SL._real_account_home(), str(target))]
     assert result["directory_trusted"] is True
@@ -870,7 +870,7 @@ def test_an_existing_directory_under_create_dir_is_never_offered(
     this call, the user may never have looked inside it, and it must keep
     prompting. Fails if the pre-trust call is moved outside the
     `dir_created` branch and gated on `create_dir` instead."""
-    result = SL.start("nyh", directory=str(tmp_path), create_dir=True)
+    result = SL.start("oak", directory=str(tmp_path), create_dir=True)
 
     assert tmux.trust_calls == []
     assert result["directory_trusted"] is None
@@ -883,7 +883,7 @@ def test_without_create_dir_nothing_is_ever_offered(SL, tmux, tmp_path):
     `claude_trust`. Fails if the pre-trust call is moved outside the
     `dir_created` branch (which is `False` unconditionally when `create_dir`
     is `False`, per `_validated_directory`)."""
-    result = SL.start("nyh", directory=str(tmp_path))
+    result = SL.start("oak", directory=str(tmp_path))
 
     assert tmux.trust_calls == []
     assert result["directory_trusted"] is None
@@ -900,7 +900,7 @@ def test_a_pretrust_failure_is_reported_not_raised(SL, tmux, tmp_path, monkeypat
                                                  "reason": "could not write it"})
     target = tmp_path / "brand-new"
 
-    result = SL.start("nyh", directory=str(target), create_dir=True)
+    result = SL.start("oak", directory=str(target), create_dir=True)
 
     assert result["ok"] is True
     assert result["directory_trusted"] is False
@@ -923,7 +923,7 @@ def test_pretrust_home_is_the_passwd_home_not_home_env(SL, tmux, tmp_path, monke
     monkeypatch.setattr(SL, "CONVIVY_ROOT", tmp_path / "Convivy")
     target = tmp_path / "Convivy" / "brand-new"
 
-    SL.start("nyh", directory=str(target), create_dir=True)
+    SL.start("oak", directory=str(target), create_dir=True)
 
     assert tmux.trust_calls == [(passwd_home, str(target))]
 
@@ -959,7 +959,7 @@ def test_a_fleet_session_is_unaddressable_by_the_reaper(SL, reaper):
     """THE GATE THAT MATTERS MOST. Everything else decides WHETHER a scratch
     shell is stale; this decides that an agent's session is not a candidate at
     all, however idle it looks."""
-    reaper.listing = "vivy 0 0\nsteward 0 0\ndeck 0 0"
+    reaper.listing = "finch 0 0\nsteward 0 0\ndeck 0 0"
     result = SL.reap_scratch_shells(now=10**9)
     assert result["reaped"] == []
     assert result["spared"] == []
@@ -968,10 +968,10 @@ def test_a_fleet_session_is_unaddressable_by_the_reaper(SL, reaper):
 
 def test_an_attached_shell_is_never_closed_however_idle(SL, reaper):
     """A pane open in front of the user must not close under them."""
-    reaper.listing = "deck-shell-vivy 1 0"
+    reaper.listing = "deck-shell-finch 1 0"
     result = SL.reap_scratch_shells(now=10**9)
     assert result["reaped"] == []
-    assert result["spared"] == [{"session": "deck-shell-vivy",
+    assert result["spared"] == [{"session": "deck-shell-finch",
                                  "why": "a client is attached"}]
     assert "kill-session" not in _verbs(reaper)
 
@@ -981,11 +981,11 @@ def test_a_shell_with_work_in_it_is_spared_however_quiet(SL, reaper):
     sleep, a `tail -f` on a quiet log — looks exactly like an abandoned prompt
     to the clock. The pane's foreground process is what tells them apart, and it
     is why the clock alone is not the gate."""
-    reaper.listing = "deck-shell-vivy 0 0"
-    reaper.panes["deck-shell-vivy"] = "%4 sleep"
+    reaper.listing = "deck-shell-finch 0 0"
+    reaper.panes["deck-shell-finch"] = "%4 sleep"
     result = SL.reap_scratch_shells(now=10**9)
     assert result["reaped"] == []
-    assert result["spared"] == [{"session": "deck-shell-vivy",
+    assert result["spared"] == [{"session": "deck-shell-finch",
                                  "why": "something is running in it"}]
     assert "kill-session" not in _verbs(reaper)
 
@@ -1000,27 +1000,27 @@ def test_a_split_shell_with_work_in_one_pane_is_spared(SL, reaper):
     The suite passed with the bug because no test had two panes. Caught by
     reviewer.
     """
-    reaper.listing = "deck-shell-vivy 0 0"
-    reaper.panes["deck-shell-vivy"] = "%1 sleep\n%2 zsh"
+    reaper.listing = "deck-shell-finch 0 0"
+    reaper.panes["deck-shell-finch"] = "%1 sleep\n%2 zsh"
     result = SL.reap_scratch_shells(idle_seconds=0, now=10**9)
     assert result["reaped"] == []
-    assert result["spared"] == [{"session": "deck-shell-vivy",
+    assert result["spared"] == [{"session": "deck-shell-finch",
                                  "why": "something is running in it"}]
     assert "kill-session" not in _verbs(reaper)
 
 
 def test_a_split_shell_idle_in_every_pane_is_reaped(SL, reaper):
     """The other side of the quantifier: all panes idle, so nothing is lost."""
-    reaper.listing = "deck-shell-vivy 0 0"
-    reaper.panes["deck-shell-vivy"] = "%1 zsh\n%2 bash"
+    reaper.listing = "deck-shell-finch 0 0"
+    reaper.panes["deck-shell-finch"] = "%1 zsh\n%2 bash"
     result = SL.reap_scratch_shells(idle_seconds=0, now=1000)
-    assert [r["session"] for r in result["reaped"]] == ["deck-shell-vivy"]
+    assert [r["session"] for r in result["reaped"]] == ["deck-shell-finch"]
 
 
 def test_an_unreadable_pane_listing_spares_the_shell(SL, reaper):
     """A reaper that cannot see what is in a pane must not close it."""
-    reaper.listing = "deck-shell-vivy 0 0"
-    reaper.panes["deck-shell-vivy"] = "garbage"
+    reaper.listing = "deck-shell-finch 0 0"
+    reaper.panes["deck-shell-finch"] = "garbage"
     result = SL.reap_scratch_shells(idle_seconds=0, now=10**9)
     assert result["reaped"] == []
     assert result["spared"][0]["why"] == "something is running in it"
@@ -1030,32 +1030,32 @@ def test_the_clock_gate_runs_before_the_pane_read(SL, reaper):
     """Comparing two integers is free; reading panes is a subprocess per
     session. A shell used moments ago is spared by age alone, so inspecting it
     costs a process for nothing on every run."""
-    reaper.listing = "deck-shell-vivy 0 990"
-    reaper.panes["deck-shell-vivy"] = "%1 zsh"
+    reaper.listing = "deck-shell-finch 0 990"
+    reaper.panes["deck-shell-finch"] = "%1 zsh"
     SL.reap_scratch_shells(idle_seconds=100, now=1000)
     assert "list-panes" not in _verbs(reaper)
 
 
 def test_a_recently_used_shell_is_spared(SL, reaper):
-    reaper.listing = "deck-shell-vivy 0 990"
-    reaper.panes["deck-shell-vivy"] = "%4 zsh"
+    reaper.listing = "deck-shell-finch 0 990"
+    reaper.panes["deck-shell-finch"] = "%4 zsh"
     result = SL.reap_scratch_shells(idle_seconds=100, now=1000)
     assert result["reaped"] == []
     assert result["spared"][0]["why"] == "idle only 10s"
 
 
 def test_an_idle_unattached_empty_shell_is_reaped(SL, reaper):
-    reaper.listing = "deck-shell-vivy 0 0"
-    reaper.panes["deck-shell-vivy"] = "%4 zsh"
+    reaper.listing = "deck-shell-finch 0 0"
+    reaper.panes["deck-shell-finch"] = "%4 zsh"
     result = SL.reap_scratch_shells(idle_seconds=100, now=1000)
-    assert result["reaped"] == [{"session": "deck-shell-vivy", "idle_seconds": 1000}]
-    assert ("tmux", "kill-session", "-t", "=deck-shell-vivy") in reaper
+    assert result["reaped"] == [{"session": "deck-shell-finch", "idle_seconds": 1000}]
+    assert ("tmux", "kill-session", "-t", "=deck-shell-finch") in reaper
 
 
 def test_an_unreadable_activity_time_spares_the_shell(SL, reaper):
     """The pass is advisory. A session it cannot judge keeps its shell."""
-    reaper.listing = "deck-shell-vivy 0 notanumber"
-    reaper.panes["deck-shell-vivy"] = "%4 zsh"
+    reaper.listing = "deck-shell-finch 0 notanumber"
+    reaper.panes["deck-shell-finch"] = "%4 zsh"
     result = SL.reap_scratch_shells(now=10**9)
     assert result["reaped"] == []
     assert result["spared"][0]["why"] == "activity time unreadable"
@@ -1084,8 +1084,8 @@ def test_a_threshold_that_cannot_be_compared_is_refused(SL, reaper, bad):
     """`idle < nan` is False, so a NaN falls THROUGH the age gate to the kill
     rather than sparing — the opposite of how every other unreadable input here
     is treated. Refused rather than clamped, so the caller learns."""
-    reaper.listing = "deck-shell-vivy 0 0"
-    reaper.panes["deck-shell-vivy"] = "%1 zsh"
+    reaper.listing = "deck-shell-finch 0 0"
+    reaper.panes["deck-shell-finch"] = "%1 zsh"
     with pytest.raises(SL.LifecycleError, match="non-negative"):
         SL.reap_scratch_shells(idle_seconds=bad, now=10**9)
     assert "kill-session" not in _verbs(reaper)
@@ -1105,8 +1105,8 @@ def test_two_tmux_calls_list_every_session(SL, reaper):
     original single-call design, but still nothing per session — Deck polls
     this on the rail's ~4s cadence, so a round trip per session would be one
     more subprocess per row every few seconds."""
-    reaper.names = "$1\tvivy\n$2\task"
-    reaper.listing = "vivy\t1\t0\t/srv/convivy/vivy\n" \
+    reaper.names = "$1\tfinch\n$2\task"
+    reaper.listing = "finch\t1\t0\t/srv/convivy/finch\n" \
                       "ask\t1\t1\t/srv/convivy/ask"
     SL.sessions()
     assert _verbs(reaper) == ["list-sessions", "list-sessions"]
@@ -1115,11 +1115,11 @@ def test_two_tmux_calls_list_every_session(SL, reaper):
 def test_deck_shell_sessions_are_excluded(SL, reaper):
     """Deck's own scratch shells, one per fleet session, are noise in a list
     meant for grouping conversations under a project."""
-    reaper.names = "$1\tvivy\n$2\tdeck-shell-vivy"
-    reaper.listing = "vivy\t1\t0\t/srv/convivy/vivy\n" \
-                      "deck-shell-vivy\t1\t0\t/srv/convivy/vivy"
+    reaper.names = "$1\tfinch\n$2\tdeck-shell-finch"
+    reaper.listing = "finch\t1\t0\t/srv/convivy/finch\n" \
+                      "deck-shell-finch\t1\t0\t/srv/convivy/finch"
     result = SL.sessions()
-    assert [s["name"] for s in result["sessions"]] == ["vivy"]
+    assert [s["name"] for s in result["sessions"]] == ["finch"]
 
 
 def test_a_session_with_more_than_one_window_reports_its_count(SL, reaper):
@@ -1132,12 +1132,12 @@ def test_a_session_with_more_than_one_window_reports_its_count(SL, reaper):
 
 def test_the_ordinary_case_keeps_every_session_and_its_path(SL, reaper):
     """Nothing dropped, paths correct, trusted-listing order preserved."""
-    reaper.names = "$1\tvivy\n$2\task"
-    reaper.listing = "vivy\t1\t0\t/srv/convivy/vivy\n" \
+    reaper.names = "$1\tfinch\n$2\task"
+    reaper.listing = "finch\t1\t0\t/srv/convivy/finch\n" \
                       "ask\t1\t1\t/srv/convivy/ask"
     result = SL.sessions()
     assert result["sessions"] == [
-        {"name": "vivy", "sessionId": "$1", "path": "/srv/convivy/vivy",
+        {"name": "finch", "sessionId": "$1", "path": "/srv/convivy/finch",
          "windows": 1, "attached": False},
         {"name": "ask", "sessionId": "$2", "path": "/srv/convivy/ask",
          "windows": 1, "attached": True},
@@ -1162,10 +1162,10 @@ def test_no_sessions_at_all_is_an_empty_list(SL, reaper):
 def test_a_session_with_no_readable_path_degrades_that_field(SL, reaper):
     """A field that could not be established is reported `null`, not dropped —
     the row still carries a name, a window count and whether it is attached."""
-    reaper.names = "$1\tvivy"
-    reaper.listing = "vivy\t1\t0\t"
+    reaper.names = "$1\tfinch"
+    reaper.listing = "finch\t1\t0\t"
     result = SL.sessions()
-    assert result["sessions"] == [{"name": "vivy", "sessionId": "$1", "path": None,
+    assert result["sessions"] == [{"name": "finch", "sessionId": "$1", "path": None,
                                    "windows": 1, "attached": False}]
 
 
@@ -1174,10 +1174,10 @@ def test_a_line_with_too_few_fields_before_any_record_is_dropped(SL, reaper):
     nowhere to attach and is dropped; the record after it is unaffected. It
     also never reaches the trusted set, since it is not a name call one
     reported."""
-    reaper.names = "$1\tvivy"
-    reaper.listing = "badline-missing-fields\nvivy\t1\t0\t/srv/convivy/vivy"
+    reaper.names = "$1\tfinch"
+    reaper.listing = "badline-missing-fields\nfinch\t1\t0\t/srv/convivy/finch"
     result = SL.sessions()
-    assert [s["name"] for s in result["sessions"]] == ["vivy"]
+    assert [s["name"] for s in result["sessions"]] == ["finch"]
 
 
 def test_an_unparseable_window_count_is_emitted_with_everything_else_null(SL, reaper):
@@ -1185,10 +1185,10 @@ def test_an_unparseable_window_count_is_emitted_with_everything_else_null(SL, re
     is still trusted (call one reported it), so the row survives with every
     field this parse could not vouch for set to `null` rather than the whole
     session vanishing from a poll Deck relies on for discovery."""
-    reaper.names = "$1\tvivy"
-    reaper.listing = "vivy\tnotanumber\t0\t/srv/convivy/vivy"
+    reaper.names = "$1\tfinch"
+    reaper.listing = "finch\tnotanumber\t0\t/srv/convivy/finch"
     result = SL.sessions()
-    assert result["sessions"] == [{"name": "vivy", "sessionId": "$1", "path": None,
+    assert result["sessions"] == [{"name": "finch", "sessionId": "$1", "path": None,
                                    "windows": None, "attached": None}]
 
 
@@ -1215,10 +1215,10 @@ def test_a_raw_tab_in_the_path_is_kept_verbatim(SL, reaper):
     so a raw tab in it (legal in a POSIX directory name; tmux does not escape
     it the way it escapes `#{session_name}`) lands in `path` rather than
     shifting the record to five fields."""
-    reaper.names = "$1\tvivy"
-    reaper.listing = "vivy\t1\t0\t/tmp/a\tb"
+    reaper.names = "$1\tfinch"
+    reaper.listing = "finch\t1\t0\t/tmp/a\tb"
     result = SL.sessions()
-    assert result["sessions"] == [{"name": "vivy", "sessionId": "$1", "path": "/tmp/a\tb",
+    assert result["sessions"] == [{"name": "finch", "sessionId": "$1", "path": "/tmp/a\tb",
                                    "windows": 1, "attached": False}]
 
 
@@ -1296,8 +1296,8 @@ def test_every_row_carries_the_tmux_session_id(SL, reaper):
     """Deck matches a pinned child to its live session by `sessionId`, the
     field that survives a rename where a name does not. Without it a session
     renamed in tmux drew twice on the rail."""
-    reaper.names = "$58\tvivy"
-    reaper.listing = "vivy\t1\t0\t/srv/convivy/vivy"
+    reaper.names = "$58\tfinch"
+    reaper.listing = "finch\t1\t0\t/srv/convivy/finch"
     assert SL.sessions()["sessions"][0]["sessionId"] == "$58"
 
 
@@ -1306,9 +1306,9 @@ def test_an_id_that_is_not_tmux_shape_reads_null(SL, reaper, raw):
     """Only tmux's `$<digits>` passes through, the same shape `session-agent
     crews` validates. Anything else is `null`, and the row is otherwise
     untouched."""
-    reaper.names = f"{raw}\tvivy"
-    reaper.listing = "vivy\t1\t0\t/x"
-    assert SL.sessions()["sessions"] == [{"name": "vivy", "sessionId": None,
+    reaper.names = f"{raw}\tfinch"
+    reaper.listing = "finch\t1\t0\t/x"
+    assert SL.sessions()["sessions"] == [{"name": "finch", "sessionId": None,
                                           "path": "/x", "windows": 1,
                                           "attached": False}]
 
@@ -1353,11 +1353,11 @@ def test_a_real_override_is_allowed(SL, allowed):
 def test_stopping_ends_the_agent_and_leaves_the_session(SL, tmux, monkeypatch):
     sent = []
     monkeypatch.setattr(SL.SI, "send_message", lambda n, t: sent.append((n, t)))
-    tmux.existing.add("nyh")
+    tmux.existing.add("oak")
 
-    result = SL.stop("nyh")
+    result = SL.stop("oak")
 
-    assert sent == [("nyh", "/exit")]
+    assert sent == [("oak", "/exit")]
     assert "kill-session" not in _verbs(tmux)
     assert result["killed"] is False
     assert result["exit_sent"] is True
@@ -1367,11 +1367,11 @@ def test_killing_is_explicit_and_ends_the_session_too(SL, tmux, monkeypatch):
     """It destroys scrollback and anything else running there, so it never
     happens as a side effect of the gentle stop."""
     monkeypatch.setattr(SL.SI, "send_message", lambda n, t: None)
-    tmux.existing.add("nyh")
+    tmux.existing.add("oak")
 
-    result = SL.stop("nyh", kill=True)
+    result = SL.stop("oak", kill=True)
 
-    assert ("tmux", "kill-session", "-t", "=nyh") in tmux
+    assert ("tmux", "kill-session", "-t", "=oak") in tmux
     assert result["killed"] is True
 
 
@@ -1380,9 +1380,9 @@ def test_stopping_a_session_with_no_agent_is_not_a_failure(SL, tmux, monkeypatch
     def no_agent(name, text):
         raise SL.TT.JoinError("no claude process found")
     monkeypatch.setattr(SL.SI, "send_message", no_agent)
-    tmux.existing.add("nyh")
+    tmux.existing.add("oak")
 
-    result = SL.stop("nyh", kill=True)
+    result = SL.stop("oak", kill=True)
     assert result["ok"] is True
     assert result["exit_sent"] is False
     assert result["killed"] is True
@@ -1390,23 +1390,23 @@ def test_stopping_a_session_with_no_agent_is_not_a_failure(SL, tmux, monkeypatch
 
 def test_stopping_a_session_that_does_not_exist_is_not_a_failure(SL, tmux):
     """The caller wanted it gone and it is gone."""
-    result = SL.stop("nyh", kill=True)
-    assert result == {"ok": True, "session": "nyh", "existed": False,
+    result = SL.stop("oak", kill=True)
+    assert result == {"ok": True, "session": "oak", "existed": False,
                       "exit_sent": False, "agent_gone": True, "killed": False}
     assert "kill-session" not in _verbs(tmux)
 
 
 def test_the_kill_target_is_anchored_to_an_exact_name(SL, tmux, monkeypatch):
-    """`-t nyh` is a prefix match in tmux; `-t =nyh` is the exact session.
-    Without the anchor, stopping `nyh` could kill `nyh-park-villa` — and the split
+    """`-t oak` is a prefix match in tmux; `-t =oak` is the exact session.
+    Without the anchor, stopping `oak` could kill `oak-park-villa` — and the split
     into three per-property sessions (ARCH-426 amendment) makes that likelier, not
     less, since there are now three live session names sharing the prefix."""
     monkeypatch.setattr(SL.SI, "send_message", lambda n, t: None)
-    tmux.existing.add("nyh")
+    tmux.existing.add("oak")
 
-    SL.stop("nyh", kill=True)
+    SL.stop("oak", kill=True)
     kill = next(c for c in tmux if c[1] == "kill-session")
-    assert kill[-1] == "=nyh"
+    assert kill[-1] == "=oak"
 
 
 # MARK: - Waiting for the agent to actually go
@@ -1418,7 +1418,7 @@ def test_the_kill_waits_for_the_agent_to_leave(SL, tmux, monkeypatch):
     destroyed the session while the agent was still exiting — "stop the agent,
     then kill the session" was really "signal it and pull the floor away"."""
     monkeypatch.setattr(SL.SI, "send_message", lambda n, t: None)
-    tmux.existing.add("nyh")
+    tmux.existing.add("oak")
 
     looks = []
 
@@ -1431,7 +1431,7 @@ def test_the_kill_waits_for_the_agent_to_leave(SL, tmux, monkeypatch):
     monkeypatch.setattr(SL.TT, "claude_pane", claude_pane)
     monkeypatch.setattr(SL.time, "sleep", lambda _s: None)
 
-    result = SL.stop("nyh", kill=True)
+    result = SL.stop("oak", kill=True)
 
     assert len(looks) >= 3, "the kill did not wait for the agent"
     assert result["agent_gone"] is True
@@ -1451,9 +1451,9 @@ def test_an_agent_that_will_not_leave_does_not_block_the_kill(SL, tmux, monkeypa
     monkeypatch.setattr(SL.time, "sleep", lambda _s: None)
     ticks = iter([0.0, 0.0] + [SL.EXIT_WAIT_SECONDS + 1.0] * 50)
     monkeypatch.setattr(SL.time, "monotonic", lambda: next(ticks))
-    tmux.existing.add("nyh")
+    tmux.existing.add("oak")
 
-    result = SL.stop("nyh", kill=True)
+    result = SL.stop("oak", kill=True)
 
     assert result["agent_gone"] is False, "it should say the agent was still there"
     assert result["killed"] is True, "and kill anyway, because that is what was asked"
@@ -1472,7 +1472,7 @@ def test_the_exit_wait_resolves_its_session_table_fresh_on_every_poll(SL, monkey
     def fake_run(argv, stdin=None):
         if argv[:2] == ["tmux", "list-sessions"]:
             calls["list_sessions"] += 1
-            return "$1 nyh"
+            return "$1 oak"
         if argv[:2] == ["tmux", "list-panes"]:
             calls["polls"] += 1
             if calls["polls"] > 2:
@@ -1485,7 +1485,7 @@ def test_the_exit_wait_resolves_its_session_table_fresh_on_every_poll(SL, monkey
     monkeypatch.setattr(SL.TT, "_run", fake_run)
     monkeypatch.setattr(SL.time, "sleep", lambda _s: None)
 
-    gone = SL._await_agent_exit("nyh", timeout=5.0)
+    gone = SL._await_agent_exit("oak", timeout=5.0)
 
     assert gone is True, "the third poll's empty pane list is the agent leaving"
     assert calls["polls"] == 3
@@ -1502,10 +1502,10 @@ def test_every_return_carries_the_same_keys(SL, tmux, monkeypatch):
     expected = {"ok", "session", "existed", "exit_sent", "agent_gone", "killed"}
 
     assert set(SL.stop("absent", kill=True)) == expected
-    tmux.existing.add("nyh")
-    assert set(SL.stop("nyh")) == expected
-    tmux.existing.add("nyh2")
-    assert set(SL.stop("nyh2", kill=True)) == expected
+    tmux.existing.add("oak")
+    assert set(SL.stop("oak")) == expected
+    tmux.existing.add("oak2")
+    assert set(SL.stop("oak2", kill=True)) == expected
 
 
 def test_send_keys_is_not_anchored_and_the_others_are(SL, tmux, tmp_path):
@@ -1513,13 +1513,13 @@ def test_send_keys_is_not_anchored_and_the_others_are(SL, tmux, tmp_path):
     `send-keys -t =name` fails and the session starts with no command in it.
     The mocked run returns success for everything, so only a live run caught it
     — this pins the shape the live run proved."""
-    SL.start("nyh", directory=str(tmp_path))
+    SL.start("oak", directory=str(tmp_path))
 
     send = next(c for c in tmux if c[1] == "send-keys")
-    assert "=nyh" not in send, "send-keys must target the pane unanchored"
+    assert "=oak" not in send, "send-keys must target the pane unanchored"
 
     has = next(c for c in tmux if c[1] == "has-session")
-    assert has[-1] == "=nyh", "session targets stay anchored"
+    assert has[-1] == "=oak", "session targets stay anchored"
 
 
 # MARK: - The key table
@@ -1536,14 +1536,14 @@ def test_a_command_that_is_a_tmux_key_name_is_typed_not_pressed(SL, tmux, tmp_pa
     Measured against real tmux: without `-l` the session was dead a second
     later; with it the shell printed `C-d: command not found` and stayed up.
     """
-    SL.start("nyh", directory=str(tmp_path), command=keyname)
+    SL.start("oak", directory=str(tmp_path), command=keyname)
 
     literal = [c for c in tmux if c[1] == "send-keys" and "-l" in c]
     assert literal, f"{keyname} was sent without -l and would be pressed, not typed"
     assert keyname in literal[0]
     # The submit is a real key press, and the only one.
     presses = [c for c in tmux if c[1] == "send-keys" and "-l" not in c]
-    assert presses == [("tmux", "send-keys", "-t", "nyh", "Enter")]
+    assert presses == [("tmux", "send-keys", "-t", "oak", "Enter")]
 
 
 @pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
@@ -1557,12 +1557,20 @@ def test_unicode_line_separators_are_refused(SL, separator):
 
 
 # ---------------------------------------------------------------------------
-# The default tmux server is started from the GUI session, never forked here.
+# The default tmux server is started from the GUI session on macOS; off macOS,
+# where there is no keeper job, this helper forks it directly instead.
 #
 # Every test below runs `tmux` and `launchctl` from a PATH holding only stub
 # scripts, so no test reaches the machine's real server or keeper job. The stubs
 # come first on PATH, and each test writes both, so a missing stub is a failing
 # test rather than a call to the real binary.
+#
+# `stubs` pins `_host_platform` to "darwin" by default, since that is the
+# branch every pre-existing test here exercises (the kickstart path) and this
+# helper otherwise reads the REAL platform of whatever machine runs the suite
+# — CI's Python job runs on Linux, which would silently swap every one of
+# those tests onto the other branch. A test about the Linux branch overrides
+# it back to "linux" itself.
 
 _TMUX_STUB = """#!/bin/sh
 echo "tmux $*" >> "$STUB_LOG"
@@ -1572,6 +1580,18 @@ case "$1" in
     if [ -f "$STUB_STATE/sessions" ]; then cat "$STUB_STATE/sessions"; exit 0; fi
     echo "no server running on /tmp/tmux-0/default" >&2
     exit 1 ;;
+  new-session)
+    if [ -n "$STUB_NEW_SESSION_FAIL" ]; then echo "$STUB_NEW_SESSION_FAIL" >&2; exit 1; fi
+    shift
+    name=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -s) name="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    if [ -n "$name" ]; then printf '%s\\n' "$name" >> "$STUB_STATE/sessions"; fi
+    exit 0 ;;
 esac
 exit 0
 """
@@ -1599,11 +1619,13 @@ def stubs(SL, tmp_path, monkeypatch):
         script.write_text(body)
         script.chmod(0o755)
     monkeypatch.setattr(SL, "ensure_default_server", SL._real_ensure_default_server)
+    monkeypatch.setattr(SL, "_host_platform", lambda: "darwin")
     monkeypatch.setenv("PATH", f"{bin_dir}:/usr/bin:/bin")
     monkeypatch.setenv("STUB_LOG", str(log))
     monkeypatch.setenv("STUB_STATE", str(state))
     monkeypatch.delenv("STUB_KICKSTART_FAIL", raising=False)
     monkeypatch.delenv("STUB_KEEPER_SESSIONS", raising=False)
+    monkeypatch.delenv("STUB_NEW_SESSION_FAIL", raising=False)
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
 
@@ -1710,8 +1732,85 @@ def test_a_timeout_names_the_os_error_when_tmux_cannot_run(SL, stubs, tmp_path, 
         SL.ensure_default_server(wait=0.3, poll=0.05)
 
 
+# ---------------------------------------------------------------------------
+# Off macOS there is no keeper job to kickstart, so this helper forks the
+# server itself instead. Same stub PATH as above; `_host_platform` is
+# overridden back to "linux" in each test here, since `stubs` defaults it to
+# "darwin".
+
+
+def test_linux_with_no_server_forks_tmux_directly_never_launchctl(SL, stubs, monkeypatch):
+    monkeypatch.setattr(SL, "_host_platform", lambda: "linux")
+
+    SL.ensure_default_server(wait=2, poll=0.01)
+
+    news = [line for line in stubs.lines() if line.startswith("tmux new-session")]
+    # Exact argv: the keeper job's own command, run directly.
+    assert news == [f"tmux new-session -d -s keeper -c {SL._real_account_home()}"]
+    # Positive control: the launchctl stub exists and would log if it ran.
+    assert not [line for line in stubs.lines() if line.startswith("launchctl")]
+
+
+def test_darwin_with_no_server_kickstarts_launchctl_never_new_session(SL, stubs, monkeypatch):
+    # The platform the `stubs` fixture already defaults to; pinned again here,
+    # explicitly, so this test does not silently depend on that default.
+    monkeypatch.setattr(SL, "_host_platform", lambda: "darwin")
+    monkeypatch.setenv("STUB_KEEPER_SESSIONS", "keeper")
+
+    SL.ensure_default_server(wait=2, poll=0.01)
+
+    assert [line for line in stubs.lines() if line.startswith("launchctl kickstart")]
+    assert not [line for line in stubs.lines() if line.startswith("tmux new-session")]
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux"])
+def test_a_running_server_runs_neither_command_on_either_platform(
+        SL, stubs, monkeypatch, platform):
+    monkeypatch.setattr(SL, "_host_platform", lambda: platform)
+    stubs.sessions("deck-x")
+
+    SL.ensure_default_server(wait=0.3, poll=0.05)
+
+    assert "tmux list-sessions -F #{session_name}" in stubs.lines()  # positive control
+    assert not [line for line in stubs.lines()
+                if line.startswith("launchctl") or line.startswith("tmux new-session")]
+
+
+def test_linux_server_fork_returns_once_the_keeper_session_appears(SL, stubs, monkeypatch):
+    monkeypatch.setattr(SL, "_host_platform", lambda: "linux")
+
+    SL.ensure_default_server(wait=2, poll=0.01)
+
+    assert SL._probe_default_server() == (["keeper"], "")
+
+
+def test_linux_with_tmux_missing_raises_tmux_server_error_without_launchctl(
+        SL, stubs, tmp_path, monkeypatch):
+    monkeypatch.setattr(SL, "_host_platform", lambda: "linux")
+    (tmp_path / "stub-bin" / "tmux").unlink()
+    monkeypatch.setenv("PATH", str(tmp_path / "stub-bin"))
+
+    with pytest.raises(SL.TmuxServerError, match="No such file or directory") as excinfo:
+        SL.ensure_default_server(wait=0.3, poll=0.05)
+
+    assert "launchctl" not in str(excinfo.value)
+    assert not [line for line in stubs.lines() if line.startswith("launchctl")]
+
+
+def test_linux_with_tmux_failing_raises_tmux_server_error_without_launchctl(
+        SL, stubs, monkeypatch):
+    monkeypatch.setattr(SL, "_host_platform", lambda: "linux")
+    monkeypatch.setenv("STUB_NEW_SESSION_FAIL", "no server on this box")
+
+    with pytest.raises(SL.TmuxServerError, match="no server on this box") as excinfo:
+        SL.ensure_default_server(wait=0.3, poll=0.05)
+
+    assert "launchctl" not in str(excinfo.value)
+    assert not [line for line in stubs.lines() if line.startswith("launchctl")]
+
+
 def test_the_default_server_is_ensured_before_the_session_is_created(SL, tmux, tmp_path):
-    SL.start("nyh", directory=str(tmp_path))
+    SL.start("oak", directory=str(tmp_path))
 
     # Positions are counted in `tmux` (the recorded calls), so an ensure that
     # ran before the create sits at an index no greater than the create's.
@@ -1729,7 +1828,7 @@ def test_a_refused_server_creates_no_session_and_no_directory(SL, tmux, tmp_path
     target = tmp_path / "not-yet"
 
     with pytest.raises(SL.LifecycleError, match="GUI session"):
-        SL.start("nyh", directory=str(target), create_dir=True)
+        SL.start("oak", directory=str(target), create_dir=True)
 
     assert not target.exists()
     assert "new-session" not in _verbs(tmux)

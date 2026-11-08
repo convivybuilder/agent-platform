@@ -10,7 +10,7 @@ it runs on the startup path of every launch. And it must not claim a filter was
 applied when it was not: an unknown query parameter is IGNORED by the store, so
 against a server predating the `needs` column this asks for operator-only issues
 and is handed every open issue. Observed live before the fix — it reported "3
-issues need you on vivy" when the true answer was zero.
+issues need you on widget" when the true answer was zero.
 """
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ def iw(issues_waiting):
     return issues_waiting
 
 
-def _issue(iid, needs="operator", product="vivy"):
+def _issue(iid, needs="operator", product="widget"):
     return {"id": f"issue_{iid}", "product": product, "needs": needs,
             "title": f"thing {iid}", "url": f"/engineering/issues/issue_{iid}"}
 
@@ -67,25 +67,35 @@ def test_a_stale_server_that_ignored_the_filter_yields_nothing(iw, monkeypatch):
     """THE regression this guard exists for. An unknown query parameter is IGNORED
     by the store, so against a server predating the `needs` column this asks for
     operator-only issues and is handed every open issue. Observed live on
-    2026-07-26: it reported "3 issues need you on vivy" when the answer was zero —
+    2026-07-26: it reported "3 issues need you on widget" when the answer was zero —
     confident, wrong, and exactly the failure that teaches a reader to ignore the
     line. The absent field is the signal."""
     _serve(iw, monkeypatch, [{"id": "issue_A", "title": "no needs key"},
                              {"id": "issue_B", "title": "also pre-column"}])
-    assert iw._fetch("vivy") == []
+    assert iw._fetch("widget") == []
 
 
 def test_only_operator_items_survive(iw, monkeypatch):
     """The client agrees with the server rather than assuming it was obeyed."""
     _serve(iw, monkeypatch, [_issue(1, "operator"), _issue(2, "agent"),
                              _issue(3, "either"), {"id": "issue_4"}])
-    assert [i["id"] for i in iw._fetch("vivy")] == ["issue_1"]
+    assert [i["id"] for i in iw._fetch("widget")] == ["issue_1"]
+
+
+def test_a_declined_item_does_not_count(iw, monkeypatch):
+    """A decline sets `maturity` to "declined" but leaves `state` "open", and the
+    store's list does not filter declined items out — so the client must."""
+    _serve(iw, monkeypatch, [
+        {**_issue(1), "maturity": "declined"},
+        {**_issue(2), "maturity": "proposed"},
+    ])
+    assert [i["id"] for i in iw._fetch("demo")] == ["issue_2"]
 
 
 def test_no_token_yields_nothing_rather_than_raising(iw, monkeypatch):
     import signal_client as SC
     monkeypatch.setattr(SC, "token", lambda: None, raising=False)
-    assert iw._fetch("vivy") == []
+    assert iw._fetch("widget") == []
 
 
 # --- output ------------------------------------------------------------------
@@ -93,22 +103,22 @@ def test_no_token_yields_nothing_rather_than_raising(iw, monkeypatch):
 
 def test_nothing_waiting_prints_nothing(iw, monkeypatch, capsys):
     monkeypatch.setattr(iw, "_fetch", lambda p: [])
-    assert iw.main(["vivy"]) == 0
+    assert iw.main(["widget"]) == 0
     assert capsys.readouterr().err == ""
 
 
 def test_a_count_line_names_the_product_and_links(iw, monkeypatch, capsys):
     monkeypatch.setattr(iw, "_fetch", lambda p: [_issue(1), _issue(2)])
-    assert iw.main(["vivy"]) == 0
+    assert iw.main(["widget"]) == 0
     err = capsys.readouterr().err
-    assert "2 issues need you on vivy" in err
+    assert "2 issues need you on widget" in err
     # A full URL, per ARCH-043 — the operator cmd-clicks these.
     assert "https://team.convivy.com/engineering/issues?needs=operator" in err
 
 
 def test_one_issue_reads_as_singular(iw, monkeypatch, capsys):
     monkeypatch.setattr(iw, "_fetch", lambda p: [_issue(1)])
-    iw.main(["vivy"])
+    iw.main(["widget"])
     assert "1 issue needs you" in capsys.readouterr().err
 
 
@@ -116,16 +126,32 @@ def test_the_line_goes_to_stderr(iw, monkeypatch, capsys):
     """Like every other co startup line, so it never lands in something capturing
     stdout."""
     monkeypatch.setattr(iw, "_fetch", lambda p: [_issue(1)])
-    iw.main(["vivy"])
+    iw.main(["widget"])
     cap = capsys.readouterr()
     assert cap.out == "" and cap.err
 
 
 def test_list_mode_prints_each_issue(iw, monkeypatch, capsys):
     monkeypatch.setattr(iw, "_fetch", lambda p: [_issue(1), _issue(2)])
-    iw.main(["vivy", "--list"])
+    iw.main(["widget", "--list"])
     err = capsys.readouterr().err
     assert "issue_1" in err and "issue_2" in err
+
+
+def test_a_declined_item_is_excluded_from_the_count_and_the_list(iw, monkeypatch, capsys):
+    """One declined, one proposed operator item: the count line reads 1, and
+    --list prints only the proposed one."""
+    _serve(iw, monkeypatch, [
+        {**_issue(1), "maturity": "declined"},
+        {**_issue(2), "maturity": "proposed"},
+    ])
+    assert iw.main(["demo"]) == 0
+    err = capsys.readouterr().err
+    assert "1 issue needs you" in err
+
+    iw.main(["demo", "--list"])
+    err = capsys.readouterr().err
+    assert "issue_2" in err and "issue_1" not in err
 
 
 # --- terminal safety ---------------------------------------------------------
@@ -140,7 +166,7 @@ def test_a_title_cannot_inject_terminal_escapes(iw, monkeypatch, capsys):
     forged = "\x1b[H\x1b[2Jco: session healthy, no issues waiting\x1b[0m"
     monkeypatch.setattr(iw, "_fetch",
                         lambda p: [{"id": "issue_1", "title": forged, "url": "/x"}])
-    iw.main(["vivy", "--list"])
+    iw.main(["widget", "--list"])
     err = capsys.readouterr().err
     assert "\x1b" not in err
     # The text survives, stripped of its teeth — the reader still sees what was
@@ -151,7 +177,7 @@ def test_a_title_cannot_inject_terminal_escapes(iw, monkeypatch, capsys):
 def test_control_bytes_are_stripped_from_every_store_field(iw, monkeypatch, capsys):
     monkeypatch.setattr(iw, "_fetch", lambda p: [
         {"id": "iss\x07ue_1", "title": "a\x00b", "url": "/x\x1b[31m"}])
-    iw.main(["vivy", "--list"])
+    iw.main(["widget", "--list"])
     err = capsys.readouterr().err
     assert not any(ch in err for ch in ("\x07", "\x00", "\x1b"))
 
@@ -161,7 +187,7 @@ def test_a_newline_in_a_title_cannot_forge_a_second_line(iw, monkeypatch, capsys
     carrying a newline would forge an extra row."""
     monkeypatch.setattr(iw, "_fetch", lambda p: [
         {"id": "issue_1", "title": "real\n  issue_9  fake entry", "url": "/x"}])
-    iw.main(["vivy", "--list"])
+    iw.main(["widget", "--list"])
     lines = [ln for ln in capsys.readouterr().err.splitlines() if ln.strip()]
     assert len(lines) == 2          # the id/title line and the url line, no more
 
@@ -189,5 +215,5 @@ def test_any_failure_is_silent_and_exits_zero(iw, monkeypatch, capsys, boom):
         raise boom
 
     monkeypatch.setattr(iw, "_fetch", raise_it)
-    assert iw.main(["vivy"]) == 0
+    assert iw.main(["widget"]) == 0
     assert capsys.readouterr().err == ""

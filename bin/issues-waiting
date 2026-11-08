@@ -59,13 +59,16 @@ def _fetch(product: str) -> list[dict]:
     observed behaviour. An unknown query parameter is IGNORED by the store, so
     against a server predating the `needs` column this asks for operator-only
     issues and is handed every open issue instead. Tested live on 2026-07-26: it
-    reported "3 issues need you on vivy" when the real answer was zero, and every
+    reported "3 issues need you on acme" when the real answer was zero, and every
     word of that line was wrong in the direction that erodes trust in it.
 
     Filtering on the serialised field closes it in both directions. An old server
     omits `needs` entirely, so nothing matches and the line is correctly silent
     until the column ships; a current one sets it, and the client agrees with the
     server instead of assuming it was obeyed.
+
+    A declined item is dropped too: a decline sets `maturity` to "declined" but
+    leaves `state` "open", and the store's list does not filter it out.
     """
     import signal_client as SC
     import vault_plane
@@ -77,7 +80,8 @@ def _fetch(product: str) -> list[dict]:
     req = urllib.request.Request(url, headers=vault_plane.headers(token=tok))
     with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
         items = json.loads(resp.read().decode("utf-8")).get("items", [])
-    return [i for i in items if i.get("needs") == "operator"]
+    return [i for i in items
+            if i.get("needs") == "operator" and i.get("maturity") != "declined"]
 
 
 from term_safe import safe as _safe  # noqa: E402

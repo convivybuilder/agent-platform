@@ -172,3 +172,73 @@ def test_worktree_and_symlinked_primary_resolve_to_different_libs(tmp_path):
     assert _marker(worktree_result) == "'worktree'"
     assert _marker(primary_result) == "'primary'"
     assert _file(worktree_result) != _file(primary_result)
+
+
+def test_the_app_prefixes_import_chain_survives_an_unreadable_registry(tmp_path):
+    """ARCH-397 Phase 2 derives the internal-app prefix set from `config/projects.json`
+    at USE, not at import — the regression this pins. `PROJECTS_JSON` pointed at a
+    path that does not exist is `projects._registry_path()`'s step 1, which wins over
+    both the tree-relative `config/` lookup and the operator-level `builder_root`
+    fallback (step 3) — the one deterministic way to force "no readable registry" on
+    any machine, including a developer's own, where step 3 usually finds the real
+    checkout's registry regardless of HOME. Before this fix, `app_prefixes.py` read
+    `projects.all_agent_prefixes()` at its own module level, so every one of these
+    four imports raised `FileNotFoundError` before returning control to the importer:
+    `review_protocol` and `tool_policy` (which imports `review_protocol` itself)
+    could not import either, and neither could `bin/agentctl`, which imports both
+    unconditionally before argparse ever runs — exactly the shape CI hit building a
+    worktree with no `config/` dir of its own (`test_worktree_copy_imports_its_own_lib`
+    above, before this fix)."""
+    worktree = tmp_path / "worktree"
+    _build_checkout(worktree, marker="worktree")
+    lib_dir = worktree / "lib" / "agent-platform"
+    probe = (
+        "import sys\n"
+        f"sys.path.insert(0, {str(lib_dir)!r})\n"
+        "import app_prefixes, crew_registration, projects, review_protocol\n"
+        "print('IMPORT_OK')\n"
+        "print('PREFIXES=' + repr(app_prefixes.internal_app_prefixes()))\n"
+    )
+    env = dict(os.environ)
+    env["PROJECTS_JSON"] = str(tmp_path / "no-such-registry" / "projects.json")
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "IMPORT_OK" in result.stdout
+    # The fail-CLOSED answer: no registry readable means no prefix recognised,
+    # never every name read as prefixed.
+    assert "PREFIXES=()" in result.stdout
+
+
+def test_agentctl_import_and_help_survive_an_unreadable_registry(tmp_path):
+    """A second way this same fixture shape (a checkout with no sibling
+    config/ at all) used to crash agentctl, distinct from the sys.path bug
+    the tests above guard: `LOCAL_AGENT_REPOS`, `_TYPECHECK_GATES` and
+    `_DEFAULT_PROFILE_BY_REPO` were module-level constants bound from
+    `projects.py` at bin/agentctl's own import, so an unreadable
+    config/projects.json died at IMPORT with FileNotFoundError before
+    argparse ever ran — taking `--help` down along with every subcommand.
+    Each is now a function called at use and degraded to the conservative
+    empty answer on a registry read failure, so both the import and
+    `--help` have to succeed here with no config/ directory reachable."""
+    checkout = tmp_path / "checkout"
+    agentctl_path = _build_checkout(checkout, marker="checkout")
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    env = dict(os.environ)
+    env["HOME"] = str(empty_home)
+    env.pop("PYTHONPATH", None)
+    # Forces `projects._registry_path()`'s step 1 so neither this checkout's
+    # own (absent) config/ dir nor a real CREWS_ROOT configured on the machine
+    # running this test can mask the bug by resolving to a registry that
+    # exists; this is the single deterministic way to make the registry
+    # unreadable regardless of what machine runs the suite.
+    env["PROJECTS_JSON"] = str(tmp_path / "no-such-file.json")
+    result = subprocess.run(
+        [sys.executable, str(agentctl_path), "--help"],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    assert result.returncode == 0, result.stderr

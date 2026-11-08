@@ -6,22 +6,28 @@ Layout (matches 3.5 spec):
   <root>/<repo>/                              # primary
   <root>/worktrees/<repo>.<purpose>/          # additional
 
-`knowledge` is one of the primaries under <root>/ (parallel to constance,
-vivy, etc.). The `worktrees/` subdir itself is naturally skipped from primary
+`knowledge` is one of the primaries under <root>/ (parallel to every product
+and project repo). The `worktrees/` subdir itself is naturally skipped from primary
 discovery because git worktree adds put a `.git` *file* in the extra, not a
 `.git/` directory in the holder dir.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import stat
 import subprocess
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 import builder_root as BR
 import git_refs
+import github_app as GA
+import projects as PJ
 import registry as R
 import run_sandbox as RS
 import safe_path as SP
@@ -52,7 +58,7 @@ _DEBRIS_DIRS = frozenset({
     "htmlcov", ".build",
 })
 # `.coverage*` is matched by prefix below; these are the DOTLESS coverage artifacts,
-# which that prefix misses. Real case: a swept vivy review tree held a `coverage.json`,
+# which that prefix misses. Real case: a swept product-repo review tree held a `coverage.json`,
 # and without this the ARCH-344 reap would classify it as work-to-preserve and keep
 # every such tree forever — re-opening the leak it exists to close, silently.
 _DEBRIS_FILES = frozenset({".DS_Store", "coverage.json", "coverage.xml"})
@@ -80,8 +86,8 @@ _DEBRIS_ROOT_FILES = frozenset({
 #
 # THE DIGIT RUN IS DELIBERATELY UNBOUNDED. Security review of #320 proposed
 # `\d{1,3}` to keep a year-named `review-2024.md` out. That would drop real
-# artifacts: PR numbers passed 999 some time ago — convivy/vivy is on #1114 — so
-# `review-1114.md` is a name the platform generates today. A four-digit review
+# artifacts: PR numbers passed 999 some time ago — one product repo is past
+# #1114 — so `review-1114.md` is a name the platform generates today. A four-digit review
 # summary at a worktree root collides with a PR number and is accepted as a
 # residual, named here rather than left for the next reader to rediscover.
 #
@@ -121,7 +127,7 @@ _PROFILE_DOCUMENTS_NAME = ".profile-documents.json"
 class Worktree:
     path: Path                  # absolute path to the worktree
     primary: Path               # absolute path to the primary repo this worktree belongs to
-    label: str                  # short label for tables/registry, e.g. "constance" or "worktrees/constance.overnight"
+    label: str                  # short label for tables/registry, e.g. "acme" or "worktrees/acme.overnight"
     branch: str | None          # current branch name (None if detached)
     is_primary: bool            # True if this is the primary worktree (path == primary)
     locked: bool                # `git worktree lock` flag (e.g. Claude Code session worktrees)
@@ -135,14 +141,80 @@ class Worktree:
 # --- discovery ---------------------------------------------------------------
 
 
+def _registry_homes() -> list[Path]:
+    """Every registered unit's home directory, when it is a real git checkout
+    under CONVIVY_ROOT — the registry homes `discover_primaries`'s depth-1 scan
+    cannot see, because a crew's home may be nested one level deeper
+    (`<root>/area/demo-nested`, the live shape a registry home takes today).
+
+    `projects.home_path` already refuses a `home_dir` that resolves outside this
+    user's home (`_expand_own_home`); the `is_relative_to(CONVIVY_ROOT)` check
+    here is a second, narrower containment test against THIS module's own root
+    rather than `projects.crews_root()` — the two agree in production (both
+    read `builder_root.root()`), but a test that patches only `CONVIVY_ROOT`
+    must not pick up the operator's real registry homes, and a registry whose
+    root has otherwise drifted from this module's must not hand back a path
+    outside it either.
+
+    Best-effort, like the depth-1 scan beside it: an unreadable or malformed
+    registry, or one entry with a malformed `home_dir`, contributes nothing
+    rather than raising — this is discovery, not a dispatch gate that must
+    fail closed."""
+    try:
+        units = PJ.load()
+    except (OSError, ValueError):
+        return []
+    root = CONVIVY_ROOT.resolve()
+    out: list[Path] = []
+    for slug in units:
+        try:
+            home = PJ.home_path(slug)
+        except ValueError:
+            continue
+        if home is None or not home.is_relative_to(root):
+            continue
+        if (home / ".git").is_dir():
+            out.append(home)
+    return out
+
+
+def _registry_primary_for(repo: str) -> Path | None:
+    """A registry unit's home directory for `repo`, when that home is nested
+    below CONVIVY_ROOT rather than a direct child (`_primary_for`'s plain
+    `CONVIVY_ROOT / repo` join cannot see it). Matches a unit that lists `repo`
+    in its own `repos`, whose `home_path` resolves to a directory basenamed
+    `repo` and which is itself a real git checkout — `None` otherwise,
+    including for an unreadable registry or a malformed entry (same
+    best-effort contract as `_registry_homes`)."""
+    try:
+        units = PJ.load()
+    except (OSError, ValueError):
+        return None
+    root = CONVIVY_ROOT.resolve()
+    for slug, unit in units.items():
+        if repo not in (unit.get("repos") or []):
+            continue
+        try:
+            home = PJ.home_path(slug)
+        except ValueError:
+            continue
+        if home is None or home.name != repo or not home.is_relative_to(root):
+            continue
+        if (home / ".git").is_dir():
+            return home
+    return None
+
+
 def discover_primaries(*, include_excluded: bool = False) -> list[Path]:
-    """Depth-1 git repos under <root>/. Sorted alphabetically.
+    """Git repos under <root>/: every depth-1 one, plus a registered unit's
+    home directory nested deeper (`_registry_homes`). Sorted alphabetically.
 
     Skips the `worktrees/` collection dir itself (its children are extras with
     `.git` *files* pointing back to their primary; only primaries have a real
     `.git/` directory). `include_excluded` also returns the DISCOVERY_EXCLUDES
     repos, for the cleanup job."""
     primaries: list[Path] = []
+    seen: set[Path] = set()
     if CONVIVY_ROOT.is_dir():
         for child in sorted(CONVIVY_ROOT.iterdir()):
             if not child.is_dir() or child.name == EXTRA_WT_DIRNAME:
@@ -151,12 +223,21 @@ def discover_primaries(*, include_excluded: bool = False) -> list[Path]:
                 continue
             if (child / ".git").is_dir():
                 primaries.append(child)
-    return primaries
+                seen.add(child.resolve())
+        for home in _registry_homes():
+            resolved = home.resolve()
+            if resolved in seen:
+                continue
+            if home.name in DISCOVERY_EXCLUDES and not include_excluded:
+                continue
+            primaries.append(home)
+            seen.add(resolved)
+    return sorted(primaries)
 
 
 def _label_for(path: Path, primary: Path) -> str:
-    """Short label for tables / registry. `<root>/constance` → `constance`;
-    `<root>/worktrees/constance.overnight` → `worktrees/constance.overnight`."""
+    """Short label for tables / registry. `<root>/acme` → `acme`;
+    `<root>/worktrees/acme.overnight` → `worktrees/acme.overnight`."""
     try:
         rel = path.relative_to(CONVIVY_ROOT)
         return str(rel)
@@ -543,7 +624,7 @@ def is_primary_checkout(repo: str, path: Path) -> bool:
     """True if `path` IS the repo's primary checkout rather than a worktree.
 
     `allocate_worktree(repo, purpose=None)` resolves to the primary. A dispatch
-    reaches it only for a repo-local agent (CFO's) or a private crew's, which take
+    reaches it only for a repo-local agent or a private crew's, which take
     no render and work on untracked files in the clone; every other dispatch gets
     its own worktree. Anything destructive in the dispatch path has to ask this
     before acting, because the primary is not disposable.
@@ -769,7 +850,16 @@ def in_use_map() -> dict[Path, dict]:
 
 
 def _primary_for(repo: str) -> Path:
-    """Resolve a repo name to its primary path. Raises if unknown."""
+    """Resolve a repo name to its primary path. Raises if unknown.
+
+    Checked before the plain `CONVIVY_ROOT / repo` join: a registry unit whose
+    home is nested below CONVIVY_ROOT (`_registry_primary_for`) answers first,
+    so a crew registered one level deeper than the depth-1 layout still
+    resolves. The join is kept as the fallback for everything that layout
+    already covers."""
+    nested = _registry_primary_for(repo)
+    if nested is not None:
+        return nested
     candidate = CONVIVY_ROOT / repo
     if not (candidate / ".git").is_dir():
         known = [p.name for p in discover_primaries()]
@@ -804,7 +894,10 @@ def is_dispatch_target(repo: str) -> bool:
     parts = (repo or "").strip().split("/")
     if len(parts) > 2 or not all(_is_safe_segment(p) for p in parts):
         return False
-    return (CONVIVY_ROOT / parts[-1] / ".git").is_dir()
+    name = parts[-1]
+    if (CONVIVY_ROOT / name / ".git").is_dir():
+        return True
+    return _registry_primary_for(name) is not None
 
 
 def _extras_dir_for(_primary: Path) -> Path:
@@ -832,14 +925,23 @@ def branch_for_purpose(purpose: str) -> str:
     return f"agent/{purpose}"
 
 
+class WorktreeVenvConflict(RuntimeError):
+    """A worktree's `.venv` is a real directory or file, not the symlink
+    `_link_primary_venv` makes to the primary checkout's `.venv`. Raised before
+    the symlink step runs anything under that path, so a worktree carrying its
+    own `.venv` is refused rather than kept as-is."""
+
+
 def _link_primary_venv(primary: Path, target: Path) -> None:
     """Symlink the primary's .venv into a worktree so workers resolve the repo's
     Python and pytest instead of Homebrew's bare /opt/homebrew/bin/pytest.
 
     Only creates the symlink when the primary has a .venv directory. Skips if the
-    worktree already holds a correct symlink. Called after every worktree creation
-    (git worktree add, reset --hard + clean -fdx) so a reused worktree re-linked
-    after the clean removes the prior symlink.
+    worktree already holds a correct symlink. Raises WorktreeVenvConflict if the
+    worktree holds a real .venv directory or file instead — the worktree's .venv
+    must always be the symlink this function creates. Called after every worktree
+    creation (git worktree add, reset --hard + clean -fdx) so a reused worktree
+    re-linked after the clean removes the prior symlink.
 
     Seven repos keep .venv in their primary checkout but not in worktrees
     (agentctl cuts a worktree from git, which shares the object store but not the
@@ -865,8 +967,10 @@ def _link_primary_venv(primary: Path, target: Path) -> None:
     if target_venv.is_symlink():
         target_venv.unlink()
     elif target_venv.exists():
-        # A real directory or file that we did not create — do not touch it
-        return
+        raise WorktreeVenvConflict(
+            f"{target_venv}: refusing to use this worktree — its .venv must be "
+            "the symlink agentctl creates to the primary checkout's .venv, not "
+            "a real directory or file.")
     target_venv.symlink_to(str(primary_venv), target_is_directory=True)
 
 
@@ -876,11 +980,23 @@ class WorktreePinError(RuntimeError):
     rather than letting an agent review a tree that isn't the commit it claims."""
 
 
-def _ensure_commit_present(primary: Path, commit: str) -> None:
+def _ensure_commit_present(primary: Path, commit: str, *, fetch_first: bool = False) -> None:
     """Make sure `commit` is in the local object store (all worktrees of a repo
     share it), fetching origin once if it isn't. Raise if it still can't be found
-    — pinning to a commit git can't see is a hard error, not a silent fallback."""
-    if _git(primary, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode == 0:
+    — pinning to a commit git can't see is a hard error, not a silent fallback.
+
+    `fetch_first` (platform/specs/reviewers-run-under-their-allow-list) fetches
+    origin UNCONDITIONALLY, even when `commit` is already present: a review-class
+    dispatch's allow-list no longer grants `git fetch` at all (a flag-execution
+    hole — `--upload-pack=<cmd>` runs a program), so this pin is the reviewer's
+    only chance to see a fresh `origin/main` before its `git merge-base
+    origin/main HEAD`-shaped reads run. Without it, `origin/main` is only as
+    fresh as whenever THIS primary checkout last fetched for an unrelated reason
+    — stale by default, not by design. `False` (every caller before this
+    parameter existed, and every non-review caller today) keeps the cheap
+    skip-when-present behavior."""
+    if not fetch_first and _git(primary, "cat-file", "-e",
+                                f"{commit}^{{commit}}", check=False).returncode == 0:
         return
     _git(primary, "fetch", "origin", check=False)
     if _git(primary, "cat-file", "-e", f"{commit}^{{commit}}", check=False).returncode != 0:
@@ -897,7 +1013,8 @@ def _assert_head(target: Path, commit: str) -> None:
             f"{target}: HEAD={head[:9] or '?'} != pinned {want[:9] or commit[:9]}")
 
 
-def _pin_existing_to_commit(primary: Path, target: Path, commit: str) -> None:
+def _pin_existing_to_commit(primary: Path, target: Path, commit: str, *,
+                            fetch_first: bool = False) -> None:
     """Force an already-existing (reused) worktree onto `commit`. This is the fix
     for the stale-review near-miss (ARCH-184): a reused review worktree kept its
     round-1 HEAD because allocate_worktree returned it as-is. fetch → reset --hard
@@ -910,22 +1027,156 @@ def _pin_existing_to_commit(primary: Path, target: Path, commit: str) -> None:
     Folds in any leftover private object store first (`import_leftover_private_objects`):
     a prior run on this exact tree may have died before its own end-of-run import, and
     `reset --hard` moving HEAD off that run's commit would otherwise leave it reachable
-    from nothing at all, not even the ref this function is about to overwrite."""
+    from nothing at all, not even the ref this function is about to overwrite.
+
+    `fetch_first` is threaded straight to `_ensure_commit_present`; see its own
+    docstring."""
     import_leftover_private_objects(target)
-    _ensure_commit_present(primary, commit)
+    _ensure_commit_present(primary, commit, fetch_first=fetch_first)
     _git(target, "reset", "--hard", commit)
     _git(target, "clean", "-fdx")
     _assert_head(target, commit)
 
 
+def _pr_review_ref(number: int) -> str:
+    """Where a PR's head is fetched to while `agentctl spawn --pr --review-sha`
+    confirms a hand-carried commit belongs to it. Outside refs/heads and refs/tags,
+    same convention as `kb_merge.pr_ref`/`docs_merge.pr_ref`, so nothing that lists
+    branches or tags sees it. Not dropped afterwards — the next check against the
+    same PR refetches and overwrites it, same as a re-dispatch's commit pin does."""
+    return f"refs/agentctl-spawn/pr-{number}"
+
+
+def commit_in_pr(repo: str, number: int, base_branch: str, commit: str, *,
+                 merge_commit: str | None = None) -> "str | None":
+    """Whether `commit` is one of pull request `number`'s own commits, or why not.
+
+    Fetches the PR's head from `refs/pull/<number>/head` — the ref GitHub keeps for
+    the life of the PR even once its branch is deleted, which a MERGED PR's usually
+    is — rather than `origin/<headRefName>`, which a caller cannot rely on once that
+    happens. `commit` must be reachable from that head AND NOT reachable from the
+    base side of the PR: for an OPEN PR (`merge_commit` is None) that is
+    `base_branch`'s own current tip, fetched fresh; for a MERGED PR it is
+    `merge_commit`'s first parent — the base's tip the instant before the PR's own
+    commit(s) joined it, which is GitHub's `mergeCommit.oid` for both a true merge
+    commit and a squash merge.
+
+    `base_branch`'s CURRENT tip is the wrong cut point once a PR has merged with a
+    true merge commit: the PR's own head is then an ancestor of that tip, so
+    `merge-base(head, tip)` degenerates to the head itself and every one of the
+    PR's own commits — its head included — would read as "already on base"
+    (agent-platform#1004, reproduced against this repo's own merge of PR #1000).
+
+    Returns None when `commit` is confirmed in the PR. Both fetches run
+    unconditionally, ambient-credentialed off `repo`'s own origin remote, same as
+    `_ensure_commit_present`'s `fetch_first` path; their stderr, and a `git
+    merge-base` failure's, is reported with any URL redacted (`_redact_urls`), the
+    same treatment `_fresh_base_sha` gives its own `fetch origin` stderr — a
+    fetch's stderr routinely echoes the remote URL back, which can itself carry
+    embedded credentials. A `git merge-base --is-ancestor` exit code other than 0
+    or 1 is a git failure, not a "not an ancestor" result, and is reported as its
+    own distinct refusal rather than read as either outcome."""
+    primary = _primary_for(repo)
+    head_ref = _pr_review_ref(number)
+    fetch_head = _git(primary, "fetch", "--quiet", "origin",
+                      f"+refs/pull/{number}/head:{head_ref}", check=False)
+    if fetch_head.returncode != 0:
+        return (f"could not fetch refs/pull/{number}/head: "
+                f"{_redact_urls(fetch_head.stderr.strip())}")
+    fetch_base = _git(primary, "fetch", "--quiet", "origin",
+                      f"+refs/heads/{base_branch}:refs/remotes/origin/{base_branch}",
+                      check=False)
+    if fetch_base.returncode != 0:
+        return (f"could not fetch origin/{base_branch}: "
+                f"{_redact_urls(fetch_base.stderr.strip())}")
+    reachable = _git(primary, "merge-base", "--is-ancestor", commit, head_ref, check=False)
+    if reachable.returncode == 1:
+        return f"{commit} is not reachable from PR #{number}'s head"
+    if reachable.returncode != 0:
+        return (f"could not confirm {commit} is reachable from PR #{number}'s head "
+                f"(git exited {reachable.returncode}): "
+                f"{_redact_urls(reachable.stderr.strip())}")
+    base_point = f"{merge_commit}^1" if merge_commit else f"origin/{base_branch}"
+    on_base_already = _git(primary, "merge-base", "--is-ancestor", commit, base_point,
+                           check=False)
+    if on_base_already.returncode == 0:
+        return f"{commit} is on {base_branch} before PR #{number} began, not one of its own commits"
+    if on_base_already.returncode != 1:
+        return (f"could not confirm {commit} is not already on {base_branch} "
+                f"(git exited {on_base_already.returncode}): "
+                f"{_redact_urls(on_base_already.stderr.strip())}")
+    return None
+
+
+def _redact_urls(text: str) -> str:
+    """Strip anything that looks like a URL out of git error text. A fetch's
+    stderr routinely echoes the remote URL back (`fatal: unable to access
+    '<url>'`), and that URL can itself carry embedded credentials
+    (`https://TOKEN@host/...`), so an error message built from raw stderr must
+    not pass it through."""
+    return re.sub(r"\S+://\S+", "<url omitted>", text)
+
+
+def _fresh_base_sha(primary: Path, base_branch: str) -> str:
+    """Resolve `base_branch` to an exact SHA for a BRAND-NEW branch: fetches `origin`
+    first, then reads `refs/remotes/origin/<base_branch>` when `primary` has an
+    `origin` remote, else the local `refs/heads/<base_branch>`.
+
+    Without this, `git worktree add -b <branch> <target> main` resolves `main` to
+    whatever the primary's own `refs/heads/main` happens to point at — which drifts
+    behind `origin/main` whenever nothing has run `git pull` in that checkout for a
+    while, and a dispatched coder was then cut from that stale base (CQ-245: two
+    product primaries, both days to weeks behind origin, each sent a
+    fresh coder dispatch off the root commit or an old tip instead of the real
+    `origin/main`).
+
+    `show-ref --verify` takes the full ref and does no search, unlike `rev-parse
+    origin/main`, which would read a TAG of that name ahead of the remote-tracking
+    branch (agent-platform#681 and #682 — the same reasoning `_detached_main_base`
+    in bin/agentctl applies for a detached-main dispatch). Raises ValueError rather
+    than falling back to local main — whether the resolved ref can't be found after
+    the fetch, or the fetch itself fails (network down, credential refused, a
+    GitHub outage): either way, a coder placed on some other commit, or on
+    whatever `origin/<base_branch>` happened to be cached from a previous fetch,
+    would build on a tree nobody chose. The fetch's stderr is reported with any
+    URL redacted, since the remote URL can carry credentials. Only reads and
+    fetches `primary`; never touches its checked-out branch or its local main."""
+    remote = _git(primary, "remote", "get-url", "origin", check=False)
+    has_origin = remote.returncode == 0
+    if has_origin:
+        fetch = _git(primary, "fetch", "origin", check=False)
+        if fetch.returncode != 0:
+            raise ValueError(
+                f"{primary}: git fetch origin failed (exit {fetch.returncode}): "
+                f"{_redact_urls(fetch.stderr.strip())}")
+        ref = f"refs/remotes/origin/{base_branch}"
+    else:
+        ref = f"refs/heads/{base_branch}"
+    sha = git_refs.exact_ref_sha(primary, ref)
+    if sha is None:
+        if has_origin:
+            raise ValueError(
+                f"{ref} does not exist in {primary} even after fetching origin, so "
+                f"there is no remote-tracking {base_branch} to cut a new branch from.")
+        raise ValueError(
+            f"{primary} has no `origin` remote and no {ref}, so there is no "
+            f"{base_branch} to cut a new branch from.")
+    return sha
+
+
 def _git_worktree_add(primary: Path, target: Path, branch: str, base_branch: str,
-                      commit: str | None = None) -> None:
+                      commit: str | None = None, *, fetch_first: bool = False) -> None:
     """Create a worktree at `target`. When `commit` is given, check out a detached
     HEAD pinned to that exact commit (review-class — no branch to drift, ARCH-184);
-    otherwise create/reuse `branch` from base_branch."""
+    otherwise create/reuse `branch` from base_branch. `fetch_first` is threaded
+    straight to `_ensure_commit_present`; see its own docstring.
+
+    Cutting a brand-new branch resolves `base_branch` through `_fresh_base_sha`
+    rather than passing the branch name straight to `git worktree add`, which
+    would resolve it against the primary's own (possibly stale) local ref."""
     target.parent.mkdir(parents=True, exist_ok=True)
     if commit is not None:
-        _ensure_commit_present(primary, commit)
+        _ensure_commit_present(primary, commit, fetch_first=fetch_first)
         _git(primary, "worktree", "add", "--detach", str(target), commit)
         return
     # Does the branch already exist locally?
@@ -933,7 +1184,8 @@ def _git_worktree_add(primary: Path, target: Path, branch: str, base_branch: str
     if cp.returncode == 0:
         _git(primary, "worktree", "add", str(target), branch)
     else:
-        _git(primary, "worktree", "add", "-b", branch, str(target), base_branch)
+        base_sha = _fresh_base_sha(primary, base_branch)
+        _git(primary, "worktree", "add", "-b", branch, str(target), base_sha)
 
 
 class WorktreeBusy(RuntimeError):
@@ -945,10 +1197,207 @@ class WorktreeBusy(RuntimeError):
         self.holder = holder
 
 
+@dataclass(frozen=True)
+class SwiftResolveResult:
+    """What the swift-resolve dispatch step did. `ran=True` means
+    `resolve_swift_package` actually invoked `swift package resolve`.
+    `ran=False` covers two different cases, told apart by `skipped_reason`:
+    the worktree held no `Package.swift` at all (the common case for a
+    non-Swift repo — `skipped_reason` stays `None`, nothing is recorded), or
+    it held one but `swift_worktree_matches_origin` or the caller's
+    review-class check refused to run it (`skipped_reason` names why). Either
+    way `returncode`, `duration_s` and `stderr` stay at their defaults."""
+    ran: bool
+    returncode: int | None = None
+    duration_s: float | None = None
+    stderr: str = ""
+    skipped_reason: str | None = None
+
+
+# PATH to find the toolchain; HOME and TMPDIR for its own caches, config and
+# scratch files; LANG so its output decodes. Nothing else from the operator's
+# own environment reaches a manifest process — `Package.swift` is Swift code
+# that `swift package resolve` evaluates and whose named dependencies it then
+# fetches, unsandboxed, with the operator's own privileges (see
+# `resolve_swift_package`'s docstring), so an ambient credential (an
+# `SSH_AUTH_SOCK`, a `GH_TOKEN`) must never be reachable to it
+# (issue_01M5CSFQ6XGEB7JVA0ATF3EN32 round 1, security review).
+_SWIFT_RESOLVE_ENV_ALLOW = ("PATH", "HOME", "TMPDIR", "LANG")
+
+
+def _swift_resolve_env() -> dict[str, str]:
+    """`os.environ`, cut down to `_SWIFT_RESOLVE_ENV_ALLOW`."""
+    return {k: v for k, v in os.environ.items() if k in _SWIFT_RESOLVE_ENV_ALLOW}
+
+
+# The one path `allocate_worktree` itself writes into a worktree between
+# creation and the swift-resolve gate: `_link_primary_venv`'s `.venv`
+# symlink, made for every worktree whose primary carries one — and `.venv` is
+# routinely gitignored, so it can be invisible to a plain `git status`
+# without `--ignored` too. Named here explicitly so a status line against
+# anything else still refuses the resolve, and so a future write
+# `allocate_worktree` makes before the gate runs has to be added to this set
+# to pass, rather than silently widening what a reused or freshly-written
+# worktree can carry through undetected (round-3 security review,
+# issue_01M5CSFQ6XGEB7JVA0ATF3EN32).
+_SWIFT_RESOLVE_SPAWN_WRITES = frozenset({".venv"})
+
+
+def _parse_status_porcelain_paths(output: str) -> list[str]:
+    """`git status --porcelain` (v1, non -z) lines → the path each one names.
+    Each line is a 2-character status code, a space, then the path."""
+    return [line[3:] for line in output.splitlines() if line]
+
+
+def _worktree_has_hidden_index_entries(worktree: Path) -> bool:
+    """Whether any index entry carries skip-worktree (an uppercase `S` in
+    `git ls-files -v`) or assume-unchanged (a lowercase tag) — either hides a
+    tracked file's real on-disk content from `git status` entirely, and a
+    sandboxed run inside a reused worktree is not shown to be denied from
+    setting either flag with its own `git update-index` (round-3 security
+    review, issue_01M5CSFQ6XGEB7JVA0ATF3EN32). Fails closed: a `git ls-files`
+    error means this can't be answered, so it's treated as hidden rather than
+    as clean."""
+    cp = _git(worktree, "ls-files", "-v", check=False)
+    if cp.returncode != 0:
+        return True
+    for line in cp.stdout.splitlines():
+        if not line:
+            continue
+        tag = line[0]
+        if tag == "S" or tag.islower():
+            return True
+    return False
+
+
+def swift_worktree_matches_origin(worktree: Path, *,
+                                  base_branch: str = DEFAULT_BASE_BRANCH) -> tuple[bool, str | None]:
+    """Whether `worktree` is safe for `resolve_swift_package` to run
+    against: its HEAD is exactly `origin/<base_branch>`'s commit, its index
+    carries no skip-worktree/assume-unchanged entry, and
+    `git status --porcelain --untracked-files=all --ignored` reports nothing
+    beyond `_SWIFT_RESOLVE_SPAWN_WRITES` — already-merged, already-reviewed
+    content, never a sandboxed coder's own unreviewed branch write and never
+    a reviewer's tree pinned to a PR head its own author controls.
+
+    This checks the whole tree rather than `Package.swift`/`Package.resolved`
+    alone (issue_01M5CSFQ6XGEB7JVA0ATF3EN32 round 2, security review): SwiftPM
+    also reads a version-specific manifest (`Package@swift-<version>.swift` and
+    friends, which take priority over `Package.swift` for a matching
+    toolchain), `.swiftpm/configuration/` (`mirrors.json` redirects any
+    dependency URL to an attacker-controlled host; `registries.json` the
+    same for the package registry), and any `.package(path:)` local
+    dependency `Package.swift` names, which resolves straight to a path
+    inside the worktree with no entry in `Package.resolved` at all. A
+    two-file comparison misses every one of those; comparing the whole
+    worktree to `origin/<base_branch>` closes the class instead of chasing
+    each file in turn. A fresh coder worktree cut straight from
+    `origin/<base_branch>` matches by construction; a revise round reusing a
+    PR branch an earlier coder round committed or left untracked files on
+    never does, so it never resolves (round-2 fix: round 1's two-file
+    comparison let exactly this case through when the two files it checked
+    happened to be untouched).
+
+    `--ignored` on the status call and the index-entry check close a round-3
+    gap: plain `--untracked-files=all` omits any path `origin/<base_branch>`'s
+    own `.gitignore` already excludes (the stock `.swiftpm/configuration/`
+    entry SwiftPM's own `swift package init` template ships), and neither
+    flag sees a tracked file hidden behind skip-worktree/assume-unchanged.
+    This function alone is not what makes a reused worktree safe — the
+    caller (`bin/agentctl`'s `_spawn_dispatch`) must also only call this
+    against a worktree it created fresh in this exact dispatch, never a
+    reused one, since a reused `commit=None` target is handed back by
+    `allocate_worktree` completely unreset (round-3 security review).
+
+    `(True, None)` only when all three hold; otherwise `(False, <reason>)`,
+    including when `origin/<base_branch>` cannot be read at all, which fails
+    closed rather than treating a missing ref as a match."""
+    ref = f"refs/remotes/origin/{base_branch}"
+    cp = _git(worktree, "rev-parse", "--verify", ref, check=False)
+    if cp.returncode != 0:
+        return False, f"origin/{base_branch} not found"
+    origin_sha = cp.stdout.strip()
+    cp = _git(worktree, "rev-parse", "--verify", "HEAD", check=False)
+    if cp.returncode != 0:
+        return False, "worktree HEAD could not be read"
+    head_sha = cp.stdout.strip()
+    if head_sha != origin_sha:
+        return False, f"HEAD ({head_sha[:12]}) is not origin/{base_branch} ({origin_sha[:12]})"
+    if _worktree_has_hidden_index_entries(worktree):
+        return False, "worktree has a skip-worktree or assume-unchanged index entry"
+    cp = _git(worktree, "status", "--porcelain", "--untracked-files=all", "--ignored", check=False)
+    if cp.returncode != 0:
+        return False, "git status failed"
+    unexpected = [p for p in _parse_status_porcelain_paths(cp.stdout)
+                 if p not in _SWIFT_RESOLVE_SPAWN_WRITES]
+    if unexpected:
+        return False, f"worktree has local changes relative to origin/{base_branch}"
+    return True, None
+
+
+def resolve_swift_package(worktree: Path) -> SwiftResolveResult:
+    """Run `swift package resolve` in `worktree`, with the operator's own
+    privileges, before a dispatched run's own sandboxed session ever starts
+    (issue_01M5CSFQ6XGEB7JVA0ATF3EN32).
+
+    Claude Code's Bash sandbox denies writes to any `.git/config` or git hooks
+    path under the run's working directory, so a session that is itself
+    sandboxed cannot let SwiftPM clone its dependencies into
+    `.build/checkouts` — the clone's own `git init` needs to write that file.
+    Resolving here, outside that sandbox, writes those checkouts once so the
+    run never clones or fetches dependency code itself.
+
+    A no-op (`ran=False`) when `worktree` holds no `Package.swift`: most repos
+    this dispatcher serves aren't Swift packages. No timeout — no hung resolve
+    has been seen, and a guard needs a named occurrence to earn one.
+
+    This function does NOT gate on `swift_worktree_matches_origin` or on the
+    dispatch's agent class — the caller (`bin/agentctl`'s `_spawn_dispatch`)
+    decides whether to call this at all, and must only ever call it against a
+    worktree `swift_worktree_matches_origin` has already passed, for a
+    non-review-class dispatch (round-1 security review).
+
+    The resolve runs with `--config-path`/`--security-path`/`--cache-path`
+    pointed at a fresh temporary directory made for this one call and removed
+    once it returns, rather than SwiftPM's own user-level defaults
+    (`~/.swiftpm`, `~/Library/org.swift.swiftpm`) — so a `mirrors.json`,
+    registry entry, or cached manifest any earlier resolve could have written
+    there is never read back in (round-2 security review,
+    issue_01M5CSFQ6XGEB7JVA0ATF3EN32)."""
+    if not (worktree / "Package.swift").exists():
+        return SwiftResolveResult(ran=False)
+    isolation_dir = Path(tempfile.mkdtemp(prefix="swift-resolve-"))
+    try:
+        config_dir = isolation_dir / "config"
+        security_dir = isolation_dir / "security"
+        cache_dir = isolation_dir / "cache"
+        for d in (config_dir, security_dir, cache_dir):
+            d.mkdir()
+        started = time.monotonic()
+        cp = subprocess.run(
+            ["swift", "package",
+             "--config-path", str(config_dir),
+             "--security-path", str(security_dir),
+             "--cache-path", str(cache_dir),
+             "resolve"],
+            cwd=str(worktree),
+            capture_output=True,
+            text=True,
+            env=_swift_resolve_env(),
+        )
+    finally:
+        shutil.rmtree(isolation_dir, ignore_errors=True)
+    return SwiftResolveResult(ran=True, returncode=cp.returncode,
+                              duration_s=time.monotonic() - started,
+                              stderr=cp.stderr)
+
+
 def allocate_worktree(repo: str, purpose: str | None = None, *,
                       branch: str | None = None,
                       base_branch: str = DEFAULT_BASE_BRANCH,
-                      commit: str | None = None) -> Path:
+                      commit: str | None = None,
+                      fetch_origin_first: bool = False,
+                      report_created: bool = False) -> "Path | tuple[Path, bool]":
     """Resolve + (if needed) create a worktree for the given (repo, purpose).
 
     Refuses if the target is in the active-runs registry under another agent.
@@ -960,7 +1409,24 @@ def allocate_worktree(repo: str, purpose: str | None = None, *,
     the commit (killing the stale-review bug where a reused worktree kept an old
     HEAD). Refused for the primary tree — pinning hard-resets, and the primary is
     the human's clone, never something to clobber.
-    """
+
+    `fetch_origin_first` (platform/specs/reviewers-run-under-their-allow-list) is
+    the caller's own answer to "is this a review dispatch?" — `True` for
+    `reviewer`/`security-reviewer`, `False` for every other commit-pinned caller
+    (a detached-main agent's own dispatch). Threaded straight to
+    `_ensure_commit_present` via `_pin_existing_to_commit`/`_git_worktree_add`;
+    see that function's own docstring for why a review dispatch needs it.
+
+    `report_created=True` returns `(target, created)` instead of plain
+    `target`: `created` is `True` only when THIS call made the worktree via
+    `git worktree add` (the `target` did not already exist on entry), `False`
+    for every reuse, pinned or not. A reused `commit=None` target is handed
+    back completely unreset — no `git status` on it proves anything about
+    what a prior run left there — so a caller deciding whether a worktree is
+    safe for an unsandboxed, privileged step (the swift-resolve gate in
+    `bin/agentctl`'s `_spawn_dispatch`) must use this fact explicitly rather
+    than infer it from the tree's content or a timestamp (round-3 security
+    review, issue_01M5CSFQ6XGEB7JVA0ATF3EN32)."""
     if commit is not None and purpose is None:
         raise ValueError(
             "commit-pinned worktree requires a dedicated purpose — refusing to "
@@ -973,9 +1439,10 @@ def allocate_worktree(repo: str, purpose: str | None = None, *,
 
     if target.exists():
         if commit is not None:
-            _pin_existing_to_commit(_primary_for(repo), target, commit)
+            _pin_existing_to_commit(_primary_for(repo), target, commit,
+                                    fetch_first=fetch_origin_first)
         _link_primary_venv(_primary_for(repo), target)
-        return target
+        return (target, False) if report_created else target
 
     if purpose is None:
         # primary must already exist
@@ -983,11 +1450,12 @@ def allocate_worktree(repo: str, purpose: str | None = None, *,
 
     primary = _primary_for(repo)
     use_branch = branch or branch_for_purpose(purpose)
-    _git_worktree_add(primary, target, use_branch, base_branch, commit=commit)
+    _git_worktree_add(primary, target, use_branch, base_branch, commit=commit,
+                      fetch_first=fetch_origin_first)
     if commit is not None:
         _assert_head(target, commit)
     _link_primary_venv(primary, target)
-    return target
+    return (target, True) if report_created else target
 
 
 # --- PR-branch reuse (ARCH-347) ---------------------------------------------
@@ -996,7 +1464,7 @@ def allocate_worktree(repo: str, purpose: str | None = None, *,
 # `agent/<purpose>`, and `purpose` is slugged from the dispatch TASK TEXT. A round-fix
 # carries a different task than the first dispatch, so it gets a different slug → a
 # different branch → a branch that is NOT the PR's. `publish` then pushes that orphan
-# branch and reports success while the PR head never moves (the vivy-co footgun, #923).
+# branch and reports success while the PR head never moves (a product-crew footgun, #923).
 # The fix is to stop deriving the branch from the task and instead reuse the branch the
 # PR actually points at — which is what these two functions do.
 
@@ -1170,19 +1638,52 @@ def _gh_path() -> str | None:
     return SP.safe_which("gh")
 
 
-def pr_merged(wt: Worktree) -> bool:
+# A GitHub remote URL in the HTTPS, `ssh://git@` or `git@host:` form, capturing
+# its `owner/repo` — `pr_merged` takes the slug straight off the worktree's own
+# `origin` rather than through the registry (company/decisions/0027: a
+# worktree's primary need not be a registered project either).
+_GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https://|ssh://git@|git@)github\.com[:/](?P<slug>[^/]+/[^/]+?)(?:\.git)?/?$",
+    re.IGNORECASE)
+
+
+def _origin_github_slug(path: Path) -> str | None:
+    """`owner/repo` for `path`'s own `origin` remote, or None when there is
+    no such remote or it isn't a GitHub HTTPS/SSH form this can parse."""
+    r = subprocess.run(["git", "-C", str(path), "remote", "get-url", "origin"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    m = _GITHUB_REMOTE_RE.match(r.stdout.strip())
+    return m.group("slug") if m else None
+
+
+def pr_merged(wt: Worktree, gh_env_for) -> bool:
     """True iff a MERGED PR exists for this worktree's branch.
 
     Squash merges leave the branch permanently "ahead" of main, so ahead-ness
     alone can't distinguish landed work from live work — the PR state can.
-    Any failure (no gh, no remote, offline) returns False, i.e. don't reap."""
+    Any failure (no gh, no remote, offline, no GitHub token mintable for this
+    worktree's repo — company/decisions/0027) returns False, i.e. don't reap.
+
+    `gh_env_for` is a `GA.read_token_pool`'s own `env_for`: several worktrees
+    commonly share one primary repo (two coders' worktrees off the same
+    checkout), so `cleanup_candidates`'s loop mints at most once per repo
+    across the whole pass, not once per worktree."""
     gh = _gh_path()
     if not gh or not wt.branch:
+        return False
+    repo_slug = _origin_github_slug(wt.path)
+    if repo_slug is None:
+        return False
+    try:
+        env = gh_env_for(repo_slug)
+    except GA.Unreadable:
         return False
     cp = subprocess.run(
         [gh, "pr", "list", "--head", wt.branch, "--state", "merged",
          "--json", "number", "--limit", "1"],
-        cwd=str(wt.path), capture_output=True, text=True,
+        cwd=str(wt.path), capture_output=True, text=True, env=env,
     )
     if cp.returncode != 0:
         return False
@@ -1237,39 +1738,44 @@ def cleanup_candidates(*, base_branch: str = DEFAULT_BASE_BRANCH) -> list[Cleanu
     one `wt.ahead` happened to read nonzero before the import could run."""
     holds = in_use_map()
     out: list[CleanupCandidate] = []
-    for wt in all_worktrees(base_branch=base_branch, include_excluded=True):
-        if wt.is_primary:
-            continue
-        if wt.path.resolve() in holds:
-            out.append(CleanupCandidate(wt, "skip:in_use"))
-            continue
-        if not is_dispatched(wt.path):
-            out.append(CleanupCandidate(wt, "skip:not-dispatched"))
-            continue
-        if wt.locked:
-            out.append(CleanupCandidate(wt, "skip:locked"))
-            continue
-        real_dirty = wt.real_dirty_files
-        if import_leftover_private_objects(wt.path):
-            dirty = _dirty_counts_or_none(wt.path)
-            if dirty is None:
+    # One `read`-scoped token per repo across this whole pass (company/
+    # decisions/0027): several worktrees commonly share one primary repo, so
+    # a pool that mints at most once per repo replaces what would otherwise
+    # be a mint per worktree.
+    with GA.read_token_pool() as gh_env_for:
+        for wt in all_worktrees(base_branch=base_branch, include_excluded=True):
+            if wt.is_primary:
+                continue
+            if wt.path.resolve() in holds:
+                out.append(CleanupCandidate(wt, "skip:in_use"))
+                continue
+            if not is_dispatched(wt.path):
+                out.append(CleanupCandidate(wt, "skip:not-dispatched"))
+                continue
+            if wt.locked:
+                out.append(CleanupCandidate(wt, "skip:locked"))
+                continue
+            real_dirty = wt.real_dirty_files
+            if import_leftover_private_objects(wt.path):
+                dirty = _dirty_counts_or_none(wt.path)
+                if dirty is None:
+                    out.append(CleanupCandidate(wt, "skip:error"))
+                    continue
+                real_dirty = dirty[1]
+            if real_dirty:
+                out.append(CleanupCandidate(wt, "skip:dirty"))
+                continue
+            try:
+                unpub = unpublished_commits(wt.path)
+            except Exception:
                 out.append(CleanupCandidate(wt, "skip:error"))
                 continue
-            real_dirty = dirty[1]
-        if real_dirty:
-            out.append(CleanupCandidate(wt, "skip:dirty"))
-            continue
-        try:
-            unpub = unpublished_commits(wt.path)
-        except Exception:
-            out.append(CleanupCandidate(wt, "skip:error"))
-            continue
-        if unpub == 0:
-            out.append(CleanupCandidate(wt, "removable:published" if wt.ahead else "removable"))
-        elif wt.branch and pr_merged(wt):
-            out.append(CleanupCandidate(wt, "removable:pr-merged"))
-        else:
-            out.append(CleanupCandidate(wt, "skip:ahead"))
+            if unpub == 0:
+                out.append(CleanupCandidate(wt, "removable:published" if wt.ahead else "removable"))
+            elif wt.branch and pr_merged(wt, gh_env_for):
+                out.append(CleanupCandidate(wt, "removable:pr-merged"))
+            else:
+                out.append(CleanupCandidate(wt, "skip:ahead"))
     return out
 
 

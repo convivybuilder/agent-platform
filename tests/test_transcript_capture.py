@@ -27,7 +27,11 @@ def _home_prefix(tc, slug: str) -> str:
     produces, computed via the module's own `_sanitize` and
     `projects.home_path` — the same primitives `_project_prefixes` uses — so
     the expectation follows `Path.home()` on whatever machine runs the test
-    rather than a literal path hardcoded to one contributor's laptop."""
+    rather than a literal path hardcoded to one contributor's laptop. Every
+    caller of this helper, and every other call site reading
+    `projects.private_slugs()` against a real, already-registered private
+    crew's slug for the same reason, carries the `rich_registry` marker
+    (CQ-546)."""
     return tc._sanitize(tc.projects.home_path(slug))
 
 
@@ -49,44 +53,48 @@ def _worktree_prefix(tc, repo: str, suffix: str) -> str:
 # --- black-box exclusion ---------------------------------------------------------
 
 
+@pytest.mark.rich_registry
 def test_private_home_dir_prefix_is_excluded(tc):
     idx = tc.all_project_prefixes()
     private = tc.projects.private_slugs()
-    assert "cfo" in private  # the one registered black-box crew today
+    assert "ledger" in private  # the one registered black-box crew today
     bb = tc.black_box_prefixes(idx, private)
-    home = _home_prefix(tc, "cfo")
+    home = _home_prefix(tc, "ledger")
     assert tc.dir_matches_prefixes(home, bb)
     # a real subdirectory of the black-box home also excludes
     assert tc.dir_matches_prefixes(home + "-sub", bb)
 
 
+@pytest.mark.rich_registry
 def test_case_insensitive_bypass_is_closed(tc):
     """The exact repro named in the dispatch: a session whose cwd was reached
-    via different case (~/convivy/cfo instead of ~/Convivy/CFO) sanitizes to a
+    via different case (~/convivy/ledger instead of ~/Convivy/LEDGER) sanitizes to a
     differently-cased directory name that still names the same on-disk
     directory under this machine's case-insensitive APFS default — it must
     still be excluded, not silently let through by a naive string compare."""
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
-    home = _home_prefix(tc, "cfo")
+    home = _home_prefix(tc, "ledger")
     assert tc.dir_matches_prefixes(home.lower(), bb)
     assert tc.dir_matches_prefixes(home.upper(), bb)
     assert tc.dir_matches_prefixes(home.swapcase(), bb)
 
 
+@pytest.mark.rich_registry
 def test_worktree_prefix_is_excluded(tc):
-    """A session run from a CFO worktree (~/Convivy/worktrees/CFO.<purpose>)
+    """A session run from a LEDGER worktree (~/Convivy/worktrees/LEDGER.<purpose>)
     excludes too, not just the primary home directory."""
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
-    worktree = _worktree_prefix(tc, "CFO", "some-purpose")
+    worktree = _worktree_prefix(tc, "LEDGER", "some-purpose")
     assert tc.dir_matches_prefixes(worktree, bb)
     # case-insensitive here too
     assert tc.dir_matches_prefixes(worktree.lower(), bb)
 
 
-def test_real_cfo_worktree_session_is_excluded_arch_dot_sanitize(tc):
-    """The security-reviewer's exact repro on PR #415: a real CFO worktree
+@pytest.mark.rich_registry
+def test_real_ledger_worktree_session_is_excluded_arch_dot_sanitize(tc):
+    """The security-reviewer's exact repro on PR #415: a real LEDGER worktree
     session, following this platform's own `<repo>.<purpose>` convention (the
     same one this test's own worktree uses), produces an on-disk
     `~/.claude/projects` dirname with the '.' already converted to '-' by
@@ -101,14 +109,15 @@ def test_real_cfo_worktree_session_is_excluded_arch_dot_sanitize(tc):
     comparing the buggy function to itself."""
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
-    real_dirname = _worktree_prefix(tc, "CFO", "quarterly-close")
+    real_dirname = _worktree_prefix(tc, "LEDGER", "quarterly-close")
     assert tc.dir_matches_prefixes(real_dirname, bb)
 
 
-def test_scratchpad_shaped_cfo_session_is_excluded(tc):
+@pytest.mark.rich_registry
+def test_scratchpad_shaped_ledger_session_is_excluded(tc):
     """Verified live on this machine: a scratchpad cwd rooted OUTSIDE
     ~/Convivy entirely (`/private/tmp/claude-<uid>/<origin-path>-scratchpad-
-    <name>`, real entries exist today for agent-platform, convivy-deck, and
+    <name>`, real entries exist today for agent-platform, northwind-deck, and
     substrate) embeds the sanitized origin path as a SUBSTRING partway
     through the `~/.claude/projects` dirname, not as a leading prefix — a
     pure `startswith` check can never catch this regardless of how many
@@ -118,11 +127,13 @@ def test_scratchpad_shaped_cfo_session_is_excluded(tc):
     dirname."""
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
-    home = _home_prefix(tc, "cfo")
+    home = _home_prefix(tc, "ledger")
     scratchpad_dirname = f"-private-tmp-claude-501-{home}-somehash-scratchpad-probe"
     assert tc.dir_matches_prefixes(scratchpad_dirname, bb)
 
 
+@pytest.mark.rich_registry  # needs a real private crew; the synthetic registry has none,
+# so `bb` would be empty and `dir_matches_prefixes` would pass vacuously either way
 def test_scratchpad_shaped_dirname_with_partial_overlap_is_not_excluded(tc):
     """A scratchpad-shaped dirname for a DIFFERENT project whose sanitized
     identifier merely shares its LEADING characters with a private crew's
@@ -132,32 +143,33 @@ def test_scratchpad_shaped_dirname_with_partial_overlap_is_not_excluded(tc):
     unrelated one); the boundary-delimited check must not."""
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
-    home = _home_prefix(tc, "cfo")
+    home = _home_prefix(tc, "ledger")
     scratchpad_dirname = f"-private-tmp-claude-501-{home}extraproject-somehash-scratchpad-probe"
     assert not tc.dir_matches_prefixes(scratchpad_dirname, bb)
 
 
-def test_cfo_nested_repo_worktree_is_excluded_today(tc):
+@pytest.mark.rich_registry
+def test_ledger_nested_repo_worktree_is_excluded_today(tc):
     """The other naming shape this machine's real `~/.claude/projects` holds
     that the exclusion never named: a worktree nested INSIDE a repo's own
     checkout (`<repo>/.claude/worktrees/<name>`, distinct from the
     `~/Convivy/worktrees/<repo>.<purpose>` shape — real entries exist today
-    for agent-platform and selector). For CFO specifically this is just an
-    ordinary subdirectory of its home_dir (CFO's repo checkout IS its home
+    for agent-platform and beacon). For LEDGER specifically this is just an
+    ordinary subdirectory of its home_dir (LEDGER's repo checkout IS its home
     directory), so it's caught by the plain home-fragment boundary match."""
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
-    home = _home_prefix(tc, "cfo")
+    home = _home_prefix(tc, "ledger")
     nested = f"{home}-.claude-worktrees-some-task"
     assert tc.dir_matches_prefixes(nested, bb)
 
 
 def test_nested_repo_worktree_excluded_for_a_future_crew_with_a_dirs_entry(tc, tmp_path, monkeypatch):
-    """CFO's nested in-repo worktree shape (previous test) happens to work
-    today only because CFO's repo checkout equals its home_dir basename. A
+    """LEDGER's nested in-repo worktree shape (previous test) happens to work
+    today only because LEDGER's repo checkout equals its home_dir basename. A
     FUTURE private crew whose repo checkout is a `dirs` (ARCH-426) entry
-    distinct from home_dir — the shape `svc` already uses for
-    `convivy-services` — must still have this nested-worktree shape excluded,
+    distinct from home_dir — the shape `relay` already uses for
+    `foundry-services` — must still have this nested-worktree shape excluded,
     via the `dirs_for` fragment this PR adds rather than via home_dir."""
     home = tmp_path / "acme-home"
     code = tmp_path / "acme-code"  # repo checkout, NOT nested under home
@@ -178,23 +190,27 @@ def test_delimited_occurrence_scans_past_unboundaried_match_to_find_a_later_one(
     this file occurs at most once in its tested dirname, so a regression that made
     the loop stop at the first raw `str.find` hit (an easy "simplification") would
     slip through unnoticed without this test (reviewer, PR #415, run-4c62edc4).
-    `"CFO"` occurs twice in `"-CFOX-CFO-foo"`: once as the unboundaried tail of
-    `"CFOX"` (left-ok, but followed by `"X"` — fails the right-boundary check),
+    `"LEDGER"` occurs twice in `"-LEDGERX-LEDGER-foo"`: once as the unboundaried tail of
+    `"LEDGERX"` (left-ok, but followed by `"X"` — fails the right-boundary check),
     and once genuinely delimited on both sides later in the string."""
-    assert tc._delimited_occurrence("-CFOX-CFO-foo", "CFO", require_right_boundary=True)
+    assert tc._delimited_occurrence("-LEDGERX-LEDGER-foo", "LEDGER", require_right_boundary=True)
 
 
+@pytest.mark.rich_registry  # needs a real private crew; the synthetic registry has none,
+# so `bb` would be empty and every `dir_matches_prefixes` call below would pass vacuously
 def test_prefix_collision_does_not_false_positive(tc):
     """A directory that merely STARTS WITH the same characters as a private
     home_dir but names a different real directory (no '/' boundary) must NOT
     be excluded — over-exclusion silently drops legitimate data too."""
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
-    assert not tc.dir_matches_prefixes(_home_prefix(tc, "cfo") + "extra", bb)
+    assert not tc.dir_matches_prefixes(_home_prefix(tc, "ledger") + "extra", bb)
     assert not tc.dir_matches_prefixes(
-        _worktree_prefix(tc, "CFOX", "overnight"), bb)
+        _worktree_prefix(tc, "LEDGERX", "overnight"), bb)
 
 
+@pytest.mark.rich_registry  # needs a real private crew; the synthetic registry has none,
+# so `bb` would be empty and every `dir_matches_prefixes` call below would pass vacuously
 def test_non_private_project_is_not_excluded(tc):
     idx = tc.all_project_prefixes()
     bb = tc.black_box_prefixes(idx, tc.projects.private_slugs())
@@ -202,23 +218,24 @@ def test_non_private_project_is_not_excluded(tc):
     assert not tc.dir_matches_prefixes(_home_prefix(tc, "bosun"), bb)
 
 
+@pytest.mark.rich_registry
 def test_exclusion_is_rederived_from_registry_not_hardcoded(tc, monkeypatch):
     """The exclusion set must be computed FRESH from projects.private_slugs()
-    every call, not hardcoded to 'cfo' — so a newly-registered black-box crew
+    every call, not hardcoded to 'ledger' — so a newly-registered black-box crew
     is excluded with no code change, per ADR-0043."""
     idx = tc.all_project_prefixes()
     library = _home_prefix(tc, "library")
     # A project that is NOT private today must not be excluded...
-    assert not tc.dir_matches_prefixes(library, tc.black_box_prefixes(idx, {"cfo"}))
+    assert not tc.dir_matches_prefixes(library, tc.black_box_prefixes(idx, {"ledger"}))
     # ...but once the registry says it's private, it must be.
-    bb_widened = tc.black_box_prefixes(idx, {"cfo", "library"})
+    bb_widened = tc.black_box_prefixes(idx, {"ledger", "library"})
     assert tc.dir_matches_prefixes(library, bb_widened)
 
 
 def test_dirs_for_directories_get_exclusion_coverage_arch426(tc, tmp_path, monkeypatch):
     """A private crew's `dirs` registry field (ARCH-426) names a directory
-    that is NOT nested under its home_dir — `svc` already uses this today for
-    `convivy-services`, a public project. Before this fix, `_project_prefixes`
+    that is NOT nested under its home_dir — `relay` already uses this today for
+    `foundry-services`, a public project. Before this fix, `_project_prefixes`
     only ever called `home_path(slug)`, so the first private crew registered
     with a non-empty `dirs` entry would get zero exclusion coverage for that
     directory tree. Uses a synthetic project so this doesn't depend on any
@@ -237,6 +254,7 @@ def test_dirs_for_directories_get_exclusion_coverage_arch426(tc, tmp_path, monke
     assert sum(1 for p in prefixes if p.value == home_frag) == 1
 
 
+@pytest.mark.rich_registry
 def test_resolve_product_matches_registered_project(tc):
     idx = tc.all_project_prefixes()
     private = tc.projects.private_slugs()
@@ -244,40 +262,43 @@ def test_resolve_product_matches_registered_project(tc):
 
 
 def test_resolve_product_is_none_for_an_unregistered_dir(tc):
-    """The raw-dirname fallback this replaced is what captured `-` and ask."""
+    """The raw-dirname fallback this replaced is what captured `-` and the
+    walled-off crew's dir."""
     idx = tc.all_project_prefixes()
     private = tc.projects.private_slugs()
     assert tc.resolve_product("-Users-operator-some-unregistered-place", idx, private) is None
     assert tc.resolve_product("-", idx, private) is None
 
 
+@pytest.mark.rich_registry  # needs a real private crew; the synthetic registry has none
 def test_resolve_product_never_returns_a_private_slug(tc):
     """Belt-and-suspenders: even if a caller forgot the upstream exclusion
     check, resolve_product must never label a turn's product with a
     black-box slug."""
     idx = tc.all_project_prefixes()
     private = tc.projects.private_slugs()
-    got = tc.resolve_product(_home_prefix(tc, "cfo"), idx, private)
-    assert got != "cfo"
+    got = tc.resolve_product(_home_prefix(tc, "ledger"), idx, private)
+    assert got != "ledger"
 
 
+@pytest.mark.rich_registry
 def test_main_captures_only_dirs_a_registered_public_project_owns(tc, tmp_path, monkeypatch):
     """The allowlist, proven through `main()`'s own loop against the real
     registry rather than a helper. Each dir holds one quiet, postable turn, so
     a dir that is skipped proves the skip rather than an empty file.
 
-    `-` is where launchd's headless `claude -p` jobs land (cwd `/`), and EA's
-    mailbox prompts reached the Library from it. Ask's dir is unregistered.
-    The `/private/tmp` dirname resolves to nothing at all, so the test shows the
-    control fails closed on an arbitrary dir, not only on the two known leaks.
-    `library` is the control: without a dir that does post, a run that captured
-    nothing for some other reason would pass too."""
-    ask = f"{tc.BR.root()}/ask".replace("/", "-").replace(".", "-")
+    `-` is where launchd's headless `claude -p` jobs land (cwd `/`), and ASSISTANT's
+    mailbox prompts reached the Library from it. The walled-off crew's dir is
+    unregistered. The `/private/tmp` dirname resolves to nothing at all, so the
+    test shows the control fails closed on an arbitrary dir, not only on the two
+    known leaks. `library` is the control: without a dir that does post, a run
+    that captured nothing for some other reason would pass too."""
+    walled = f"{tc.BR.root()}/parlor".replace("/", "-").replace(".", "-")
     stray = "-private-tmp-xyz-unregistered-probe"
     library = _home_prefix(tc, "library")
     projects_dir = tmp_path / "projects"
     quiet = time.time() - tc.LIVE_THRESHOLD_SECONDS - 60
-    for name in ("-", ask, stray, library):
+    for name in ("-", walled, stray, library):
         d = projects_dir / name
         d.mkdir(parents=True)
         f = d / "sess.jsonl"
@@ -813,6 +834,7 @@ def test_a_deadline_expiring_mid_retry_reports_the_unsent_signal_as_a_failure(tc
     assert slept == []  # the deadline check runs before the wait, not after
 
 
+@pytest.mark.rich_registry
 def test_main_reports_a_signal_still_unsent_at_the_deadline_as_a_failure(
         tc, tmp_path, monkeypatch):
     """End to end through main(): a 429-storm signal that never lands inside

@@ -14,13 +14,17 @@
 # directly — the same admission `agentctl crew doctor`'s `check_registry` was
 # fixed to make (company decision 0011) — rather than a second hardcoded
 # list. `project_for_repo` is checked FIRST and its own regression is pinned
-# below: a repo config/projects.json already claims for a registered project
-# (`convivy-services`, crew `svc`) must stay refused here exactly as before,
-# because `co` deliberately has no generic reindividuation branch for it —
-# `_co_reindividuate --force` would rmtree its git-tracked hand-written agents
-# (bin/co's own comment beside `_co_profiled_dirs`). A first version of this
-# fix used `resolve_project` alone and reindividuated straight over that
-# directory.
+# below: a repo a registered project already claims must stay refused here
+# exactly as before, because `co` deliberately has no generic reindividuation
+# branch for it — `_co_reindividuate --force` would rmtree its git-tracked
+# hand-written agents (bin/co's own comment beside `_co_profiled_dirs`). A
+# first version of this fix used `resolve_project` alone and reindividuated
+# straight over that directory. The regression below pins this against a
+# synthetic registry entry (PROJECTS_REGISTRY, the same seam
+# `write_private_registry` uses) rather than the operator's own
+# `config/projects.json`, which is gone from this checkout since CQ·565 —
+# the Library serves that registry over the wire now, and a test run has
+# neither the network nor the credential for it.
 #
 # `co` is zsh (excluded from the ARCH-082 bash-3.2 contract by lint.sh's
 # shebang filter); bash invoking it here is exactly how a login shell will.
@@ -102,14 +106,48 @@ setup() { # -> echoes fake HOME
     mkdir -p "$home/Convivy/nope"
     ( cd "$home/Convivy/nope" && git init -q . )
 
-    # The regression this fix must not open: a repo THIS checkout's own
-    # config/projects.json already claims for a registered project (`svc`),
-    # with no branch of its own in bin/co and no adopter fallback either —
-    # `co -r` must keep refusing it rather than reindividuating over its
-    # hand-written agents. Never individuated here on purpose: the real
-    # convivy-services carries git-tracked svc-* agents from the start.
-    mkdir -p "$home/Convivy/convivy-services"
-    ( cd "$home/Convivy/convivy-services" && git init -q . )
+    # A synthetic registry entry claiming "widget-repo" for project "widget",
+    # standing in for an operator-registered project now that
+    # config/projects.json is gone (CQ·565) — the one case
+    # `co_root_config`'s PROJECTS_REGISTRY override exists for.
+    #
+    # The `kb_scope_exceptions` self-mapping below (widget-repo -> kb_project
+    # "widget-repo", declared via `_kb_legacy` since "widget" itself is
+    # `kb: local`) has the same shape a registered crew's services repository
+    # has: a `kb_scope_exceptions` entry mapping the repository to itself.
+    # THAT is what makes `resolve_project("widget-repo")` equal
+    # "widget-repo" through the explicit-mapping route (not the
+    # knowledge_root/projects/ fallback, which has no `projects/widget-repo/`
+    # dir) — reopening the regression this file exists to pin: a
+    # `resolve_project`-alone check would wrongly read this name as its own
+    # project and reindividuate over it, exactly like the bug the first
+    # version of the fix had.
+    cat > "$home/synthetic-registry.json" <<JSON
+{
+  "_kb_legacy": ["widget-repo"],
+  "widget": {
+    "class": "project", "display": "Widget Co", "owner": "convivy",
+    "home_dir": "$home/Convivy/widget-repo", "dirs": [], "crew": "widget",
+    "lifecycle": "active", "products": [], "repos": ["widget-repo"],
+    "aliases": [], "kb": "local", "private": false,
+    "kb_scope_exceptions": {
+      "widget-repo": {
+        "kb_project": "widget-repo",
+        "reason": "projects/widget/ does not exist in the knowledge repo."
+      }
+    }
+  }
+}
+JSON
+
+    # The regression this fix must not open: a repo the registry already
+    # claims for a registered project, with no branch of its own in bin/co
+    # and no adopter fallback either — `co -r` must keep refusing it rather
+    # than reindividuating over its hand-written agents. Never individuated
+    # here on purpose: the project this fixture models carries git-tracked
+    # agents from the start.
+    mkdir -p "$home/Convivy/widget-repo"
+    ( cd "$home/Convivy/widget-repo" && git init -q . )
 
     # THE INJECTION FIXTURE: a directory basename carrying a raw BEL byte
     # (0x07 — the filesystem permits any byte but `/` and NUL; a real
@@ -154,7 +192,7 @@ run_co() {
     # which is also the branch the OSC-injection assertions below exercise.
     ( cd "$home/$rel" && HOME="$home" PATH="$home/stubbin:$PATH" \
       CLAUDE_CALL_LOG="$call_log" KX_CALL_LOG="$kx_log" TMUX="" TMUX_PANE="" \
-      /bin/zsh "$CO" --root-config "$(co_root_config "$home")" "$@" \
+      /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$home/synthetic-registry.json")" "$@" \
       >"$out_log" 2>"$err_log" )
     RC=$?
     CLAUDE_ARGS=$(cat "$call_log"); KX_ARGS=$(cat "$kx_log")
@@ -194,17 +232,18 @@ assert_contains "$ERR" "not a recognized product repo" "nope: co -r says why"
 assert_not_contains "$KX_ARGS" "use" "nope: co -r never reaches knowledge-ctx use"
 
 echo "== a repo the registry already claims for another project stays refused =="
-# THE REGRESSION THIS FIX MUST NOT OPEN. `convivy-services` is not individuated
+# THE REGRESSION THIS FIX MUST NOT OPEN. `widget-repo` is not individuated
 # and has no branch of its own in bin/co; a check keyed on resolve_project
-# alone would admit it (it IS in projects.py's EXPLICIT_PROJECT_BY_NAME) and
+# alone could still misjudge it, so project_for_repo must catch it first —
+# from the synthetic registry entry's `repos` list above — and
 # `--force`-reindividuate over a directory whose real counterpart carries
-# hand-written, git-tracked agents. project_for_repo must catch it first.
-run_co "$H" Convivy/convivy-services -r
-assert_rc 1 "$RC" "convivy-services: co -r exits 1 rather than reindividuating it"
+# hand-written, git-tracked agents.
+run_co "$H" Convivy/widget-repo -r
+assert_rc 1 "$RC" "widget-repo: co -r exits 1 rather than reindividuating it"
 assert_contains "$ERR" "not a recognized product repo" \
-    "convivy-services: co -r says why"
+    "widget-repo: co -r says why"
 assert_not_contains "$KX_ARGS" "use" \
-    "convivy-services: co -r never reaches knowledge-ctx use"
+    "widget-repo: co -r never reaches knowledge-ctx use"
 
 echo "== bare co (no -r, no --resolve) still styles a valid adopter name =="
 # THE PASSING CASE: gating the `*)` arm must not cost a valid name its style.

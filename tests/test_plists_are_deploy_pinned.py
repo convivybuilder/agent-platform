@@ -159,12 +159,16 @@ def test_the_knowledge_watcher_reads_the_deploy_area():
 
 
 def test_the_last_six_jobs_read_the_deploy_area():
-    """The six plists that were still loaded and firing from the farm or the
+    """The five plists that were still loaded and firing from the farm or the
     checkout when this change was made (check-deploy-pinned-jobs has exited 2
     on this every day since 2026-09-04): run-observer, run-retention,
-    check-serving-checkouts, transcript-capture, vivy-main-suite and
-    launch-weekly-consulting. transcript-capture named the checkout directly
+    check-serving-checkouts, transcript-capture and main-suite (renamed from
+    its original, single-product name by CQ-589).
+    transcript-capture named the checkout directly
     rather than the farm — see the module docstring's WHY THE CHECKOUT ROOT TOO.
+    (A sixth, com.convivy.weekly-consulting.plist, was migrated here too;
+    the job itself was later retired — platform/decisions/0103 — and its
+    plist deleted.)
 
     Pinned by name for the same reason as test_the_jobs_this_pr_migrated_read_the_deploy_area
     and test_the_knowledge_watcher_reads_the_deploy_area: reverting one of these
@@ -176,7 +180,7 @@ def test_the_last_six_jobs_read_the_deploy_area():
         "com.convivy.run-retention.plist": "run-retention",
         "com.convivy.serving-checkout-check.plist": "check-serving-checkouts",
         "com.convivy.transcript-capture.plist": "transcript-capture",
-        "com.convivy.vivy-main-suite.plist": "vivy-main-suite",
+        "com.convivy.main-suite.plist": "main-suite",
     }
     for name, script in python_jobs.items():
         argv = _argv(LAUNCHD / name)
@@ -186,14 +190,6 @@ def test_the_last_six_jobs_read_the_deploy_area():
         ], f"{name} no longer runs the deploy copy's own interpreter and script"
         assert not _farm_entries(LAUNCHD / name), f"{name} reaches the symlink farm again"
         assert not _checkout_entries(LAUNCHD / name), f"{name} reaches the agent-platform checkout again"
-
-    argv = _argv(LAUNCHD / "com.convivy.weekly-consulting.plist")
-    assert argv == [f"{DEPLOY_AREA}/bin/launch-weekly-consulting"], \
-        "com.convivy.weekly-consulting.plist no longer runs the deploy copy by its own path"
-    assert not _farm_entries(LAUNCHD / "com.convivy.weekly-consulting.plist"), \
-        "com.convivy.weekly-consulting.plist reaches the symlink farm again"
-    assert not _checkout_entries(LAUNCHD / "com.convivy.weekly-consulting.plist"), \
-        "com.convivy.weekly-consulting.plist reaches the agent-platform checkout again"
 
 
 def test_the_tailscale_watchdog_keeps_the_system_shell_as_its_interpreter():
@@ -254,7 +250,7 @@ def test_argv_reads_program_and_program_arguments_together(tmp_path):
 # paused: autonomous work returns event-triggered rather than cron-fired.
 RETIRED_OVERNIGHT_PLISTS = {
     "com.convivy.overnight-orchestrator.plist",
-    "com.convivy.overnight-orchestrator-hollis.plist",
+    "com.convivy.overnight-orchestrator-galley.plist",
     "com.convivy.overnight-preflight.plist",
     "com.convivy.overnight-healthcheck.plist",
     "com.convivy.overnight-wrapup.plist",
@@ -266,7 +262,7 @@ RETIRED_OVERNIGHT_PLISTS = {
 # itself is gone too (the operator, 2026-09-14: "we're doing things differently now,
 # events-based rather than on cron" — issue_01M2GDVPR81Z0X991Z7XD3VR0M's removal
 # of overnight-orchestrator, knowledge-scribe, kb-sync-verifier and full-monty).
-# `launch-overnight`, `launch-overnight-hollis`, `overnight-wrapup`,
+# `launch-overnight`, `launch-overnight-galley`, `overnight-wrapup`,
 # `overnight-preflight`, `overnight-healthcheck`, `overnight-checkout-guard`,
 # `overnight-resume-watchdog`, `overnight-digest-assemble`, `overnight-ledger`,
 # `overnight-manifest` and `overnight-claim` are deleted outright, not merely

@@ -13,7 +13,21 @@ these pin the pure logic.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _ledger_refusal_marker_home(model_scorecard, tmp_path, monkeypatch):
+    """`report_to_ledger`'s own refusal check (`ledger.refused_figure_
+    unchanged`) resolves `home` through `run_sandbox.passwd_home()` when not
+    given explicitly — redirected here to this test's own `tmp_path` so no
+    test in this file touches this machine's own
+    `~/.local/state/agent-platform/ledger-refusals` (round 2, PR #1021
+    round 1 finding)."""
+    monkeypatch.setattr(model_scorecard.LG.RS, "passwd_home", lambda: tmp_path)
 
 
 # --- is_close_loop -------------------------------------------------------------
@@ -21,7 +35,7 @@ from pathlib import Path
 
 def test_is_close_loop_true_for_close_loop_task(model_scorecard):
     meta = {"agent": "bug-fixer",
-            "task": "CLOSE-LOOP MODE only — no code. Bug fixed in https://github.com/convivy/vivy/pull/436"}
+            "task": "CLOSE-LOOP MODE only — no code. Bug fixed in https://github.com/convivy/widget/pull/436"}
     assert model_scorecard.is_close_loop(meta) is True  # produces no PR even though it cites one
 
 
@@ -149,7 +163,7 @@ def test_linked_pr_number_none_when_absent_or_malformed(model_scorecard):
 
 
 def _run(run_id="run-1", agent="bug-fixer", model="deepseek/deepseek-v4-flash",
-         usd=0.01, repo="vivy", started="2026-06-02T08:00:00Z"):
+         usd=0.01, repo="widget", started="2026-06-02T08:00:00Z"):
     return {"run_id": run_id,
             "meta": {"agent": agent, "model": model, "repo": repo,
                      "billing_source": "provider_api:deepseek", "started_at": started},
@@ -193,6 +207,20 @@ def test_build_row_unresolved(model_scorecard):
     assert row["pr_state"] == "unresolved"
     assert row["merged"] is None and row["pr_number"] is None
     assert row["join_source"] == "unresolved"  # forced when no PR, even if a source was passed
+
+
+def test_build_row_carries_the_raw_pr_link_for_report_to_ledgers_own_match(model_scorecard):
+    """`pr_url`/`pr_number` come from the raw `pr-link.json` stamp
+    (`run["pr_link"]`), not from `pr` (the gh-resolved object) — against code
+    that reads them off `pr` alone, these would stay None here even though a
+    real link exists, because the gh lookup (`pr`) missed (E16: `report_to_
+    ledger`'s PR match needs the raw link either way)."""
+    run = _run()
+    run["pr_link"] = {"pr_url": "https://github.com/convivy/widget/pull/9", "pr_number": 9}
+    row = model_scorecard.build_row(run, None, ci_first_pass=None)  # gh lookup missed
+    assert row["pr_number"] == 9
+    assert row["pr_url"] == "https://github.com/convivy/widget/pull/9"
+    assert row["pr_state"] == "unresolved"  # unaffected: gh still never resolved it
 
 
 # --- upsert_ledger -----------------------------------------------------------
@@ -313,7 +341,7 @@ def test_references_pr_rejects_superstring_number(model_scorecard):
     # #4410 must not match a reference to PR #441
     assert model_scorecard._references_pr("see #4410", 441) is False
     assert model_scorecard._references_pr("see #441 thanks", 441) is True
-    assert model_scorecard._references_pr("convivy/vivy/pull/441", 441) is True
+    assert model_scorecard._references_pr("convivy/widget/pull/441", 441) is True
 
 
 # --- revert_in_window (the false-positive guard) -----------------------------
@@ -423,7 +451,7 @@ def test_model_comparison_skips_single_model_agents(model_scorecard):
 # --- Phase 3: LLM judge (pure selection + parse) -----------------------------
 
 
-def _mrow(run_id, agent, model, date, pr, repo="vivy", merged=True):
+def _mrow(run_id, agent, model, date, pr, repo="widget", merged=True):
     return {"run_id": run_id, "agent": agent, "model": model, "date": date,
             "pr_number": pr, "repo": repo, "merged": merged}
 
@@ -490,6 +518,7 @@ def test_judge_sample_still_resolves_a_registered_repo(model_scorecard, monkeypa
     row = _mrow("run-y", "bug-fixer", "deepseek/deepseek-v4-flash", today, 1,
                 repo="homebrew-tap")
     monkeypatch.setattr(model_scorecard, "_task_for_run", lambda run_id: "")
+    monkeypatch.setattr(model_scorecard.GA, "read_token_pool", _fake_read_token_pool)
     called = []
     monkeypatch.setattr(model_scorecard, "fetch_pr_context",
                         lambda repo, *a, **kw: called.append(repo) or {
@@ -563,6 +592,28 @@ def test_run_judge_env_excludes_tmux(model_scorecard, monkeypatch):
     assert captured_kwargs["env"]["TMUX_TMPDIR"] != "/tmp"
 
 
+def test_run_judge_passes_no_tools(model_scorecard, monkeypatch):
+    """run_judge's `claude -p` call is a single headless model call with no
+    tool access — the boundary decision 0102 draws between a function call and
+    a crew. Fails against code with no `--tools` argument at all."""
+    import types
+
+    captured_cmd = {}
+
+    def _fake_run(cmd, **kw):
+        captured_cmd["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout='{"result": "ok"}', stderr="")
+
+    monkeypatch.setattr(model_scorecard.subprocess, "run", _fake_run)
+
+    model_scorecard.run_judge("prompt", "model")
+
+    cmd = captured_cmd["cmd"]
+    assert "--tools" in cmd, "run_judge's claude -p call carries no --tools argument"
+    assert cmd[cmd.index("--tools") + 1] == "", (
+        "run_judge's --tools argument must be an empty string (no tools)")
+
+
 def test_task_for_run_refuses_a_run_id_planted_under_two_date_dirs(model_scorecard, monkeypatch, tmp_path):
     """A run-id resolved under two date directories (a planted duplicate,
     issue_01M1JWB7M75SZ160VRJRCGARBF) must not let the newer-sorting directory's
@@ -581,72 +632,90 @@ def test_task_for_run_refuses_a_run_id_planted_under_two_date_dirs(model_scoreca
 
 
 def test_build_judge_prompt_contains_context_and_json_contract(model_scorecard):
-    row = {"pr_number": 441, "repo": "vivy", "agent": "bug-fixer", "model": "deepseek/deepseek-v4-flash"}
+    row = {"pr_number": 441, "repo": "widget", "agent": "bug-fixer", "model": "deepseek/deepseek-v4-flash"}
     ctx = {"task": "Fix formatUSD", "title": "fix: formatUSD", "reviews": "@bot: LGTM", "diff": "- a\n+ b"}
     pr = model_scorecard.build_judge_prompt(row, ctx)
     assert "PR #441" in pr and "Fix formatUSD" in pr and "review_thoroughness" in pr
     assert "Output ONLY a JSON object" in pr
 
 
+@pytest.mark.rich_registry
 def test_build_judge_prompt_names_the_registered_owner_for_homebrew_tap(model_scorecard):
     """Round-1 review (PR #881, comment 6150937461): this label built
     `convivy/{repo}` directly — the same pattern the PR centralizes
     everywhere else."""
-    row = {"pr_number": 1, "repo": "homebrew-tap", "agent": "bug-fixer", "model": "sonnet"}
+    row = {"pr_number": 1, "repo": "brewcask-tap", "agent": "bug-fixer", "model": "sonnet"}
     ctx = {"task": "t", "title": "t", "reviews": "", "diff": "d"}
     pr = model_scorecard.build_judge_prompt(row, ctx)
-    assert "convivybuilder/homebrew-tap" in pr
+    assert "caskforge/brewcask-tap" in pr
+
+
+# --- CI_WORKFLOW is registry-derived, not a hand-maintained product list ---
+
+
+@pytest.mark.rich_registry
+def test_ci_workflow_matches_the_registrys_shared_and_own_coverage_products(model_scorecard):
+    """Pinned against the registry's own accessors, not a copy of the slugs —
+    this fails red if CI_WORKFLOW drifts back to a hardcoded list."""
+    import projects
+    expected = {slug: "ci.yml"
+                for slug in projects.shared_coverage_products() + projects.own_coverage_products()}
+    assert model_scorecard.CI_WORKFLOW == expected
 
 
 # --- gh-calling slug sites: the registered owner, not always convivy --------
 
 
+@pytest.mark.rich_registry
 def test_pr_maps_queries_the_registered_owner_for_homebrew_tap(model_scorecard, monkeypatch):
     captured = {}
 
-    def fake_gh_json(args):
+    def fake_gh_json(args, env):
         captured["args"] = args
         return []
 
     monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
-    model_scorecard.pr_maps("homebrew-tap")
+    model_scorecard.pr_maps("brewcask-tap", {})
 
     assert captured["args"] and "--repo" in captured["args"]
     repo_arg = captured["args"][captured["args"].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap"
+    assert repo_arg == "caskforge/brewcask-tap"
 
 
+@pytest.mark.rich_registry
 def test_ci_first_pass_queries_the_registered_owner_for_homebrew_tap(model_scorecard, monkeypatch):
-    monkeypatch.setitem(model_scorecard.CI_WORKFLOW, "homebrew-tap", "ci.yml")
+    monkeypatch.setitem(model_scorecard.CI_WORKFLOW, "brewcask-tap", "ci.yml")
     captured = {}
 
-    def fake_gh_json(args):
+    def fake_gh_json(args, env):
         captured["args"] = args
         return []
 
     monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
-    model_scorecard.ci_first_pass("homebrew-tap", "a-branch")
+    model_scorecard.ci_first_pass("brewcask-tap", "a-branch", {})
 
     assert captured["args"] and "--repo" in captured["args"]
     repo_arg = captured["args"][captured["args"].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap"
+    assert repo_arg == "caskforge/brewcask-tap"
 
 
+@pytest.mark.rich_registry
 def test_was_reverted_queries_the_registered_owner_for_homebrew_tap(model_scorecard, monkeypatch):
     captured = {}
 
-    def fake_gh_json(args):
+    def fake_gh_json(args, env):
         captured["args"] = args
         return []
 
     monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
-    model_scorecard.was_reverted("homebrew-tap", 1, "2026-05-20T18:34:53Z")
+    model_scorecard.was_reverted("brewcask-tap", 1, "2026-05-20T18:34:53Z", {})
 
     assert captured["args"] and "--repo" in captured["args"]
     repo_arg = captured["args"][captured["args"].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap"
+    assert repo_arg == "caskforge/brewcask-tap"
 
 
+@pytest.mark.rich_registry
 def test_had_follow_up_bug_queries_the_registered_owner_for_homebrew_tap(
         model_scorecard, monkeypatch):
     captured = {}
@@ -656,48 +725,33 @@ def test_had_follow_up_bug_queries_the_registered_owner_for_homebrew_tap(
         return []
 
     monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
-    model_scorecard.had_follow_up_bug("homebrew-tap", 1, "2026-05-20T18:34:53Z")
+    model_scorecard.had_follow_up_bug("brewcask-tap", 1, "2026-05-20T18:34:53Z")
 
     assert captured["args"] and "--repo" in captured["args"]
     repo_arg = captured["args"][captured["args"].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap"
+    assert repo_arg == "caskforge/brewcask-tap"
 
 
+@pytest.mark.rich_registry
 def test_fetch_pr_context_queries_the_registered_owner_for_homebrew_tap(
         model_scorecard, monkeypatch):
     captured = []
 
-    def fake_gh_text(args):
+    def fake_gh_text(args, env):
         captured.append(args)
         return "diff"
 
-    def fake_gh_json(args):
+    def fake_gh_json(args, env):
         captured.append(args)
         return {}
 
     monkeypatch.setattr(model_scorecard, "_gh_text", fake_gh_text)
     monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
-    model_scorecard.fetch_pr_context("homebrew-tap", 1, "task")
+    model_scorecard.fetch_pr_context("brewcask-tap", 1, "task", {})
 
     assert captured and all("--repo" in c for c in captured)
     for c in captured:
-        assert c[c.index("--repo") + 1] == "convivybuilder/homebrew-tap"
-
-
-def test_harvest_repo_prs_queries_the_registered_owner_for_homebrew_tap(
-        model_scorecard, monkeypatch):
-    captured = {}
-
-    def fake_gh_json(args):
-        captured["args"] = args
-        return []
-
-    monkeypatch.setattr(model_scorecard, "_gh_json", fake_gh_json)
-    model_scorecard.harvest_repo_prs("homebrew-tap", 30, "shipwright")
-
-    assert captured["args"] and "--repo" in captured["args"]
-    repo_arg = captured["args"][captured["args"].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap"
+        assert c[c.index("--repo") + 1] == "caskforge/brewcask-tap"
 
 
 def test_render_judge_report_averages_non_null_scores(model_scorecard):
@@ -710,66 +764,6 @@ def test_render_judge_report_averages_non_null_scores(model_scorecard):
     out = model_scorecard.render_judge_report(rows)
     assert "3.0" in out  # review avg (4+2)/2
     assert "5.0" in out  # fix avg = 5/1 (the null excluded)
-
-
-# --- GitHub-only repo scorecard (telemetry-less crews, e.g. PA) --------------
-
-
-def test_build_repo_row_synthetic_run_id_and_no_cost(model_scorecard):
-    pr = {"number": 36, "state": "MERGED", "mergedAt": "2026-06-02T10:00:00Z",
-          "createdAt": "2026-06-01T09:00:00Z", "title": "Add ledger",
-          "author": {"login": "convivy-bot"}}
-    row = model_scorecard.build_repo_row(pr, "personal-assistant", "personal-assistant",
-                                         ci_first_pass=True, survived=None)
-    assert row["run_id"] == "personal-assistant#36"  # synthetic, for upsert keying
-    assert row["agent"] == "personal-assistant" and row["model"] is None
-    assert row["cost_usd"] is None and row["source"] == "github-pr"
-    assert row["merged"] is True and row["date"] == "2026-06-01"
-    assert row["ci_first_pass"] is True and row["author"] == "convivy-bot"
-
-
-def test_build_repo_row_reads_model_label(model_scorecard):
-    # A telemetry-less repo stamps the producing model as a `model:` PR label (ARCH-169).
-    pr = {"number": 149, "state": "MERGED", "mergedAt": "2026-06-15T10:00:00Z",
-          "createdAt": "2026-06-15T09:00:00Z", "title": "feat",
-          "labels": [{"name": "enhancement"}, {"name": "model:claude-sonnet-4-6"}]}
-    row = model_scorecard.build_repo_row(pr, "personal-assistant", "personal-assistant",
-                                         ci_first_pass=True, survived=None)
-    assert row["model"] == "claude-sonnet-4-6"
-
-
-def test_model_from_labels_variants(model_scorecard):
-    f = model_scorecard._model_from_labels
-    assert f({"labels": [{"name": "model:claude-opus-4-8"}]}) == "claude-opus-4-8"
-    assert f({"labels": [{"name": "bug"}]}) is None
-    assert f({}) is None
-    assert f({"labels": []}) is None
-    # more than one model: label → deterministic first-sorted pick
-    assert f({"labels": [{"name": "model:gpt-5"}, {"name": "model:claude-opus-4-8"}]}) \
-        == "claude-opus-4-8"
-
-
-def test_build_repo_row_closed_unmerged(model_scorecard):
-    pr = {"number": 5, "state": "CLOSED", "mergedAt": None,
-          "createdAt": "2026-06-01T09:00:00Z", "title": "Abandoned"}
-    row = model_scorecard.build_repo_row(pr, "personal-assistant", "pa-crew", None, None)
-    assert row["merged"] is False and row["pr_state"] == "CLOSED"
-
-
-def test_repo_rows_upsert_and_summarize_for_merge_rate(model_scorecard):
-    # 3 decided PRs (2 merged, 1 closed) → merge% 67% over decided; reuses summarize()
-    rows = [
-        model_scorecard.build_repo_row(
-            {"number": n, "state": s, "mergedAt": ("2026-06-02T10:00:00Z" if s == "MERGED" else None),
-             "createdAt": "2026-06-01T09:00:00Z", "title": "t"},
-            "personal-assistant", "personal-assistant", ci, None)
-        for n, s, ci in [(1, "MERGED", True), (2, "MERGED", False), (3, "CLOSED", None)]
-    ]
-    a = model_scorecard.summarize(rows)[("personal-assistant", None)]
-    assert a["resolved"] == 3 and a["merged"] == 2     # merge% = 2/3
-    assert a["ci_runs"] == 2 and a["ci_first_pass"] == 1
-    out = model_scorecard.render_repo_report(rows)
-    assert "67%" in out and "| personal-assistant |" in out
 
 
 def test_summarize_rates(model_scorecard):
@@ -788,28 +782,9 @@ def test_summarize_rates(model_scorecard):
 
 
 # --- a None model beside a str model (issue_01M3ABF19NHZK4KP5PQY6SFRX7) -------
-# A PR without a `model:<id>` label aggregates under (agent, None) beside
-# (agent, "<model>"); a bare sorted() over those keys raised
-# "'<' not supported between 'str' and 'NoneType'" and killed the daily
-# com.convivy.model-scorecard-hollis run.
-
-
-def _mixed_model_repo_rows(model_scorecard):
-    def row(n, model):
-        r = model_scorecard.build_repo_row(
-            {"number": n, "state": "MERGED", "mergedAt": "2026-06-02T10:00:00Z",
-             "createdAt": "2026-06-01T09:00:00Z", "title": "t"},
-            "hollis", "hollis", True, None)
-        r["model"] = model
-        return r
-    return [row(1, "deepseek/deepseek-v4-flash"), row(2, None), row(3, "anthropic/claude-sonnet-5")]
-
-
-def test_render_repo_report_sorts_none_model_beside_str_model(model_scorecard):
-    rows = _mixed_model_repo_rows(model_scorecard)
-    out = model_scorecard.render_repo_report(rows)
-    assert out.count("| hollis |") == 3
-    assert model_scorecard.render_repo_report(list(reversed(rows))) == out  # order stable
+# A PR without a `model:<id>` label, or a judge row missing an agent, aggregates
+# under a None key beside a str one; a bare sorted() over those keys raises
+# "'<' not supported between 'str' and 'NoneType'".
 
 
 def test_render_judge_report_sorts_none_model_beside_str_model(model_scorecard):
@@ -829,7 +804,7 @@ def test_render_judge_report_sorts_none_model_beside_str_model(model_scorecard):
 
 _LEDGER_ROW = {
     "run_id": "run-abc", "date": "2026-10-01", "agent": "coder",
-    "model": "claude-sonnet-5", "repo": "vivy", "cost_usd": 0.1234,
+    "model": "claude-sonnet-5", "repo": "widget", "cost_usd": 0.1234,
     "pr_number": 9, "pr_state": "MERGED", "merged": True,
 }
 
@@ -851,13 +826,14 @@ def test_ledger_lane_none_for_no_model(model_scorecard):
     assert model_scorecard.ledger_lane("") is None
 
 
-def test_ledger_lane_none_for_a_codex_model(model_scorecard):
+def test_ledger_lane_openai_subscription_for_a_codex_model(model_scorecard):
     """Codex runs bill at OpenAI's API rates (telemetry.CODEX_BILLING_SOURCE),
     neither the gateway's metered lane nor the Anthropic subscription — against
     an implementation that falls through to "subscription" for anything that
-    isn't a gateway model, this would read "subscription" instead of None."""
-    assert model_scorecard.ledger_lane("codex-auto-review") is None
-    assert model_scorecard.ledger_lane("gpt-5.5") is None
+    isn't a gateway model, this would read "subscription" instead of
+    "openai-subscription"."""
+    assert model_scorecard.ledger_lane("codex-auto-review") == "openai-subscription"
+    assert model_scorecard.ledger_lane("gpt-5.5") == "openai-subscription"
 
 
 def test_report_to_ledger_posts_the_documented_fields_and_dedup_key(
@@ -878,7 +854,7 @@ def test_report_to_ledger_posts_the_documented_fields_and_dedup_key(
     # model, so ledger_lane resolves it to "subscription" — against the unfixed
     # code (no `lane` kwarg on post_ledger_entry at all), this fails with a
     # TypeError before the assertion is ever reached.
-    assert captured == [{"product": "vivy", "usd": 0.1234, "run_id": "run-abc",
+    assert captured == [{"product": "widget", "usd": 0.1234, "run_id": "run-abc",
                          "dedup_key": "run-abc", "lane": "subscription",
                          "agent": "coder", "model": "claude-sonnet-5"}]
 
@@ -897,20 +873,29 @@ def test_report_to_ledger_sends_the_gateway_lane_for_a_gateway_model(
     assert captured == ["gateway"]
 
 
-def test_report_to_ledger_skips_a_row_with_no_determinable_lane(model_scorecard, monkeypatch):
-    """A Codex model (is_codex_model) has no ledger lane — it is billed at
-    OpenAI's API rates, neither the gateway's metered lane nor the Anthropic
-    subscription — so the row is never posted. Against the unfixed code
-    (which always calls post_ledger_entry), `calls` below would be non-empty."""
-    calls = []
-    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry",
-                        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+def test_report_to_ledger_sends_the_openai_subscription_lane_for_a_codex_model(
+        model_scorecard, monkeypatch, tmp_path):
+    """A Codex model (is_codex_model) gets its own ledger lane, not a skip —
+    against an implementation that still treats a Codex model as having no
+    determinable lane, this row would never reach post_ledger_entry and
+    `captured` below would stay empty. Pinned to the payload report_to_ledger
+    actually builds for the POST, not to a value this test constructs."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    captured = []
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane, agent=None, model=None,
+                 tok=None, timeout=5, **kw):
+        captured.append({"product": product, "usd": usd, "run_id": run_id,
+                         "dedup_key": dedup_key, "lane": lane, "agent": agent, "model": model})
+        return {"status": "recorded", "entry": {}}
+
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
     row = dict(_LEDGER_ROW, run_id="run-codex", model="codex-auto-review")
     report = model_scorecard.report_to_ledger([row])
-    assert calls == []
-    assert report["recorded"] == 0
-    assert report["errors"] == [("run-codex", "skip:no-lane",
-                                 "no ledger lane for model 'codex-auto-review'")]
+    assert report == {"recorded": 1, "not_recorded": 0, "errors": []}
+    assert captured == [{"product": "widget", "usd": 0.1234, "run_id": "run-codex",
+                         "dedup_key": "run-codex", "lane": "openai-subscription",
+                         "agent": "coder", "model": "codex-auto-review"}]
 
 
 def test_report_to_ledger_skips_a_row_with_no_model(model_scorecard, monkeypatch):
@@ -921,6 +906,23 @@ def test_report_to_ledger_skips_a_row_with_no_model(model_scorecard, monkeypatch
     report = model_scorecard.report_to_ledger([row])
     assert calls == []
     assert report["errors"] == [("run-no-model", "skip:no-lane", "no ledger lane for model None")]
+
+
+def test_report_to_ledger_rejects_a_non_finite_cost(model_scorecard, monkeypatch):
+    """`cost_usd` is validated finite and non-negative before any arithmetic
+    or network call — the same boundary `ledger.post_run_ledger_entry`
+    applies on its own side. Against code with no such check, `float('nan')`
+    would flow straight into `remaining_after_live`'s subtraction."""
+    calls = []
+    monkeypatch.setattr(model_scorecard.issue_client, "list_ledger_entries",
+                        lambda *a, **kw: calls.append("read"))
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry",
+                        lambda *a, **kw: calls.append("post"))
+    row = dict(_LEDGER_ROW, cost_usd=float("nan"))
+    report = model_scorecard.report_to_ledger([row])
+    assert calls == []
+    assert report["errors"] == [("run-abc", "error:invalid-cost",
+                                 "non-finite or negative cost_usd nan")]
 
 
 def test_report_to_ledger_sends_item_id_only_when_the_row_carries_one(
@@ -943,6 +945,127 @@ def test_report_to_ledger_sends_item_id_only_when_the_row_carries_one(
     assert captured == [{}]
     model_scorecard.report_to_ledger([dict(_LEDGER_ROW, item_id="issue_E16_5")])
     assert captured == [{}, {"item_id": "issue_E16_5"}]
+
+
+# --- report_to_ledger resolves a missing item_id from the row's own PR (E16) -
+
+
+def test_report_to_ledger_resolves_the_item_from_the_rows_pr_when_it_carries_none(
+        model_scorecard, monkeypatch, tmp_path):
+    """A row with no `item_id` but a PR (`_LEDGER_ROW`'s own `pr_number`, no
+    `pr_url`) still attaches a work item — resolved through the same PR-match
+    rule `cost_join.build_item_costs` applies on the run-cost side, via
+    `ledger.resolve_item_id`'s own `cost_join.item_for_pr`. Against code that
+    sends `item_id` only from the row's own field, `captured` below would
+    carry no `item_id` key at all."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "list_all_items",
+        lambda *a, **kw: [{"id": "issue_PR9", "pr_repo": "convivy/widget",
+                           "pr": 9, "pr_url": None}])
+    captured = []
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane=None, agent=None, model=None,
+                 tok=None, timeout=5, **kw):
+        captured.append(kw)
+        return {"status": "recorded", "entry": {}}
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+
+    model_scorecard.report_to_ledger([_LEDGER_ROW])
+
+    assert captured == [{"item_id": "issue_PR9"}]
+
+
+def test_report_to_ledger_does_not_fetch_items_when_the_row_already_names_one(
+        model_scorecard, monkeypatch, tmp_path):
+    """A row that already carries `item_id` never reaches the item-corpus
+    fetch at all — `list_all_items` is left unstubbed to raise `AssertionError`
+    rather than quietly succeed, so a regression that always fetches fails here."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+
+    def _boom(*a, **kw):
+        raise AssertionError("must not fetch the item corpus when item_id is already given")
+    monkeypatch.setattr(model_scorecard.issue_client, "list_all_items", _boom)
+    captured = []
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane=None, agent=None, model=None,
+                 tok=None, timeout=5, **kw):
+        captured.append(kw)
+        return {"status": "recorded", "entry": {}}
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+
+    model_scorecard.report_to_ledger([dict(_LEDGER_ROW, item_id="issue_E16_5")])
+
+    assert captured == [{"item_id": "issue_E16_5"}]
+
+
+def test_report_to_ledger_posts_with_no_item_when_the_row_has_neither_issue_nor_pr(
+        model_scorecard, monkeypatch, tmp_path):
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    captured = []
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane=None, agent=None, model=None,
+                 tok=None, timeout=5, **kw):
+        captured.append(kw)
+        return {"status": "recorded", "entry": {}}
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+
+    row = dict(_LEDGER_ROW, pr_number=None)
+    model_scorecard.report_to_ledger([row])
+
+    assert captured == [{}]
+
+
+def test_report_to_ledger_posts_with_no_item_and_records_why_on_a_failed_lookup(
+        model_scorecard, monkeypatch, tmp_path):
+    """A failed item-corpus fetch (the Library unreachable) must never block or
+    fail the ledger post: this posts with no `item_id`, and the reason is
+    recorded on the run's own meta.json beside `ledger_post_status`."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    run_dir = _make_run_dir(tmp_path, "run-abc")
+
+    def _boom(*a, **kw):
+        raise model_scorecard.issue_client.IssueQueueUnavailable("library is down")
+    monkeypatch.setattr(model_scorecard.issue_client, "list_all_items", _boom)
+    captured = []
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane=None, agent=None, model=None,
+                 tok=None, timeout=5, **kw):
+        captured.append(kw)
+        return {"status": "recorded", "entry": {}}
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+
+    model_scorecard.report_to_ledger([_LEDGER_ROW])
+
+    assert captured == [{}]
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert "IssueQueueUnavailable" in meta[model_scorecard.LG.ITEM_LOOKUP_ERROR_FIELD]
+
+
+def test_report_to_ledger_fetches_the_item_corpus_at_most_once_per_pass(
+        model_scorecard, monkeypatch, tmp_path):
+    """Two rows that both need a PR match in one `report_to_ledger` call share
+    ONE item-corpus fetch — against a per-row fetch, `fetch_calls` below would
+    read `[1, 1]`, not `[1]`."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    fetch_calls = []
+
+    def _list_all_items(*a, **kw):
+        fetch_calls.append(1)
+        return [{"id": "issue_PR9", "pr_repo": "convivy/widget", "pr": 9, "pr_url": None}]
+    monkeypatch.setattr(model_scorecard.issue_client, "list_all_items", _list_all_items)
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry",
+                        lambda *a, **kw: {"status": "recorded", "entry": {}})
+
+    model_scorecard.report_to_ledger(
+        [dict(_LEDGER_ROW, run_id="run-abc"), dict(_LEDGER_ROW, run_id="run-xyz")])
+
+    assert fetch_calls == [1]
 
 
 def test_report_to_ledger_a_rerun_sends_the_same_dedup_key(model_scorecard, monkeypatch, tmp_path):
@@ -992,7 +1115,7 @@ def test_report_to_ledger_counts_errors_and_keeps_going_over_the_rest(
 def _make_run_dir(root: Path, run_id: str, *, meta_extra=None) -> Path:
     rd = root / "2026-10-13" / run_id
     rd.mkdir(parents=True)
-    meta = {"run_id": run_id, "agent": "coder", "task": "t", "repo": "vivy",
+    meta = {"run_id": run_id, "agent": "coder", "task": "t", "repo": "widget",
             "worktree": "/wt", "profile": "p", "model": "claude-sonnet-5",
             "started_at": "2026-10-13T00:00:00Z", "pid": None}
     meta.update(meta_extra or {})
@@ -1000,12 +1123,26 @@ def _make_run_dir(root: Path, run_id: str, *, meta_extra=None) -> Path:
     return rd
 
 
+def _stub_no_live_reported_entries(model_scorecard, monkeypatch):
+    """Every `report_to_ledger` test below whose row's run dir resolves now
+    makes a Library read (`ledger.read_live_ledger_state`) before its own
+    post — a test that doesn't stub it would otherwise hit the real network
+    client and get back `IssueQueueUnavailable`, which `report_to_ledger`
+    correctly counts as an error rather than posting; stubbing an empty
+    ledger here reproduces the pre-CQ·446-round-2 case of a run with
+    nothing live-reported yet."""
+    monkeypatch.setattr(model_scorecard.issue_client, "list_ledger_entries",
+                        lambda *a, **kw: [])
+
+
 def test_report_to_ledger_marks_a_disproportionate_refusal_on_the_run(
         model_scorecard, monkeypatch, tmp_path):
     """Against the unfixed code (no write back to the run at all), the run dir's
     meta.json never gains `ledger_report_refused_usd`/`_reason`, so the second
-    assertion below fails."""
+    assertion below fails. The poster/dedup_key fields name the sweep as the
+    poster and `run_id` as the key it posted (and was refused) under."""
     monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
     run_dir = _make_run_dir(tmp_path, "run-abc")
     monkeypatch.setattr(
         model_scorecard.issue_client, "post_ledger_entry",
@@ -1018,6 +1155,8 @@ def test_report_to_ledger_marks_a_disproportionate_refusal_on_the_run(
     meta = json.loads((run_dir / "meta.json").read_text())
     assert meta["ledger_report_refused_usd"] == 0.1234
     assert meta["ledger_report_refused_reason"] == "this report exceeds 10x the scope's soft cap"
+    assert meta["ledger_report_refused_poster"] == "sweep"
+    assert meta["ledger_report_refused_dedup_key"] == "run-abc"
 
 
 def test_report_to_ledger_does_not_resend_an_unchanged_refused_figure(
@@ -1025,12 +1164,16 @@ def test_report_to_ledger_does_not_resend_an_unchanged_refused_figure(
     """Clause 6: a refused report is surfaced against its run and not resubmitted
     unchanged. Against the unfixed code (no pre-post check against the run's own
     mark), the stub below would receive a second call for the same $0.1234 figure
-    — `calls` would be 2, not 1."""
+    — `calls` would be 2, not 1. The marker comes from the state-tree file
+    (round 2, PR #1021: never meta.json, which a dispatched run can write
+    for its whole execution window)."""
     monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
-    _make_run_dir(tmp_path, "run-abc", meta_extra={
-        "ledger_report_refused_usd": 0.1234,
-        "ledger_report_refused_reason": "this report exceeds 10x the scope's soft cap",
-    })
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    _make_run_dir(tmp_path, "run-abc")
+    model_scorecard.LG.write_refusal_marker(
+        "run-abc", usd=0.1234,
+        reason="this report exceeds 10x the scope's soft cap",
+        poster="sweep", dedup_key="run-abc")
     calls = []
     monkeypatch.setattr(
         model_scorecard.issue_client, "post_ledger_entry",
@@ -1038,8 +1181,33 @@ def test_report_to_ledger_does_not_resend_an_unchanged_refused_figure(
                                              "error": "x", "entry": {}})
     report = model_scorecard.report_to_ledger([_LEDGER_ROW])
     assert calls == []
-    assert report["errors"] == [("run-abc", "skip:refused-unchanged",
-                                 "this report exceeds 10x the scope's soft cap")]
+    assert report["errors"] == [("run-abc", "skip:refused-unchanged", "")]
+
+
+def test_report_to_ledger_posts_despite_a_meta_json_only_refused_figure(
+        model_scorecard, monkeypatch, tmp_path):
+    """Round 2 (security review of PR #1021 round 1, BLOCKING finding): a
+    run's own meta.json carrying `ledger_report_refused_usd` equal to the
+    row's `cost_usd`, with NO marker file, must not be skipped — a
+    dispatched run can forge that field onto its own meta.json.
+
+    AGAINST THE ROUND-1 CODE (a4e1bc1e3's ledger.py, which read
+    `REFUSED_USD_FIELD` straight off the run's meta.json), this test fails:
+    `calls` comes back `[]` and the row is counted `"skip:refused-unchanged"`
+    instead of `"recorded"`."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    _make_run_dir(tmp_path, "run-abc", meta_extra={
+        "ledger_report_refused_usd": 0.1234,
+        "ledger_report_refused_reason": "forged by the run itself",
+    })
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == [1]
+    assert report == {"recorded": 1, "not_recorded": 0, "errors": []}
 
 
 def test_report_to_ledger_reposts_a_corrected_figure(model_scorecard, monkeypatch, tmp_path):
@@ -1048,10 +1216,12 @@ def test_report_to_ledger_reposts_a_corrected_figure(model_scorecard, monkeypatc
     run_id alone rather than the figure, the stub below would never be called
     and `calls` would stay empty."""
     monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
-    _make_run_dir(tmp_path, "run-abc", meta_extra={
-        "ledger_report_refused_usd": 999.0,
-        "ledger_report_refused_reason": "this report exceeds 10x the scope's soft cap",
-    })
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    _make_run_dir(tmp_path, "run-abc")
+    model_scorecard.LG.write_refusal_marker(
+        "run-abc", usd=999.0,
+        reason="this report exceeds 10x the scope's soft cap",
+        poster="sweep", dedup_key="run-abc")
     calls = []
     monkeypatch.setattr(
         model_scorecard.issue_client, "post_ledger_entry",
@@ -1074,6 +1244,297 @@ def test_report_to_ledger_posts_unconditionally_with_no_resolvable_run_dir(
     report = model_scorecard.report_to_ledger([_LEDGER_ROW])
     assert calls == [1]
     assert report["errors"] == [("run-abc", "disproportionate", "x")]
+
+
+# --- report_to_ledger: a run already `ledger_post_status: "recorded"` is --
+# skipped (either agentctl's own at-finish post, or an earlier sweep pass) ---
+
+
+def test_report_to_ledger_skips_a_run_already_recorded(model_scorecard, monkeypatch, tmp_path):
+    """Against the unfixed code (no such check), the stub below would be
+    called and `calls` would be `[1]`, not `[]`."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _make_run_dir(tmp_path, "run-abc", meta_extra={"ledger_post_status": "recorded"})
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == []
+    assert report["errors"] == [("run-abc", "skip:already-recorded", "")]
+
+
+def test_report_to_ledger_posts_a_run_not_yet_recorded_and_marks_it(
+        model_scorecard, monkeypatch, tmp_path):
+    """A run with no prior `ledger_post_status` mark posts normally, and this
+    pass's own status is what gets written back — the mark a later pass (or
+    `agentctl`'s own at-finish post, for a different run) reads to skip it."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    run_dir = _make_run_dir(tmp_path, "run-abc")
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: {"status": "recorded", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert report == {"recorded": 1, "not_recorded": 0, "errors": []}
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["ledger_post_status"] == "recorded"
+
+
+def test_report_to_ledger_sends_the_rows_day(model_scorecard, monkeypatch, tmp_path):
+    """A row carrying `day` (the sweep's own finish-day bucket) sends it
+    through to `post_ledger_entry`; `_LEDGER_ROW` carries none, so this pins
+    the field is forwarded rather than silently dropped."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _stub_no_live_reported_entries(model_scorecard, monkeypatch)
+    _make_run_dir(tmp_path, "run-abc")
+    captured = {}
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane=None, **kw):
+        captured.update(kw)
+        return {"status": "recorded", "entry": {}}
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+    model_scorecard.report_to_ledger([dict(_LEDGER_ROW, day="2026-10-20")])
+    assert captured["day"] == "2026-10-20"
+
+
+# --- report_to_ledger: the backstop subtracts what's already posted for this
+# lane, read FRESH from the Library's own ledger (CQ·446 round 2), so a run
+# whose at-finish post failed outright is not double-counted between the
+# live deltas and this sweep's own entry -----------------------------------
+
+
+def test_report_to_ledger_posts_only_the_remainder_after_live_reporting(
+        model_scorecard, monkeypatch, tmp_path):
+    """Against the unfixed code (no subtraction at all), `_LEDGER_ROW`'s full
+    $0.1234 would be posted again here, double-counting the $0.10 the live
+    reporter already got through while the run was still going."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _make_run_dir(tmp_path, "run-abc")
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "list_ledger_entries",
+        lambda *a, **kw: [{"usd": 0.10, "lane": "subscription", "voided_at": None}])
+    captured = {}
+
+    def fake_post(product, usd, *, run_id, dedup_key, lane, **kw):
+        captured["usd"] = usd
+        return {"status": "recorded", "entry": {}}
+
+    monkeypatch.setattr(model_scorecard.issue_client, "post_ledger_entry", fake_post)
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert report == {"recorded": 1, "not_recorded": 0, "errors": []}
+    assert captured["usd"] == pytest.approx(0.0234)
+
+
+def test_report_to_ledger_skips_a_run_the_live_reporter_already_fully_covered(
+        model_scorecard, monkeypatch, tmp_path):
+    """The run's own at-finish post failed (meta carries no
+    `ledger_post_status: recorded`), but its live reporter already posted the
+    whole $0.1234 before the run finished — the backstop sweep must post
+    nothing, not the full figure again."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _make_run_dir(tmp_path, "run-abc")
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "list_ledger_entries",
+        lambda *a, **kw: [{"usd": 0.1234, "lane": "subscription", "voided_at": None}])
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == []
+    assert report["errors"] == [("run-abc", "skip:already-reported-live", "")]
+
+
+def test_report_to_ledger_a_disproportionate_refusal_marks_the_post_live_remainder(
+        model_scorecard, monkeypatch, tmp_path):
+    """`ledger_report_refused_usd` must record the figure THIS sweep actually
+    sent (the post-live-reduction remainder), not the row's raw `cost_usd` —
+    otherwise a later pass's own (identically-reduced) figure would never
+    compare equal to it, and `skip:refused-unchanged` would never fire."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    run_dir = _make_run_dir(tmp_path, "run-abc")
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "list_ledger_entries",
+        lambda *a, **kw: [{"usd": 0.10, "lane": "subscription", "voided_at": None}])
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: {"status": "disproportionate", "error": "x",
+                          "reported_usd": 0.0234, "basis": "soft_cap", "entry": {}})
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert report["errors"] == [("run-abc", "disproportionate", "x")]
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["ledger_report_refused_usd"] == pytest.approx(0.0234)
+
+    # A second pass, same row, same (still-fixed) live-reported figure at the
+    # Library: the reduced remainder reproduces 0.0234 again, matches the
+    # refused mark, and is held back rather than resent.
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1))
+    report2 = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == []
+    assert report2["errors"] == [("run-abc", "skip:refused-unchanged", "x")]
+
+
+def test_report_to_ledger_posts_nothing_when_the_ledger_read_fails_and_a_later_pass_posts_the_remainder(
+        model_scorecard, monkeypatch, tmp_path):
+    """Against 3adf80d9b, there is no ledger read at all here — this failure
+    mode doesn't exist, and the row posts (or is refused) on its raw
+    `cost_usd` regardless. Against the fixed code, a Library read that fails
+    must post NOTHING for this row (never falling back to the raw,
+    un-reduced figure), and a LATER pass whose read succeeds — finding
+    nothing yet reported, since the first attempt posted nothing — posts
+    exactly the row's own remainder."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    _make_run_dir(tmp_path, "run-abc")
+
+    def _boom(*a, **kw):
+        raise model_scorecard.issue_client.IssueQueueUnavailable("library is down")
+    monkeypatch.setattr(model_scorecard.issue_client, "list_ledger_entries", _boom)
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "recorded", "entry": {}})
+
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == []
+    assert report["errors"] == [("run-abc", "error:ledger-read-IssueQueueUnavailable",
+                                 "library is down")]
+
+    monkeypatch.setattr(model_scorecard.issue_client, "list_ledger_entries",
+                        lambda *a, **kw: [])
+    report2 = model_scorecard.report_to_ledger([_LEDGER_ROW])
+    assert calls == [1]
+    assert report2 == {"recorded": 1, "not_recorded": 0, "errors": []}
+
+
+# --- cross-poster: a refusal recorded by one poster is read by the next (E1·9,
+# Clause 6 — the refusal record is the ONE module (ledger.py) all three
+# posters share, so this is provoked across the real module boundary rather
+# than mocked away) -----------------------------------------------------------
+
+
+def test_a_refused_finish_post_then_a_sweep_pass_sends_nothing(
+        model_scorecard, monkeypatch, tmp_path):
+    """agentctl's at-finish post (`ledger.post_run_ledger_entry`) is refused;
+    `model-scorecard`'s sweep then sees the SAME remainder for the same run
+    and must not resend it. Against code where the two posters' refusal
+    records don't share a module, or don't compare the same figure, the stub
+    would receive the $0.1234 figure a second time."""
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    run_dir = _make_run_dir(tmp_path, "run-abc")
+    monkeypatch.setattr(model_scorecard.issue_client, "list_ledger_entries",
+                        lambda *a, **kw: [])
+    calls = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: calls.append(1) or {"status": "disproportionate",
+                                             "error": "too large", "entry": {}})
+
+    finish_status = model_scorecard.LG.post_run_ledger_entry(
+        run_dir, run_id="run-abc", repo="example-product", model="claude-sonnet-5",
+        agent="coder", cost_usd=0.1234, is_gateway_model=model_scorecard.is_gateway_model,
+        is_codex_model=model_scorecard.is_codex_model)
+    assert finish_status == "disproportionate"
+    assert calls == [1]
+    meta = json.loads((run_dir / "meta.json").read_text())
+    assert meta["ledger_report_refused_poster"] == "finish"
+
+    report = model_scorecard.report_to_ledger([_LEDGER_ROW])  # same $0.1234
+    assert calls == [1]  # unchanged — the sweep sent nothing
+    assert report["errors"] == [("run-abc", "skip:refused-unchanged", "too large")]
+
+
+# --- ledger_post_rows: the Library post widens beyond ledger membership -----
+# (is_ledger_member stays link-only; every OTHER finished run in the window
+# still reaches the Library, closing the reviewer/scout/planner/architect gap)
+
+
+def test_ledger_post_rows_includes_a_non_member_finished_run(model_scorecard, monkeypatch, tmp_path):
+    """A reviewer-family run with no pr-link.json is not a ledger member
+    (`is_ledger_member` stays link-only), but `ledger_post_rows` still names
+    it — the coverage gap `report_to_ledger`'s old `fresh`/`finished`-only
+    call site never closed."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    today = datetime.now(timezone.utc)
+    run_dir = tmp_path / today.date().isoformat() / "run-reviewer-1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text(json.dumps({
+        "run_id": "run-reviewer-1", "agent": "reviewer", "model": "claude-sonnet-5",
+        "repo": "widget", "started_at": today.isoformat().replace("+00:00", "Z"),
+        "task": "review PR #42",
+    }))
+    (run_dir / "cost.json").write_text(json.dumps({"usd": 2.5}))
+
+    rows = model_scorecard.ledger_post_rows(14, fresh=[], finished=set())
+    assert len(rows) == 1
+    assert rows[0]["run_id"] == "run-reviewer-1"
+    assert rows[0]["agent"] == "reviewer"
+    assert rows[0]["model"] == "claude-sonnet-5"
+    assert rows[0]["cost_usd"] == 2.5
+
+
+def test_ledger_post_rows_carries_the_non_members_own_pr_link(
+        model_scorecard, monkeypatch, tmp_path):
+    """A non-member row (no `meta.issue`) still carries its own `pr-link.json`
+    fields through to `report_to_ledger`'s PR match (E16) — against code that
+    only copies `item_id`, these would be absent here."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    today = datetime.now(timezone.utc)
+    run_dir = tmp_path / today.date().isoformat() / "run-reviewer-2"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text(json.dumps({
+        "run_id": "run-reviewer-2", "agent": "reviewer", "model": "claude-sonnet-5",
+        "repo": "widget", "started_at": today.isoformat().replace("+00:00", "Z"),
+        "task": "review PR #42",
+    }))
+    (run_dir / "cost.json").write_text(json.dumps({"usd": 2.5}))
+    (run_dir / "pr-link.json").write_text(json.dumps(
+        {"pr_url": "https://github.com/convivy/widget/pull/42", "pr_number": 42}))
+
+    rows = model_scorecard.ledger_post_rows(14, fresh=[], finished=set())
+    assert len(rows) == 1
+    assert rows[0]["pr_number"] == 42
+    assert rows[0]["pr_url"] == "https://github.com/convivy/widget/pull/42"
+
+
+def test_ledger_post_rows_excludes_a_run_still_in_flight(model_scorecard, monkeypatch, tmp_path):
+    """No cost.json yet (still running) — never posted, same `is_cost_final`
+    contract the ledger-member path already holds."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    today = datetime.now(timezone.utc)
+    run_dir = tmp_path / today.date().isoformat() / "run-in-flight"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text(json.dumps({
+        "run_id": "run-in-flight", "agent": "reviewer", "model": "claude-sonnet-5",
+        "repo": "widget", "started_at": today.isoformat().replace("+00:00", "Z"),
+        "task": "review PR #42",
+    }))
+    rows = model_scorecard.ledger_post_rows(14, fresh=[], finished=set())
+    assert rows == []
+
+
+def test_ledger_post_rows_does_not_duplicate_a_ledger_member(model_scorecard, monkeypatch, tmp_path):
+    """A run already covered by `fresh`/`finished` (a ledger member) is not
+    also picked up a second time by the widened scan."""
+    from datetime import datetime, timezone
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    today = datetime.now(timezone.utc)
+    run_dir = tmp_path / today.date().isoformat() / "run-abc"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text(json.dumps({
+        "run_id": "run-abc", "agent": "coder", "model": "claude-sonnet-5",
+        "repo": "widget", "started_at": today.isoformat().replace("+00:00", "Z"),
+        "task": "fix a bug",
+    }))
+    (run_dir / "cost.json").write_text(json.dumps({"usd": 0.1234}))
+    rows = model_scorecard.ledger_post_rows(14, fresh=[_LEDGER_ROW], finished={"run-abc"})
+    assert [r["run_id"] for r in rows] == ["run-abc"]
 
 
 def test_main_still_writes_the_local_ledger_when_the_library_is_unreachable(
@@ -1152,14 +1613,14 @@ def test_harvest_prices_a_row_from_the_same_read_that_decided_finality(
         "agent": "bug-fixer",
         "model": "claude-sonnet-5",
         "billing_source": "api",
-        "repo": "vivy",
+        "repo": "widget",
         "task": "Fix GH issue #99",
     }))
     (run_dir / "pr-link.json").write_text(json_mod.dumps({"pr_number": 99}))
     # No cost.json yet: list_candidate_runs scans this run while it's still in flight.
     monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
 
-    def _pr_maps_writes_cost_mid_harvest(repo):
+    def _pr_maps_writes_cost_mid_harvest(repo, env):
         # The run finishes (cost.json lands) after list_candidate_runs's scan,
         # in the window harvest's loop reaches while resolving this repo's PRs —
         # before it reaches this run's own build_row/is_cost_final step.
@@ -1167,13 +1628,23 @@ def test_harvest_prices_a_row_from_the_same_read_that_decided_finality(
         return {99: {"number": 99, "state": "OPEN", "headRefName": "fix-99", "mergedAt": None}}
 
     monkeypatch.setattr(model_scorecard, "pr_maps", _pr_maps_writes_cost_mid_harvest)
-    monkeypatch.setattr(model_scorecard, "ci_first_pass", lambda repo, branch: None)
+    monkeypatch.setattr(model_scorecard, "ci_first_pass", lambda repo, branch, env: None)
+    monkeypatch.setattr(model_scorecard.GA, "read_token_pool", _fake_read_token_pool)
 
     rows, skipped, finished = model_scorecard.harvest(days=3)
 
     assert [r["run_id"] for r in rows] == ["run-toctou"]
     assert finished == {"run-toctou"}  # the run that finished mid-pass is posted
     assert rows[0]["cost_usd"] == 4.50  # priced from cost.json, not the stale $0.00 snapshot
+
+
+@contextmanager
+def _fake_read_token_pool(**kw):
+    """Stands in for `GA.read_token_pool` in a `harvest()`/`judge_sample()`
+    test that stubs the gh-calling functions it wraps: yields an `env_for`
+    that answers every repo with a plain dict rather than reaching the
+    install's GitHub App."""
+    yield lambda repo_slug: {}
 
 
 def _write_candidate_run(tmp_path, run_id: str, repo: str, pr_number: int = 1) -> None:
@@ -1220,12 +1691,13 @@ def test_harvest_still_resolves_a_registered_repo_like_homebrew_tap(
 
     calls = []
 
-    def fake_pr_maps(repo):
+    def fake_pr_maps(repo, env):
         calls.append(repo)
         return {1: {"number": 1, "state": "OPEN", "headRefName": "b", "mergedAt": None}}
 
     monkeypatch.setattr(model_scorecard, "pr_maps", fake_pr_maps)
-    monkeypatch.setattr(model_scorecard, "ci_first_pass", lambda repo, branch: None)
+    monkeypatch.setattr(model_scorecard, "ci_first_pass", lambda repo, branch, env: None)
+    monkeypatch.setattr(model_scorecard.GA, "read_token_pool", _fake_read_token_pool)
 
     rows, skipped, finished = model_scorecard.harvest(days=3)
 
@@ -1234,6 +1706,11 @@ def test_harvest_still_resolves_a_registered_repo_like_homebrew_tap(
 
 
 def test_main_does_not_post_a_run_still_in_flight(model_scorecard, monkeypatch, tmp_path):
+    # ledger_post_rows also scans RUNS_ROOT for every other finished run in the
+    # window (the reviewer/scout/planner/architect widening) — redirect it here
+    # too, or this test is at the mercy of whatever real run dirs this
+    # machine's (or another test's) actual runs root happens to hold.
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
     row = dict(_LEDGER_ROW, run_id="run-inflight", cost_usd=0.0)
     monkeypatch.setattr(model_scorecard, "harvest", lambda days: ([row], {}, set()))
     posted = []
@@ -1248,7 +1725,38 @@ def test_main_does_not_post_a_run_still_in_flight(model_scorecard, monkeypatch, 
     assert [r["run_id"] for r in rows] == ["run-inflight"]  # the local ledger still upserts it
 
 
+def test_main_does_not_post_a_scan_found_run_still_in_flight(model_scorecard, monkeypatch, tmp_path):
+    """The widened scan (`list_candidate_runs`, not `harvest`) finds a
+    reviewer-family run with no pr-link.json. Its cost.json is the only field
+    that marks a run's cost final (telemetry.write_cost_partial's docstring:
+    cost.json's mere presence means "this run is done" to every reader) — a
+    run `main` finds this way, with no cost.json yet, must never be posted,
+    the same `is_cost_final` contract `ledger_post_rows`'s harvest-sourced
+    rows already hold."""
+    from datetime import datetime, timezone
+
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    monkeypatch.setattr(model_scorecard, "harvest", lambda days: ([], {}, set()))
+    today = datetime.now(timezone.utc)
+    run_dir = tmp_path / today.date().isoformat() / "run-scanned-inflight"
+    run_dir.mkdir(parents=True)
+    (run_dir / "meta.json").write_text(json.dumps({
+        "run_id": "run-scanned-inflight", "agent": "reviewer", "model": "claude-sonnet-5",
+        "repo": "widget", "started_at": today.isoformat().replace("+00:00", "Z"),
+        "task": "review PR #42",
+    }))
+    posted = []
+    monkeypatch.setattr(
+        model_scorecard.issue_client, "post_ledger_entry",
+        lambda *a, **kw: posted.append(1) or {"status": "recorded", "entry": {}})
+    ledger_path = tmp_path / "scorecard.jsonl"
+    rc = model_scorecard.main(["--ledger", str(ledger_path)])
+    assert rc == 0
+    assert posted == []  # no cost.json yet: never posted
+
+
 def test_main_posts_a_run_once_it_finishes_with_its_real_cost(model_scorecard, monkeypatch, tmp_path):
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path / "agent-runs")
     row = dict(_LEDGER_ROW, run_id="run-abc", cost_usd=1.23)
     monkeypatch.setattr(model_scorecard, "harvest", lambda days: ([row], {}, {"run-abc"}))
     captured = []
@@ -1260,3 +1768,78 @@ def test_main_posts_a_run_once_it_finishes_with_its_real_cost(model_scorecard, m
     rc = model_scorecard.main(["--ledger", str(ledger_path)])
     assert rc == 0
     assert captured == [("run-abc", 1.23)]
+
+
+# --- the GitHub credential seam (company/decisions/0027): every `gh` call
+# runs on a token minted from the install's own GitHub App, never the
+# operator's `gh` login ------------------------------------------------------
+
+def test_harvest_threads_the_minted_tokens_env_into_pr_maps_and_ci_first_pass(
+        model_scorecard, monkeypatch, tmp_path):
+    """Drives `harvest`'s real `GA.read_token_pool` (only `GA.installed_app`
+    and `GA.mint_token` are stubbed — `GA.gh_env` runs for real): the minted
+    token lands in `GH_TOKEN`, and `GH_CONFIG_DIR` is an empty, throwaway
+    directory, on every `gh` call `pr_maps`/`ci_first_pass` make for the repo."""
+    from pathlib import Path as P
+
+    _write_candidate_run(tmp_path, "run-real", "widget")
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+    monkeypatch.setitem(model_scorecard.CI_WORKFLOW, "widget", "ci.yml")
+    monkeypatch.setattr(
+        model_scorecard.GA, "installed_app",
+        lambda: model_scorecard.GA.InstalledApp(app_id="1", key_path=P("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(model_scorecard.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = P(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(model_scorecard.subprocess, "run", fake_run)
+    rows, skipped, finished = model_scorecard.harvest(days=3)
+    assert len(rows) == 1
+    assert captured, "gh must have been called with the minted token's environment"
+
+
+def test_a_mint_failure_runs_no_gh_process_for_that_repo(
+        model_scorecard, monkeypatch, tmp_path, capsys):
+    """A repo whose token cannot be minted is never queried: `pr_maps`'s own
+    `gh` call must not run, and the failure is named on stderr rather than
+    silently resolving to an unlinked PR."""
+    _write_candidate_run(tmp_path, "run-real", "widget")
+    monkeypatch.setattr(model_scorecard, "RUNS_ROOT", tmp_path)
+
+    class _FailingReadTokenPool:
+        def __enter__(self):
+            def env_for(repo_slug):
+                raise model_scorecard.GA.Unreadable("no App key configured at .../app.pem")
+            return env_for
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(model_scorecard.GA, "read_token_pool",
+                        lambda **kw: _FailingReadTokenPool())
+    calls = []
+    monkeypatch.setattr(model_scorecard.subprocess, "run",
+                        lambda *a, **k: calls.append((a, k)))
+
+    rows, skipped, finished = model_scorecard.harvest(days=3)
+    assert calls == [], "a mint failure must never fall back to running gh"
+    assert rows[0]["pr_state"] == "unresolved"
+    err = capsys.readouterr().err
+    assert "cannot mint a GitHub token for widget" in err

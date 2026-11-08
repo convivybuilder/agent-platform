@@ -47,12 +47,18 @@ Library IS and whether the vaults are THERE are different questions.
 """
 from __future__ import annotations
 
+import email
+import io
 import os
 import re
 import urllib.error
 import urllib.parse
 import urllib.request
+import urllib.response
 from collections.abc import Mapping
+
+import builder_root as _BR
+import forwarding_transport as _FT
 
 # Orient's control plane. Reached only on the rollback, `VAULTS_ON_LIBRARY=0`
 # — the cutover moved the default to the Library, below.
@@ -181,6 +187,144 @@ def _plane_from_env(env: Mapping[str, str] | None = None) -> bool:
 
 
 VAULTS_ON_LIBRARY = _plane_from_env()
+
+# ---------------------------------------------------------------------------
+# WHETHER THIS HOST REACHES THE KEEL DIRECTLY, OR ONLY THROUGH THE LOCAL
+# INDIVIDUATOR'S FORWARDING SOCKET (E12-2 slice S5c;
+# platform/decisions/0092, "The Individuator carries a sessions-only host's
+# clients to the Keel").
+#
+# READ FROM THE SAME PER-MACHINE FILE `builder_root.CONFIG` ALREADY READS
+# FOR CREWS_ROOT, under its own key. SESSIONS_ONLY is host configuration in
+# the same sense CREWS_ROOT is: set once, by hand, for a machine that runs
+# no Library and no Bosun of its own. NEVER INFERRED from whether a Keel
+# service answers on loopback — a service that is merely down on an
+# ordinary host must not make this process start dialling a socket nothing
+# created for it.
+#
+# WITH THE SETTING OFF (the default, and every host before this slice),
+# `_ForwardingSocketHandler.http_open` below always returns None and the
+# ordinary `_NoDowngrade` opener reaches `url()` / `library_url()` /
+# `fixed_library_url()` over the network exactly as it did on main.
+# `tests/test_vault_plane.py` pins that.
+SESSIONS_ONLY_KEY = "SESSIONS_ONLY"
+
+
+def _sessions_only_from_config(config=None) -> bool:
+    """Whether this process should reach the Keel through the forwarding
+    socket. Unset means no. `1` means yes and `0` means no. Every other
+    value raises, for the identical reason `_plane_from_env` raises on an
+    unrecognised `VAULTS_ON_LIBRARY`: a value nobody can read is not a
+    default, and guessing it would route every Library call of this
+    process's life either over a network nothing is listening on, or past
+    a socket that exists for exactly this.
+    """
+    raw = _BR.configured_raw(config, key=SESSIONS_ONLY_KEY)
+    if raw is None:
+        return False
+    value = raw.strip()
+    if value == _ON:
+        return True
+    if value == _OFF:
+        return False
+    raise RuntimeError(
+        f"{SESSIONS_ONLY_KEY}={raw!r} in {_BR.CONFIG} is neither {_ON!r} nor "
+        f"{_OFF!r}. Refusing to guess whether this host reaches the Keel "
+        f"directly or only through the Individuator's forwarding socket: "
+        f"remove the line for the default (not sessions-only).")
+
+
+SESSIONS_ONLY = _sessions_only_from_config()
+
+
+def sessions_only() -> bool:
+    """Whether this host is sessions-only (see SESSIONS_ONLY above)."""
+    return SESSIONS_ONLY
+
+
+def _is_library_request(req: urllib.request.Request) -> bool:
+    """Whether `req` is bound for the Library's own origin — either the
+    configured `LIBRARY_BASE_URL` or the literal `DEFAULT_LIBRARY_URL`
+    `fixed_library_url` always uses. Anything else (GitHub, the model
+    gateway, any other address this process ever calls) is left for the
+    ordinary `HTTPHandler`, so this handler only ever touches a Library
+    call."""
+    origin = _NoDowngrade._origin(req.full_url)
+    return origin in (_NoDowngrade._origin(LIBRARY_BASE_URL), _NoDowngrade._origin(DEFAULT_LIBRARY_URL))
+
+
+def _forward_via_socket(req: urllib.request.Request) -> urllib.response.addinfourl:
+    """Send `req` over the Individuator's forwarding socket and hand back
+    a response object `urllib.request.OpenerDirector` can process exactly
+    as it would a real `http.client.HTTPResponse`: `HTTPErrorProcessor`
+    raises `urllib.error.HTTPError` for a 4xx/5xx status the same as it
+    always has, and every caller's `with urlopen(...) as resp: resp.read()`
+    is unaffected. `req`'s path, method, headers and body all travel
+    unchanged — only the socket they go out on differs.
+    """
+    parsed = urllib.parse.urlparse(req.full_url)
+    target = parsed.path or "/"
+    if parsed.query:
+        target += "?" + parsed.query
+    header_items = list(req.header_items())
+    if not any(name.lower() == "host" for name, _ in header_items):
+        header_items.append(("Host", req.host))
+    body = req.data or b""
+    if body and not any(name.lower() == "content-length" for name, _ in header_items):
+        header_items.append(("Content-Length", str(len(body))))
+
+    # `forwarding_transport.request` only ever sums `connect_timeout_s` and
+    # `response_timeout_s` into ONE absolute deadline (it has no separate
+    # per-phase enforcement — see that module's own docstring); leaving
+    # `connect_timeout_s` at its 10s default on top of the caller's own
+    # `timeout` turned every `urlopen(req, timeout=N)` caller's budget into
+    # `N + 10` once routed through this socket (reviewer, round 1). Giving
+    # the caller's whole budget to `response_timeout_s` and none to
+    # `connect_timeout_s` keeps the total at exactly `N`, matching what
+    # every other caller of that same `timeout=` argument already expects —
+    # a caller with no explicit timeout (`None`) still gets this module's
+    # own `CONNECT_TIMEOUT_S` + `RESPONSE_TIMEOUT_S` default, unchanged.
+    caller_timeout = getattr(req, "timeout", None)
+    result = _FT.request(
+        req.get_method(), target, header_items, body,
+        connect_timeout_s=0.0 if caller_timeout is not None else None,
+        response_timeout_s=caller_timeout)
+    if not result.ok:
+        raise urllib.error.URLError(
+            f"the forwarding socket refused {req.get_method()} {target}: {result.reason}")
+    resp = result.response
+    header_text = "".join(f"{name}: {value}\r\n" for name, value in resp.headers)
+    message = email.message_from_string(header_text)
+    response = urllib.response.addinfourl(io.BytesIO(resp.body), message, req.full_url, resp.status)
+    # `HTTPErrorProcessor.http_response` reads `.msg` directly off the
+    # response (never through `addinfourl`'s own `__getattr__` delegation
+    # to `fp`, which a `BytesIO` has no such attribute to satisfy) — set
+    # here rather than left to that delegation, which would raise
+    # AttributeError on the very first error response this handler ever
+    # produces.
+    response.msg = resp.reason_phrase
+    return response
+
+
+class _ForwardingSocketHandler(urllib.request.BaseHandler):
+    """Redirects a Library-bound request onto the Individuator's
+    forwarding socket when `SESSIONS_ONLY` is set (0092; build plan slice
+    S5c), in the same process-wide opener `_NoDowngrade` already installs
+    below — so every existing call site that builds a `Request` against
+    `url()` / `library_url()` / `fixed_library_url()` and calls
+    `urllib.request.urlopen` is covered with no change to its own code.
+
+    `handler_order` below `HTTPHandler`'s default (500) means this is
+    tried first; returning None for anything that is not a Library request
+    lets the ordinary handler take it, unchanged.
+    """
+    handler_order = 400
+
+    def http_open(self, req: urllib.request.Request):
+        if not (sessions_only() and _is_library_request(req)):
+            return None
+        return _forward_via_socket(req)
+
 
 # The protocol version this client speaks. The Library refuses a request that
 # declares none, so a client that reached it without this header would fail on
@@ -330,7 +474,12 @@ class _NoDowngrade(urllib.request.HTTPRedirectHandler):
 # Process-wide is broader than the vault, and that is acceptable in one
 # direction only: this handler can refuse a redirect and can never permit one the
 # stdlib would have refused. Nothing else in the process loses an option.
-urllib.request.install_opener(urllib.request.build_opener(_NoDowngrade()))
+#
+# `_ForwardingSocketHandler` rides in the same opener for the identical
+# reason (E12-2 slice S5c): every one of those same fourteen call sites is
+# covered the moment `SESSIONS_ONLY` is set, with no second name to adopt.
+urllib.request.install_opener(
+    urllib.request.build_opener(_NoDowngrade(), _ForwardingSocketHandler()))
 
 
 def library_url(path: str) -> str:

@@ -41,4 +41,13 @@ public enum IndividuatorPaths {
     /// bit and let a `gid=daemon` process redirect where the socket bound
     /// (review round 2).
     public static let defaultDaemonSocketPath = URL(fileURLWithPath: "/var/db/individuator-daemon/register.sock")
+
+    /// The Unix socket the root daemon listens on for the forwarding
+    /// endpoint (E12·2 slice S5b; 0092 "The Individuator carries a
+    /// sessions-only host's clients to the Keel"): a sibling of
+    /// `defaultDaemonSocketPath`, same directory, same reasoning — mode
+    /// 0755 so any local uid can traverse it to reach the socket, with the
+    /// real access control being the peer-uid check against the root-owned
+    /// account map at `accept()` time, not this directory's mode.
+    public static let defaultForwardingSocketPath = URL(fileURLWithPath: "/var/db/individuator-daemon/forward.sock")
 }

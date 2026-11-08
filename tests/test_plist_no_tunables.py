@@ -3,14 +3,18 @@
 THE BUG THIS PINS. The overnight feature flags (phase-split, digest-assembler) lived
 in the live plists, set by hand with PlistBuddy and never committed. `install.sh`
 copies repo templates OVER the live plists — so running the installer would have
-silently reverted the sous-chef phase-split canary and the digest assembler, turning
+silently reverted the initech phase-split canary and the digest assembler, turning
 fragment mode off and re-breaking the consolidated digest, with an exit code of 0.
 Caught on 2026-07-13 by diffing live against template, one command before running it.
 
 THE INVARIANT. A plist carries only what never changes on a running machine: the
 program, its schedule, PATH, and the budget caps (which are safety limits, versioned
-on purpose). Everything an operator might tune belongs in ~/.config/convivy/
-overnight.env, which the launchers source. Template == live, so there is nothing left
+on purpose). Everything an operator might tune belongs in a config file the launcher
+sources, not the plist — ~/.config/convivy/overnight.env held that role for the
+overnight fleet this rule was written to protect; the fleet and the env file are both
+since retired (platform/decisions/0102), and the four OVERNIGHT_* entries in
+FORBIDDEN_KEYS below are that fleet's own flags, kept as a record of the bug's shape
+rather than deleted with the rest of it. Template == live, so there is nothing left
 to drift.
 
 This test is the enforcement. Add a flag to a plist and it goes red, naming the file.
@@ -66,8 +70,8 @@ def test_no_plist_carries_a_tunable_flag(path: Path):
         f"{path.name} carries tunable flag(s) {sorted(offending)} in "
         f"EnvironmentVariables. install.sh copies this template OVER the live plist, "
         f"so a flag here is a flag that silently reverts an operator's live setting "
-        f"(ARCH-342). Put it in ~/.config/convivy/overnight.env instead — see "
-        f"launchd/overnight.env.example."
+        f"(ARCH-342). Put it in a config file the launcher sources instead, not the "
+        f"plist."
     )
 
 
@@ -83,8 +87,8 @@ def test_plist_env_keys_are_on_the_allowlist(path: Path):
     assert not unknown, (
         f"{path.name} has env key(s) {sorted(unknown)} that are on neither the "
         f"allowlist nor the config file. If it is launchd plumbing, add it to "
-        f"ALLOWED_ENV_KEYS here. If an operator would ever tune it, it belongs in "
-        f"~/.config/convivy/overnight.env (ARCH-342)."
+        f"ALLOWED_ENV_KEYS here. If an operator would ever tune it, it belongs in a "
+        f"config file the launcher sources, not the plist (ARCH-342)."
     )
 
 

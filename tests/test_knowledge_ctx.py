@@ -52,27 +52,29 @@ def test_co_generic_tail_matches_no_project_mapping_code(knowledge_ctx):
     )
 
 
+@pytest.mark.rich_registry
 def test_detect_project_canonical_clone(knowledge_ctx, tmp_path, monkeypatch):
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
     dp = knowledge_ctx.detect_project
-    assert dp(tmp_path / "vivy" / "app") == "vivy"
-    assert dp(tmp_path / "constance") == "constance"
-    assert dp(tmp_path / "sous-chef" / "x") == "sous-chef"
+    assert dp(tmp_path / "finch" / "app") == "finch"
+    assert dp(tmp_path / "harbor") == "harbor"
+    assert dp(tmp_path / "galley" / "x") == "galley"
     # the platform repo maps to its own KB project (ARCH-099)
     assert dp(tmp_path / "agent-platform") == "agent-platform"
     assert dp(tmp_path / "agent-platform" / "bin") == "agent-platform"
     # family + commercial aliases collapse to the parent product's KB
-    assert dp(tmp_path / "vivy-commercial") == "vivy"
-    assert dp(tmp_path / "constance-commercial") == "constance"
-    assert dp(tmp_path / "vivy-ownerrez-sandbox-tools") == "vivy"
+    assert dp(tmp_path / "finch-commercial") == "finch"
+    assert dp(tmp_path / "harbor-commercial") == "harbor"
+    assert dp(tmp_path / "finch-ownerrez-sandbox-tools") == "finch"
 
 
+@pytest.mark.rich_registry
 def test_detect_project_worktree_shape(knowledge_ctx, tmp_path, monkeypatch):
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
     dp = knowledge_ctx.detect_project
     # worktrees/<product>.<purpose> → product (prefix before the first dot)
-    assert dp(tmp_path / "worktrees" / "constance.overnight" / "app") == "constance"
-    assert dp(tmp_path / "worktrees" / "sous-chef.test-xdist") == "sous-chef"
+    assert dp(tmp_path / "worktrees" / "harbor.overnight" / "app") == "harbor"
+    assert dp(tmp_path / "worktrees" / "galley.test-xdist") == "galley"
     # agent-platform worktree → agent-platform (split on the FIRST dot, so the
     # hyphenated product name survives; ARCH-099)
     assert dp(tmp_path / "worktrees" / "agent-platform.ci-fix") == "agent-platform"
@@ -96,6 +98,111 @@ def test_detect_project_unmapped_exits(knowledge_ctx, tmp_path, monkeypatch):
     with pytest.raises(SystemExit) as exc3:
         dp(tmp_path.parent / "not-under-convivy-at-all")
     assert exc3.value.code == knowledge_ctx.NO_PROJECT_MAPPING
+
+
+# --- detect_product resolves a nested home_dir (the OAK business-area move,
+# agent-platform PR 964: oak-park-villa and its siblings moved from
+# <root>/oak-park-villa to <root>/oak/oak-park-villa, so the first path
+# segment under the root stopped being the project) --------------------------
+
+
+@pytest.fixture
+def nested_registry(tmp_path, monkeypatch, knowledge_ctx):
+    """A throwaway registry rooted at `tmp_path` — never the real registry,
+    this machine's actual Convivy root, or Path.home() — so
+    detect_product's registry-driven resolution runs for real rather than
+    only through the other tests' "tmp_path can never match the live root"
+    fallback.
+
+    `oak-park-villa` is the live nested case. `bosun` is an ordinary
+    top-level project whose home_dir basename (`agent-platform`) differs
+    from its own registry slug, the existing shape detect_product's answer
+    must keep matching. `beacon`/`beacon-backend` and
+    `oak-arch-tools`/`oak-architecture` are the two cases a registry-based
+    worktree-prefix lookup must tell apart: a `repos` entry names a
+    physically separate checkout and must NOT fold into its project's
+    directory, where an `aliases` entry names the SAME directory and must.
+    """
+    import projects
+    units = {
+        "cartographer": {"home_dir": "<root>/cartographer", "aliases": []},
+        "bosun": {"home_dir": "<root>/agent-platform", "aliases": ["keel"]},
+        "beacon": {"home_dir": "<root>/beacon", "aliases": [],
+                   "repos": ["beacon", "beacon-backend"]},
+        "oak-park-villa": {"home_dir": "<root>/oak/oak-park-villa", "aliases": []},
+        "oak-arch-tools": {"home_dir": "<root>/oak/oak-arch-tools",
+                            "aliases": ["oak-architecture"]},
+        "oak-guest": {"home_dir": "<root>/oak/oak-guest", "aliases": []},
+    }
+    registry = tmp_path / "projects.json"
+    registry.write_text(json.dumps(units))
+    monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
+    monkeypatch.setattr(projects, "PROJECTS_JSON", registry)
+    monkeypatch.setattr(projects, "ROOT_OVERRIDE", tmp_path)
+    projects._load_raw.cache_clear()
+    yield tmp_path
+    projects._load_raw.cache_clear()
+
+
+def test_a_nested_home_dir_resolves_to_its_own_directory_not_the_umbrella(
+        knowledge_ctx, nested_registry):
+    root = nested_registry
+    product, label = knowledge_ctx.detect_product(
+        root / "oak" / "oak-park-villa" / "sub")
+    assert product == "oak-park-villa"
+    assert "oak-park-villa" in label
+
+
+def test_a_cwd_under_the_umbrella_in_no_projects_home_dir_falls_back_to_first_segment(
+        knowledge_ctx, nested_registry):
+    root = nested_registry
+    product, _ = knowledge_ctx.detect_product(root / "oak" / "not-a-registered-project")
+    assert product == "oak"
+
+
+def test_a_worktree_named_for_a_nested_project_resolves_to_its_own_slug(
+        knowledge_ctx, nested_registry):
+    root = nested_registry
+    product, _ = knowledge_ctx.detect_product(
+        root / "worktrees" / "oak-guest.fix-bug")
+    assert product == "oak-guest"
+
+
+def test_existing_products_clone_and_worktree_resolve_exactly_as_before(
+        knowledge_ctx, nested_registry):
+    root = nested_registry
+    # canonical clone, home_dir basename == slug
+    assert knowledge_ctx.detect_product(root / "cartographer" / "app")[0] == "cartographer"
+    # canonical clone, home_dir basename (agent-platform) != slug (bosun) —
+    # detect_product has always keyed on the directory, not the slug
+    assert knowledge_ctx.detect_product(root / "agent-platform" / "bin")[0] == "agent-platform"
+    # a `repos` entry is not an alias: beacon-backend is its own directory,
+    # not nested under beacon's home_dir, so it keeps its own identity
+    assert knowledge_ctx.detect_product(root / "beacon-backend")[0] == "beacon-backend"
+    # worktree prefixes: unaffected basenames, and a true alias folded to the
+    # one directory name its project already uses everywhere else
+    assert knowledge_ctx.detect_product(root / "worktrees" / "cartographer.overnight")[0] == "cartographer"
+    assert knowledge_ctx.detect_product(
+        root / "worktrees" / "agent-platform.ci-fix")[0] == "agent-platform"
+    assert knowledge_ctx.detect_product(
+        root / "worktrees" / "oak-architecture.redo")[0] == "oak-arch-tools"
+
+
+def test_an_unreadable_registry_falls_back_to_first_segment(
+        knowledge_ctx, tmp_path, monkeypatch):
+    """The registry lookup never costs knowledge-ctx a cwd it already
+    resolved: an unreadable PROJECTS_JSON (missing file, here) must fall
+    back to today's first-path-segment answer rather than raising."""
+    import projects
+    monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
+    monkeypatch.setattr(projects, "PROJECTS_JSON", tmp_path / "no-such-registry.json")
+    monkeypatch.setattr(projects, "ROOT_OVERRIDE", tmp_path)
+    projects._load_raw.cache_clear()
+    try:
+        product, _ = knowledge_ctx.detect_product(tmp_path / "cartographer" / "app")
+    finally:
+        projects._load_raw.cache_clear()
+    assert product == "cartographer"
 
 
 _EMPTY_KB = pathlib.Path(tempfile.gettempdir()) / "no-such-knowledge-checkout"
@@ -175,7 +282,7 @@ def test_individuate_refuses_a_live_other_session_in_the_primary(knowledge_ctx, 
     for: a real force-individuation (`agentctl.activate_profile` → `knowledge-ctx
     use <name> --force`) landing in a repo's PRIMARY checkout.
 
-    convivy-commercial has no origin remote, so it can never get a dedicated
+    northwind-commercial has no origin remote, so it can never get a dedicated
     worktree (unlike coder/reviewer/etc — _DEDICATED_WORKTREE_WORKERS), which
     means every commercial-writer dispatch individuates straight into the live
     workspace. The question this pins is whether the EXISTING guard already
@@ -186,7 +293,7 @@ def test_individuate_refuses_a_live_other_session_in_the_primary(knowledge_ctx, 
     Faked `ps`/`lsof` rather than a real process, per this PR's instruction never
     to run knowledge-ctx against a real workspace.
     """
-    target = tmp_path / "convivy-commercial"
+    target = tmp_path / "northwind-commercial"
     target.mkdir()
 
     def fake_run(cmd, *a, **k):
@@ -224,7 +331,7 @@ def test_individuate_exempts_one_live_claude_but_still_refuses_a_second(
     SECOND, genuinely different live claude session in the same directory
     must still refuse the write.
     """
-    target = tmp_path / "convivy-commercial"
+    target = tmp_path / "northwind-commercial"
     target.mkdir()
 
     def fake_run(cmd, *a, **k):
@@ -281,7 +388,7 @@ def test_individuate_refuses_a_live_non_ancestor_claude_when_the_plan_is_stale(
     individuation a real write, not a no-op, so the live-process guard is
     reached and the predecessor's unexempted pid refuses it.
     """
-    target = tmp_path / "constance-commercial"
+    target = tmp_path / "outfitter-commercial"
     claude_dir = target / ".claude"
     claude_dir.mkdir(parents=True)
     claude_dir.joinpath(".active-profile").write_text("company/commercial-stale\n")
@@ -308,6 +415,7 @@ def test_individuate_refuses_a_live_non_ancestor_claude_when_the_plan_is_stale(
 
 
 @pytest.mark.needs_kb
+@pytest.mark.rich_registry
 def test_every_mapping_resolves_to_a_real_profile(agentctl, knowledge_ctx):
     """A workspace mapping must name a project that actually has a profile.
 
@@ -333,7 +441,7 @@ def test_every_mapping_resolves_to_a_real_profile(agentctl, knowledge_ctx):
     missing = []
     import projects as projects_registry
     for repo, project in sorted(projects_registry.EXPLICIT_PROJECT_BY_NAME.items()):
-        if repo in agentctl.LOCAL_AGENT_REPOS:
+        if repo in agentctl._local_agent_repos():
             continue
         if not any((projects / project / "profiles").glob("*.yaml")):
             missing.append((repo, project))
@@ -343,28 +451,35 @@ def test_every_mapping_resolves_to_a_real_profile(agentctl, knowledge_ctx):
         f"knowledge/projects/<project>/profiles/, or map the repo elsewhere.")
 
 
-# --- the EA profile allowlist (2026-09-08) ------------------------------------
-# EA is a black box holding the operator's personal correspondence. Mapping it to
+# --- the SATCHEL profile allowlist (2026-09-08) ------------------------------------
+# SATCHEL is a black box holding the operator's personal correspondence. Mapping it to
 # `platform` is what makes its own narrow profile reachable, and the same row
 # makes `platform/daytime` — which carries the company reference slice — equally
-# reachable. `_PROFILE_ALLOWLIST` is what closes that, and it must fail closed.
+# reachable. The registry's `kb_profile_allowlist` field is what closes that
+# (CQ·587 moved it off a hardcoded dict literal), and it must fail closed.
 
-def test_ea_may_individuate_only_its_own_profile(knowledge_ctx, tmp_path, monkeypatch):
+@pytest.mark.rich_registry
+def test_satchel_may_individuate_only_its_own_profile(knowledge_ctx, tmp_path, monkeypatch):
     """THE OCCURRENCE IS A HARDCODED LITERAL, not a typo. Every crew's `-r` branch
-    in bin/co runs `knowledge-ctx use daytime --force`; an EA branch written by
+    in bin/co runs `knowledge-ctx use daytime --force`; a SATCHEL branch written by
     analogy with its siblings would resolve the wide platform profile, and
-    `--force` rmtrees agents/ and skills/ before installing it."""
+    `--force` rmtrees agents/ and skills/ before installing it.
+
+    `@pytest.mark.rich_registry`: the restriction now lives on the SATCHEL unit's
+    own `kb_profile_allowlist` field in the registry (CQ·587), not in this
+    file, so the small synthetic registry every other test gets by default
+    carries no such row."""
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
     check = knowledge_ctx.check_profile_allowed
-    product, _ = knowledge_ctx.detect_product(tmp_path / "EA")
-    assert product == "EA", "the allowlist keys on the directory name, capital-EA"
+    product, _ = knowledge_ctx.detect_product(tmp_path / "SATCHEL")
+    assert product == "SATCHEL", "the allowlist keys on the directory name, capital-SATCHEL"
 
     # The permitted one is permitted — without this the test below would pass
     # against a function that refused everything.
-    check("EA", "ea-daytime")
+    check("SATCHEL", "satchel-daytime")
 
     with pytest.raises(SystemExit) as exc:
-        check("EA", "daytime")
+        check("SATCHEL", "daytime")
     # A DISTINCT CODE FROM `NO_PROJECT_MAPPING`, whose own comment forbids
     # reusing it. "no mapping at all" tells `bin/co` to fall back safely;
     # "mapped fine, not allowed that profile" means a fallback is exactly
@@ -372,43 +487,46 @@ def test_ea_may_individuate_only_its_own_profile(knowledge_ctx, tmp_path, monkey
     assert exc.value.code == knowledge_ctx.PROFILE_NOT_ALLOWED
     assert knowledge_ctx.PROFILE_NOT_ALLOWED != knowledge_ctx.NO_PROJECT_MAPPING
     with pytest.raises(SystemExit):
-        check("EA", "overnight")
+        check("SATCHEL", "overnight")
 
 
+@pytest.mark.rich_registry
 def test_the_allowlist_restricts_the_directory_not_the_project(knowledge_ctx, tmp_path,
                                                                monkeypatch):
-    """EA maps to `platform`, and so does substrate. Keying the
+    """SATCHEL maps to `platform`, and so does substrate. Keying the
     restriction on the resolved PROJECT would forbid `platform/daytime` in
     substrate, where it is substrate's own profile and must keep working."""
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
-    assert knowledge_ctx.detect_project(tmp_path / "EA") == "platform"
+    assert knowledge_ctx.detect_project(tmp_path / "SATCHEL") == "platform"
     assert knowledge_ctx.detect_project(tmp_path / "substrate") == "platform"
 
     # Same project, opposite answers — this is the whole point of the split.
     knowledge_ctx.check_profile_allowed("substrate", "daytime")
     with pytest.raises(SystemExit):
-        knowledge_ctx.check_profile_allowed("EA", "daytime")
+        knowledge_ctx.check_profile_allowed("SATCHEL", "daytime")
 
 
 def test_an_unlisted_directory_is_unrestricted(knowledge_ctx):
     """Absent from the table means unrestricted, so this costs nothing anywhere
     else. A guard that refused by default would break every other crew."""
-    assert knowledge_ctx.allowed_profiles("vivy") is None
-    knowledge_ctx.check_profile_allowed("vivy", "daytime")
-    knowledge_ctx.check_profile_allowed("vivy", "anything-at-all")
+    assert knowledge_ctx.allowed_profiles("cartographer") is None
+    knowledge_ctx.check_profile_allowed("cartographer", "daytime")
+    knowledge_ctx.check_profile_allowed("cartographer", "anything-at-all")
 
 
-def test_the_ea_row_and_its_restriction_are_present_together(knowledge_ctx):
+@pytest.mark.rich_registry
+def test_the_satchel_row_and_its_restriction_are_present_together(knowledge_ctx):
     """The row and the restriction are only safe together: the row is what makes
-    the wide profile reachable from EA. Whichever is removed, this fails."""
+    the wide profile reachable from SATCHEL. Whichever is removed, this fails."""
     import projects
-    assert projects.EXPLICIT_PROJECT_BY_NAME.get("EA") == "platform", (
-        "EA must map to platform or its own profile is unreachable")
-    assert knowledge_ctx.allowed_profiles("EA") == {"ea-daytime"}, (
-        "the EA row without the allowlist entry reopens platform/daytime to a "
+    assert projects.EXPLICIT_PROJECT_BY_NAME.get("SATCHEL") == "platform", (
+        "SATCHEL must map to platform or its own profile is unreachable")
+    assert knowledge_ctx.allowed_profiles("SATCHEL") == {"satchel-daytime"}, (
+        "the SATCHEL row without the allowlist entry reopens platform/daytime to a "
         "crew holding personal correspondence")
 
 
+@pytest.mark.rich_registry
 def test_the_use_path_actually_calls_the_guard(knowledge_ctx, tmp_path, monkeypatch):
     """THROUGH `main()`, NOT THE HELPER. The four tests above call
     `check_profile_allowed` directly, so all of them would stay green if the call
@@ -418,78 +536,86 @@ def test_the_use_path_actually_calls_the_guard(knowledge_ctx, tmp_path, monkeypa
     The refusal must land BEFORE `load_profile`, so this needs no index and no
     profile on disk: reaching either means the guard did not fire first."""
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
-    ea = tmp_path / "EA"
-    ea.mkdir()
-    monkeypatch.chdir(ea)
+    satchel = tmp_path / "SATCHEL"
+    satchel.mkdir()
+    monkeypatch.chdir(satchel)
 
     monkeypatch.setattr("sys.argv", ["knowledge-ctx", "use", "daytime"])
     with pytest.raises(SystemExit) as exc:
         knowledge_ctx.main()
     assert exc.value.code == knowledge_ctx.PROFILE_NOT_ALLOWED, (
-        "`use daytime` from EA must be refused by the guard, not fall through "
+        "`use daytime` from SATCHEL must be refused by the guard, not fall through "
         "to load_profile — and with the code that says WHY it was refused")
 
 
-def test_list_from_ea_does_not_advertise_the_wide_profile(knowledge_ctx, tmp_path,
+@pytest.mark.rich_registry
+def test_list_from_satchel_does_not_advertise_the_wide_profile(knowledge_ctx, tmp_path,
                                                           monkeypatch, capsys):
     """Listing a profile the directory may not use is an invitation to type it.
     `list` runs the same filter, so the two cannot disagree."""
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
-    ea = tmp_path / "EA"
-    ea.mkdir()
-    monkeypatch.chdir(ea)
+    satchel = tmp_path / "SATCHEL"
+    satchel.mkdir()
+    monkeypatch.chdir(satchel)
     monkeypatch.setattr(knowledge_ctx, "list_profiles",
-                        lambda project: ["daytime", "ea-daytime", "overnight"])
+                        lambda project: ["daytime", "satchel-daytime", "overnight"])
 
     monkeypatch.setattr("sys.argv", ["knowledge-ctx", "list"])
     assert knowledge_ctx.main() == 0
     out = capsys.readouterr().out
-    assert "ea-daytime" in out
-    assert "\n  daytime" not in out, "the wide profile must not be offered in EA"
+    assert "satchel-daytime" in out
+    assert "\n  daytime" not in out, "the wide profile must not be offered in SATCHEL"
     assert "overnight" not in out
 
 
-def test_a_dispatch_on_ea_never_reaches_a_profile_at_all(agentctl):
-    """EA IS LOCAL-RESOLVED, SO DISPATCH SKIPS INDIVIDUATION ENTIRELY, and an
+@pytest.mark.rich_registry
+def test_a_dispatch_on_satchel_never_reaches_a_profile_at_all(agentctl):
+    """SATCHEL IS LOCAL-RESOLVED, SO DISPATCH SKIPS INDIVIDUATION ENTIRELY, and an
     earlier revision of this PR did not know that.
 
-    It added a per-repo default so a spawn would ask for `ea-daytime` rather
+    It added a per-repo default so a spawn would ask for `satchel-daytime` rather
     than `platform/daytime`. That code was unreachable: `resolve_agent` returns
     `local: True` for every repo in LOCAL_AGENT_REPOS, `_spawn_dispatch` then
     uses the sentinel `<repo>/none` instead of calling `default_profile`, and
-    gates `activate_profile` on `not is_local`. So no dispatch on EA resolves a
-    profile or consults the allowlist (reviewer, PR #513 round 2).
+    gates `activate_profile` on `not (is_local or is_private)`. So no dispatch
+    on SATCHEL resolves a profile or consults the allowlist (reviewer, PR #513
+    round 2). `is_private` joined this gate later (the dispatch-defect fix
+    for a private crew's PLATFORM-role dispatch, platform/decisions/0043) —
+    SATCHEL is `is_local`, so it still takes the sentinel either way; this test
+    pins that SATCHEL's own route to it survived the OR being added, not that the
+    OR is absent.
 
     This pins the property the removed code misunderstood, so the next reader
     does not re-add it. Reads `_spawn_dispatch` (the function `cmd_spawn`
     delegates to as of the model-lane epic's slice 1,
     issue_01M35KQ8WTW8R3WSKXS81TV2DZ) rather than `cmd_spawn` itself, which is
     now a thin wrapper carrying none of this logic."""
-    assert "EA" in agentctl.LOCAL_AGENT_REPOS
+    assert "SATCHEL" in agentctl._local_agent_repos()
     src = inspect.getsource(agentctl._spawn_dispatch)
-    assert 'f"{repo}/none" if is_local else default_profile' in src, (
+    assert 'f"{repo}/none" if (is_local or is_private)' in src, (
         "_spawn_dispatch must take the sentinel for a local-resolved repo rather "
-        "than computing a profile; if this changed, EA dispatch now resolves one "
+        "than computing a profile; if this changed, SATCHEL dispatch now resolves one "
         "and the allowlist becomes reachable from it")
-    assert "if not is_local:\n        claude_md_blocked = activate_profile" in src, (
-        "individuation must stay gated on not is_local")
+    assert "elif not (is_local or is_private):\n        try:\n            claude_md_blocked = activate_profile" in src, (
+        "individuation must stay gated on not is_local (now OR'd with is_private)")
 
 
+@pytest.mark.rich_registry
 def test_the_default_profile_is_daytime_for_every_repo(agentctl, monkeypatch):
     """No per-repo override exists for THESE repos, and none should be
-    re-added for EA — see the test above for why it would be dead code there
-    (EA is local-resolved and never reaches `default_profile` at all).
+    re-added for SATCHEL — see the test above for why it would be dead code there
+    (SATCHEL is local-resolved and never reaches `default_profile` at all).
 
-    convivy-commercial is the one repo that DOES override the default (its
+    northwind-commercial is the one repo that DOES override the default (its
     product, `company`, has no `daytime` profile — see
-    test_default_profile_resolves_convivy_commercial_to_its_named_profile in
-    test_agentctl.py); that repo is a real dispatch target, unlike EA, so the
+    test_default_profile_resolves_northwind_commercial_to_its_named_profile in
+    test_agentctl.py); that repo is a real dispatch target, unlike SATCHEL, so the
     override is load-bearing rather than dead code."""
     from conftest import stub_profile_listing
     stub_profile_listing(agentctl, monkeypatch)
-    assert agentctl.default_profile("vivy", "reviewer") == "vivy/daytime"
+    assert agentctl.default_profile("finch", "reviewer") == "finch/daytime"
     assert agentctl.default_profile("substrate", "reviewer") == "platform/daytime"
-    assert agentctl.default_profile("EA", "reviewer") == "platform/daytime"
+    assert agentctl.default_profile("SATCHEL", "reviewer") == "platform/daytime"
 
 
 # --- the refusal must be the LAST thing a blocked run prints (2026-09-09) ---
@@ -554,7 +680,7 @@ def test_a_refused_individuation_says_so_last(knowledge_ctx):
     The exit code was correct throughout and is not what this fixes.
     """
     out, code = _run_piped(
-        "print('profile: placard/daytime')\n"
+        "print('profile: signpost/daytime')\n"
         "print('plan:    32 files')\n"
         "sys.exit(mod.abort('\\nX live Claude Code processes detected - aborting.\\n"
         "NOTHING WAS WRITTEN - the plan above was not applied.\\n', 2))\n"
@@ -1035,12 +1161,12 @@ def test_all_agent_and_skill_ids_reads_the_full_corpus_any_status(
     answer on a machine with no `~/.knowledge-index/index.db` at all."""
     _Library(knowledge_ctx, monkeypatch, tmp_path, docs=[
         _bdoc("shared/agents/coder", "agent", ""),
-        _bdoc("constance/agents/coder", "agent", ""),
+        _bdoc("outfitter/agents/coder", "agent", ""),
         _bdoc("shared/skills/triage-corrections-queue", "skill", ""),
         _bdoc("shared/decisions/0001-thing", "decision", ""),
     ])
     result = knowledge_ctx.all_agent_and_skill_ids()
-    assert result["agent"] == {"shared/agents/coder", "constance/agents/coder"}
+    assert result["agent"] == {"shared/agents/coder", "outfitter/agents/coder"}
     assert result["skill"] == {"shared/skills/triage-corrections-queue"}
 
 
@@ -1169,7 +1295,7 @@ def test_individuate_force_deletes_and_names_an_orphan_with_no_source_anywhere(
     ])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1210,7 +1336,7 @@ def test_individuate_non_force_blocks_an_orphan_absent_from_any_previous_manifes
     # deliberately no `.materialized` written — first-ever individuation
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1242,7 +1368,7 @@ def test_individuate_leaves_alone_a_file_whose_document_still_exists_elsewhere(
     known_ids = {"agent": {"shared/agents/other"},
                 "skill": {"shared/skills/triage-corrections-queue"}}
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False, known_ids=known_ids,
     )
@@ -1266,7 +1392,7 @@ def test_individuate_skips_orphan_detection_when_known_ids_is_none(
     stray.write_text("untouched without known_ids\n")
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False,
     )
@@ -1308,7 +1434,7 @@ def test_an_empty_index_refuses_all_deletion_and_says_why(
                     [".active-profile", ".materialized", ".profile-documents.json"])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False, known_ids={"agent": set(), "skill": set()},
     )
@@ -1347,7 +1473,7 @@ def test_force_mode_leaves_a_symlinked_skill_and_its_target_alone(
     _write_manifest(knowledge_ctx, target / ".claude", ["skills/evil-link/SKILL.md"])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1380,7 +1506,7 @@ def test_a_git_tracked_orphan_survives_and_is_reported(
     # from_any_previous_manifest for why a manifest listing an orphan the
     # fresh plan doesn't own always conflicts in non-force mode regardless.
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1421,7 +1547,7 @@ def test_an_orphan_absent_from_the_previous_manifest_survives(
                     [".active-profile", ".materialized", ".profile-documents.json"])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1455,7 +1581,7 @@ def test_an_orphan_that_clears_every_gate_is_removed_and_named(
     # deliberately not `git add`ed — untracked in a real git repo
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1509,7 +1635,7 @@ def test_a_dry_run_with_orphan_detection_escapes_a_newline_in_a_planted_filename
     # echo, and the one the round 5 finding named.
 
     rc, current = _individuate_with_signal(
-        knowledge_ctx, project="constance", profile_name="commercial",
+        knowledge_ctx, project="outfitter", profile_name="commercial",
         profile={}, target_repo=target, rows=[], force=False,
         force_anyway=False, dry_run=True, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1547,15 +1673,15 @@ def test_inventory_matches_by_slug_and_lists_unmatched(
     matched to its source id, with unmatched ones called out — the read-only
     tool the epic asks for, run by hand against this machine for the PR body."""
     convivy = tmp_path / "Convivy"
-    (convivy / "constance-commercial" / ".claude" / "agents").mkdir(parents=True)
-    (convivy / "constance-commercial" / ".claude" / "agents" / "coder.md").write_text("x")
-    (convivy / "constance-commercial" / ".claude" / "skills" / "start-overnight").mkdir(
+    (convivy / "outfitter-commercial" / ".claude" / "agents").mkdir(parents=True)
+    (convivy / "outfitter-commercial" / ".claude" / "agents" / "coder.md").write_text("x")
+    (convivy / "outfitter-commercial" / ".claude" / "skills" / "start-overnight").mkdir(
         parents=True)
-    (convivy / "constance-commercial" / ".claude" / "skills" / "start-overnight" /
+    (convivy / "outfitter-commercial" / ".claude" / "skills" / "start-overnight" /
      "SKILL.md").write_text("orphan")
-    (convivy / "worktrees" / "vivy.overnight" / ".claude" / "skills" /
+    (convivy / "worktrees" / "cartographer.overnight" / ".claude" / "skills" /
      "rollover").mkdir(parents=True)
-    (convivy / "worktrees" / "vivy.overnight" / ".claude" / "skills" / "rollover" /
+    (convivy / "worktrees" / "cartographer.overnight" / ".claude" / "skills" / "rollover" /
      "SKILL.md").write_text("matched")
 
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", convivy)
@@ -1567,11 +1693,11 @@ def test_inventory_matches_by_slug_and_lists_unmatched(
     rc = knowledge_ctx.inventory()
     assert rc == 0
     out = capsys.readouterr().out
-    assert "constance-commercial\tagent\tcoder\tshared/agents/coder" in out
-    assert "vivy.overnight\tskill\trollover\tshared/skills/rollover" in out
-    assert "constance-commercial\tskill\tstart-overnight\tUNMATCHED" in out
+    assert "outfitter-commercial\tagent\tcoder\tshared/agents/coder" in out
+    assert "cartographer.overnight\tskill\trollover\tshared/skills/rollover" in out
+    assert "outfitter-commercial\tskill\tstart-overnight\tUNMATCHED" in out
     assert "1 unmatched" in out
-    assert str(convivy / "constance-commercial" / ".claude" / "skills" /
+    assert str(convivy / "outfitter-commercial" / ".claude" / "skills" /
                "start-overnight" / "SKILL.md") in out
 
 
@@ -1582,7 +1708,7 @@ def test_inventory_marks_unmatched_files_with_tracked_symlink_manifest_flags(
     tell "a render would actually remove this" from "a render would report
     and leave it" — a bare UNMATCHED tag can't distinguish those."""
     convivy = tmp_path / "Convivy"
-    ws = convivy / "constance-commercial"
+    ws = convivy / "outfitter-commercial"
     claude_dir = ws / ".claude"
     (claude_dir / "agents").mkdir(parents=True)
     tracked = claude_dir / "agents" / "tracked.md"
@@ -1650,7 +1776,7 @@ def test_a_source_still_on_disk_survives_a_mid_reconcile_index_gap(
     # `known_ids` (the index) has no entry for start-overnight at all — the
     # reconcile-gap shape — while the source .md is still on disk.
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1680,7 +1806,7 @@ def test_an_orphan_gone_from_disk_and_index_is_still_removed(
     _write_manifest(knowledge_ctx, target / ".claude", ["skills/start-overnight/SKILL.md"])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1716,7 +1842,7 @@ def test_a_missing_knowledge_root_on_disk_refuses_deletion_and_says_why(
                     [".active-profile", ".materialized", ".profile-documents.json"])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -1782,7 +1908,7 @@ def test_force_still_clears_a_stray_whose_document_exists_elsewhere(
     known_ids = {"agent": {"shared/agents/other"},
                 "skill": {"shared/skills/triage-corrections-queue"}}
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=known_ids,
     )
@@ -2140,7 +2266,7 @@ def test_individuate_skips_the_disk_walk_when_nothing_is_unattributed(
     # correctly empty either way, so this also confirms the skip doesn't
     # itself cause a false orphan report.
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -2181,7 +2307,7 @@ def test_individuate_still_walks_disk_when_a_candidate_exists(
     monkeypatch.setattr(knowledge_ctx, "_known_ids_from_disk", spy)
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -2392,7 +2518,7 @@ def test_a_source_appearing_mid_render_survives_the_reverify(
     monkeypatch.setattr(knowledge_ctx, "live_claude_processes_in", plant_then_check)
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -2458,7 +2584,7 @@ def test_an_oversized_frontmatter_on_disk_blocks_deletion_rather_than_hiding_it(
                     [".active-profile", ".materialized", ".profile-documents.json"])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=False, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -2668,7 +2794,7 @@ def test_individuate_treats_a_crlf_source_as_present_and_blocks_the_candidate(
     _write_manifest(knowledge_ctx, target / ".claude", ["skills/start-overnight/SKILL.md"])
 
     rc = knowledge_ctx.individuate(
-        project="constance", profile_name="commercial", profile={},
+        project="outfitter", profile_name="commercial", profile={},
         target_repo=target, rows=[], force=True, force_anyway=False,
         dry_run=False, known_ids=_TRUSTED_KNOWN_IDS,
     )
@@ -2742,7 +2868,7 @@ _DECLARED_ROLES = {
     "agent-platform/agents/coder": "coder",
     "agent-platform/agents/platform-coder": "coder",
     "deck/agents/deck-coder": "coder",
-    "selector/agents/sel-reviewer": "reviewer",
+    "beacon/agents/sel-reviewer": "reviewer",
     "write-better/agents/wb-reviewer": "writing-reviewer",
 }
 
@@ -2787,7 +2913,7 @@ def test_fleet_scope_binds_every_session_with_no_selectors(knowledge_ctx):
     for crew, agent, kind in [
         (None, None, "interactive"),
         ("bosun", "reviewer", "dispatched"),
-        ("selector", "wb-reviewer", "dispatched"),
+        ("beacon", "wb-reviewer", "dispatched"),
     ]:
         assert knowledge_ctx._instruction_block_binds(
             fm, crew=crew, agent=agent, session_kind=kind)
@@ -2853,7 +2979,7 @@ def test_an_agent_with_no_document_binds_no_binds_agents_block(knowledge_ctx):
     into a role."""
     fm = {"scope": "agent", "binds_agents": ["reviewer"]}
     assert not knowledge_ctx._instruction_block_binds(
-        fm, crew=None, agent="svc-reviewer", session_kind="dispatched")
+        fm, crew=None, agent="ghost-reviewer", session_kind="dispatched")
 
 
 def test_a_bare_name_whose_documents_disagree_fails_the_render(knowledge_ctx, capsys):
@@ -2944,8 +3070,8 @@ def test_resolve_instruction_blocks_ignores_non_current_status_when_excluded_any
     """A block that does NOT bind this session is excluded on selector
     grounds alone, whatever its status — only a block this session was
     actually going to receive triggers the fail-closed abort."""
-    rows = [_ib_row("selector/instruction-blocks/other-crew-only", scope="crew",
-                    binds_crews=["selector"], status="deprecated")]
+    rows = [_ib_row("beacon/instruction-blocks/other-crew-only", scope="crew",
+                    binds_crews=["beacon"], status="deprecated")]
     resolved = knowledge_ctx.resolve_instruction_blocks(
         rows, crew="bosun", agent=None, session_kind="interactive")
     assert resolved == []
@@ -3571,7 +3697,7 @@ def _index_with_instruction_blocks(db: pathlib.Path) -> None:
         ("platform/instruction-blocks/working-with-the-operator",
          "End on one concrete proposal.\n",
          {"scope": "crew", "binds_sessions": ["interactive"]}),
-        # The product `convivy-deck` resolves to crew `deck`; its PROJECT,
+        # The product `northwind-deck` resolves to crew `deck`; its PROJECT,
         # `deck`, resolves to no crew at all. So this block binds only if
         # `main()` passes the PRODUCT to `crew_for_repo`, which is what makes
         # the product/project distinction observable at all.
@@ -3634,12 +3760,12 @@ def _run_use_through_main(knowledge_ctx, tmp_path, monkeypatch, db, argv,
     keep their meaning) writes a manifest naming the sandbox's CLAUDE.md;
     `cut_over=False` leaves the sandbox without one.
 
-    COUPLED TO THE REAL `config/projects.json`, deliberately and not
+    COUPLED TO THE REAL PROJECT REGISTRY, deliberately and not
     incidentally: `crew_for_repo` is not monkeypatched, so the `deck` crew
-    that `convivy-deck` resolves to is the registry's own. That coupling is
+    that `northwind-deck` resolves to is the registry's own. That coupling is
     the fixture's whole point — a stubbed crew map would make the
     product/project distinction unobservable again — but it is worth stating,
-    because renaming the `deck` crew or moving `convivy-deck` out of its
+    because renaming the `deck` crew or moving `northwind-deck` out of its
     `repos` list will fail these tests from another file with nothing linking
     the two. The registry is only READ here; nothing outside `tmp_path` is
     written.
@@ -3656,7 +3782,7 @@ def _run_use_through_main(knowledge_ctx, tmp_path, monkeypatch, db, argv,
     elif manifest.exists():
         manifest.unlink()
 
-    # The product is `convivy-deck` and its project is `deck` — DELIBERATELY a
+    # The product is `northwind-deck` and its project is `deck` — DELIBERATELY a
     # pair that disagrees, so the render depends on which of the two reaches
     # `crew_for_repo`. Some `projects.EXPLICIT_PROJECT_BY_NAME` rows diverge this
     # way; a fixture drawn from the rows that do not cannot tell them apart.
@@ -3664,7 +3790,7 @@ def _run_use_through_main(knowledge_ctx, tmp_path, monkeypatch, db, argv,
     _Library(knowledge_ctx, monkeypatch, tmp_path)
 
     # Callable twice in one test (a dispatched render, then an interactive one).
-    product_dir = tmp_path / "convivy-deck"
+    product_dir = tmp_path / "northwind-deck"
     if not product_dir.exists():
         product_dir.mkdir()
         _git_init(product_dir)
@@ -3675,6 +3801,7 @@ def _run_use_through_main(knowledge_ctx, tmp_path, monkeypatch, db, argv,
     return (product_dir / ".claude" / "CLAUDE.md").read_text()
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_with_an_agent_renders_a_dispatched_session_through_main(
         knowledge_ctx, tmp_path, monkeypatch):
     """THROUGH `main()`, NOT `resolve_instruction_blocks`. Every other
@@ -3686,7 +3813,7 @@ def test_use_with_an_agent_renders_a_dispatched_session_through_main(
     planted and caught here: inverting the `session_kind` ternary, dropping
     `args.agent` from the `resolve_instruction_blocks` call, passing no crew,
     and passing `project` where `crew_for_repo` wants `product`. The last is
-    why this renders `convivy-deck` rather than a repo whose product and
+    why this renders `northwind-deck` rather than a repo whose product and
     project share a name — most `projects.EXPLICIT_PROJECT_BY_NAME` rows resolve
     to the same crew either way, so a fixture drawn from those cannot tell the two
     arguments apart, and a test written on one would pass whichever was
@@ -3712,6 +3839,7 @@ def test_use_with_an_agent_renders_a_dispatched_session_through_main(
     assert "platform/instruction-blocks/working-with-the-operator" not in text
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_without_an_agent_renders_an_interactive_session_through_main(
         knowledge_ctx, tmp_path, monkeypatch):
     """The other half of the same ternary: no `--agent` is a crew session, so
@@ -4013,7 +4141,7 @@ def test_check_exits_1_naming_a_blocks_changed_body(
     _, db = _render_for_check(knowledge_ctx, tmp_path, monkeypatch, instruction_blocks=[
         (block_id, "Say what you ran.\n", {"scope": "fleet"}),
     ])
-    # The rule was replaced (the vivy-commercial occurrence this fixes:
+    # The rule was replaced (the cartographer-commercial occurrence this fixes:
     # platform/decisions/0083 replaced a review-round rule, in place, at the
     # same id) — not added or removed, so the comparison must say "changed",
     # not "+"/"-".
@@ -4108,18 +4236,18 @@ def test_check_exits_3_when_the_profile_no_longer_resolves(
 
 def test_check_refuses_a_disallowed_profile_before_resolving_it(
         knowledge_ctx, tmp_path, monkeypatch):
-    """EA may only ever individuate `ea-daytime` (the allowlist tests above).
+    """SATCHEL may only ever individuate `satchel-daytime` (the allowlist tests above).
     `cmd_use` enforces that through `check_profile_allowed` before
     `load_profile`; `check` must refuse the same way from the same
     workspace-writable `.active-profile` marker, rather than silently
     resolving and diffing a profile this directory is forbidden to use
     (security-reviewer, PR #835 round 1)."""
     monkeypatch.setattr(knowledge_ctx, "CONVIVY", tmp_path)
-    ea = tmp_path / "EA"
-    (ea / ".claude").mkdir(parents=True)
-    (ea / ".claude" / ".active-profile").write_text("platform/daytime\n")
-    (ea / ".claude" / ".profile-documents.json").write_text("{}")
-    monkeypatch.chdir(ea)
+    satchel = tmp_path / "SATCHEL"
+    (satchel / ".claude").mkdir(parents=True)
+    (satchel / ".claude" / ".active-profile").write_text("platform/daytime\n")
+    (satchel / ".claude" / ".profile-documents.json").write_text("{}")
+    monkeypatch.chdir(satchel)
 
     load_profile_calls = []
     monkeypatch.setattr(knowledge_ctx, "load_profile",
@@ -4132,21 +4260,21 @@ def test_check_refuses_a_disallowed_profile_before_resolving_it(
         "load_profile, not after resolving the disallowed profile")
 
 
-def test_check_refuses_a_marker_naming_ea_from_an_unrestricted_workspace(
+def test_check_refuses_a_marker_naming_satchel_from_an_unrestricted_workspace(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
-    """The reverse of the test above: there the CALLING directory was EA and
+    """The reverse of the test above: there the CALLING directory was SATCHEL and
     the marker named a wider profile; here the calling directory
     (`agent-platform`) is unrestricted, so `check_profile_allowed` is a
     no-op for whatever `profile_name` the marker names, and the only thing
-    standing between an unrestricted workspace and EA's own profile is
-    `project` itself. Rewriting `.active-profile` to name EA — the
+    standing between an unrestricted workspace and SATCHEL's own profile is
+    `project` itself. Rewriting `.active-profile` to name SATCHEL — the
     platform's black box (platform/decisions/0043) — must not make `check`
-    fetch and print EA's profile; `cmd_use` can never be pointed at a
+    fetch and print SATCHEL's profile; `cmd_use` can never be pointed at a
     project the marker names, because it only ever resolves `project` from
     cwd, and `check` must refuse the same way before any `load_profile` call
     (security-reviewer, PR #835 round 3)."""
     product_dir, _ = _render_for_check(knowledge_ctx, tmp_path, monkeypatch)
-    (product_dir / ".claude" / ".active-profile").write_text("EA/ea-daytime\n")
+    (product_dir / ".claude" / ".active-profile").write_text("SATCHEL/satchel-daytime\n")
 
     load_profile_calls = []
     monkeypatch.setattr(knowledge_ctx, "load_profile",
@@ -4161,9 +4289,9 @@ def test_check_refuses_a_marker_naming_ea_from_an_unrestricted_workspace(
 
 def test_check_refuses_a_marker_naming_any_other_project_than_cwd_resolves_to(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
-    """Same gap as the test above, generalized past the EA literal: the
+    """Same gap as the test above, generalized past the SATCHEL literal: the
     mismatch check must compare `project` against what cwd itself resolves
-    to, not special-case EA's name, since any directory could have its
+    to, not special-case SATCHEL's name, since any directory could have its
     marker rewritten to name any OTHER project it has no claim to."""
     product_dir, _ = _render_for_check(knowledge_ctx, tmp_path, monkeypatch)
     (product_dir / ".claude" / ".active-profile").write_text(
@@ -4359,7 +4487,7 @@ class _Library:
         tokens = tmp_path / "client-tokens.json"
         tokens.write_text(json.dumps({_BUNDLE_TOKEN: {"name": "bosun", "products": ["*"]},
                                       "other-token": {"name": "deck", "products": ["*"]}}))
-        monkeypatch.setattr(knowledge_ctx, "LIBRARY_CLIENT_TOKENS", tokens)
+        monkeypatch.setenv(knowledge_ctx.LIBRARY_CLIENT_TOKENS_ENV, str(tokens))
         monkeypatch.setattr(knowledge_ctx, "_library_open", self._open)
 
     def _open(self, req):
@@ -4588,12 +4716,71 @@ def test_library_open_waits_the_full_60s_before_giving_up(knowledge_ctx, monkeyp
 def test_a_missing_credential_refuses_without_printing_any_token(
         knowledge_ctx, tmp_path, monkeypatch):
     lib = _Library(knowledge_ctx, monkeypatch, tmp_path)
-    knowledge_ctx.LIBRARY_CLIENT_TOKENS.write_text(
+    (tmp_path / "client-tokens.json").write_text(
         json.dumps({"other-token": {"name": "deck", "products": ["*"]}}))
     with pytest.raises(knowledge_ctx.BundleRefused) as ei:
         knowledge_ctx.fetch_bundle("platform-coder", repo="agent-platform", variant="daytime")
     assert "bosun" in str(ei.value) and "other-token" not in str(ei.value)
     assert lib.calls == []
+
+
+# --- where the Library client-token file resolves (issue_01M6A7CBACJG5XTR1JK4WH6PRQ):
+# the LIBRARY_CLIENT_TOKENS env var, else ~/.library/client-tokens.json, else
+# ~/.local/state/library/client-tokens.json ----------------------------------------
+
+
+def _write_tokens(path, name="bosun"):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"tok": {"name": name, "products": ["*"]}}))
+
+
+def test_library_client_tokens_env_var_wins_over_either_default_location(
+        knowledge_ctx, tmp_path, monkeypatch):
+    monkeypatch.setattr(knowledge_ctx.BR, "real_account_home", lambda: tmp_path)
+    _write_tokens(tmp_path / ".library" / "client-tokens.json", name="dot-library")
+    _write_tokens(tmp_path / ".local" / "state" / "library" / "client-tokens.json",
+                  name="state-dir")
+    env_tokens = tmp_path / "elsewhere" / "client-tokens.json"
+    _write_tokens(env_tokens, name="bosun")
+    monkeypatch.setenv(knowledge_ctx.LIBRARY_CLIENT_TOKENS_ENV, str(env_tokens))
+    assert knowledge_ctx._library_client_tokens_candidates() == [env_tokens]
+    assert knowledge_ctx._library_token() == "tok"
+
+
+def test_library_client_tokens_falls_back_to_dot_library_when_env_unset(
+        knowledge_ctx, tmp_path, monkeypatch):
+    monkeypatch.delenv(knowledge_ctx.LIBRARY_CLIENT_TOKENS_ENV, raising=False)
+    monkeypatch.setattr(knowledge_ctx.BR, "real_account_home", lambda: tmp_path)
+    dot_library = tmp_path / ".library" / "client-tokens.json"
+    _write_tokens(dot_library, name="bosun")
+    _write_tokens(tmp_path / ".local" / "state" / "library" / "client-tokens.json",
+                  name="state-dir")
+    assert knowledge_ctx._library_token() == "tok"
+    candidates = knowledge_ctx._library_client_tokens_candidates()
+    assert next(c for c in candidates if c.exists()) == dot_library
+
+
+def test_library_client_tokens_falls_back_to_state_dir_when_dot_library_is_absent(
+        knowledge_ctx, tmp_path, monkeypatch):
+    monkeypatch.delenv(knowledge_ctx.LIBRARY_CLIENT_TOKENS_ENV, raising=False)
+    monkeypatch.setattr(knowledge_ctx.BR, "real_account_home", lambda: tmp_path)
+    state_tokens = tmp_path / ".local" / "state" / "library" / "client-tokens.json"
+    _write_tokens(state_tokens, name="bosun")
+    assert not (tmp_path / ".library" / "client-tokens.json").exists()
+    assert knowledge_ctx._library_token() == "tok"
+    candidates = knowledge_ctx._library_client_tokens_candidates()
+    assert next(c for c in candidates if c.exists()) == state_tokens
+
+
+def test_library_client_tokens_refuses_naming_both_paths_when_neither_exists(
+        knowledge_ctx, tmp_path, monkeypatch):
+    monkeypatch.delenv(knowledge_ctx.LIBRARY_CLIENT_TOKENS_ENV, raising=False)
+    monkeypatch.setattr(knowledge_ctx.BR, "real_account_home", lambda: tmp_path)
+    with pytest.raises(knowledge_ctx.BundleRefused) as ei:
+        knowledge_ctx._library_token()
+    msg = str(ei.value)
+    assert str(tmp_path / ".library" / "client-tokens.json") in msg
+    assert str(tmp_path / ".local" / "state" / "library" / "client-tokens.json") in msg
 
 
 def test_the_bundle_request_goes_to_the_librarys_own_address(
@@ -4826,15 +5013,20 @@ def test_an_agent_with_no_bundle_trigger_renders_its_body_derived_first_sentence
 
 
 def _linked_worktree(tmp_path) -> pathlib.Path:
-    """`convivy-deck` as a LINKED worktree — the tree `agentctl spawn` owns,
+    """`northwind-deck` as a LINKED worktree — the tree `agentctl spawn` owns,
     where `.git` is a file — beside a primary checkout with a real commit."""
-    primary = tmp_path / "convivy-deck"
+    primary = tmp_path / "northwind-deck"
     primary.mkdir()
     _git_init(primary)
+    # Git's detached auto-maintenance after a commit briefly holds
+    # objects/maintenance.lock, which races a test that later rmtrees this
+    # primary's `.git`.
+    subprocess.run(["git", "config", "maintenance.auto", "false"], cwd=primary, check=True)
+    subprocess.run(["git", "config", "gc.auto", "0"], cwd=primary, check=True)
     (primary / "README").write_text("x\n")
     subprocess.run(["git", "add", "README"], cwd=primary, check=True)
     subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=primary, check=True)
-    wt = tmp_path / "worktrees" / "convivy-deck.spawn"
+    wt = tmp_path / "worktrees" / "northwind-deck.spawn"
     wt.parent.mkdir()
     subprocess.run(["git", "worktree", "add", "-q", "--detach", str(wt)],
                    cwd=primary, check=True)
@@ -4898,6 +5090,7 @@ def _own_docs():
     return [_agent_doc("deck-coder"), _skill_doc("skill-0"), _skill_doc("skill-1")]
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_an_agent_render_writes_only_the_bundle_and_never_reads_the_checkout(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     wt = _linked_worktree(tmp_path)
@@ -4923,6 +5116,7 @@ def test_an_agent_render_writes_only_the_bundle_and_never_reads_the_checkout(
     assert len([c for c in lib.calls if c[0] == "/bundles"]) == 1
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_use_with_an_agent_does_not_double_deliver_a_bound_block(
         knowledge_ctx, tmp_path, monkeypatch):
     """The `--agent` dispatch path already composes a `binds_roles` block
@@ -4953,6 +5147,7 @@ def test_use_with_an_agent_does_not_double_deliver_a_bound_block(
     assert "instruction blocks bound to this agent" not in agent_md
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_narrowed_force_render_removes_the_wide_renders_and_is_not_refused_by_the_orphan_gate(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     """THE HAZARD, worked through. The 11 files a narrowed render stops writing
@@ -4992,6 +5187,7 @@ def test_a_narrowed_force_render_removes_the_wide_renders_and_is_not_refused_by_
     assert not ghost.exists()
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_narrowed_render_without_force_refuses_over_a_wide_one_and_deletes_nothing(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     """Without `--force` (a human at a terminal, not spawn) the manifest a wide
@@ -5031,6 +5227,7 @@ def test_a_refused_bundle_writes_nothing_and_does_not_fall_back_to_the_index(
     assert not (wt / ".claude" / ".active-profile").exists()
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_crew_session_renders_the_library_profile_and_never_asks_for_a_bundle(
         knowledge_ctx, tmp_path, monkeypatch):
     """A crew session has no `--agent`, so it renders the whole profile. The profile
@@ -5048,13 +5245,14 @@ def test_a_crew_session_renders_the_library_profile_and_never_asks_for_a_bundle(
     assert [c for c in lib.calls if c[0] == "/bundles"] == []
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_an_agent_render_into_a_primary_checkout_keeps_the_profile_render(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     """`planner`/`curator` resolve into the operator's own clone. A narrowed
     `--force` there would delete the sibling agents and skills from under the co
     session working in it. The profile comes from the Library; no bundle is issued."""
     _linked_worktree(tmp_path)
-    primary = tmp_path / "convivy-deck"
+    primary = tmp_path / "northwind-deck"
     assert (primary / ".git").is_dir()
     _seed_render_env(knowledge_ctx, tmp_path, monkeypatch, [])
     lib = _Library(knowledge_ctx, monkeypatch, tmp_path)
@@ -5071,6 +5269,7 @@ def test_an_agent_render_into_a_primary_checkout_keeps_the_profile_render(
 
 
 @pytest.mark.parametrize("what", ["absent", "directory", "not-a-gitdir-file"])
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_tree_that_is_not_provably_a_linked_worktree_keeps_the_profile_render(
         knowledge_ctx, tmp_path, monkeypatch, capsys, what):
     """CANNOT TELL MUST FALL TO THE PROFILE RENDER, and the first version of the
@@ -5091,7 +5290,7 @@ def test_a_tree_that_is_not_provably_a_linked_worktree_keeps_the_profile_render(
     # The PRIMARY that `_linked_worktree` builds, so the render environment is
     # the same one the sibling tests use; only its `.git` varies.
     _linked_worktree(tmp_path)
-    tree = tmp_path / "convivy-deck"
+    tree = tmp_path / "northwind-deck"
     if what == "absent":
         shutil.rmtree(tree / ".git")
     elif what == "not-a-gitdir-file":
@@ -5099,7 +5298,7 @@ def test_a_tree_that_is_not_provably_a_linked_worktree_keeps_the_profile_render(
         # A SUBMODULE'S REAL POINTER, not invented text. The first version wrote
         # "this is not a gitdir pointer", which no real tree contains, so the row
         # passed while the shape it named stayed accepted (both reviewers, #630).
-        (tree / ".git").write_text("gitdir: ../.git/modules/convivy-deck\n")
+        (tree / ".git").write_text("gitdir: ../.git/modules/northwind-deck\n")
     # "directory" is the primary as git left it.
 
     _seed_render_env(knowledge_ctx, tmp_path, monkeypatch, [])
@@ -5238,6 +5437,7 @@ def test_the_worktree_probe_against_trees_git_itself_built(knowledge_ctx, tmp_pa
         pytest.skip(f"git refused the submodule add: {added.stderr.strip()[:120]}")
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_issue_without_an_agent_is_refused(knowledge_ctx, tmp_path, monkeypatch):
     wt = _linked_worktree(tmp_path)
     _seed_render_env(knowledge_ctx, tmp_path, monkeypatch, [])
@@ -5245,6 +5445,7 @@ def test_issue_without_an_agent_is_refused(knowledge_ctx, tmp_path, monkeypatch)
     assert _run_main(knowledge_ctx, monkeypatch, wt, ["--issue", "issue_X"]) == 1
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_an_agent_render_scopes_the_bundle_to_the_issue_it_was_given(
         knowledge_ctx, tmp_path, monkeypatch):
     wt = _linked_worktree(tmp_path)
@@ -5473,10 +5674,11 @@ def test_floor_requires_an_explicit_output(
 # --- floor slice 2: the targeted render drops fleet blocks --------------------
 # (issue_01M3ABW3HN0J8N154YZMM8Y6G5)
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_render_composes_no_fleet_block_for_an_interactive_session(
         knowledge_ctx, tmp_path, monkeypatch):
     """Red on origin/main: `_instruction_block_binds` returned True on
-    `scope: fleet` before any selector check, so `use` composed every fleet
+    `scope: fleet` before any beacon check, so `use` composed every fleet
     block. The non-fleet control proves the render composed something at all."""
     db = tmp_path / "index.db"
     _index_with_instruction_blocks(db)
@@ -5490,6 +5692,7 @@ def test_use_render_composes_no_fleet_block_for_an_interactive_session(
 
 
 @pytest.mark.parametrize("agent", ["reviewer", "coder"])
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_render_composes_every_fleet_block_for_a_dispatched_run(
         knowledge_ctx, tmp_path, monkeypatch, agent):
     """A dispatched run's own claude never reads the floor once
@@ -5518,6 +5721,7 @@ def _fleet_ids_in(text):
             if f"instruction-blocks/{i}" in text]
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_targeted_render_composes_fleet_blocks_before_the_cutover(
         knowledge_ctx, tmp_path, monkeypatch):
     """No manifest: `~/.claude/CLAUDE.md` is still hand-written and lacks two
@@ -5550,6 +5754,7 @@ def test_targeted_render_composes_fleet_blocks_before_the_cutover(
         "composed": True, "reason": "a dispatched run does not read the floor"}
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_targeted_render_drops_fleet_blocks_once_the_manifest_names_the_floor(
         knowledge_ctx, tmp_path, monkeypatch):
     db = tmp_path / "index.db"
@@ -5563,6 +5768,7 @@ def test_targeted_render_drops_fleet_blocks_once_the_manifest_names_the_floor(
         "composed": False, "reason": "floor cut over"}
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_a_manifest_naming_another_path_is_not_a_cutover(
         knowledge_ctx, tmp_path, monkeypatch):
     """The manifest must name `~/.claude/CLAUDE.md` itself. One for a floor
@@ -5575,7 +5781,7 @@ def test_a_manifest_naming_another_path_is_not_a_cutover(
     _cut_over_floor(tmp_path / "home", output=tmp_path / "elsewhere" / "CLAUDE.md")
     monkeypatch.setattr("sys.argv", argv)
     assert knowledge_ctx.main() == 0
-    text = (tmp_path / "convivy-deck" / ".claude" / "CLAUDE.md").read_text()
+    text = (tmp_path / "northwind-deck" / ".claude" / "CLAUDE.md").read_text()
     assert _fleet_ids_in(text) == ["verify-before-you-report"]
     assert _read_profile_record(tmp_path)["fleet_blocks"]["composed"] is True
 
@@ -5590,6 +5796,7 @@ def test_an_unreadable_manifest_is_not_a_cutover(knowledge_ctx, tmp_path, monkey
     assert knowledge_ctx.floor_cut_over() is False
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_a_retired_fleet_block_does_not_fail_a_targeted_render(
         knowledge_ctx, tmp_path, monkeypatch):
     """Red on origin/main: `resolve_instruction_blocks` died on `status !=
@@ -5605,6 +5812,7 @@ def test_a_retired_fleet_block_does_not_fail_a_targeted_render(
     assert "retired-rule" not in text
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_floor_render_still_fails_closed_on_a_retired_fleet_block(
         knowledge_ctx, floor_env, tmp_path, monkeypatch, capsys):
     """The pair to the test above. The safety property moved rather than went
@@ -5641,9 +5849,10 @@ def test_resolve_instruction_blocks_keeps_fleet_by_default(knowledge_ctx):
 
 def _read_profile_record(tmp_path):
     return json.loads(
-        (tmp_path / "convivy-deck" / ".claude" / ".profile-documents.json").read_text())
+        (tmp_path / "northwind-deck" / ".claude" / ".profile-documents.json").read_text())
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_profile_documents_records_each_composed_block_and_hash(
         knowledge_ctx, tmp_path, monkeypatch):
     """Red on origin/main: `documents` was built from profile rows only and
@@ -5689,11 +5898,12 @@ def _add_writing_standard_blocks(db):
         _insert_instruction_block_row(db, doc_id, _import_line(db), fm)
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_profile_documents_states_why_a_writing_standard_was_not_composed(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     """Red on origin/main: no `writing_standards` field. A dispatched coder is
     the case that drops both standards, each for a different reason; the same
-    index rendered for an interactive session composes both, so a selector
+    index rendered for an interactive session composes both, so a beacon
     that matched nobody could not produce the coder's record."""
     db = tmp_path / "index.db"
     _index_with_instruction_blocks(db)
@@ -5728,6 +5938,7 @@ def test_profile_documents_states_why_a_writing_standard_was_not_composed(
     assert "writing standard write-better: composed via" in capsys.readouterr().err
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_a_fleet_writing_standard_says_the_floor_delivers_it(
         knowledge_ctx, tmp_path, monkeypatch):
     """A candidate authored `scope: fleet` is dropped by a cut-over render; the
@@ -5832,6 +6043,7 @@ def test_session_topics_a_failed_lookup_is_visibly_distinct_from_no_topics(
     assert knowledge_ctx.session_topics("issue_X") == (frozenset(), "error:404")
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_with_a_matching_item_composes_a_topic_bound_block_through_main(
         knowledge_ctx, tmp_path, monkeypatch):
     """Red on origin/main: `main()` passed no `topics=` at all, so this block
@@ -5851,6 +6063,7 @@ def test_use_with_a_matching_item_composes_a_topic_bound_block_through_main(
     assert "platform/instruction-blocks/dependency-bump-only" in text
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_with_a_non_matching_item_omits_the_topic_bound_block_through_main(
         knowledge_ctx, tmp_path, monkeypatch):
     """The same agent, the same block — only the item's topics differ (a UI
@@ -5877,6 +6090,7 @@ def test_use_with_a_non_matching_item_omits_the_topic_bound_block_through_main(
     assert "platform/instruction-blocks/dependency-bump-only" not in text
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_with_an_issue_writing_standards_record_sees_the_same_topics(
         knowledge_ctx, tmp_path, monkeypatch):
     """`writing_standards_record` is a second call beside `resolve_instruction_
@@ -5899,6 +6113,7 @@ def test_use_with_an_issue_writing_standards_record_sees_the_same_topics(
         "composed": True, "blocks": ["platform/instruction-blocks/talk-better-import"]}
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_use_with_a_failed_topic_lookup_is_visible_on_stderr(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     """A failed lookup must not render identically to a real item with no
@@ -5921,6 +6136,7 @@ def test_use_with_a_failed_topic_lookup_is_visible_on_stderr(
     assert "error:404" in err
 
 
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_profile_documents_names_a_writing_standard_the_index_does_not_serve(
         knowledge_ctx, tmp_path, monkeypatch):
     """Today's corpus: the three blocks do not exist yet. The record says so
@@ -6004,10 +6220,10 @@ def _agent_doc_without_a_role(db, doc_id):
     conn.close()
 
 
-@pytest.mark.parametrize("agent", ["roleless", "svc-reviewer", None])
+@pytest.mark.parametrize("agent", ["roleless", "ghost-reviewer", None])
 def test_an_agent_with_no_declared_role_matches_no_binds_roles_block(
         knowledge_ctx, agent):
-    """`roleless` has a document declaring no role; `svc-reviewer` has no
+    """`roleless` has a document declaring no role; `ghost-reviewer` has no
     document; None is a crew render. All fail closed. Red on origin/main, where
     the block bound everyone."""
     _agent_doc_without_a_role(knowledge_ctx.DB_PATH, "x/agents/roleless")
@@ -6017,7 +6233,7 @@ def test_an_agent_with_no_declared_role_matches_no_binds_roles_block(
 def test_an_agent_with_no_declared_role_still_binds_by_exact_name(knowledge_ctx):
     _agent_doc_without_a_role(knowledge_ctx.DB_PATH, "x/agents/roleless")
     assert _binds(knowledge_ctx, {"binds_agents": ["roleless"]}, "roleless") is True
-    assert _binds(knowledge_ctx, {"binds_agents": ["roleless"]}, "svc-reviewer") is False
+    assert _binds(knowledge_ctx, {"binds_agents": ["roleless"]}, "ghost-reviewer") is False
 
 
 def test_binds_roles_and_binds_agents_combine_with_and(knowledge_ctx):
@@ -6312,6 +6528,160 @@ def test_generic_bundle_unknown_part_exits_1_not_2(
     assert cap.out == "" and "nonsense" in cap.err
 
 
+# --- `blocks` packs into `blocks`, `blocks-2`, ... when it is over the cap ---
+
+def _fake_block(name, body, scope="crew"):
+    """A made-up row shaped like `resolve_instruction_blocks` output, for
+    exercising `_pack_blocks_into_parts` and `_generic_bundle_parts` directly
+    without a database."""
+    return {"id": f"platform/instruction-blocks/{name}", "_fm": {"scope": scope},
+            "body_hash": "0" * 64, "body": body}
+
+
+def test_pack_blocks_into_parts_keeps_blocks_together_under_the_cap(knowledge_ctx):
+    blocks = [_fake_block("zzz-filler-a", "A" * 50), _fake_block("zzz-filler-b", "B" * 50)]
+    size = len(knowledge_ctx.render_instruction_blocks_md(blocks).encode("utf-8"))
+    assert knowledge_ctx._pack_blocks_into_parts(blocks, size) == [blocks]
+
+
+def test_pack_blocks_into_parts_moves_a_block_one_byte_over_the_boundary(knowledge_ctx):
+    """A block exactly filling the remaining space stays in the earlier part;
+    a cap one byte smaller moves it into the next one."""
+    blocks = [_fake_block("zzz-filler-a", "A" * 50), _fake_block("zzz-filler-b", "B" * 50)]
+    size = len(knowledge_ctx.render_instruction_blocks_md(blocks).encode("utf-8"))
+    assert knowledge_ctx._pack_blocks_into_parts(blocks, size) == [blocks]
+    assert knowledge_ctx._pack_blocks_into_parts(blocks, size - 1) == \
+        [[blocks[0]], [blocks[1]]]
+
+
+def test_pack_blocks_into_parts_splits_at_the_first_overflowing_block(knowledge_ctx):
+    a, b, c = (_fake_block(f"zzz-filler-{n}", n.upper() * 50) for n in "abc")
+    size_ab = len(knowledge_ctx.render_instruction_blocks_md([a, b]).encode("utf-8"))
+    assert knowledge_ctx._pack_blocks_into_parts([a, b, c], size_ab) == [[a, b], [c]]
+
+
+def test_pack_blocks_into_parts_concatenates_with_no_loss_or_duplication(knowledge_ctx):
+    blocks = [_fake_block(f"zzz-filler-{i}", chr(65 + i) * 40) for i in range(6)]
+    size_one = len(knowledge_ctx.render_instruction_blocks_md([blocks[0]]).encode("utf-8"))
+    groups = knowledge_ctx._pack_blocks_into_parts(blocks, size_one)
+    assert [b for group in groups for b in group] == blocks
+    assert all(len(knowledge_ctx.render_instruction_blocks_md(g).encode("utf-8")) <= size_one
+               for g in groups)
+
+
+def test_pack_blocks_into_parts_groups_a_single_oversized_block_alone(knowledge_ctx):
+    big = _fake_block("zzz-filler-big", "X" * 5000)
+    small = _fake_block("zzz-filler-small", "y" * 10)
+    groups = knowledge_ctx._pack_blocks_into_parts([big, small], cap=200)
+    assert groups == [[big], [small]]
+
+
+def test_generic_bundle_parts_names_blocks_blocks_2_and_the_imports(knowledge_ctx):
+    a = _fake_block("zzz-filler-0", "A" * 100)
+    b = _fake_block("zzz-filler-1", "B" * 100)
+    wb = _fake_block("write-better-import", "Import write-better.\n")
+    tb = _fake_block("talk-better-import", "Import talk-better.\n")
+    size_one = len(knowledge_ctx.render_instruction_blocks_md([a]).encode("utf-8"))
+    parts = knowledge_ctx._generic_bundle_parts([a, b, wb, tb], size_one)
+    assert set(parts) == {"blocks", "blocks-2", "write-better", "talk-better"}
+    assert parts["blocks"] == [a]
+    assert parts["blocks-2"] == [b]
+    assert parts["write-better"] == [wb]
+    assert parts["talk-better"] == [tb]
+
+
+def test_generic_bundle_blocks_part_over_the_cap_is_refused_naming_it(
+        knowledge_ctx, bundle_env, monkeypatch, capsys):
+    with pytest.raises(SystemExit) as e:
+        _generic_part(knowledge_ctx, monkeypatch, capsys, "blocks", cap=10)
+    assert e.value.code == 1
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    lines = [ln for ln in cap.err.splitlines() if "'blocks'" in ln and "cap" in ln]
+    assert len(lines) == 1
+    assert re.search(r"'blocks' is \d+ bytes, over the 10-byte cap", lines[0])
+
+
+def test_generic_bundle_empty_blocks_2_exits_1_with_the_empty_part_message(
+        knowledge_ctx, bundle_env, monkeypatch, capsys):
+    """bundle_env's only `blocks`-category block fits well under the default
+    cap, so `blocks-2` holds nothing yet; a hook line for it must fail
+    visibly rather than silently printing nothing."""
+    with pytest.raises(SystemExit) as e:
+        _generic_part(knowledge_ctx, monkeypatch, capsys, "blocks-2")
+    assert e.value.code == 1
+    cap = capsys.readouterr()
+    assert cap.out == ""
+    assert "generic bundle part 'blocks-2' holds no instruction block" in cap.err
+
+
+def _add_filler_blocks(db, add_block, n, body_size):
+    for i in range(n):
+        add_block(db, f"platform/instruction-blocks/zzz-filler-{i}",
+                  ("x" * body_size) + f" filler-{i}\n",
+                  {"scope": "crew", "binds_sessions": ["interactive"]})
+
+
+def test_generic_bundle_blocks_and_blocks_2_concatenate_to_the_unsplit_blocks(
+        knowledge_ctx, bundle_env, monkeypatch, capsys):
+    _, db = bundle_env
+    _add_filler_blocks(db, _add_block, 3, 4000)
+    unsplit = _generic_part(knowledge_ctx, monkeypatch, capsys, "blocks",
+                            cap=1_000_000)[1].out
+
+    def sections(text):
+        return [s.strip() for s in re.split(
+            r"(?=^<!-- instruction-block: )", text, flags=re.M) if s.strip()]
+
+    collected = []
+    for part in ("blocks", "blocks-2"):
+        collected.append(_generic_part(knowledge_ctx, monkeypatch, capsys, part,
+                                       cap=9000)[1].out)
+    # a third part is not needed at this cap: asking for it is the
+    # empty-part refusal, not a size refusal, so no block was lost into it
+    with pytest.raises(SystemExit) as e:
+        _generic_part(knowledge_ctx, monkeypatch, capsys, "blocks-3", cap=9000)
+    assert "holds no instruction block" in capsys.readouterr().err
+    assert e.value.code == 1
+
+    assert sections("\n".join(collected)) == sections(unsplit)
+    for text in collected:
+        assert len(text.encode("utf-8")) <= 9000
+
+
+def test_generic_bundle_list_parts_reports_names_and_sizes(
+        knowledge_ctx, bundle_env, monkeypatch, capsys):
+    _, db = bundle_env
+    _add_filler_blocks(db, _add_block, 3, 4000)
+    monkeypatch.setattr("sys.argv", ["knowledge-ctx", "bundle", "--generic", "--list-parts"])
+    monkeypatch.setenv("KNOWLEDGE_CTX_PART_MAX_BYTES", "9000")
+    assert knowledge_ctx.main() == 0
+    lines = [ln for ln in capsys.readouterr().out.splitlines() if ln]
+    rows = [ln.split("\t") for ln in lines]
+    assert [name for name, _ in rows] == ["blocks", "blocks-2", "write-better", "talk-better"]
+    for _, size in rows:
+        assert int(size) <= 9000
+
+
+def test_generic_bundle_list_parts_exits_1_when_a_part_is_over_the_cap(
+        knowledge_ctx, bundle_env, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["knowledge-ctx", "bundle", "--generic", "--list-parts"])
+    monkeypatch.setenv("KNOWLEDGE_CTX_PART_MAX_BYTES", "10")
+    assert knowledge_ctx.main() == 1
+    out = capsys.readouterr().out
+    assert out.strip() != ""
+
+
+def test_generic_bundle_part_and_list_parts_are_mutually_exclusive(
+        knowledge_ctx, bundle_env, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["knowledge-ctx", "bundle", "--generic",
+                                     "--part", "blocks", "--list-parts"])
+    with pytest.raises(SystemExit) as e:
+        knowledge_ctx.main()
+    assert e.value.code == 1
+    assert "mutually exclusive" in capsys.readouterr().err
+
+
 def test_generic_bundle_hook_passes_the_part_through_and_exits_1_on_size(
         tmp_path, bundle_env, monkeypatch):
     ws = tmp_path / "ws"
@@ -6438,7 +6808,7 @@ def test_generic_bundle_hook_finds_the_manifest_at_the_git_toplevel(tmp_path, bu
 
 def test_a_hand_written_claude_tree_with_no_manifest_still_gets_the_bundle(
         tmp_path, bundle_env):
-    ws = tmp_path / "hollis"
+    ws = tmp_path / "galley"
     (ws / ".claude" / "agents").mkdir(parents=True)
     (ws / ".claude" / "agents" / "scout.md").write_text("hand-written\n")
     r = _run_bundle_hook(tmp_path, bundle_env, ws)
@@ -6484,6 +6854,7 @@ def _render_with_imports(knowledge_ctx, tmp_path, monkeypatch, capsys, argv,
     ["knowledge-ctx", "use", "daytime", "--agent", "coder", "--force",
      "--force-anyway"],
 ], ids=["crew", "dispatched"])
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_render_inlines_an_allowlisted_import(
         knowledge_ctx, tmp_path, monkeypatch, capsys, argv):
     text, ws, _ = _render_with_imports(
@@ -6502,6 +6873,7 @@ def test_render_inlines_an_allowlisted_import(
     ["knowledge-ctx", "use", "daytime", "--agent", "coder", "--force",
      "--force-anyway"],
 ], ids=["crew", "dispatched"])
+@pytest.mark.rich_registry  # needs a crew that an instruction block binds via binds_crews
 def test_render_drops_an_import_outside_the_roots_and_says_not_composed(
         knowledge_ctx, tmp_path, monkeypatch, capsys, argv):
     secret = tmp_path / "secret.txt"
@@ -6553,9 +6925,10 @@ def _no_checkout(knowledge_ctx, tmp_path, monkeypatch, docs):
     return _Library(knowledge_ctx, monkeypatch, tmp_path, docs=docs, profile=docs), knowledge
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_crew_session_renders_its_profile_with_no_profiles_directory_and_an_index_present(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
-    product_dir = tmp_path / "convivy-deck"
+    product_dir = tmp_path / "northwind-deck"
     product_dir.mkdir()
     _git_init(product_dir)
     lib, knowledge = _no_checkout(knowledge_ctx, tmp_path, monkeypatch, _own_docs())
@@ -6567,10 +6940,11 @@ def test_a_crew_session_renders_its_profile_with_no_profiles_directory_and_an_in
     assert not knowledge.exists()
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_primary_checkout_dispatch_renders_its_profile_with_no_profiles_directory_and_an_index_present(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
-    _linked_worktree(tmp_path)   # builds the primary `convivy-deck`, with a `.git` directory
-    primary = tmp_path / "convivy-deck"
+    _linked_worktree(tmp_path)   # builds the primary `northwind-deck`, with a `.git` directory
+    primary = tmp_path / "northwind-deck"
     assert (primary / ".git").is_dir()
     lib, knowledge = _no_checkout(knowledge_ctx, tmp_path, monkeypatch, _own_docs())
     rc = _run_main(knowledge_ctx, monkeypatch, primary,
@@ -6581,6 +6955,7 @@ def test_a_primary_checkout_dispatch_renders_its_profile_with_no_profiles_direct
     assert not knowledge.exists()
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_bundle_dispatch_renders_its_profile_with_no_profiles_directory_and_an_index_present(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     wt = _linked_worktree(tmp_path)
@@ -6615,11 +6990,12 @@ def test_an_unreachable_library_fails_a_profile_render_by_naming_it(
     assert not (product_dir / ".claude").exists()
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_profile_route_the_library_cannot_answer_fails_the_render_by_naming_it(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
     """The list answers and the profile route does not: the render still stops, and
     the message names the profile it could not load from the Library."""
-    product_dir = tmp_path / "convivy-deck"
+    product_dir = tmp_path / "northwind-deck"
     product_dir.mkdir()
     _git_init(product_dir)
     lib, _ = _no_checkout(knowledge_ctx, tmp_path, monkeypatch, _own_docs())
@@ -6654,9 +7030,10 @@ def test_an_unreachable_library_fails_a_bundle_dispatch_by_naming_it(
     assert not (wt / ".claude").exists()
 
 
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_an_absent_profile_is_a_not_found_that_names_the_library(
         knowledge_ctx, tmp_path, monkeypatch, capsys):
-    product_dir = tmp_path / "convivy-deck"
+    product_dir = tmp_path / "northwind-deck"
     product_dir.mkdir()
     _git_init(product_dir)
     _no_checkout(knowledge_ctx, tmp_path, monkeypatch, _own_docs())
@@ -6698,6 +7075,7 @@ def test_the_profile_route_rule_counts_are_what_the_render_reports(
     ("when writing\x07tests", "when writingtests"),
     ("x" * 600, "x" * 500),
 ], ids=["newline", "control-char", "over-500-chars"])
+@pytest.mark.rich_registry  # needs this product's real registry row (ARCH-375)
 def test_a_trigger_from_the_profile_route_is_bounded_before_it_renders(
         knowledge_ctx, tmp_path, monkeypatch, capsys, kind, raw, expected):
     """The profile route serves each skill's and agent's `trigger` unbounded
@@ -6706,7 +7084,7 @@ def test_a_trigger_from_the_profile_route_is_bounded_before_it_renders(
            if kind == "agent" else
            _bdoc("engineering-practice/skills/skill-0", "skill", "# Tests\n\nWrite them.\n",
                  trigger=raw))
-    product_dir = tmp_path / "convivy-deck"
+    product_dir = tmp_path / "northwind-deck"
     product_dir.mkdir()
     _git_init(product_dir)
     _no_checkout(knowledge_ctx, tmp_path, monkeypatch, [doc])

@@ -8,16 +8,17 @@
 #
 # A render exists when `.claude/.active-profile` or `.claude/.profile-documents.json`
 # is present in cwd or in its git toplevel. THE TEST IS THE MANIFEST, NOT THE
-# `.claude` DIRECTORY: convivy-app-kit, convivy-services, hollis and write-better
-# carry hand-written `.claude` trees and no render, so a directory test would
-# starve exactly the workspaces this bundle exists for.
+# `.claude` DIRECTORY: some repos — the shared app-kit library's own repos, a
+# lab product's repo and Write Better among them — carry hand-written `.claude`
+# trees and no render, so a directory test would starve exactly the workspaces
+# this bundle exists for.
 #
 # A broken bundle must never block a session from starting: any failure prints
 # nothing to stdout, one line to stderr, and exits 0. bash 3.2 only (ARCH-082).
 #
-# Usage: generic-bundle-context.sh [<part>]   (part: blocks, write-better,
-# talk-better; none = the whole bundle). One hook per part keeps each under
-# Claude Code's hook-context limit. THE ONE FAILURE THAT EXITS 1 is
+# Usage: generic-bundle-context.sh [<part>]   (part: blocks, blocks-2,
+# write-better, talk-better; none = the whole bundle). One hook per part keeps
+# each under Claude Code's hook-context limit. THE ONE FAILURE THAT EXITS 1 is
 # knowledge-ctx refusing a part for size, so the refusal is visible; exit 2 has
 # its own meaning for a SessionStart hook and is never used. Every other
 # failure, an unknown part included, still exits 0.

@@ -26,6 +26,32 @@ assert_eq "$cfgdir/crews" "$("$REPO_ROOT/bin/builder-root" --root --config "$cfg
 "$REPO_ROOT/bin/builder-root" --config "$cfgdir/session-agent.env" >/dev/null 2>&1; rc=$?
 assert_rc 2 "$rc" "--config without --root is refused"
 
+echo "== --root with no --home behaves exactly as it did before --home existed (round-1 revise, PR 1119) =="
+# Pinning test: adding --home must not change the no-option, --config-only, or
+# BUILDER_ROOT-still-ignored behaviour above for a caller that never passes it.
+assert_eq "$want" "$("$REPO_ROOT/bin/builder-root" --root)" "--root alone is unchanged"
+assert_eq "$cfgdir/crews" "$("$REPO_ROOT/bin/builder-root" --root --config "$cfgdir/session-agent.env")" \
+    "--root --config alone is unchanged"
+
+echo "== --root --home resolves against a DIFFERENT account's home than the calling process's own =="
+# install-individuator's SUDO_USER fix (round-1 revise, PR 1119): --config alone
+# moves which file is read, but '~' expansion, the default root and the "too
+# wide" guard still resolved against the CALLING process's own passwd home.
+# --home carries all three against a given account's home instead.
+homedir=$(mktemp -d)/someone
+mkdir -p "$homedir/.config/convivy" "$homedir/builder"
+assert_eq "$homedir/builder" "$("$REPO_ROOT/bin/builder-root" --root --home "$homedir")" \
+    "--home alone: no CREWS_ROOT configured for that account falls back to ITS OWN default root"
+printf 'CREWS_ROOT=~/builder\n' > "$homedir/.config/convivy/session-agent.env"
+assert_eq "$homedir/builder" "$("$REPO_ROOT/bin/builder-root" --root --home "$homedir")" \
+    "--home alone: ~ in that account's own config expands against ITS OWN home"
+printf 'CREWS_ROOT=~\n' > "$homedir/.config/convivy/session-agent.env"
+assert_eq "$homedir/builder" "$("$REPO_ROOT/bin/builder-root" --root --home "$homedir")" \
+    "--home alone: CREWS_ROOT=~ is too wide against THAT account's home and falls back"
+"$REPO_ROOT/bin/builder-root" --home "$homedir" >/dev/null 2>&1; rc=$?
+assert_rc 2 "$rc" "--home without --root is refused"
+rm -rf "$(dirname "$homedir")"
+
 echo "== --root --config refuses a config that names no root, rather than printing the real one =="
 # root() answers each of these with the machine's real root instead of raising,
 # so without the refusal a test with a broken config would read and write the
@@ -44,15 +70,6 @@ done
 rm -rf "$cfgdir"
 
 farm=$(mktemp -d)
-
-echo "== a launcher reached through a ~/.local/bin-style link finds its real bin/ =="
-# mark-fresh resolves the data root first, then refuses an unknown product with
-# exit 2 before writing anything. Reaching that refusal means the hop found
-# bin/builder-root; a missed hop exits 1 at the resolution line instead.
-ln -s "$REPO_ROOT/bin/mark-fresh" "$farm/mark-fresh"
-out=$(env -u BUILDER_ROOT /bin/bash "$farm/mark-fresh" notaproduct bug-fix 2>&1); rc=$?
-assert_rc 2 "$rc" "mark-fresh resolved its data root through the link"
-assert_contains "$out" "invalid product" "and reached its own refusal"
 
 echo "== install-decision-hooks' /bin/sh hop, run from a link =="
 # Its real resolution lines, run under sh with \$0 set to a link, since running the

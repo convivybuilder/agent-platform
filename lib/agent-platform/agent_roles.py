@@ -1,10 +1,10 @@
-"""What GENERIC role is this agent — `sel-reviewer` is a `reviewer`?
+"""What GENERIC role is this agent — `acme-reviewer` is a `reviewer`?
 
 WHY ANYTHING NEEDS TO ASK. Skills and documents declare `audience`, and that
 vocabulary names generic roles: `coder` appears on 22 skills, `reviewer` on 22,
 `platform-coder` on none. An audience filter applied literally hands a
 `platform-coder` zero skills. Instruction blocks hit the same gap:
-`binds_agents: [reviewer]` has to reach `sel-reviewer` and `deck-reviewer`
+`binds_agents: [reviewer]` has to reach `acme-reviewer` and `deck-reviewer`
 without naming each one.
 
 THE ROLE IS WHAT THE AGENT'S DOCUMENT DECLARES. Every `kind: agent` document
@@ -48,7 +48,7 @@ class AgentRoleError(Exception):
 
 
 def _doc_id_from_ref(source_ref: str) -> str:
-    """`projects/selector/agents/sel-reviewer.md` -> `selector/agents/sel-reviewer`."""
+    """`projects/acme/agents/acme-reviewer.md` -> `acme/agents/acme-reviewer`."""
     ref = source_ref[:-3] if source_ref.endswith(".md") else source_ref
     return ref[len("projects/"):] if ref.startswith("projects/") else ref
 
@@ -56,7 +56,7 @@ def _doc_id_from_ref(source_ref: str) -> str:
 def role_for(agent_id: str, *, db_path: Path | str | None = None) -> str | None:
     """The `role` declared on this agent's document, or None.
 
-    Accepts a full document id (`selector/agents/sel-reviewer`) or a bare agent
+    Accepts a full document id (`acme/agents/acme-reviewer`) or a bare agent
     name (`sel-reviewer`), because callers have both: an assembler reading the
     corpus knows the id, a dispatch knows the name.
 

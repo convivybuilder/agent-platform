@@ -45,6 +45,18 @@ AGENTCTL_LIVE_CONFINEMENT=1 .venv/bin/python -m pytest \
     tests/live/test_reviewer_verdict_path.py -s
 ```
 
+The read-allowlist check runs `claude -p` directly (no `agentctl spawn`) under two
+settings designs, against stand-in files in a scratch home this test creates and tears
+down: a candidate design that closes the whole scratch home and the real account home
+(`run_sandbox.passwd_home()`) for Bash and for Read/Grep/Glob, reopening only named
+paths, and today's `run_sandbox.settings()`, which denies a fixed, named list of paths
+under the home it is given:
+
+```bash
+AGENTCTL_LIVE_CONFINEMENT=1 .venv/bin/python -m pytest \
+    tests/live/test_dispatch_read_allowlist_live.py -s
+```
+
 Tests that start a real tmux server skip inside a dispatched run's sandbox, which
 refuses tmux sockets (`tests/tmux_sandbox.py`). CI runs them on its Linux runner.
 
@@ -65,7 +77,6 @@ correctness paths:
 - **frontmatter validation** — `knowledge.validate_frontmatter` (`test_knowledge.py`)
 - **dispatch helpers** — agentctl model_id / derive_purpose / _slug /
   _parse_frontmatter / default_profile (`test_agentctl.py`)
-- **cost-shift markers** — `mark-fresh` (`tests/bash/test_mark_fresh.sh`)
 
 ## NOT yet covered (grows via tests-as-touched)
 
@@ -78,12 +89,11 @@ platform PR adds tests for what it touches.
 - `design-room`, thin wrappers (`slack-react`, `worktrees-status`)
 - `co` + `knowledge-autopull` are **zsh**, out of the bash-3.2 harness (a
   separate zsh track if needed); `co` is interactive (smoke-only)
-- `notion-migrate` — legacy (Notion sunset 2026-05-28); not tested
 
 ## Known issue surfaced by the suite
 
-`test_agentctl.py::test_default_profile_sous_chef_known_gap` is an **xfail**:
-`agentctl`'s project table (then `PRODUCT_BY_REPO`, now `projects.EXPLICIT_PROJECT_BY_NAME`) was missing `sous-chef` (predates its onboarding),
-so `default_profile` falls back to `shared/`. Masked today because callers pass
-`--profile` explicitly. Fix the dict alongside the in-flight `--purpose` change
-in agentctl; the test flips to xpass.
+`test_agentctl.py::test_default_profile_resolves_galley` once ran as an **xfail**:
+`agentctl`'s project table (then `PRODUCT_BY_REPO`, now `projects.EXPLICIT_PROJECT_BY_NAME`) was missing `galley` (predating its onboarding),
+so `default_profile` fell back to `shared/`. Masked at the time because callers pass
+`--profile` explicitly. The dict was fixed alongside the `--purpose` change in
+agentctl, and the test is now a plain assertion.

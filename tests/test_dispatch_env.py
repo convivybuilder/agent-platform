@@ -5,6 +5,7 @@ any subprocess that starts a claude process or an agent run
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -49,6 +50,17 @@ def _reset_private_git_wrapper_dir_singleton():
         DE._git_wrapper_dir = None
 
 
+@pytest.fixture(autouse=True)
+def _reset_private_swift_wrapper_dir_singleton():
+    """Same contract as `_reset_private_tmpdir_singleton`, for `_private_swift_wrapper_dir()`."""
+    DE._swift_wrapper_dir = None
+    yield
+    if DE._swift_wrapper_dir is not None:
+        import shutil
+        shutil.rmtree(DE._swift_wrapper_dir, ignore_errors=True)
+        DE._swift_wrapper_dir = None
+
+
 def test_strips_tmux_and_tmux_pane_from_the_default_environment(monkeypatch):
     monkeypatch.setenv("TMUX", "/private/tmp/tmux-501/default,1314,3")
     monkeypatch.setenv("TMUX_PANE", "%3")
@@ -58,7 +70,9 @@ def test_strips_tmux_and_tmux_pane_from_the_default_environment(monkeypatch):
 
     assert "TMUX" not in env
     assert "TMUX_PANE" not in env
-    assert env["PATH"] == "/usr/bin"  # everything else still passes through
+    # everything else still passes through -- PATH gets the swift wrapper dir
+    # prepended unconditionally (below), so check the tail rather than equality.
+    assert env["PATH"].endswith(os.pathsep + "/usr/bin")
 
 
 @pytest.mark.parametrize("deny_push", [False, True])
@@ -67,13 +81,13 @@ def test_strips_the_co_credential_path_so_no_spawned_run_inherits_it(monkeypatch
     path exported in the calling shell would reach the run. bin/co exports the path nowhere,
     so only a hand export puts it there. The strip has to hold on both the coder path and the reviewer path,
     which passes deny_push=True."""
-    monkeypatch.setenv("ORIENT_OPS_CO_TOKEN_FILE", "/tmp/co-credential")
+    monkeypatch.setenv("ORIENT_OPS_CREW_TOKEN_FILE", "/tmp/co-credential")
     monkeypatch.setenv("PATH", "/usr/bin")
 
     env = DE.dispatch_env(deny_push=deny_push)
 
-    assert "ORIENT_OPS_CO_TOKEN_FILE" not in env
-    assert env["PATH"] == "/usr/bin"  # everything else still passes through
+    assert "ORIENT_OPS_CREW_TOKEN_FILE" not in env
+    assert env["PATH"].endswith(os.pathsep + "/usr/bin")  # everything else still passes through
 
 
 def test_strips_tmux_from_an_explicit_base_dict():
@@ -83,7 +97,7 @@ def test_strips_tmux_from_an_explicit_base_dict():
 
     assert "TMUX" not in env
     assert "TMUX_PANE" not in env
-    assert env["PATH"] == "/x"
+    assert env["PATH"].endswith(os.pathsep + "/x")
 
 
 def test_does_not_mutate_the_base_dict():
@@ -103,7 +117,7 @@ def test_no_op_when_tmux_is_already_absent(monkeypatch):
 
     assert "TMUX" not in env
     assert "TMUX_PANE" not in env
-    assert env["PATH"] == "/usr/bin"
+    assert env["PATH"].endswith(os.pathsep + "/usr/bin")
 
 
 # --- TMUX_TMPDIR: closing the same-UID default-socket route ------------------
@@ -497,53 +511,132 @@ def test_wrapper_refuses_when_agentctl_real_git_is_a_different_copy_of_the_wrapp
     assert "AGENTCTL_REAL_GIT" in result.stderr
 
 
-def test_wrapper_does_not_refuse_a_bare_name_that_resolves_to_the_real_git(tmp_path):
-    """AGENTCTL_REAL_GIT unset falls back to the bare name `git` inside the script
-    (_resolve_real_git's own fallback, for when nothing else set it) — resolved through
-    PATH, bash 3.2 style, by the same check that refuses a wrapper copy. A PATH with no
-    wrapper directory on it must resolve this to the real git and run normally, not
-    refuse it as if it were a copy.
+# --- OUTAGE, 2026-10-17 08:11-08:25 MST: a test in another repository took
+# `shutil.which("git")` as "the real git" -- which, inside a dispatched run, resolved to
+# THIS wrapper -- then ran a subprocess whose env held only PATH=<dir holding a git
+# stub>. With AGENTCTL_REAL_GIT unset, the OLD script fell back to the bare name `git`
+# and resolved IT through that PATH too, landing back on the stub, which called `git`
+# again, forking the next generation the same way, until the operator's account hit its
+# 10,122-of-10,666 process ceiling. The wrapper must never exec, probe, or resolve a bare
+# `git` through PATH at all -- AGENTCTL_REAL_GIT unset now falls back to an absolute path
+# baked into the script at write time, and the script refuses outright (before any exec
+# or probe) when neither value is an absolute path to an executable file. These tests
+# write the wrapper the same way `_private_git_wrapper_dir` does (`_write_wrapper`,
+# substituting @@BAKED_REAL_GIT@@ exactly as production does) and build every stub that
+# calls back into `git` with `_write_capped_git_stub`, which gives it its own hard cap, so
+# a regression back to a PATH search can never grow this test's own process count without
+# bound. A stub that only prints a fixed line and never calls `git` carries no such cap --
+# it cannot recurse either way. --------------------------------------------------------
 
-    SAFETY: this test's PATH must never contain a wrapper directory, including this
-    process's OWN ambient one if it is itself running inside a dispatched run — a bare
-    `git` resolving to a wrapper is exactly the recursion this file guards against (see
-    the OUTAGE comment above), so every `git` call here, including the setup calls,
-    uses `clean_path`, never the ambient PATH as-is: when this test is itself running
-    dispatched, `clean_path` is this process's own AGENTCTL_REAL_GIT's directory
-    (dispatch_env's invariant is that var always names the real binary, never a
-    wrapper); otherwise (an undispatched run, e.g. CI) it falls back to the ambient
-    PATH, which has no wrapper on it in the first place."""
-    wrapper = tmp_path / "git"
-    wrapper.write_text(DE._GIT_WRAPPER_SCRIPT)
-    wrapper.chmod(0o755)
-    ambient_real_git = os.environ.get("AGENTCTL_REAL_GIT")
-    clean_path = (os.path.dirname(ambient_real_git) if ambient_real_git
-                 else os.environ.get("PATH", os.defpath))
-    clean_env = {**os.environ, "PATH": clean_path}
-    clean_env.pop("AGENTCTL_REAL_GIT", None)
+def _write_capped_git_stub(stub_dir, counter, cap=3):
+    """Write a `git` stub at `stub_dir / "git"` that re-execs `git` on every call -- so it
+    would recurse through PATH without bound if the wrapper regressed and ever entered it
+    -- but refuses once `counter` (one line appended per call) reaches `cap`. Every test
+    stub in this file that calls back into `git` must be built through this helper, so a
+    future one can't be added without the cap."""
+    stub = stub_dir / "git"
+    stub.write_text(f"""#!/bin/bash
+echo x >> {shlex.quote(str(counter))}
+count=$(wc -l < {shlex.quote(str(counter))})
+if [ "$count" -ge {cap} ]; then
+    exit 99
+fi
+exec git "$@"
+""")
+    stub.chmod(0o755)
+    return stub
 
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)],
-                   check=True, timeout=10, env=clean_env)
-    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
-                    "commit", "-q", "--allow-empty", "-m", "x"],
-                   check=True, timeout=10, env=clean_env)
-    own_common_dir = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        capture_output=True, text=True, check=True, timeout=10, env=clean_env).stdout.strip()
 
-    private = tmp_path / "private"
-    private.mkdir()
-    env = {**clean_env,
-           "AGENTCTL_OWN_GIT_COMMON_DIR": own_common_dir,
-           "GIT_OBJECT_DIRECTORY": str(private),
-           "GIT_ALTERNATE_OBJECT_DIRECTORIES": str(repo / ".git" / "objects")}
+def _write_wrapper(path, baked_real_git):
+    """Write `_GIT_WRAPPER_SCRIPT` to `path` with `@@BAKED_REAL_GIT@@` substituted the
+    same way `_private_git_wrapper_dir` substitutes it in production: shlex.quote()'d,
+    so a path holding a space or a shell metacharacter round-trips as one literal
+    value."""
+    script = DE._GIT_WRAPPER_SCRIPT.replace("@@BAKED_REAL_GIT@@", shlex.quote(baked_real_git))
+    path.write_text(script)
+    path.chmod(0o755)
 
-    result = subprocess.run([str(wrapper), "-C", str(repo), "rev-parse", "HEAD"],
-                            capture_output=True, text=True, timeout=10, env=env)
+
+def _real_git_for_tests():
+    """A real git binary's path, safe to use as a test's baked fallback even when this
+    test process is itself running inside a dispatched run (this process's own ambient
+    PATH then has a wrapper first): `_resolve_real_git` already skips any PATH entry
+    whose `git` is a wrapper copy, the same way `dispatch_env()` itself resolves
+    AGENTCTL_REAL_GIT, so it lands on the real binary either way."""
+    return DE._resolve_real_git(os.environ.get("PATH", os.defpath), wrapper_dir="")
+
+
+def test_wrapper_runs_the_baked_real_git_without_resolving_a_path_stub(tmp_path):
+    """AGENTCTL_REAL_GIT unset, PATH pointing only at a stub that calls back into
+    `git`: the wrapper must run its own baked real git and never enter the stub at
+    all. The stub's own hard cap at its third entry (exit 99) is the test's safety net
+    — it fires only if this regresses, and bounds the damage to 3 processes instead of
+    an unbounded fork chain."""
+    counter = tmp_path / "counter"
+    stub_dir = tmp_path / "stubpath"
+    stub_dir.mkdir()
+    _write_capped_git_stub(stub_dir, counter)
+    wrapper = tmp_path / "git-wrapper"
+    _write_wrapper(wrapper, _real_git_for_tests())
+
+    result = subprocess.run([str(wrapper), "--version"], env={"PATH": str(stub_dir)},
+                            capture_output=True, text=True, timeout=10)
 
     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert "git version" in result.stdout
+    assert not counter.exists() or counter.read_text() == "", \
+        "the stub was entered -- the wrapper resolved a bare 'git' through PATH"
+
+
+def test_wrapper_refuses_when_agentctl_real_git_unset_and_baked_value_empty(tmp_path):
+    """No AGENTCTL_REAL_GIT and no usable baked fallback: the wrapper must refuse with
+    exit 127 and a stderr line, and must never enter the PATH stub at all."""
+    counter = tmp_path / "counter"
+    stub_dir = tmp_path / "stubpath"
+    stub_dir.mkdir()
+    _write_capped_git_stub(stub_dir, counter)
+    wrapper = tmp_path / "git-wrapper"
+    _write_wrapper(wrapper, "")
+
+    result = subprocess.run([str(wrapper), "--version"], env={"PATH": str(stub_dir)},
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 127, (result.returncode, result.stdout, result.stderr)
+    assert result.stderr.strip() != ""
+    assert not counter.exists(), \
+        "the stub was entered -- the wrapper resolved a bare 'git' through PATH"
+
+
+def test_resolve_real_git_returns_nothing_usable_when_path_has_no_real_git(tmp_path):
+    """Must never return the bare name `"git"` — that name would have to be resolved
+    through $PATH by something to be of any use, which is the exact lookup this fix
+    removes."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+
+    resolved = DE._resolve_real_git(str(empty_dir), wrapper_dir="/does/not/matter")
+
+    assert resolved in ("", None)
+    assert resolved != "git"
+
+
+def test_baked_real_git_path_with_space_and_dollar_round_trips_intact(tmp_path):
+    """A baked path holding a space and a `$` must reach the wrapper's `real_git`
+    variable as one literal value, never shell-expanded or split -- a fake "real git"
+    that only prints a fixed line proves it ran, rather than failing some other way."""
+    weird_dir = tmp_path / "weird path with $dollar"
+    weird_dir.mkdir()
+    fake_real_git = weird_dir / "git"
+    fake_real_git.write_text("#!/bin/bash\necho weird-real-git-ran\n")
+    fake_real_git.chmod(0o755)
+    wrapper = tmp_path / "git-wrapper"
+    _write_wrapper(wrapper, str(fake_real_git))
+
+    result = subprocess.run([str(wrapper), "--version"], env={"PATH": "/usr/bin:/bin"},
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.strip() == "weird-real-git-ran"
 
 
 def test_object_store_redirect_lets_a_different_repositorys_own_git_read_its_own_objects(tmp_path):
@@ -864,6 +957,85 @@ def test_git_config_redirect_hides_a_real_gitconfig_credential_helper(tmp_path):
     assert "would-print" not in result.stdout
 
 
+# --- sixth gap: no git identity resolves for the operator's account -------------
+
+def test_identity_resolves_true_when_git_var_succeeds(monkeypatch):
+    monkeypatch.setattr(DE.subprocess, "run",
+                        lambda *a, **kw: subprocess.CompletedProcess(a, 0))
+    assert DE._git_identity_resolves({}, None) is True
+
+
+def test_identity_resolves_false_when_git_var_fails(monkeypatch):
+    monkeypatch.setattr(DE.subprocess, "run",
+                        lambda *a, **kw: subprocess.CompletedProcess(a, 128))
+    assert DE._git_identity_resolves({}, None) is False
+
+
+def test_identity_resolves_false_when_git_itself_cannot_be_run(monkeypatch):
+    def _raise(*a, **kw):
+        raise OSError("no such file or directory: git")
+    monkeypatch.setattr(DE.subprocess, "run", _raise)
+    assert DE._git_identity_resolves({}, None) is False
+
+
+def test_dispatch_env_sets_the_fallback_identity_when_none_resolves(tmp_path):
+    """Functional proof, not a mock: a repo whose own `user.useConfigOnly` disables
+    git's GECOS/hostname auto-identity fallback reproduces, without needing a bare
+    passwd entry or a scrubbed $HOME, the exact "no identity anywhere" shape
+    measured on the adopter's Linux account. `dispatch_env` must fill in all four
+    identity vars, and a real commit under the returned env must then succeed."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.useConfigOnly", "true", cwd=repo)
+
+    env = DE.dispatch_env({**os.environ, "PATH": os.environ["PATH"]}, worktree=repo)
+
+    assert env["GIT_AUTHOR_NAME"] == DE._FALLBACK_COMMIT_NAME
+    assert env["GIT_AUTHOR_EMAIL"] == DE._FALLBACK_COMMIT_EMAIL
+    assert env["GIT_COMMITTER_NAME"] == DE._FALLBACK_COMMIT_NAME
+    assert env["GIT_COMMITTER_EMAIL"] == DE._FALLBACK_COMMIT_EMAIL
+
+    (repo / "f.txt").write_text("x")
+    _git("add", "f.txt", cwd=repo, env=env)
+    commit = subprocess.run(["git", "commit", "-q", "-m", "x"], cwd=str(repo), env=env,
+                            capture_output=True, text=True, timeout=10)
+    assert commit.returncode == 0, commit.stderr
+
+
+def test_dispatch_env_leaves_a_configured_identity_unchanged(tmp_path):
+    """A repo with its own local `user.name`/`user.email` resolves the probe on its
+    own — `dispatch_env` adds no override, the same "a configured identity always
+    wins" contract `_kb_commit` (bin/agentctl) already holds for a kb commit."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", "-b", "main", cwd=repo)
+    _git("config", "user.name", "Someone Else", cwd=repo)
+    _git("config", "user.email", "someone@example.com", cwd=repo)
+
+    env = DE.dispatch_env({**os.environ, "PATH": os.environ["PATH"]}, worktree=repo)
+
+    for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+        assert key not in env
+
+
+def test_dispatch_env_without_a_worktree_probes_with_cwd_none(monkeypatch):
+    """No `worktree` (a non-repo agent, or a caller that has none to give) probes
+    with `cwd=None` rather than skipping the probe outright, and still sets the
+    fallback when that probe fails."""
+    seen_cwd = []
+
+    def _fake(env, cwd):
+        seen_cwd.append(cwd)
+        return False
+    monkeypatch.setattr(DE, "_git_identity_resolves", _fake)
+
+    env = DE.dispatch_env()
+
+    assert seen_cwd == [None]
+    assert env["GIT_AUTHOR_NAME"] == DE._FALLBACK_COMMIT_NAME
+
+
 def test_github_token_sets_gh_token_and_github_token():
     env = DE.dispatch_env(github_token="ghs_run_specific")
 
@@ -943,3 +1115,433 @@ def test_cleanup_private_gh_config_dir_is_idempotent():
 
     assert not os.path.exists(path)
     assert DE._gh_config_dir is None
+
+
+# --- the swift wrapper: SwiftPM's own sandbox-exec around manifest/plugin
+# compilation fails inside this run's own sandbox (2026-10-21, deck-coder
+# run-ccc745b2) --------------------------------------------------------------
+#
+# `swift build`/`swift test` inside a dispatched run fails with
+# "sandbox-exec: sandbox_apply: Operation not permitted" while compiling
+# Package.swift — a sandbox can't be applied inside a sandbox. SwiftPM has no
+# environment variable or config setting for this (measured 2026-10-21:
+# SWIFTC_DISABLE_SANDBOX governs swiftc's own sandboxing, not the manifest/
+# plugin sandbox, and has no effect on the failure). `--disable-sandbox` is
+# the only thing that does. This wrapper, put first on every dispatched run's
+# PATH by `dispatch_env()` unconditionally, adds that flag to the subcommands
+# that compile a manifest (build/test/run/package) when the caller hasn't
+# already passed it, and follows the git wrapper's exact
+# never-resolve-a-bare-name-through-PATH discipline (the OUTAGE comments
+# above `_GIT_WRAPPER_SCRIPT`).
+
+def test_swift_wrapper_script_carries_its_own_marker_line():
+    """`_agentctl_is_swift_wrapper_copy` in the script tells a second run's wrapper
+    copy apart from the real swift binary by this exact line — it has to stay
+    present."""
+    assert DE._SWIFT_WRAPPER_MARKER in DE._SWIFT_WRAPPER_SCRIPT
+
+
+def _write_fake_real_swift(path):
+    """A minimal executable standing in for a real `swift` binary, for a test that only
+    needs `_resolve_real_swift` to find SOMETHING on PATH and never actually runs it —
+    a CI runner and most non-Xcode hosts have no real `swift` at all, so these tests
+    must never depend on the host's own toolchain."""
+    path.write_text("#!/bin/bash\nexit 0\n")
+    path.chmod(0o755)
+
+
+def test_swift_wrapper_is_first_on_path_and_contains_an_executable_swift(tmp_path, monkeypatch):
+    real_swift_dir = tmp_path / "real-swift-bin"
+    real_swift_dir.mkdir()
+    fake_real_swift = real_swift_dir / "swift"
+    _write_fake_real_swift(fake_real_swift)
+    monkeypatch.setenv("PATH", str(real_swift_dir))
+
+    env = DE.dispatch_env()
+
+    assert env["AGENTCTL_REAL_SWIFT"] == str(fake_real_swift)
+    assert Path(env["AGENTCTL_REAL_SWIFT"]).is_file()
+    wrapper_dir = env["PATH"].split(os.pathsep)[0]
+    assert (Path(wrapper_dir) / "swift").is_file()
+    assert os.access(Path(wrapper_dir) / "swift", os.X_OK)
+
+
+def test_swift_wrapper_present_unconditionally_even_with_the_object_store_redirect(tmp_path, monkeypatch):
+    """The swift wrapper is wired independently of the git object-store redirect — a
+    dispatch that also gets the git wrapper (private_object_dir/shared_object_dir both
+    given) must still carry AGENTCTL_REAL_SWIFT and a swift wrapper on PATH, alongside
+    the git wrapper."""
+    private = tmp_path / "private-objects"
+    private.mkdir()
+    shared = tmp_path / "shared" / "objects"
+    shared.mkdir(parents=True)
+    real_swift_dir = tmp_path / "real-swift-bin"
+    real_swift_dir.mkdir()
+    _write_fake_real_swift(real_swift_dir / "swift")
+    monkeypatch.setenv("PATH", str(real_swift_dir))
+
+    env = DE.dispatch_env(private_object_dir=private, shared_object_dir=shared)
+
+    assert env["AGENTCTL_REAL_SWIFT"]
+    path_entries = env["PATH"].split(os.pathsep)
+    assert (Path(path_entries[0]) / "git").is_file()
+    assert (Path(path_entries[1]) / "swift").is_file()
+
+
+def test_dispatch_env_on_a_host_with_no_swift_at_all_still_installs_the_wrapper_but_refuses(tmp_path, monkeypatch):
+    """A host with no `swift` anywhere on PATH at all -- CI, and most non-Xcode hosts --
+    must behave exactly as it does today: no AGENTCTL_REAL_SWIFT, and `swift` still
+    fails. The wrapper is installed unconditionally regardless, so the failure comes
+    from its own 127 refusal rather than a bare "command not found", but it is still a
+    127, never a successful run of something unintended."""
+    empty_path_dir = tmp_path / "no-swift-here"
+    empty_path_dir.mkdir()
+    monkeypatch.setenv("PATH", str(empty_path_dir))
+
+    env = DE.dispatch_env()
+
+    assert "AGENTCTL_REAL_SWIFT" not in env
+    wrapper_dir = env["PATH"].split(os.pathsep)[0]
+    assert (Path(wrapper_dir) / "swift").is_file()
+
+    result = subprocess.run([str(Path(wrapper_dir) / "swift"), "--version"],
+                            capture_output=True, text=True, timeout=10,
+                            env={"PATH": str(empty_path_dir)})
+
+    assert result.returncode == 127, (result.returncode, result.stdout, result.stderr)
+    assert "AGENTCTL_REAL_SWIFT" in result.stderr
+
+
+def test_swift_wrapper_dir_is_reused_across_calls_in_the_same_process():
+    first = DE.dispatch_env()["PATH"].split(os.pathsep)[0]
+    second = DE.dispatch_env()["PATH"].split(os.pathsep)[0]
+
+    assert first == second
+
+
+def test_cleanup_private_swift_wrapper_dir_removes_a_created_directory():
+    DE.dispatch_env()
+    path = DE._swift_wrapper_dir
+    assert path is not None and os.path.isdir(path)
+
+    DE.cleanup_private_swift_wrapper_dir()
+
+    assert not os.path.exists(path)
+    assert DE._swift_wrapper_dir is None
+
+
+def test_cleanup_private_swift_wrapper_dir_is_a_no_op_when_nothing_was_created():
+    assert DE._swift_wrapper_dir is None
+
+    DE.cleanup_private_swift_wrapper_dir()  # must not raise
+
+    assert DE._swift_wrapper_dir is None
+
+
+def test_cleanup_private_swift_wrapper_dir_is_idempotent():
+    DE.dispatch_env()
+    path = DE._swift_wrapper_dir
+
+    DE.cleanup_private_swift_wrapper_dir()
+    DE.cleanup_private_swift_wrapper_dir()  # must not raise the second time either
+
+    assert not os.path.exists(path)
+    assert DE._swift_wrapper_dir is None
+
+
+def _write_swift_wrapper(path, baked_real_swift):
+    """Write `_SWIFT_WRAPPER_SCRIPT` to `path` with `@@BAKED_REAL_SWIFT@@`
+    substituted the same way `_private_swift_wrapper_dir` substitutes it in
+    production: shlex.quote()'d, so a path holding a space or a shell
+    metacharacter round-trips as one literal value."""
+    script = DE._SWIFT_WRAPPER_SCRIPT.replace("@@BAKED_REAL_SWIFT@@", shlex.quote(baked_real_swift))
+    path.write_text(script)
+    path.chmod(0o755)
+
+
+def _write_argv_recording_swift_stub(path, out_file):
+    """Write a `swift` stub at `path` that records its received argv (one argument
+    per line, overwritten on every call) to `out_file` and exits 0. Never calls back
+    into `swift`, so it can never recurse either way — safe to use as the wrapper's
+    AGENTCTL_REAL_SWIFT target in every functional test below."""
+    path.write_text(f"""#!/bin/bash
+printf '%s\\n' "$@" > {shlex.quote(str(out_file))}
+""")
+    path.chmod(0o755)
+
+
+@pytest.mark.parametrize("subcommand", ["build", "test", "run"])
+def test_swift_wrapper_adds_disable_sandbox_for_manifest_compiling_subcommands(tmp_path, subcommand):
+    out = tmp_path / "argv"
+    stub = tmp_path / "real-swift"
+    _write_argv_recording_swift_stub(stub, out)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(stub))
+
+    result = subprocess.run([str(wrapper), subcommand, "--verbose"],
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert out.read_text().splitlines() == [subcommand, "--disable-sandbox", "--verbose"]
+
+
+def test_swift_wrapper_adds_disable_sandbox_for_a_package_subcommand(tmp_path):
+    """Every `package` subcommand loads the manifest, so the flag goes on
+    unconditionally for `package`, not only for a fixed allow-list of its
+    subcommands."""
+    out = tmp_path / "argv"
+    stub = tmp_path / "real-swift"
+    _write_argv_recording_swift_stub(stub, out)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(stub))
+
+    result = subprocess.run([str(wrapper), "package", "resolve"],
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert out.read_text().splitlines() == ["package", "--disable-sandbox", "resolve"]
+
+
+def test_swift_wrapper_does_not_add_disable_sandbox_twice(tmp_path):
+    out = tmp_path / "argv"
+    stub = tmp_path / "real-swift"
+    _write_argv_recording_swift_stub(stub, out)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(stub))
+
+    result = subprocess.run([str(wrapper), "build", "--disable-sandbox", "--verbose"],
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    argv = out.read_text().splitlines()
+    assert argv == ["build", "--disable-sandbox", "--verbose"]
+    assert argv.count("--disable-sandbox") == 1
+
+
+def test_swift_wrapper_passes_other_subcommands_through_unchanged(tmp_path):
+    out = tmp_path / "argv"
+    stub = tmp_path / "real-swift"
+    _write_argv_recording_swift_stub(stub, out)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(stub))
+
+    result = subprocess.run([str(wrapper), "--version"],
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert out.read_text().splitlines() == ["--version"]
+
+
+def test_swift_wrapper_passes_no_arguments_through_unchanged(tmp_path):
+    """`swift` with no arguments at all (the bare compiler/REPL invocation) must not
+    crash the subcommand check on an unset `$1`."""
+    out = tmp_path / "argv"
+    stub = tmp_path / "real-swift"
+    _write_argv_recording_swift_stub(stub, out)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(stub))
+
+    result = subprocess.run([str(wrapper)],
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert out.read_text() == "\n"  # printf with zero args still writes a bare newline
+
+
+def _run_swift_wrapper_against(wrapper_path, real_swift, args):
+    env = {**os.environ, "AGENTCTL_REAL_SWIFT": real_swift}
+    return subprocess.run([str(wrapper_path), *args], capture_output=True, text=True,
+                          timeout=10, env=env)
+
+
+def test_swift_wrapper_refuses_when_agentctl_real_swift_is_its_own_file(tmp_path):
+    """Mirrors the git wrapper's self-reference refusal
+    (`test_wrapper_refuses_when_agentctl_real_git_is_its_own_file`): the exact incident
+    shape is AGENTCTL_REAL_SWIFT naming this wrapper's own file."""
+    wrapper = tmp_path / "swift"
+    wrapper.write_text(DE._SWIFT_WRAPPER_SCRIPT)
+    wrapper.chmod(0o755)
+
+    result = _run_swift_wrapper_against(wrapper, str(wrapper), ["build"])
+
+    assert result.returncode == 127, (result.returncode, result.stdout, result.stderr)
+    assert "AGENTCTL_REAL_SWIFT" in result.stderr
+
+
+def test_swift_wrapper_refuses_when_agentctl_real_swift_is_a_different_copy_of_the_wrapper(tmp_path):
+    """The $0 comparison alone would miss this: a SECOND run's wrapper is a different
+    file. Only the marker line (shared, verbatim, across every copy of the script)
+    catches it."""
+    wrapper = tmp_path / "swift"
+    wrapper.write_text(DE._SWIFT_WRAPPER_SCRIPT)
+    wrapper.chmod(0o755)
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    copy = other_dir / "swift"
+    copy.write_text(DE._SWIFT_WRAPPER_SCRIPT)
+    copy.chmod(0o755)
+
+    result = _run_swift_wrapper_against(wrapper, str(copy), ["build"])
+
+    assert result.returncode == 127, (result.returncode, result.stdout, result.stderr)
+    assert "AGENTCTL_REAL_SWIFT" in result.stderr
+
+
+def _write_capped_swift_stub(stub_dir, counter, cap=3):
+    """Mirrors `_write_capped_git_stub`: a `swift` stub that re-execs `swift` on every
+    call — so it would recurse through PATH without bound if the wrapper regressed and
+    ever entered it — but refuses once `counter` (one line appended per call) reaches
+    `cap`. Every test stub in this file that calls back into `swift` must be built
+    through this helper, so a future one can't be added without the cap."""
+    stub = stub_dir / "swift"
+    stub.write_text(f"""#!/bin/bash
+echo x >> {shlex.quote(str(counter))}
+count=$(wc -l < {shlex.quote(str(counter))})
+if [ "$count" -ge {cap} ]; then
+    exit 99
+fi
+exec swift "$@"
+""")
+    stub.chmod(0o755)
+    return stub
+
+
+def test_swift_wrapper_runs_the_baked_real_swift_without_resolving_a_path_stub(tmp_path):
+    """AGENTCTL_REAL_SWIFT unset, PATH pointing only at a stub that calls back into
+    `swift`: the wrapper must run its own baked real swift and never enter the stub at
+    all. The baked real swift is this test's own fake binary, never the host's —
+    a CI runner and most non-Xcode hosts have no `swift` at all."""
+    counter = tmp_path / "counter"
+    stub_dir = tmp_path / "stubpath"
+    stub_dir.mkdir()
+    _write_capped_swift_stub(stub_dir, counter)
+    out = tmp_path / "argv"
+    real_swift = tmp_path / "real-swift"
+    _write_argv_recording_swift_stub(real_swift, out)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(real_swift))
+
+    result = subprocess.run([str(wrapper), "--version"], env={"PATH": str(stub_dir)},
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert out.read_text().splitlines() == ["--version"]
+    assert not counter.exists() or counter.read_text() == "", \
+        "the stub was entered -- the wrapper resolved a bare 'swift' through PATH"
+
+
+def test_swift_wrapper_refuses_when_agentctl_real_swift_unset_and_baked_value_empty(tmp_path):
+    """No AGENTCTL_REAL_SWIFT and no usable baked fallback: the wrapper must refuse with
+    exit 127 and a stderr line, and must never enter the PATH stub at all."""
+    counter = tmp_path / "counter"
+    stub_dir = tmp_path / "stubpath"
+    stub_dir.mkdir()
+    _write_capped_swift_stub(stub_dir, counter)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, "")
+
+    result = subprocess.run([str(wrapper), "--version"], env={"PATH": str(stub_dir)},
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 127, (result.returncode, result.stdout, result.stderr)
+    assert result.stderr.strip() != ""
+    assert not counter.exists(), \
+        "the stub was entered -- the wrapper resolved a bare 'swift' through PATH"
+
+
+def test_resolve_real_swift_returns_nothing_usable_when_path_has_no_real_swift(tmp_path):
+    """Must never return the bare name `"swift"` — that name would have to be resolved
+    through $PATH by something to be of any use, which is the exact lookup this fix
+    removes."""
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+
+    resolved = DE._resolve_real_swift(str(empty_dir), wrapper_dir="/does/not/matter")
+
+    assert resolved in ("", None)
+    assert resolved != "swift"
+
+
+def test_resolve_real_swift_skips_an_inherited_wrapper_elsewhere_on_path(tmp_path):
+    """Mirrors `test_resolve_real_git_skips_an_inherited_wrapper_elsewhere_on_path`: a
+    `dispatch_env()` call made from INSIDE an already-dispatched run inherits an
+    ANCESTOR process's wrapper directory already first on PATH, under a tmp path this
+    call's own `_private_swift_wrapper_dir()` never created. `_resolve_real_swift` must
+    skip that directory too, by recognizing its `swift` as a wrapper copy, never by
+    running anything."""
+    inherited_wrapper_dir = tmp_path / "inherited-wrapper"
+    inherited_wrapper_dir.mkdir()
+    fake_wrapper = inherited_wrapper_dir / "swift"
+    fake_wrapper.write_text(f"#!/bin/bash\n# {DE._SWIFT_WRAPPER_MARKER}\necho should-never-run\n")
+    fake_wrapper.chmod(0o755)
+
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    fake_real_swift = real_dir / "swift"
+    fake_real_swift.write_text("#!/bin/bash\necho real-swift\n")
+    fake_real_swift.chmod(0o755)
+
+    path = os.pathsep.join([str(inherited_wrapper_dir), str(real_dir)])
+
+    resolved = DE._resolve_real_swift(path, wrapper_dir=str(tmp_path / "some-other-wrapper-dir"))
+
+    assert resolved == str(fake_real_swift)
+
+
+def test_baked_real_swift_path_with_space_and_dollar_round_trips_intact(tmp_path):
+    """A baked path holding a space and a `$` must reach the wrapper's `real_swift`
+    variable as one literal value, never shell-expanded or split."""
+    weird_dir = tmp_path / "weird path with $dollar"
+    weird_dir.mkdir()
+    fake_real_swift = weird_dir / "swift"
+    fake_real_swift.write_text("#!/bin/bash\necho weird-real-swift-ran\n")
+    fake_real_swift.chmod(0o755)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(fake_real_swift))
+
+    result = subprocess.run([str(wrapper), "--version"], env={"PATH": "/usr/bin:/bin"},
+                            capture_output=True, text=True, timeout=10)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    assert result.stdout.strip() == "weird-real-swift-ran"
+
+
+def _write_env_dumping_swift_stub(path, out_file):
+    """Write a `swift` stub at `path` that dumps the environment it actually received
+    (`env`'s own output, one `NAME=VALUE` pair per line) to `out_file` and exits 0.
+    Never calls back into `swift`, so it can never recurse either way."""
+    path.write_text(f"""#!/bin/bash
+env > {shlex.quote(str(out_file))}
+""")
+    path.chmod(0o755)
+
+
+def test_swift_wrapper_strips_credentials_from_the_real_swift_env(tmp_path):
+    """PR #965 round-1 security finding: `--disable-sandbox` removes SwiftPM's own
+    network denial during manifest/plugin compilation, so a run's live GH_TOKEN/
+    GITHUB_TOKEN (dispatch_env.py's `git_credential_guard_env` — a read-only GitHub
+    App installation token, scoped to the run's one repository) and ANTHROPIC_API_KEY
+    (bin/agentctl's `gateway_env` — a gateway-model dispatch's LiteLLM virtual key)
+    must never reach manifest/plugin code through the wrapper's exec. An ordinary
+    variable must still reach it unchanged."""
+    out = tmp_path / "env-dump"
+    stub = tmp_path / "real-swift"
+    _write_env_dumping_swift_stub(stub, out)
+    wrapper = tmp_path / "swift-wrapper"
+    _write_swift_wrapper(wrapper, str(stub))
+    env = {**os.environ,
+          "GH_TOKEN": "fake-gh-token",
+          "GITHUB_TOKEN": "fake-github-token",
+          "ANTHROPIC_API_KEY": "fake-anthropic-key",
+          "AN_ORDINARY_VAR": "should-still-arrive"}
+    env.pop("AGENTCTL_REAL_SWIFT", None)
+
+    result = subprocess.run([str(wrapper), "build"], capture_output=True, text=True,
+                            timeout=10, env=env)
+
+    assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
+    dumped = out.read_text()
+    assert "GH_TOKEN" not in dumped
+    assert "GITHUB_TOKEN" not in dumped
+    assert "ANTHROPIC_API_KEY" not in dumped
+    assert "AN_ORDINARY_VAR=should-still-arrive" in dumped

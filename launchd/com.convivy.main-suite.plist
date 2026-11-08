@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.convivy.main-suite</string>
+
+    <!-- Deploy-pinned per platform/decisions/0059 rule 1
+         (issue_01M19RRWSS9ETR09N9M2BJPA0Q): a timer firing unattended is
+         production USE of main-suite, not someone working on it, so this reads
+         a COPY installed from `main` into ~/.local/deploy/agent-platform-shared/
+         (rules 2, 6, 7) instead of the ~/.local/bin symlink into the checkout —
+         that symlink still exists and still reaches the tree, for the person who
+         re-invokes main-suite interactively while working on it (rule 5).
+         bin/agent-platform-autopull refreshes the deploy area on every
+         origin/main advance; bin/install-agent-platform-shared is what actually
+         builds it.
+         ProgramArguments names the deploy area's own pinned interpreter
+         explicitly (rule 4), not the shebang or launchd's PATH. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__HOME__/.local/deploy/agent-platform-shared/venv/bin/python3</string>
+        <string>__HOME__/.local/deploy/agent-platform-shared/bin/main-suite</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.local/deploy/agent-platform-shared</string>
+
+    <!-- 20:00 local time, every day. Runs each opted-in product's full test
+         suite against current origin/main in its own dedicated clone
+         (~/.local/state/main-suite/<slug>/checkout). Silent on pass; logs an
+         alert signal on failure.
+
+         WHY 20:00 and WHO OPTS IN. A product opts in by setting
+         main_suite_test_db on its project-registry unit; today exactly one
+         does, because every other fleet repo already has a push:[main]
+         trigger and the suite is too expensive to run per-merge (a
+         25-minute serial gate plus three shards) while the org is over
+         budget on Actions minutes. The 20:00 slot catches combination drift
+         from the day's merges before any overnight spend begins.
+
+         20:00 is chosen so a broken main is found before the next day's
+         work builds on it, rather than after a night of spend has already
+         gone to waste on an unrelated root cause. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>20</integer>
+        <key>Minute</key><integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.local/state/main-suite/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.local/state/main-suite/logs/launchd.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

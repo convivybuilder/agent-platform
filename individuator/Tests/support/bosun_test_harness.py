@@ -9,9 +9,14 @@ and never by pytest or the bash harness. Lives under `Tests/support/`
 source for any target.
 
 Protocol on stdin/stdout, line-delimited:
-  (on startup)        -> prints "PORT <port>"
-  "QUERY_SESSIONS\n"  -> prints "SESSIONS <count>"
-  "QUIT\n"            -> exits 0
+  (on startup)            -> prints "PORT <port>"
+  "QUERY_SESSIONS\n"      -> prints "SESSIONS <count>"
+  "QUERY_AUTHZ_COUNT\n"   -> prints "AUTHZ_COUNT <count>" (E12·2 slice S3: the
+                             row count in `authorization_audit` — every call
+                             that reached `bosun_authz.decide()`)
+  "REVOKE_MACHINE <name>\n" -> prints "REVOKED <count>" (E12·2 slice S3: calls
+                             `bosun_registration.revoke_sessions_for_machine`)
+  "QUIT\n"                -> exits 0
 
 The Library registry lookup (`library_machine_verify`) and the lookup token
 (`read_lookup_token`) are monkeypatched to a fixed, always-active,
@@ -140,6 +145,17 @@ def main() -> int:
             finally:
                 conn.close()
             print(f"SESSIONS {count}", flush=True)
+        elif line == "QUERY_AUTHZ_COUNT":
+            conn = sqlite3.connect(str(BR.SESSIONS_DB))
+            try:
+                count = conn.execute("SELECT COUNT(*) FROM authorization_audit").fetchone()[0]
+            finally:
+                conn.close()
+            print(f"AUTHZ_COUNT {count}", flush=True)
+        elif line.startswith("REVOKE_MACHINE "):
+            machine = line[len("REVOKE_MACHINE "):]
+            count = BR.revoke_sessions_for_machine(machine)
+            print(f"REVOKED {count}", flush=True)
         elif line == "QUIT":
             break
 

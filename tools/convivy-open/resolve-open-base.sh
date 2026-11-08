@@ -15,8 +15,8 @@
 #                                                            pasted mini path)
 #
 # CONVIVY_OPEN_BASE the ENVIRONMENT VARIABLE still overrides both of these at
-# runtime (convivy-open / convivy-open-server check it first) — this script
-# only decides what the config file, and so the generated plist, defaults to.
+# runtime (convivy-open checks it first) — this script only decides what the
+# config file defaults to.
 set -euo pipefail
 
 CONFIG="${1:?usage: resolve-open-base.sh <config-file>}"
@@ -40,7 +40,7 @@ MINI_ROOT="$(ssh -o BatchMode=yes -o ConnectTimeout=10 mini \
 # time (a `case` glob's `*` matches across embedded newlines, and grep splits
 # on them), so a two-line answer where each line individually looks like a
 # safe absolute path passes both, with its second line then landing,
-# unvalidated, in the config file, the plist and the server's environment.
+# unvalidated, in the config file this script writes.
 case "$MINI_ROOT" in
   *$'\n'*|*$'\r'*)
     echo "resolve-open-base.sh: the mini's answer spans more than one line; refusing rather than guessing. CONVIVY_OPEN_BASE not written." >&2

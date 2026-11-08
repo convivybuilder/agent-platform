@@ -10,8 +10,8 @@ The authoritative fields — `reviewed-commit` and `run-id` — are stamped by
 `agentctl review-post` from the harness env the Phase-1 pin set, NOT typed by the
 agent. So an APPROVE can never claim a commit it didn't review, and the gate
 counts an APPROVE only when its `reviewed-commit` equals the PR's current head.
-That is what makes a stale review (PA's near-miss) or a coder's "merge anyway"
-claim unmergeable by construction.
+That is what makes a stale review or a coder's "merge anyway" claim
+unmergeable by construction.
 
 Authenticity (ARCH-193): because every agentctl run is dispatched
 `bypassPermissions`, the per-agent `tools:` scoping is not actually enforced — any
@@ -36,6 +36,7 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import app_prefixes as AP
 import telemetry as T
 
 PROTOCOL_VERSION = "1"
@@ -171,7 +172,18 @@ class RunFacts:
     `posted_verdict` and `posted_pr` are what `review-post` recorded in meta.json
     when the run posted (`review_verdict`, `review_pr`; CQ·399). Empty for a run that
     has not posted and for every run that predates those fields. `authenticate`
-    refuses a stamp against an empty value."""
+    refuses a stamp against an empty value.
+
+    `agent_source` is the file `resolve_agent()` actually read for this run
+    (`telemetry.write_meta`'s own `agent_source` field), read back here for
+    `cmd_review_post`'s privacy check (CQ·557 round 3) — the post-time half of
+    the same `--agents-dir` bypass `_is_private_dispatch` already closes at
+    spawn time (see that function's docstring). `None` both when the field is
+    absent (a run that predates it, or a Library-resolved agent, which
+    `resolve_agent()` always records with `source: None`) and when present but
+    not a string — a corrupt or hand-edited meta.json degrades to the same
+    "no source known" answer `dispatch_is_private` already treats as safe,
+    never a crash on `Path(agent_source)`."""
     found: bool
     agent: str = ""
     repo: str = ""
@@ -181,6 +193,7 @@ class RunFacts:
     run_dir: "Path | None" = None
     posted_verdict: str = ""
     posted_pr: str = ""
+    agent_source: "str | None" = None
 
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -396,6 +409,7 @@ def resolve_run_facts(run_id: str, runs_root: "Path | None" = None) -> RunFacts:
     meta = _read_meta_bounded(d / "meta.json")
     if meta is None:
         return RunFacts(found=False)
+    source = meta.get("agent_source")
     return RunFacts(found=True, agent=str(meta.get("agent") or ""),
                     repo=str(meta.get("repo") or ""),
                     review_sha=str(meta.get("review_sha") or ""),
@@ -403,31 +417,32 @@ def resolve_run_facts(run_id: str, runs_root: "Path | None" = None) -> RunFacts:
                     started_at=str(meta.get("started_at") or ""),
                     run_dir=d,
                     posted_verdict=str(meta.get("review_verdict") or ""),
-                    posted_pr=str(meta.get("review_pr") or ""))
+                    posted_pr=str(meta.get("review_pr") or ""),
+                    agent_source=source if isinstance(source, str) else None)
 
 
-# The internal-app crew prefixes. Must equal agentctl._INTERNAL_APP_PREFIXES, which
-# test_agentctl_and_review_protocol_prefixes_match enforces. (Two literals rather
-# than one shared constant on purpose — agentctl imports its libs from the deployed
-# ~/.local/lib path, so a branch's agentctl gets MAIN's review_protocol; see the
-# note at agentctl's copy. The test is what holds them together across that seam.)
+# The internal-app crew prefixes (ARCH-397 Phase 2) — read from
+# `app_prefixes.internal_app_prefixes()`, itself derived from each crew's own
+# `agent_prefix` field in the project registry, rather than
+# a literal this module, bin/agentctl and app_prefixes.py each once kept pinned
+# equal to one another by a test. `_review_base` below calls it at use rather than
+# through a module-level binding here: `AP.internal_app_prefixes()` degrades to
+# `()` on a missing or unreadable registry rather than raising, and binding it
+# once at THIS module's import would bake in whatever that read answered for the
+# rest of the process, with no chance to recover.
 #
-# They drifted once (2026-07-12): agentctl's list had grown `hollis-`, while this
-# module's `_review_base` still stripped only `pa-`. So `_review_base` returned
-# "hollis-reviewer" unchanged, that name isn't in `review_agents`, and the ARCH-193
-# authenticity gate — the check of record for a review stamp — rejected EVERY Hollis
-# review stamp as "not a review-class agent". Silently, on a live crew.
-#
-# When you add a crew, add its prefix in BOTH places, in the same commit. Since
-# 2026-09-06 agentctl's `spawn` refuses a crew variant whose prefix is in neither,
-# so a forgotten crew fails at its first dispatch rather than writing into a
-# shared checkout (`platform-` was the second crew to do that).
-INTERNAL_APP_PREFIXES = ("hollis-", "svc-", "sel-", "pa-", "deck-", "orient-", "platform-",
-                         "wb-", "sig-", "archy-")
+# Before the Phase 1 collapse, this module's own copy once drifted from
+# bin/agentctl's: a crew's prefix was added to agentctl's list but not here, so
+# `_review_base` left that crew's `<prefix>-reviewer` names unstripped, no stripped
+# name matched `review_agents`, and the ARCH-193 authenticity gate rejected EVERY
+# one of that crew's review stamps as "not a review-class agent" — silently, on a
+# live crew. A crew registered with its own `agent_prefix` is covered the moment
+# that registry edit lands, closing the drift at its source rather than relying on
+# a sync test to catch the next instance of it.
 
 # Review-class agents (role base, after stripping an internal-app prefix). Must
 # equal agentctl._REVIEW_AGENTS, which test_agentctl_and_review_protocol_review_
-# agents_match enforces — same seam as INTERNAL_APP_PREFIXES above, and for the
+# agents_match enforces — same seam as the prefix derivation above, and for the
 # same reason (agentctl imports its libs from the deployed ~/.local path, so a
 # branch's agentctl gets MAIN's review_protocol). `authenticate()` below takes
 # this as a caller-supplied parameter rather than reading it directly, so
@@ -436,12 +451,54 @@ INTERNAL_APP_PREFIXES = ("hollis-", "svc-", "sel-", "pa-", "deck-", "orient-", "
 # same review-class test and has no reason to own a third copy of the list.
 REVIEW_AGENTS = ("reviewer", "security-reviewer")
 
+# The one review role that observes without gating (CQ·526, model trial 2's
+# shadow review: a non-arm model, today gpt-6-astra, reviews a trial PR's
+# round-1 head so its verdict can be compared against the gating reviewer's
+# without ever counting toward the merge gate). Deliberately kept OUT of
+# REVIEW_AGENTS so nothing that defaults its required-reviewer set from that
+# tuple — `evaluate_gate`'s callers, the review-eval corpus scan — picks it up
+# by surprise. A caller that wants a shadow stamp to AUTHENTICATE (prove it
+# came from a real review-class run, not a forgery) passes
+# `REVIEW_AGENTS + SHADOW_REVIEW_AGENTS`; a caller deciding who is REQUIRED
+# keeps passing `REVIEW_AGENTS` (or its own `required_agents`) alone. Must
+# equal agentctl._SHADOW_REVIEW_AGENTS, which
+# test_agentctl_and_review_protocol_shadow_review_agents_match enforces — the
+# same seam REVIEW_AGENTS/_REVIEW_AGENTS above is held together by.
+SHADOW_REVIEW_AGENTS = ("shadow-reviewer",)
+
+
+def latest_non_required_stamps(*, stamps: list[ReviewStamp],
+                               required_agents: list[str]) -> dict[str, ReviewStamp]:
+    """The latest stamp per role, for every authenticated stamp whose role is
+    NOT among `required_agents` — `evaluate_gate`'s own "last stamp per agent
+    wins" rule (see its docstring), applied to the roles it never looks up.
+
+    A shadow review (CQ·526) is exactly this: authenticated like any other
+    review-class stamp, so `_authenticated_stamps` keeps it rather than
+    reporting it as forged, but never a member of `required_agents`, so
+    `evaluate_gate` never reads it either way. This function is how a caller
+    (`agentctl review-status`) reports such a stamp informationally without
+    ever feeding it into the PASS/FAIL decision, which only `evaluate_gate`
+    makes."""
+    required_bases = {_review_base(a) for a in required_agents}
+    latest: dict[str, ReviewStamp] = {}
+    for s in stamps:
+        latest[_review_base(s.agent)] = s
+    return {role: s for role, s in latest.items() if role not in required_bases}
+
+
+def internal_app_prefixes() -> tuple[str, ...]:
+    """Thin re-export of `app_prefixes.internal_app_prefixes()` (see the comment
+    above `_review_base`): this module's own name for the one set
+    `bin/agentctl` and the test suite also know it by."""
+    return AP.internal_app_prefixes()
+
 
 def _review_base(agent_name: str) -> str:
-    """Role base for review-class membership: an internal-app variant
-    (`hollis-reviewer`, `svc-security-reviewer`, the legacy `pa-reviewer`)
-    reviews the same as its product counterpart (ARCH-177)."""
-    for p in INTERNAL_APP_PREFIXES:
+    """Role base for review-class membership: an internal-app variant (an
+    internal-app crew's own `security-reviewer`, say) reviews the same as its
+    product counterpart (ARCH-177)."""
+    for p in internal_app_prefixes():
         if agent_name.startswith(p):
             return agent_name[len(p):]
     return agent_name
@@ -459,12 +516,12 @@ def is_review_class(agent_name: str, review_agents: tuple[str, ...]) -> bool:
 
 def _repo_basename(repo: str) -> str:
     """The bare repo name, tolerant of the owner prefix. A reviewer sources the
-    stamp's repo from `gh pr view` as `convivy/constance` (owner/name), but the
-    run registry records the short `--on` form `constance`; without this the
+    stamp's repo from `gh pr view` as `acme/widget` (owner/name), but the
+    run registry records the short `--on` form `widget`; without this the
     authenticity compare `!=`'d those and failed EVERY overnight PR despite a valid
     APPROVE (ARCH-198 stamp-format bug). Basename comparison keeps the cross-repo
-    -replay guard intact (Convivy repo names are unique) while accepting both
-    forms. `convivy/constance` and `constance` → `constance`."""
+    -replay guard intact (repo names are unique) while accepting both
+    forms. `acme/widget` and `widget` → `widget`."""
     return repo.rsplit("/", 1)[-1]
 
 
@@ -565,8 +622,8 @@ def authenticate_run(stamp: ReviewStamp, facts: RunFacts, *,
       - run's agent not review-class → a worker stamped its OWN run-id (e.g. coder).
       - role mismatch        → a run claimed a role it did not perform, e.g. a
                                `reviewer` run stamping `security-reviewer` to fill
-                               both required slots. Compared on `_review_base`, so a
-                               crew prefix (`hollis-`) does not count as a mismatch.
+                               both required slots. Compared on `_review_base`, so an
+                               internal-app crew prefix does not count as a mismatch.
       - repo mismatch        → a reviewer run-id replayed from another repo's PR.
       - review_sha mismatch  → a reviewer run-id replayed onto a newer head than it
                                actually reviewed (the stale-replay attack).
@@ -594,31 +651,32 @@ def authenticate_run(stamp: ReviewStamp, facts: RunFacts, *,
     if not is_review_class(facts.agent, review_agents):
         return (f"run {stamp.run_id} ran agent '{facts.agent}', "
                 f"not a review-class agent — stamp not trusted")
-    # Compare ROLES, not raw names — `hollis-security-reviewer` and
-    # `security-reviewer` are the same reviewer, one deployed under a prefixed crew.
+    # Compare ROLES, not raw names — an internal-app crew's `security-reviewer`
+    # and the bare `security-reviewer` are the same reviewer, one deployed under
+    # a prefixed crew.
     #
     # THE THIRD INSTANCE OF THIS BUG CLASS (role equality). The membership check
     # directly above already uses `_review_base`; `evaluate_gate` matches both
     # sides on it too (see its docstring, which calls itself the second instance).
-    # This equality did not, so an auto-dispatched review that RAN as
-    # `hollis-security-reviewer` and STAMPED `security-reviewer` was rejected as
-    # inauthentic — and hollis PR #550 carried two genuine APPROVEs while the gate
-    # reported "no review posted by security-reviewer" (hollis co, 2026-07-23).
-    # Every prefixed crew hits it on the auto-dispatch path.
+    # This equality did not, so an auto-dispatched review that RAN under a crew
+    # prefix and STAMPED the bare role was rejected as inauthentic — a PR carried
+    # two genuine APPROVEs while the gate reported "no review posted by
+    # security-reviewer" (PR #550, 2026-07-23). Every prefixed crew hits it on
+    # the auto-dispatch path.
     #
     # THE FOURTH INSTANCE was the SHA equality seven lines below: the pinned
     # review_sha is always the full 40-char form; a stamp carrying a 9-char git
     # abbreviation never compared equal. The gate discarded the stamp as a stale
     # replay, and since a discarded stamp is absent — not a blocker — a
-    # REQUEST_CHANGES silently became a PASS (sous-chef PR #380, 2026-07-27).
+    # REQUEST_CHANGES silently became a PASS (PR #380, 2026-07-27).
     # Fixed with `_sha_match`, which accepts a prefix of at least _MIN_SHA_PREFIX
     # chars. An empty or too-short value still fails; a genuinely different commit
     # still fails. The file has no further un-normalized comparisons.
     #
-    # This grants nothing. A run that executed `hollis-reviewer` still cannot stamp
-    # as `security-reviewer`: those bases differ and the check still rejects it. Only
-    # the prefix — a deployment detail of WHICH crew ran the role — is normalized
-    # away, exactly as the two checks either side of it already do.
+    # This grants nothing. A run that executed a crew-prefixed `reviewer` still
+    # cannot stamp as `security-reviewer`: those bases differ and the check still
+    # rejects it. Only the prefix — a deployment detail of WHICH crew ran the role
+    # — is normalized away, exactly as the two checks either side of it already do.
     if _review_base(facts.agent) != _review_base(stamp.agent):
         return (f"stamp claims agent '{stamp.agent}' but run {stamp.run_id} "
                 f"ran '{facts.agent}'")
@@ -670,10 +728,10 @@ def evaluate_gate(*, head: str, stamps: list[ReviewStamp], required_agents: list
     Without it the gate keyed on the raw name, found none of the required roles, and
     reported "no review posted by reviewer" at a PR carrying two valid APPROVEs —
     which under ARCH-364 also meant `_mark_pr_ready` never fired, so the PR stayed a
-    draft and its full suite never ran. Every prefixed crew (hollis, selector, svc,
-    legacy pa) was unmergeable by construction. This is the second instance of that
-    bug class: see the INTERNAL_APP_PREFIXES note above for the 2026-07-12 drift that
-    broke the authenticity check the same way, one layer up.
+    draft and its full suite never ran. Every prefixed crew was unmergeable by
+    construction. This is the second instance of that bug class: see the prefix
+    note above `_review_base` for the drift that broke the authenticity check
+    the same way, one layer up.
 
     This grants no authority. `authenticate` has already proved each stamp came from
     a real review-class run whose meta.json records that same agent and repo, so

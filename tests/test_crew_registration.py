@@ -1,46 +1,37 @@
 """`agentctl crew register` — one crew, one row, no hand edit.
 
 issue_01M3YN6857H5J541G73Y9P3KA1: Shipwright's single-account rehearsal
-created a crew with a directory, a tmux session and a bead but no row in
-config/projects.json, and the work-queue tools refused to file its epics
-because they resolve `product` through that file. These tests never read or
-write the real config/projects.json or any deploy area — every one builds
-its own registry under `tmp_path`.
+created a crew with a directory, a tmux session and a bead but no row in the
+registry, and the work-queue tools refused to file its epics because they
+resolve `product` through it.
+
+CQ·564 (the 2026-10-25 amendment to platform/decisions/0098) moved the
+registry onto the Library: `register()` sends the row to the Library's
+`POST /registry/crews` (CQ·242, library#334) and writes NO FILE anywhere, on
+any outcome. Every test here uses a FAKE OPENER standing in for the Library
+and, for the ci_workflows tests, for GitHub too — the same pattern
+`tests/test_github_mint.py` uses for `GA.mint`/`GA.mint_token`, so this suite
+needs no real socket and no `sandbox.network.allowLocalBinding` — and a
+synthetic crew, repo and owner name throughout. None reads or writes any
+deploy area; the tests that assert "nothing was written" check the real
+committed config/projects.seed.json's bytes too, as the strongest version
+of that claim.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 import crew_registration as CR
+import github_app as GA
 import projects
 
-
-def _seed(tmp_path: Path, extra: dict | None = None) -> Path:
-    """A minimal, schema-valid registry: one existing project (so a
-    collision has something real to collide with), the `_scopes` and
-    `_products` blocks ARCH-426 gives a uniform meaning across the platform.
-    """
-    registry = {
-        "_meta": {"doc": "test fixture"},
-        "_products": {"widgets": {"display": "Widgets", "owner": "convivy"}},
-        "_scopes": {"platform": {"display": "Platform"}},
-        "existing": {
-            "class": "project", "display": "Existing", "owner": "convivy",
-            "home_dir": "<root>/existing", "dirs": [], "crew": "existing",
-            "lifecycle": "active", "products": [], "repos": ["existing-repo"],
-            "aliases": ["existing-alias"], "kb": "central", "kb_project": "existing",
-            "task_text_public": False, "overnight": False,
-        },
-    }
-    if extra:
-        registry.update(extra)
-    path = tmp_path / "projects.json"
-    path.write_text(json.dumps(registry, indent=2, ensure_ascii=False) + "\n")
-    return path
+REPO = Path(__file__).resolve().parents[1]
 
 
 def _spec(**kw) -> CR.CrewSpec:
@@ -49,324 +40,478 @@ def _spec(**kw) -> CR.CrewSpec:
     return CR.CrewSpec(**base)
 
 
-# --- a new row lands and resolves through projects.py -----------------------
+# --- a fake opener standing in for the Library's POST /registry/crews ------
 
 
-def test_register_writes_a_schema_valid_row(tmp_path):
-    path = _seed(tmp_path)
-    returned_path, row = CR.register(_spec(), registry_path=path)
-    assert returned_path == path
-    data = json.loads(path.read_text())
-    assert data["recipe-units"] == row
-    for field in projects.REQUIRED_FIELDS:
-        assert field in row, f"missing required field {field!r}"
-    assert row["class"] in projects.CLASSES
-    assert row["kb"] in projects.KB_VALUES
-    assert row["lifecycle"] in projects.LIFECYCLES
-    # kb defaults to central, so kb_project and crew_cockpit both default on
-    assert row["kb_project"] == "recipe-units"
-    assert row["crew_cockpit"] is True
-    assert row["home_dir"] == "<root>/recipe-units"
-    assert row["crew"] == "recipe-units"
-    # the existing row is untouched
-    assert data["existing"]["repos"] == ["existing-repo"]
+class _Resp:
+    """A `urlopen`-shaped response a fake opener returns directly, with no
+    exception, for ANY status — the same shape `GA.request`'s own fakes in
+    `tests/test_github_mint.py` use, and what `_post_crew_row` is written
+    to accept alongside a real `HTTPError`."""
+
+    def __init__(self, status: int, payload: dict):
+        self.status = status
+        self._body = json.dumps(payload).encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
 
-def test_registered_row_resolves_through_projects_py(tmp_path, monkeypatch):
-    path = _seed(tmp_path)
-    CR.register(_spec(repos=["recipe-units", "recipe-units-backend"],
-                       aliases=["recipes"]),
-                registry_path=path)
-    monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+class _FakeLibrary:
+    """Stands in for the Library's `POST /registry/crews`: a `status`/`body`
+    override when given, else an in-memory `store` that refuses a slug
+    already claimed — real registration behaviour, synthesized rather than
+    asked of a real service. Used two ways:
+
+    - as an `opener` passed to `CR.register(..., opener=stub)`, exercising
+      the real request-building and status-handling code in
+      `_post_crew_row` with no real socket;
+    - via `stub.post`, a drop-in for `CR._post_crew_row` itself, for the
+      CLI-level tests that go through `cmd_crew_register` — `register()`
+      calls that with no `opener` of its own to inject into, so those tests
+      replace the function rather than its transport.
+    """
+
+    def __init__(self, *, status: int | None = None, body: dict | None = None):
+        self.requests: list[dict] = []
+        self.store: dict[str, Any] = {}
+        self.status = status
+        self.body = body
+
+    def __call__(self, req, timeout=None) -> _Resp:
+        payload = json.loads(req.data) if req.data else {}
+        self.requests.append({"method": req.get_method(), "url": req.full_url,
+                              "headers": dict(req.header_items()), "body": payload})
+        status, body = self._answer(payload)
+        return _Resp(status, body)
+
+    def post(self, body: dict, *, opener=None) -> dict:
+        """The shape `CR._post_crew_row` has, for monkeypatching it
+        directly in a CLI-level test."""
+        self.requests.append({"method": "POST", "url": "/registry/crews", "body": body})
+        status, resp_body = self._answer(body)
+        if status == 201:
+            return resp_body
+        message = resp_body.get("error") or f"HTTP {status}"
+        hint = f" ({resp_body['hint']})" if resp_body.get("hint") else ""
+        verb = "refused" if status in (400, 409) else "failed to"
+        raise CR.RegistrationRefused(
+            f"the Library {verb} register {body.get('slug')!r} (HTTP {status}): "
+            f"{message}{hint}")
+
+    def _answer(self, payload: dict) -> tuple[int, dict]:
+        if self.status is not None:
+            return self.status, (self.body if self.body is not None else {})
+        slug = payload.get("slug")
+        if not slug or slug in self.store:
+            return 409, {"error": f"{slug!r} already claimed"}
+        row = {k: v for k, v in payload.items() if k != "slug"}
+        row["updated_at"] = "2026-10-26T00:00:00Z"
+        row["updated_by"] = "person_01TESTBOSUNWRITER00000000"
+        self.store[slug] = row
+        return 201, {**row, "slug": slug}
+
+
+def _unreachable(req, timeout=None):
+    """An opener raising the way a closed/unreachable socket does — never a
+    status at all."""
+    raise ConnectionRefusedError("[Errno 61] Connection refused")
+
+
+@pytest.fixture
+def writer_token(tmp_path, monkeypatch):
+    """A readable writer-token file at the path `_registry_writer_token_file`
+    resolves, under a `Path.home()` this fixture points at a scratch
+    directory — never the real `~/.orient-control`."""
+    home = tmp_path / "home"
+    (home / ".orient-control").mkdir(parents=True)
+    token_path = home / ".orient-control" / "agent-platform-registry-writer-token"
+    token_path.write_text("writer-test-token\n", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    return token_path
+
+
+@pytest.fixture
+def no_ci_workflows(monkeypatch):
+    """Every test that is not itself about the GitHub read stubs
+    `_repo_ci_workflows` to a fixed answer, so `register()`'s own Library
+    interaction is exercised with no real (or fake) GitHub call at all."""
+    monkeypatch.setattr(CR, "_repo_ci_workflows", lambda repo, row, **kw: ["ci.yml"])
+
+
+def _watched_files(tmp_path: Path) -> tuple[Path, bytes, bytes]:
+    """A throwaway file standing in for "PROJECTS_JSON's target", plus the
+    `before` bytes of it and of the real committed config/projects.seed.json —
+    config/projects.json is gone from the repo (CQ·565), so the seed is this
+    check's other real file — the two files every test below re-reads
+    afterwards to show `register()` wrote to NEITHER, which is the whole
+    point of CQ·564."""
+    target = tmp_path / "projects.json"
+    target.write_text('{"_meta": {"doc": "untouched"}}\n', encoding="utf-8")
+    return target, target.read_bytes(), (REPO / "config" / "projects.seed.json").read_bytes()
+
+
+def _assert_nothing_written(target: Path, before_target: bytes, before_repo: bytes) -> None:
+    assert target.read_bytes() == before_target, "PROJECTS_JSON's target was written to"
+    assert (REPO / "config" / "projects.seed.json").read_bytes() == before_repo, (
+        "the committed config/projects.seed.json was written to")
+
+
+# --- a new row is sent to the Library, with the writer token, and nothing is written
+
+
+def test_register_sends_the_row_and_the_writer_token_and_writes_no_file(
+        writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+    stub = _FakeLibrary()
+
+    row = CR.register(_spec(display="Recipe Units", aliases=["recipes"]), opener=stub)
+
+    assert row["slug"] == "recipe-units"
+    assert row["display"] == "Recipe Units"
+    assert row["updated_at"] and row["updated_by"]
+
+    assert len(stub.requests) == 1
+    req = stub.requests[0]
+    assert req["method"] == "POST"
+    assert req["url"].endswith("/registry/crews")
+    assert req["headers"]["Authorization"] == "Bearer writer-test-token"
+    assert req["headers"]["Library-protocol"]
+    assert req["body"]["slug"] == "recipe-units"
+    assert req["body"]["display"] == "Recipe Units"
+    assert req["body"]["repos"] == ["recipe-units"]
+    assert req["body"]["aliases"] == ["recipes"]
+
+    _assert_nothing_written(target, before_target, before_repo)
+
+
+def test_registered_row_resolves_through_projects_py_in_the_same_process(
+        writer_token, no_ci_workflows, monkeypatch):
+    stub = _FakeLibrary()
+    monkeypatch.setenv("AGENT_PLATFORM_REGISTRY_TOKEN", "reader-test-token")
+    monkeypatch.setattr(projects, "PROJECTS_JSON", None)
+    monkeypatch.setattr(projects.urllib.request, "urlopen",
+                        lambda req, timeout=None: _Resp(200, dict(stub.store)))
     projects._load_raw.cache_clear()
+
+    CR.register(_spec(repos=["recipe-units", "recipe-units-backend"], aliases=["recipes"]),
+               opener=stub)
+
     try:
         assert projects.get("recipe-units")["display"] == "Recipe Units"
         assert projects.project_for_repo("recipe-units-backend") == "recipe-units"
         assert projects.project_for_repo("recipes") == "recipe-units"
-        assert projects.crew_for_repo("recipe-units") == "recipe-units"
-        assert "recipe-units" in projects.kb_slugs()
     finally:
         projects._load_raw.cache_clear()
 
 
-def test_dry_run_returns_the_row_but_writes_nothing(tmp_path):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
-    _, row = CR.register(_spec(), registry_path=path, dry_run=True)
+def test_dry_run_builds_and_fills_the_row_but_sends_nothing(
+        writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+    stub = _FakeLibrary()
+
+    row = CR.register(_spec(), dry_run=True, opener=stub)
+
     assert row["class"] == "project"
-    assert path.read_bytes() == before
+    assert row["ci_workflows"] == {"recipe-units": ["ci.yml"]}
+    assert stub.requests == [], "a dry run must send nothing to the Library"
+    _assert_nothing_written(target, before_target, before_repo)
 
 
-# --- refusal: a clashing slug, alias or repo name, each leaving the file unchanged
+# --- the Library's answer decides the outcome -------------------------------
 
 
-@pytest.mark.parametrize("spec_kwargs,clash_desc", [
-    ({"slug": "existing"}, "project 'existing'"),
-    ({"aliases": ["existing-repo"]}, "project 'existing'"),  # alias collides with a REPO
-    ({"repos": ["existing-alias"]}, "project 'existing'"),   # repo collides with an ALIAS
-    ({"slug": "platform"}, "the 'platform' scope"),
-])
-def test_a_clashing_name_refuses_and_leaves_the_file_unchanged(
-        tmp_path, spec_kwargs, clash_desc):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
+def test_a_400_is_reported_with_the_stub_error_and_writes_nothing(
+        writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+    stub = _FakeLibrary(status=400, body={"error": "display must be a non-empty string"})
+
+    with pytest.raises(CR.RegistrationRefused, match="display must be a non-empty string"):
+        CR.register(_spec(), opener=stub)
+    _assert_nothing_written(target, before_target, before_repo)
+
+
+def test_a_409_is_reported_with_the_stub_error_and_writes_nothing(
+        writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+    stub = _FakeLibrary(status=409, body={
+        "error": "'recipe-units' is already claimed", "hint": "pick a different slug"})
+
+    with pytest.raises(CR.RegistrationRefused, match="already claimed") as exc_info:
+        CR.register(_spec(), opener=stub)
+    assert "pick a different slug" in str(exc_info.value)
+    _assert_nothing_written(target, before_target, before_repo)
+
+
+def test_an_unreachable_library_fails_and_is_never_read_as_success(
+        writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+
+    with pytest.raises(CR.RegistrationRefused):
+        CR.register(_spec(), opener=_unreachable)
+    _assert_nothing_written(target, before_target, before_repo)
+
+
+def test_a_503_fails_and_is_never_read_as_success(writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+    stub = _FakeLibrary(status=503, body={"error": "empty registry"})
+
+    with pytest.raises(CR.RegistrationRefused):
+        CR.register(_spec(), opener=stub)
+    _assert_nothing_written(target, before_target, before_repo)
+
+
+def test_a_403_fails_and_is_never_read_as_success(writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+    stub = _FakeLibrary(status=403, body={"error": "forbidden: missing registry.write"})
+
+    with pytest.raises(CR.RegistrationRefused):
+        CR.register(_spec(), opener=stub)
+    _assert_nothing_written(target, before_target, before_repo)
+
+
+def test_a_401_fails_and_is_never_read_as_success(writer_token, no_ci_workflows, tmp_path):
+    target, before_target, before_repo = _watched_files(tmp_path)
+    stub = _FakeLibrary(status=401, body={"error": "unknown token"})
+
+    with pytest.raises(CR.RegistrationRefused):
+        CR.register(_spec(), opener=stub)
+    _assert_nothing_written(target, before_target, before_repo)
+
+
+def test_a_missing_token_file_fails_and_names_the_path(tmp_path, monkeypatch, no_ci_workflows):
+    stub = _FakeLibrary()
+    home = tmp_path / "no-orient-control-here"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+
     with pytest.raises(CR.RegistrationRefused) as exc_info:
-        CR.register(_spec(**spec_kwargs), registry_path=path)
-    assert clash_desc in str(exc_info.value)
-    assert path.read_bytes() == before, "a refused registration must not touch the file"
+        CR.register(_spec(), opener=stub)
+    expected_path = home / ".orient-control" / "agent-platform-registry-writer-token"
+    assert str(expected_path) in str(exc_info.value)
+    assert stub.requests == [], "no request should be made with no token"
 
 
-def test_the_match_is_case_insensitive(tmp_path):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
-    with pytest.raises(CR.RegistrationRefused):
-        CR.register(_spec(slug="existing".upper().lower(), repos=["EXISTING-REPO"]),
-                     registry_path=path)
-    assert path.read_bytes() == before
+# --- after a 201, projects.py's cache is cleared in the same process -------
 
 
-def test_an_unknown_product_refuses(tmp_path):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
-    with pytest.raises(CR.RegistrationRefused, match="no-such-product"):
-        CR.register(_spec(products=["no-such-product"]), registry_path=path)
-    assert path.read_bytes() == before
-
-
-def test_a_known_product_is_accepted(tmp_path):
-    path = _seed(tmp_path)
-    _, row = CR.register(_spec(products=["widgets"]), registry_path=path)
-    assert row["products"] == ["widgets"]
-
-
-def test_missing_registry_file_refuses_rather_than_creating_one(tmp_path):
-    missing = tmp_path / "no-such-file.json"
-    with pytest.raises(CR.RegistrationRefused):
-        CR.register(_spec(), registry_path=missing)
-    assert not missing.exists()
-
-
-# --- write is atomic (temp file + rename in the same directory) -------------
-
-
-def test_write_is_a_same_directory_rename(tmp_path, monkeypatch):
-    path = _seed(tmp_path)
-    seen_names = []
-    import tempfile as _tempfile
-    real_mkstemp = _tempfile.mkstemp
-
-    def spy(*a, **kw):
-        fd, name = real_mkstemp(*a, **kw)
-        seen_names.append(name)
-        return fd, name
-
-    monkeypatch.setattr(_tempfile, "mkstemp", spy)
-    CR.register(_spec(), registry_path=path)
-    assert len(seen_names) == 1
-    assert Path(seen_names[0]).parent == path.parent
-
-
-def test_byte_identical_reproduction_when_nothing_changes(tmp_path):
-    """The registry's own JSON style round-trips (2-space indent, real UTF-8
-    rather than \\uXXXX escapes) — the premise `register`'s atomic write
-    relies on to keep an unrelated diff out of a real registration."""
-    path = _seed(tmp_path, extra={
-        "em-dash": {
-            "class": "project", "display": "Em—Dash", "owner": "convivy",
-            "home_dir": "<root>/em-dash", "dirs": [], "crew": "em-dash",
-            "lifecycle": "active", "products": [], "repos": ["em-dash"],
-            "aliases": [], "kb": "local", "task_text_public": False,
-            "overnight": False,
-        },
-    })
-    original = json.loads(path.read_text())
-    reproduced = json.dumps(original, indent=2, ensure_ascii=False) + "\n"
-    assert reproduced == path.read_text()
-
-
-# --- the deployed-path resolution --------------------------------------------
-
-
-def test_default_registry_path_matches_projects_pys_own_live_resolution():
-    """The command must not guess a second path: it writes exactly where
-    `projects._registry_path()` — projects.py's own live resolver — answers
-    right now, in-process, without a `--registry` override — the symlink-farm
-    checkout and a packaged adopter's copy deploy alike.
-
-    Equality, not identity: `default_registry_path()` calls that resolver
-    fresh on every call (see the PROJECTS_JSON test below) rather than
-    returning the cached `projects.PROJECTS_JSON` snapshot, so the two Path
-    objects are independently constructed and merely have to agree."""
-    assert CR.default_registry_path() == projects._registry_path()
-
-
-def test_default_registry_path_honours_a_freshly_set_PROJECTS_JSON(tmp_path, monkeypatch):
-    """`projects.PROJECTS_JSON` is only `_registry_path()`'s result cached at
-    whichever moment `projects` first imported in this process — setting the
-    env var afterwards never touches that cached attribute. This command must
-    not inherit that staleness: Shipwright's adopter install sets
-    PROJECTS_JSON once for every job's environment, and the Library is
-    adopting the same variable (platform/decisions, 2026-10-02), so a value
-    set before this call has to land on the same file both resolve."""
-    target = tmp_path / "adopter-projects.json"
-    monkeypatch.setenv("PROJECTS_JSON", str(target))
-    assert CR.default_registry_path() == target
-
-
-def test_resolved_registry_path_is_absolute(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PROJECTS_JSON", "relative/projects.json")
-    resolved = CR.resolved_registry_path()
-    assert resolved.is_absolute()
-    assert resolved == (tmp_path / "relative" / "projects.json").resolve()
-
-
-# --- the reader this change touches: bin/co's crew-cockpit derivation -------
-
-
-def test_crew_cockpit_dirs_reads_the_new_field(tmp_path, monkeypatch):
-    path = _seed(tmp_path)
-    CR.register(_spec(crew_cockpit=True), registry_path=path)
-    CR.register(_spec(slug="other", display="Other", repos=["other"],
-                       crew_cockpit=False, kb="local"),
-                registry_path=path)
-    monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+def test_after_a_201_a_projects_py_read_in_the_same_process_sees_the_new_crew(
+        writer_token, no_ci_workflows, monkeypatch):
+    stub = _FakeLibrary()
+    monkeypatch.setenv("AGENT_PLATFORM_REGISTRY_TOKEN", "reader-test-token")
+    monkeypatch.setattr(projects, "PROJECTS_JSON", None)
+    monkeypatch.setattr(projects.urllib.request, "urlopen",
+                        lambda req, timeout=None: _Resp(200, dict(stub.store)))
     projects._load_raw.cache_clear()
+    assert projects.get("recipe-units") is None  # primed the cache with "not yet registered"
+
     try:
-        assert projects.crew_cockpit_dirs() == ["recipe-units"]
+        CR.register(_spec(), opener=stub)
+        assert projects.get("recipe-units") is not None
+        assert projects.get("recipe-units")["display"] == "Recipe Units"
     finally:
         projects._load_raw.cache_clear()
 
 
-def test_crew_cockpit_defaults_off_for_a_local_kb_crew(tmp_path):
-    path = _seed(tmp_path)
-    _, row = CR.register(_spec(kb="local"), registry_path=path)
-    assert "crew_cockpit" not in row
-
-
-# --- field validation ---------------------------------------------------------
+# --- field validation (build_row's own pure checks, no registry to read) ---
 
 
 @pytest.mark.parametrize("bad_slug", ["Recipe-Units", "-recipe", "recipe units", ""])
-def test_bad_slug_is_refused(tmp_path, bad_slug):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
+def test_bad_slug_is_refused_before_any_request(bad_slug, writer_token, no_ci_workflows):
+    stub = _FakeLibrary()
     with pytest.raises(CR.RegistrationRefused):
-        CR.register(_spec(slug=bad_slug, repos=[bad_slug or "x"]), registry_path=path)
-    assert path.read_bytes() == before
+        CR.register(_spec(slug=bad_slug, repos=[bad_slug or "x"]), opener=stub)
+    assert stub.requests == []
 
 
-def test_kb_project_is_refused_when_kb_is_local(tmp_path):
-    path = _seed(tmp_path)
+def test_kb_project_is_refused_when_kb_is_local(writer_token, no_ci_workflows):
+    stub = _FakeLibrary()
     with pytest.raises(CR.RegistrationRefused):
-        CR.register(_spec(kb="local", kb_project="recipe-units"), registry_path=path)
+        CR.register(_spec(kb="local", kb_project="recipe-units"), opener=stub)
+    assert stub.requests == []
 
 
-def test_unknown_model_tier_is_refused(tmp_path):
-    path = _seed(tmp_path)
+def test_a_regex_breaking_kb_project_is_refused(writer_token, no_ci_workflows):
+    """A `kb_project` that is not valid regex syntax reaches
+    `knowledge.id_pattern_for`'s alternation unless it is refused here first
+    — an unbalanced paren broke `re.compile()` at knowledge.py's own import
+    (security-reviewer, PR #978 round 2)."""
+    stub = _FakeLibrary()
+    with pytest.raises(CR.RegistrationRefused, match="kb_project"):
+        CR.register(_spec(kb_project="widget(crew"), opener=stub)
+    assert stub.requests == []
+
+
+def test_unknown_model_tier_is_refused(writer_token, no_ci_workflows):
+    stub = _FakeLibrary()
     with pytest.raises(CR.RegistrationRefused):
-        CR.register(_spec(model_tier="sonnett"), registry_path=path)
+        CR.register(_spec(model_tier="sonnett"), opener=stub)
+    assert stub.requests == []
 
 
-def test_task_text_public_and_overnight_are_always_written_explicitly(tmp_path):
-    path = _seed(tmp_path)
-    _, row = CR.register(_spec(), registry_path=path)
+@pytest.mark.parametrize("bad_prefix", ["acme", "", "acme_", "-acme"])
+def test_malformed_agent_prefix_is_refused_before_any_request(
+        bad_prefix, writer_token, no_ci_workflows):
+    """`projects.agent_prefixes()` raises `ValueError` on any row whose
+    `agent_prefix` is not a non-empty string ending in `-`. Checked here, on
+    the write side, so a bad value refuses before it ever reaches the live
+    registry — the shape `app_prefixes.internal_app_prefixes()` degrades to
+    `()` for AFTER the fact, which is one crew too late for every other
+    crew's prefix lookups in the same process."""
+    stub = _FakeLibrary()
+    with pytest.raises(CR.RegistrationRefused, match="agent_prefix"):
+        CR.register(_spec(agent_prefix=bad_prefix), opener=stub)
+    assert stub.requests == []
+
+
+def test_well_formed_agent_prefix_is_sent_and_resolves(
+        writer_token, no_ci_workflows, monkeypatch):
+    stub = _FakeLibrary()
+    monkeypatch.setenv("AGENT_PLATFORM_REGISTRY_TOKEN", "reader-test-token")
+    monkeypatch.setattr(projects, "PROJECTS_JSON", None)
+    monkeypatch.setattr(projects.urllib.request, "urlopen",
+                        lambda req, timeout=None: _Resp(200, dict(stub.store)))
+    projects._load_raw.cache_clear()
+
+    try:
+        row = CR.register(_spec(agent_prefix="acme-"), opener=stub)
+        assert row["agent_prefix"] == "acme-"
+        assert stub.requests[0]["body"]["agent_prefix"] == "acme-"
+        assert "acme-" in projects.all_agent_prefixes()
+    finally:
+        projects._load_raw.cache_clear()
+
+
+def test_task_text_public_is_always_sent_explicitly(writer_token, no_ci_workflows):
+    stub = _FakeLibrary()
+    row = CR.register(_spec(), opener=stub)
     assert row["task_text_public"] is False
-    assert row["overnight"] is False
 
 
-def test_optional_fields_are_omitted_when_not_requested(tmp_path):
-    path = _seed(tmp_path)
-    _, row = CR.register(_spec(), registry_path=path)
-    for absent in ("private", "model_tier", "agent_prefix", "data_local", "note",
-                   "created_by"):
-        assert absent not in row
+def test_optional_fields_are_omitted_when_not_requested(writer_token, no_ci_workflows):
+    stub = _FakeLibrary()
+    CR.register(_spec(), opener=stub)
+    body = stub.requests[0]["body"]
+    for absent in ("private", "model_tier", "agent_prefix", "data_local", "note", "created_by"):
+        assert absent not in body
 
 
-# --- created_by: who created the project (issue_01M2QWFR8PCBPANF8Q5P460GHY) --
+# --- ADR-0043: a private row must come out internally consistent ----------
 
 
-_PERSON_ID = "person_01ARZ3NDEKTSV4RRFFQ69G5FAV"
-
-
-def test_created_by_is_written_when_well_formed(tmp_path):
-    path = _seed(tmp_path)
-    _, row = CR.register(_spec(created_by=_PERSON_ID), registry_path=path)
-    assert row["created_by"] == _PERSON_ID
-    assert projects.valid_person_id(row["created_by"])
-
-
-def test_registering_created_by_does_not_touch_meta_products_or_scopes(tmp_path):
-    """The hazard comment 2963 names: a writer that iterates the file's
-    top-level keys would write a creator onto `_meta`, `_products` or
-    `_scopes` too. `register()` only ever sets `data[spec.slug]`, so those
-    three must come out byte-identical to what `_seed` wrote."""
-    path = _seed(tmp_path)
-    before = json.loads(path.read_text())
-    CR.register(_spec(created_by=_PERSON_ID), registry_path=path)
-    after = json.loads(path.read_text())
-    for block in ("_meta", "_products", "_scopes"):
-        assert after[block] == before[block]
-
-
-@pytest.mark.parametrize("bad", [
-    "Jane Doe",              # a display name
-    "convivy",               # an organisation, what `owner` holds
-    "person_tooshort",
-    "",
-])
-def test_created_by_is_refused_when_malformed(tmp_path, bad):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
-    with pytest.raises(CR.RegistrationRefused, match="created_by"):
-        CR.register(_spec(created_by=bad), registry_path=path)
-    assert path.read_bytes() == before
-
-
-# --- ADR-0043: a private row must come out internally consistent -------------
-#
-# `--kb` defaults to "central" (both CrewSpec's own default and the CLI
-# argparser's), so `--private` with no other flag would write exactly the
-# contradiction `projects.privacy_invariant_errors` and
-# `tests/test_projects.py::test_a_private_crew_cannot_also_be_centrally_indexed`
-# exist to catch. These refuse before a byte is written, rather than silently
-# defaulting `kb` to "local" under `--private` — seeing CrewSpec.kb's module
-# docstring on why a silent default was rejected.
-
-
-def test_a_private_crew_with_default_kb_is_refused(tmp_path):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
+def test_a_private_crew_with_default_kb_is_refused(writer_token, no_ci_workflows):
+    stub = _FakeLibrary()
     with pytest.raises(CR.RegistrationRefused, match="kb='central'"):
-        CR.register(_spec(private=True), registry_path=path)
-    assert path.read_bytes() == before
+        CR.register(_spec(private=True), opener=stub)
+    assert stub.requests == []
 
 
-def test_a_private_crew_with_task_text_public_is_refused(tmp_path):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
-    with pytest.raises(CR.RegistrationRefused, match="task_text_public is true"):
-        CR.register(_spec(private=True, kb="local", task_text_public=True),
-                     registry_path=path)
-    assert path.read_bytes() == before
-
-
-def test_a_private_crew_with_overnight_true_is_refused(tmp_path):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
-    with pytest.raises(CR.RegistrationRefused, match="overnight is true"):
-        CR.register(_spec(private=True, kb="local", overnight=True), registry_path=path)
-    assert path.read_bytes() == before
-
-
-def test_a_private_crew_with_consistent_fields_is_accepted(tmp_path):
-    path = _seed(tmp_path)
-    _, row = CR.register(_spec(private=True, kb="local"), registry_path=path)
+def test_a_private_crew_with_consistent_fields_is_accepted(writer_token, no_ci_workflows):
+    stub = _FakeLibrary()
+    row = CR.register(_spec(private=True, kb="local"), opener=stub)
     assert row["private"] is True
     assert row["kb"] == "local"
-    assert row["task_text_public"] is False
-    assert row["overnight"] is False
-    assert projects.privacy_invariant_errors(row) == []
+
+
+# --- ci_workflows: filled from a live GitHub read, never from caller input --
+
+
+@pytest.fixture()
+def rsa_key(tmp_path):
+    key = tmp_path / "app.pem"
+    subprocess.run(["openssl", "genrsa", "-out", str(key), "2048"], check=True,
+                   capture_output=True)
+    key.chmod(0o600)
+    return key
+
+
+def _fake_transport(*, contents_status=200, workflow_items=None):
+    """A fake opener answering the org-installation lookup, the access-token
+    mint, the revoke, the `.github/workflows` contents listing, AND —
+    `register()` shares one `opener` across both calls — a 201 for
+    `POST /registry/crews`, so these tests can exercise the WHOLE pipeline
+    (the GitHub fill feeding the row that reaches the Library) with one
+    fake. Extends `tests/test_github_mint.py`'s own fake-opener pattern with
+    the routes this module's own calls add."""
+    calls: list[str] = []
+
+    def opener(req, timeout=None):
+        calls.append(req.full_url)
+        method = req.get_method()
+        url = req.full_url
+        if method == "GET" and url.endswith("/installation"):
+            return _Resp(200, {"id": 1, "account": {"login": "convivy"}})
+        if method == "POST" and url.endswith("/access_tokens"):
+            body = json.loads(req.data)
+            return _Resp(201, {"token": "ghs_test", "permissions": body.get("permissions"),
+                               "repository_selection": "selected",
+                               "expires_at": "2026-10-17T12:00:00Z"})
+        if method == "DELETE" and url.endswith("/installation/token"):
+            return _Resp(204, {})
+        if method == "GET" and url.endswith("/contents/.github/workflows"):
+            if contents_status != 200:
+                return _Resp(contents_status, {"message": "error"})
+            return _Resp(200, workflow_items if workflow_items is not None else [])
+        if method == "POST" and url.endswith("/registry/crews"):
+            body = json.loads(req.data)
+            row = {k: v for k, v in body.items() if k != "slug"}
+            row["updated_at"] = "2026-10-26T00:00:00Z"
+            row["updated_by"] = "person_01TESTBOSUNWRITER00000000"
+            return _Resp(201, {**row, "slug": body.get("slug")})
+        raise AssertionError(f"unexpected {method} {url}")
+    return opener, calls
+
+
+def test_ci_workflows_fills_the_row_from_a_stubbed_github_listing(
+        rsa_key, tmp_path, monkeypatch, writer_token):
+    monkeypatch.setattr(GA, "installed_app",
+                        lambda: GA.InstalledApp(app_id="1234567", key_path=rsa_key,
+                                                slug="test-app"))
+    monkeypatch.setattr(GA, "mint_log_path", lambda: tmp_path / "mint-log.jsonl")
+    opener, calls = _fake_transport(workflow_items=[
+        {"name": "ci.yml", "type": "file"},
+        {"name": "e2e.yaml", "type": "file"},
+        {"name": "README.md", "type": "file"},
+        {"name": "actions", "type": "dir"},
+    ])
+
+    row = CR.register(_spec(), opener=opener)
+
+    assert row["ci_workflows"] == {"recipe-units": ["ci.yml", "e2e.yaml"]}
+    assert any(u.endswith("/registry/crews") for u in calls)
+
+
+def test_ci_workflows_an_empty_listing_gives_an_explicit_empty_list(
+        rsa_key, tmp_path, monkeypatch, writer_token):
+    monkeypatch.setattr(GA, "installed_app",
+                        lambda: GA.InstalledApp(app_id="1234567", key_path=rsa_key,
+                                                slug="test-app"))
+    monkeypatch.setattr(GA, "mint_log_path", lambda: tmp_path / "mint-log.jsonl")
+    opener, _ = _fake_transport(contents_status=404)
+
+    row = CR.register(_spec(), opener=opener)
+
+    assert row["ci_workflows"] == {"recipe-units": []}
+
+
+def test_ci_workflows_an_unreadable_listing_refuses_before_any_library_request(
+        rsa_key, tmp_path, monkeypatch, writer_token):
+    monkeypatch.setattr(GA, "installed_app",
+                        lambda: GA.InstalledApp(app_id="1234567", key_path=rsa_key,
+                                                slug="test-app"))
+    monkeypatch.setattr(GA, "mint_log_path", lambda: tmp_path / "mint-log.jsonl")
+    opener, calls = _fake_transport(contents_status=500)
+
+    with pytest.raises(CR.RegistrationRefused, match="recipe-units"):
+        CR.register(_spec(), opener=opener)
+    assert not any(u.endswith("/registry/crews") for u in calls), (
+        "the Library must not be asked when a repo's CI can't be read")
 
 
 # --- the CLI wiring: `agentctl crew register` --------------------------------
@@ -378,144 +523,78 @@ def _cli_args(**overrides) -> argparse.Namespace:
     accident of an attribute neither side set."""
     base = dict(
         slug="recipe-units", display="Recipe Units", repos=None, aliases=[],
-        products=[], crew=None, owner="convivy", cls="project", kb="central",
+        products=[], crew=None, owner="convivy", github_owner=None,
+        cls="project", kb="central",
         kb_project=None, home_dir=None, dirs=[], lifecycle="active",
-        model_tier=None, task_text_public=False, overnight=None,
-        private=False, data_local=False, agent_prefix=None, crew_cockpit=None,
-        note=None, registry=None, dry_run=False,
+        model_tier=None, task_text_public=False,
+        private=False, data_local=False, agent_prefix=None,
+        crew_cockpit=None, note=None, dry_run=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
 
 
-def test_cmd_crew_register_writes_the_row(agentctl, tmp_path, capsys):
-    path = _seed(tmp_path)
-    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "registered 'recipe-units'" in out
-    assert "Library" in out and "next lookup" in out, (
-        "the Library's projects.py re-reads the registry when the file's "
-        "(st_mtime_ns, st_size, st_ino) changes, so the success output "
-        "must say the new row is picked up on the next lookup")
-    data = json.loads(path.read_text())
-    assert data["recipe-units"]["display"] == "Recipe Units"
-    assert data["recipe-units"]["repos"] == ["recipe-units"]
+@pytest.fixture
+def fake_post(monkeypatch, no_ci_workflows):
+    """`cmd_crew_register` goes through `CR.register` with no `opener` seam
+    of its own, so these CLI-level tests replace `CR._post_crew_row`
+    directly — the shape `_FakeLibrary.post` has."""
+    stub = _FakeLibrary()
+    monkeypatch.setattr(CR, "_post_crew_row", stub.post)
+    return stub
 
 
-def test_cmd_crew_register_no_longer_tells_operator_to_restart_the_library(
-        agentctl, tmp_path, capsys):
-    """issue_01M4PGRW8SSE9GCHT919WKPFHB: the Library's `_snapshot()` stats
-    the registry on every lookup and re-reads it when the file changes, so
-    a just-registered slug resolves with no restart — the success output
-    must not tell the operator to restart or reload the Library."""
-    path = _seed(tmp_path)
-    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "restart" not in out
-    assert "reload" not in out
-
-
-def test_cmd_crew_register_dry_run_has_no_library_caveat(agentctl, tmp_path, capsys):
-    """The caveat is about a row that actually reached the live file; a
-    `--dry-run` writes nothing, so there is nothing for the Library to miss."""
-    path = _seed(tmp_path)
-    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path), dry_run=True))
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "Library" not in out
-
-
-def test_cmd_crew_register_refuses_a_clash_and_exits_nonzero(agentctl, tmp_path, capsys):
-    path = _seed(tmp_path)
-    before = path.read_bytes()
-    rc = agentctl.cmd_crew_register(_cli_args(slug="existing", repos=["existing"],
-                                               registry=str(path)))
-    assert rc != 0
-    err = capsys.readouterr().err
-    assert "refused" in err
-    assert path.read_bytes() == before
-
-
-def test_cmd_crew_register_honours_PROJECTS_JSON_with_no_registry_override(
-        agentctl, tmp_path, monkeypatch, capsys):
-    """No `--registry` flag at all: the command must resolve through
-    PROJECTS_JSON, the variable Shipwright's adopter install sets and the
-    Library is adopting, and its success output must name the resolved
-    (absolute) file it actually wrote so an operator can see it agrees with
-    what the Library will read."""
-    path = _seed(tmp_path)
-    monkeypatch.setenv("PROJECTS_JSON", str(path))
+def test_cmd_crew_register_sends_the_row_to_the_library(agentctl, fake_post, capsys):
     rc = agentctl.cmd_crew_register(_cli_args())
     assert rc == 0
     out = capsys.readouterr().out
-    assert str(path.resolve()) in out
-    data = json.loads(path.read_text())
-    assert data["recipe-units"]["display"] == "Recipe Units"
+    assert "registered 'recipe-units'" in out
+    assert "Library" in out
+    assert fake_post.requests[0]["body"]["display"] == "Recipe Units"
 
 
-def test_cmd_crew_register_refusal_names_the_resolved_registry_path(
-        agentctl, tmp_path, monkeypatch, capsys):
-    """A refusal raised inside `build_row()` (here, a malformed slug) carries
-    no path in its own message — `build_row` never receives one. The command
-    must still tell the operator which file was left untouched, so it does
-    not have to re-derive PROJECTS_JSON / --registry / projects.py's own
-    fallback order by hand to find out."""
-    path = _seed(tmp_path)
-    monkeypatch.setenv("PROJECTS_JSON", str(path))
-    before = path.read_bytes()
-    rc = agentctl.cmd_crew_register(_cli_args(slug="Not-A-Valid-Slug"))
+def test_cmd_crew_register_refuses_a_409_and_exits_nonzero(agentctl, monkeypatch,
+                                                            no_ci_workflows, capsys):
+    stub = _FakeLibrary(status=409, body={"error": "'recipe-units' already claimed"})
+    monkeypatch.setattr(CR, "_post_crew_row", stub.post)
+    rc = agentctl.cmd_crew_register(_cli_args())
     assert rc != 0
     err = capsys.readouterr().err
-    assert "refused" in err
-    assert str(path.resolve()) in err
-    assert path.read_bytes() == before
+    assert "refused" in err and "already claimed" in err
+
+
+def test_cmd_crew_register_dry_run_sends_nothing(agentctl, fake_post, capsys):
+    rc = agentctl.cmd_crew_register(_cli_args(dry_run=True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "would register" in out
+    assert fake_post.requests == []
 
 
 # --- `created_by`, read from the operator config's `person_id` --------------
 
 
+_PERSON_ID = "person_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+
+
 def test_cmd_crew_register_writes_created_by_from_operator_config(
-        agentctl, tmp_path, monkeypatch, capsys):
-    path = _seed(tmp_path)
+        agentctl, tmp_path, monkeypatch, fake_post, capsys):
     config_path = tmp_path / "operator.json"
     config_path.write_text(json.dumps({"person_id": _PERSON_ID}))
     monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(config_path))
-    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
+    rc = agentctl.cmd_crew_register(_cli_args())
     assert rc == 0
-    data = json.loads(path.read_text())
-    assert data["recipe-units"]["created_by"] == _PERSON_ID
+    assert fake_post.requests[0]["body"]["created_by"] == _PERSON_ID
 
 
 def test_cmd_crew_register_without_person_id_omits_created_by_and_says_why(
-        agentctl, tmp_path, monkeypatch, capsys):
-    """No `person_id` key at all — the fresh-install case, before the
-    Library's bootstrap has created anyone. The registration still succeeds;
-    it just records no creator, and says so rather than failing silently."""
-    path = _seed(tmp_path)
+        agentctl, tmp_path, monkeypatch, fake_post, capsys):
     config_path = tmp_path / "operator.json"
     config_path.write_text(json.dumps({"roster_crew": "operator-crew"}))
     monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(config_path))
-    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
+    rc = agentctl.cmd_crew_register(_cli_args())
     assert rc == 0
     err = capsys.readouterr().err
     assert "did not record a creator" in err
     assert "person_id" in err
-    data = json.loads(path.read_text())
-    assert "created_by" not in data["recipe-units"]
-
-
-def test_cmd_crew_register_with_unreadable_operator_config_still_registers(
-        agentctl, tmp_path, monkeypatch, capsys):
-    """A missing operator config file entirely — not just a missing key — is
-    the same "don't refuse" case: a fresh machine may have no
-    `~/.config/convivy/operator.json` at all yet."""
-    path = _seed(tmp_path)
-    monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(tmp_path / "no-such-file.json"))
-    rc = agentctl.cmd_crew_register(_cli_args(registry=str(path)))
-    assert rc == 0
-    err = capsys.readouterr().err
-    assert "did not record a creator" in err
-    data = json.loads(path.read_text())
-    assert "created_by" not in data["recipe-units"]
+    assert "created_by" not in fake_post.requests[0]["body"]

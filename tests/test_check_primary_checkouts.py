@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.machinery
 import importlib.util
+import json
 import os
 import pathlib
 import re
@@ -18,6 +19,13 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 CHECK = REPO / "bin" / "check-primary-checkouts"
+AUTOUPDATE = REPO / "bin" / "primary-checkout-autoupdate"
+
+# bin/primary-checkout-autoupdate reads which repo(s) it pulls from the
+# registry (`primary_checkout_autoupdate_repos`), so the tests below that
+# exercise the real, unchanged script invent their own repo name rather than
+# reading one out of the script's source.
+_AUTOUPDATE_REPO = "harborview-tools"
 
 
 def _load():
@@ -39,10 +47,186 @@ def cpc():
     return mod
 
 
+@pytest.mark.rich_registry
+def test_live_checkouts_matches_the_registrys_own_live_checkout_readers(cpc):
+    """Pinned against the registry's own accessor, not a copy of the repo
+    list — fails red if _LIVE_CHECKOUTS drifts back to a hardcoded dict."""
+    import projects
+    assert cpc._LIVE_CHECKOUTS == projects.live_checkout_readers()
+    assert len(cpc._LIVE_CHECKOUTS) > 0, "the real registry should declare at least one live-read repo"
+
+
+def _load_with_unreadable_registry(monkeypatch, tmp_path):
+    """A FRESH `check-primary-checkouts` module exec'd with `projects.PROJECTS_JSON`
+    pointed at a path that does not exist — the same unreadable-registry
+    pattern `tests/bash/test_registry_unreadable.sh` uses for the four bash
+    siblings this PR already made fail closed. Must be a fresh exec rather
+    than reusing the module-scoped `cpc` fixture above: the crash this is
+    about happens at module IMPORT time, so the already-imported `cpc` (built
+    against the healthy synthetic registry) can never show it."""
+    import projects
+    bogus = tmp_path / "does-not-exist.json"
+    monkeypatch.setattr(projects, "PROJECTS_JSON", bogus)
+    projects._load_raw.cache_clear()
+    return _load()
+
+
+def test_registry_unreadable_does_not_crash_the_import(monkeypatch, tmp_path):
+    """Round 5 (security review of PR#985): before the fix, an unreadable
+    registry raised straight out of `exec_module` — which is what killed
+    `--assert` and the monitor before either could choose how to fail."""
+    mod = _load_with_unreadable_registry(monkeypatch, tmp_path)
+    assert mod._LIVE_CHECKOUTS == {}
+    assert mod._REGISTRY_ERROR is not None
+
+
+def test_assert_one_refuses_when_the_registry_is_unreadable(monkeypatch, tmp_path, capsys):
+    """`bin/primary-checkout-autoupdate` treats EXIT_ASSERT_BREACH (4) as the
+    only refusal and any other nonzero as "the check could not run; pull
+    anyway" — so an unreadable registry must come back as 4, not a crash
+    that reads as "the check could not run"."""
+    mod = _load_with_unreadable_registry(monkeypatch, tmp_path)
+    rc = mod.assert_one("foundry-kit", tmp_path, actor="northwind-robot")
+    assert rc == mod.EXIT_ASSERT_BREACH
+    err = capsys.readouterr().err
+    assert "registry" in err
+    assert "northwind-robot" in err
+
+
+def test_main_reports_and_refuses_to_sweep_when_the_registry_is_unreadable(
+        monkeypatch, tmp_path, capsys):
+    """The monitor must not read an unreadable registry as "zero live
+    checkouts, nothing to check" — a false all-clear during the exact outage
+    window this check exists to catch. It reports through `_post_signal`,
+    the same alert path a breach uses, and exits nonzero rather than 0."""
+    mod = _load_with_unreadable_registry(monkeypatch, tmp_path)
+    posted = []
+    monkeypatch.setattr(
+        mod, "_post_signal",
+        lambda *a, **kw: posted.append((a, kw)) or {"status": "created"})
+    rc = mod.main(["--convivy-root", str(tmp_path)])
+    assert rc == mod.EXIT_REGISTRY_UNAVAILABLE
+    assert rc != 0
+    assert posted, "the registry outage itself must be reported, not swallowed"
+    err = capsys.readouterr().err
+    assert "registry" in err
+
+
+# Round 6 (both reviewers, round 5): the registry can be READABLE JSON and
+# still make `projects.live_checkout_readers()` raise something other than
+# `OSError`/`json.JSONDecodeError`/`projects.RegistryUnavailable` — the three
+# round 5 caught. `load()` (which `live_checkout_readers()` calls) runs
+# `_validate_kb_project_targets()` over every unit in the document, raising a
+# plain `ValueError` for a bad one anywhere, even a unit this file never
+# otherwise looks at; and a `live_checkout_readers` row missing `"reads"`
+# raises `KeyError` while `live_checkout_readers()` reads its own rows. Both
+# registries below are readable JSON — the failure is in what they say, not
+# whether they can be opened — made up names throughout, naming no real
+# Convivy crew.
+_INVALID_KB_TARGET_REGISTRY = {
+    "northwind-robotics": {
+        "class": "project", "kb": "local",
+        "kb_project_by_repo": {
+            "northwind-repo": {
+                "kb_project": "no-such-kb-project-anywhere",
+                "reason": "round 6 synthetic registry: an undeclared "
+                          "kb_project target, to make _validate_kb_project_targets "
+                          "raise ValueError while this file's own rows are "
+                          "still readable JSON",
+            },
+        },
+    },
+}
+
+_MISSING_READS_FIELD_REGISTRY = {
+    "driftwood-collective": {
+        "class": "project", "kb": "local",
+        "live_checkout_readers": {
+            "driftwood-repo": {
+                # "reads" deliberately absent: round 6 synthetic registry,
+                # to make live_checkout_readers() raise KeyError while
+                # reading its own rows.
+                "adr": "ADR-0000 (made up, not a real decision)",
+            },
+        },
+    },
+}
+
+
+def _load_with_broken_registry(monkeypatch, tmp_path, registry: dict, *, name: str):
+    """A FRESH `check-primary-checkouts` module exec'd with `projects.PROJECTS_JSON`
+    pointed at *registry*, written out as real, readable JSON — unlike
+    `_load_with_unreadable_registry` above, the file opens and parses fine;
+    the failure this is testing is in `live_checkout_readers()`'s own
+    interpretation of the document, not in reading it off disk."""
+    import projects
+    path = tmp_path / name
+    path.write_text(json.dumps(registry))
+    monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+    projects._load_raw.cache_clear()
+    return _load()
+
+
+@pytest.mark.parametrize("registry,name,exc_type", [
+    (_INVALID_KB_TARGET_REGISTRY, "invalid-kb-target.json", ValueError),
+    (_MISSING_READS_FIELD_REGISTRY, "missing-reads.json", KeyError),
+])
+def test_registry_interpretation_failure_does_not_crash_the_import(
+        monkeypatch, tmp_path, registry, name, exc_type):
+    """Before round 6, either registry above raised straight out of
+    `exec_module`, same crash shape round 5 fixed for a merely-unreadable
+    file — the `except` clause round 5 wrote only caught `OSError`,
+    `json.JSONDecodeError` and `projects.RegistryUnavailable`, so a
+    `ValueError` from `_validate_kb_project_targets` or a `KeyError` from a
+    row missing `"reads"` escaped it."""
+    mod = _load_with_broken_registry(monkeypatch, tmp_path, registry, name=name)
+    assert mod._LIVE_CHECKOUTS == {}
+    assert mod._REGISTRY_ERROR is not None
+    assert isinstance(mod._REGISTRY_ERROR, exc_type)
+
+
+@pytest.mark.parametrize("registry,name", [
+    (_INVALID_KB_TARGET_REGISTRY, "invalid-kb-target.json"),
+    (_MISSING_READS_FIELD_REGISTRY, "missing-reads.json"),
+])
+def test_assert_one_refuses_when_the_registry_fails_to_interpret(
+        monkeypatch, tmp_path, registry, name, capsys):
+    """Same contract as `test_assert_one_refuses_when_the_registry_is_unreadable`
+    above, for a registry that opens fine but fails interpretation."""
+    mod = _load_with_broken_registry(monkeypatch, tmp_path, registry, name=name)
+    rc = mod.assert_one("foundry-kit", tmp_path, actor="northwind-robot")
+    assert rc == mod.EXIT_ASSERT_BREACH
+    err = capsys.readouterr().err
+    assert "registry" in err
+    assert "northwind-robot" in err
+
+
+@pytest.mark.parametrize("registry,name", [
+    (_INVALID_KB_TARGET_REGISTRY, "invalid-kb-target.json"),
+    (_MISSING_READS_FIELD_REGISTRY, "missing-reads.json"),
+])
+def test_main_reports_and_refuses_to_sweep_when_the_registry_fails_to_interpret(
+        monkeypatch, tmp_path, registry, name, capsys):
+    """Same contract as
+    `test_main_reports_and_refuses_to_sweep_when_the_registry_is_unreadable`
+    above, for a registry that opens fine but fails interpretation."""
+    mod = _load_with_broken_registry(monkeypatch, tmp_path, registry, name=name)
+    posted = []
+    monkeypatch.setattr(
+        mod, "_post_signal",
+        lambda *a, **kw: posted.append((a, kw)) or {"status": "created"})
+    rc = mod.main(["--convivy-root", str(tmp_path)])
+    assert rc == mod.EXIT_REGISTRY_UNAVAILABLE
+    assert rc != 0
+    assert posted, "the registry interpretation failure must be reported, not swallowed"
+    err = capsys.readouterr().err
+    assert "registry" in err
+
+
 @pytest.fixture(autouse=True)
 def _no_private_crews(cpc, monkeypatch):
     """Every test in this file except the ones under "private-crew gating"
-    below is about something other than CFO's own registry entry, and none
+    below is about something other than LEDGER's own registry entry, and none
     of them should depend on whether the REAL machine's
     `~/Convivy/agent-platform/config/projects.json` happens to be readable.
     `_is_private_checkout` delegates to `private_crew.private_home_for`,
@@ -157,7 +341,7 @@ def test_a_detached_head_is_a_breach_and_says_so(cpc, tmp_path):
 def test_a_missing_checkout_is_not_a_breach(cpc, tmp_path):
     """A repo that is not on this machine must read as absent. Policing a checkout
     that does not exist would file a bug every fifteen minutes forever."""
-    ok, reason = cpc.check("selector", cpc._LIVE_CHECKOUTS["selector"], tmp_path)
+    ok, reason = cpc.check("beacon", cpc._LIVE_CHECKOUTS["beacon"], tmp_path)
     assert ok and "not found" in reason
 
 
@@ -204,9 +388,9 @@ def test_the_audit_finds_a_referenced_repo_nobody_classified(cpc, tmp_path, caps
     """The failure one level up from a branch check: a live-deployed repo that is
     not in the list is not reported healthy, it is not reported at all.
 
-    PR #347's reviewer found `convivy-services` missing; sweeping the plists found
-    three more, so the gap was not a one-off. A declared list nobody re-derives
-    will have another.
+    PR #347's reviewer found a crew's services repository missing; sweeping the
+    plists found three more, so the gap was not a one-off. A declared list
+    nobody re-derives will have another.
     """
     _repo(tmp_path, "agent-platform")
     _repo(tmp_path, "brand-new-service")
@@ -270,18 +454,19 @@ def test_every_declared_repo_carries_its_deployment_reason(cpc):
             f"{repo} has no ADR reference"
 
 
-def test_library_and_cfo_are_classified(cpc):
+@pytest.mark.rich_registry
+def test_library_and_ledger_are_classified(cpc):
     """check-serving-checkouts' own launchd audit (agent-platform#423/#424) found
     these two read by a launchd job and classified in NEITHER `_LIVE_CHECKOUTS`
     nor `_NOT_LIVE` — exactly the gap this file's completeness audit exists to
-    surface. Pinned by name and directory casing: CFO's checkout is capital-`CFO`
-    on disk while its registry slug is lower-case `cfo` (`config/projects.json`),
-    and a regression back to the lower-case form would silently stop the branch
+    surface. Pinned by name and directory casing: the private crew's checkout is
+    capital-`LEDGER` on disk while its registry slug is lower-case `ledger`, and
+    a regression back to the lower-case form would silently stop the branch
     check from ever finding the real checkout."""
     assert "library" in cpc._LIVE_CHECKOUTS
-    assert "CFO" in cpc._LIVE_CHECKOUTS
-    assert "cfo" not in cpc._LIVE_CHECKOUTS
-    for repo in ("library", "CFO"):
+    assert "LEDGER" in cpc._LIVE_CHECKOUTS
+    assert "ledger" not in cpc._LIVE_CHECKOUTS
+    for repo in ("library", "LEDGER"):
         cfg = cpc._LIVE_CHECKOUTS[repo]
         assert cfg.get("reads"), f"{repo} has no deployment reason"
         assert cfg.get("adr"), f"{repo} has no ADR reference"
@@ -294,7 +479,7 @@ _COUNT_WORDS = ("one", "two", "three", "four", "five", "six", "seven", "eight",
 def test_no_deployment_reason_states_a_job_count(cpc):
     """A count in a paging alert drifts the moment a job is added or retired.
 
-    The first version of the `selector` entry said "nine launchd jobs" and the
+    The first version of the `beacon` entry said "nine launchd jobs" and the
     real number was ten. Being wrong about the number is worse than omitting it,
     because a precise-looking figure invites the reader to trust the rest of the
     sentence (reviewer, #347). Describe the mechanism instead.
@@ -393,9 +578,9 @@ def test_job_status_is_a_breach_when_the_disabled_query_itself_failed(
 
 
 def test_check_jobs_reports_only_the_unhealthy_label(cpc, tmp_path, monkeypatch):
-    """`convivy-app-kit` declares two jobs; one disabled and one healthy must
+    """`foundry-kit` declares two jobs; one disabled and one healthy must
     report exactly the disabled one, not both and not neither."""
-    _repo(tmp_path, "convivy-app-kit")
+    _repo(tmp_path, "foundry-kit")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _fake_launchctl(bin_dir,
@@ -403,7 +588,7 @@ def test_check_jobs_reports_only_the_unhealthy_label(cpc, tmp_path, monkeypatch)
                     disabled={"com.convivy.appkit.autoupdate"})
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     disabled = cpc._launchctl_disabled_labels(uid=501)
-    breaches = cpc.check_jobs("convivy-app-kit", cpc._LIVE_CHECKOUTS["convivy-app-kit"],
+    breaches = cpc.check_jobs("foundry-kit", cpc._LIVE_CHECKOUTS["foundry-kit"],
                               tmp_path, disabled)
     assert breaches == [("com.convivy.appkit.autoupdate", "disabled (launchctl print-disabled)")]
 
@@ -414,10 +599,10 @@ def test_check_jobs_reports_every_label_as_unknown_when_the_disabled_query_faile
     of a repo whose checkout exists and is loaded must still come back as a
     breach — "unknown" propagated through, not silently dropped into "healthy"
     because `check_jobs` only has a failed query to work with."""
-    _repo(tmp_path, "convivy-app-kit")
+    _repo(tmp_path, "foundry-kit")
     disabled = cpc.DisabledQuery(False, frozenset(), "print-disabled timed out after 10s")
     monkeypatch.setattr(cpc, "_launchctl_list_one", lambda label: (True, ""))
-    breaches = cpc.check_jobs("convivy-app-kit", cpc._LIVE_CHECKOUTS["convivy-app-kit"],
+    breaches = cpc.check_jobs("foundry-kit", cpc._LIVE_CHECKOUTS["foundry-kit"],
                               tmp_path, disabled)
     labels = {label for label, _reason in breaches}
     assert labels == {"com.convivy.rails.update", "com.convivy.appkit.autoupdate"}
@@ -607,12 +792,12 @@ def test_job_status_falls_back_to_the_pre_migration_label(cpc, tmp_path, monkeyp
 def test_legacy_label_loaded_ignores_a_non_owned_prefix(cpc, tmp_path, monkeypatch):
     """Scoped to com.convivy.* labels only — a bare last-dot-segment match
     would false-match an unrelated job for a label this platform never
-    owned, such as a different crew's `com.selector-backend.api`."""
+    owned, such as a different crew's `com.beacon-backend.api`."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     _fake_launchctl(bin_dir, loaded={"com.example-legacy.api"})
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-    assert cpc._legacy_label_loaded("com.selector-backend.api") is None
+    assert cpc._legacy_label_loaded("com.beacon-backend.api") is None
 
 
 def test_legacy_label_loaded_handles_a_multi_dot_bare_name(cpc, tmp_path, monkeypatch):
@@ -644,14 +829,14 @@ def test_job_status_reports_not_loaded_when_neither_label_is_up(cpc, tmp_path, m
 
 
 def test_a_private_checkouts_job_breach_is_not_filed(cpc, tmp_path, monkeypatch, capsys):
-    """Same gate as a branch breach (ADR-0043): CFO's job being disabled is
+    """Same gate as a branch breach (ADR-0043): LEDGER's job being disabled is
     still counted and still printed locally, and must never reach `_post_signal`."""
-    _repo(tmp_path, "CFO")
+    _repo(tmp_path, "LEDGER")
     monkeypatch.setattr(cpc, "_is_private_checkout", lambda repo_dir: True)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _fake_launchctl(bin_dir, loaded={"com.convivy.cfo-review"},
-                    disabled={"com.convivy.cfo-review"})
+    _fake_launchctl(bin_dir, loaded={"com.convivy.ledger-review"},
+                    disabled={"com.convivy.ledger-review"})
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
 
     bug_calls = []
@@ -665,22 +850,22 @@ def test_a_private_checkouts_job_breach_is_not_filed(cpc, tmp_path, monkeypatch,
     assert bug_calls == []
     assert rc == 2
     err = capsys.readouterr().err
-    assert "CFO job com.convivy.cfo-review" in err and "not logged" in err
+    assert "LEDGER job com.convivy.ledger-review" in err and "not logged" in err
 
 
 # --- private-crew gating: a black-box crew's breach is counted, printed
 # locally, and never reaches the shared issue queue (platform/decisions/0043) --
 #
-# CFO is a black-box crew. `bin/check-serving-checkouts` already had this exact
+# LEDGER is a black-box crew. `bin/check-serving-checkouts` already had this exact
 # gate added after a security-reviewer finding (PR #423, run-0d72a1e3): a
 # finding's own EXISTENCE in the shared, multi-reader issue queue is a leak
-# independent of how little it says — filing "CFO is on branch `x`" is exactly
-# what ADR-0043 forbids, even though this check never reads a line of CFO's own
+# independent of how little it says — filing "LEDGER is on branch `x`" is exactly
+# what ADR-0043 forbids, even though this check never reads a line of LEDGER's own
 # code. These tests port the sibling file's coverage for the same gate here.
 
 
 def test_a_private_checkouts_breach_is_not_filed(cpc, tmp_path, monkeypatch, capsys):
-    _repo(tmp_path, "CFO", branch="feat/x")
+    _repo(tmp_path, "LEDGER", branch="feat/x")
     monkeypatch.setattr(cpc, "_is_private_checkout", lambda repo_dir: True)
 
     bug_calls = []
@@ -694,15 +879,15 @@ def test_a_private_checkouts_breach_is_not_filed(cpc, tmp_path, monkeypatch, cap
     assert bug_calls == [], "a private crew's breach must never reach _post_signal"
     assert rc == 2, "the breach still counts — a real problem on a private checkout is still real"
     err = capsys.readouterr().err
-    assert "CFO" in err and "feat/x" in err and "not logged" in err, \
+    assert "LEDGER" in err and "feat/x" in err and "not logged" in err, \
         "still visible locally, with full detail (branch included), just not shared"
 
 
 def test_a_non_private_checkouts_breach_is_still_filed(cpc, tmp_path, monkeypatch):
     """The gate must be a gate, not a kill switch — an ordinary checkout's breach
-    (here, CFO with privacy forced off) must still reach `_post_signal` exactly as
+    (here, LEDGER with privacy forced off) must still reach `_post_signal` exactly as
     before."""
-    _repo(tmp_path, "CFO", branch="feat/x")
+    _repo(tmp_path, "LEDGER", branch="feat/x")
     monkeypatch.setattr(cpc, "_is_private_checkout", lambda repo_dir: False)
 
     bug_calls = []
@@ -712,7 +897,7 @@ def test_a_non_private_checkouts_breach_is_still_filed(cpc, tmp_path, monkeypatc
         cpc.main(["--convivy-root", str(tmp_path), "--no-report"])
     finally:
         cpc._post_signal = original
-    assert any(a[0] == "CFO" for a, k in bug_calls), \
+    assert any(a[0] == "LEDGER" for a, k in bug_calls), \
         "a non-private checkout's breach must still be logged"
 
 
@@ -723,8 +908,8 @@ def test_is_private_checkout_delegates_to_the_shared_private_crew_module(
     registry lookup `check-serving-checkouts`/`session_state.py` already use, not
     a second implementation), using a real fake registry rather than a
     monkeypatched boolean. Also pins the case-sensitivity trap a naive fix would
-    hit: the checkout directory here is capital-`CFO`, the registry slug is
-    lower-case `cfo` — a bare string/slug comparison would silently never match.
+    hit: the checkout directory here is capital-`LEDGER`, the registry slug is
+    lower-case `ledger` — a bare string/slug comparison would silently never match.
     """
     spec = importlib.util.find_spec("private_crew")
     if spec is None:
@@ -732,16 +917,16 @@ def test_is_private_checkout_delegates_to_the_shared_private_crew_module(
     private_crew = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(private_crew)
 
-    crew_home = tmp_path / "CFO"
+    crew_home = tmp_path / "LEDGER"
     crew_home.mkdir()
     cfg = tmp_path / "config"
     cfg.mkdir()
     registry = cfg / "projects.json"
-    registry.write_text(f'{{"cfo": {{"home_dir": "{crew_home}", "private": true}}}}')
+    registry.write_text(f'{{"ledger": {{"home_dir": "{crew_home}", "private": true}}}}')
     monkeypatch.setattr(private_crew, "_REGISTRY", str(registry))
     monkeypatch.setitem(sys.modules, "private_crew", private_crew)
 
-    ordinary = tmp_path / "not-cfo"
+    ordinary = tmp_path / "not-ledger"
     ordinary.mkdir()
     assert cpc._is_private_checkout_real(crew_home) is True
     assert cpc._is_private_checkout_real(ordinary) is False
@@ -890,8 +1075,8 @@ def test_an_all_private_unclassified_set_files_nothing_but_still_counts(
 
 
 def test_assert_passes_a_checkout_on_main(cpc, tmp_path, capsys):
-    _repo(tmp_path, "convivy-app-kit")
-    assert cpc.assert_one("convivy-app-kit", tmp_path, actor="the pull") == 0
+    _repo(tmp_path, "foundry-kit")
+    assert cpc.assert_one("foundry-kit", tmp_path, actor="the pull") == 0
     out = capsys.readouterr()
     assert out.out == "" and out.err == ""  # a pass says nothing
 
@@ -901,8 +1086,8 @@ def test_assert_passes_a_checkout_on_main(cpc, tmp_path, capsys):
     ({"detach": True}, "detached HEAD"),
 ])
 def test_assert_refuses_a_checkout_off_main(cpc, tmp_path, capsys, kwargs, expected):
-    _repo(tmp_path, "convivy-app-kit", **kwargs)
-    rc = cpc.assert_one("convivy-app-kit", tmp_path, actor="the hourly pull")
+    _repo(tmp_path, "foundry-kit", **kwargs)
+    rc = cpc.assert_one("foundry-kit", tmp_path, actor="the hourly pull")
     assert rc == cpc.EXIT_ASSERT_BREACH
     err = capsys.readouterr().err
     assert "REFUSING" in err and expected in err
@@ -914,7 +1099,7 @@ def test_assert_passes_a_missing_checkout(cpc, tmp_path):
     """Same as the monitor: a repo that is not there cannot be off main, and
     refusing on absence would stop an actor on a box where the repo was never
     cloned."""
-    assert cpc.assert_one("convivy-app-kit", tmp_path, actor="x") == 0
+    assert cpc.assert_one("foundry-kit", tmp_path, actor="x") == 0
 
 
 def test_assert_refuses_a_repo_nobody_classified(cpc, tmp_path, capsys):
@@ -933,21 +1118,21 @@ def test_assert_files_no_bug(cpc, tmp_path, monkeypatch):
     count of it wrong."""
     calls = []
     monkeypatch.setattr(cpc, "_post_signal", lambda *a, **kw: calls.append(a) or {})
-    _repo(tmp_path, "convivy-app-kit", branch="feat/x")
-    assert cpc.assert_one("convivy-app-kit", tmp_path, actor="x") == cpc.EXIT_ASSERT_BREACH
+    _repo(tmp_path, "foundry-kit", branch="feat/x")
+    assert cpc.assert_one("foundry-kit", tmp_path, actor="x") == cpc.EXIT_ASSERT_BREACH
     assert calls == []
 
 
 def test_assert_through_main_exits_four_and_skips_the_sweep(cpc, tmp_path, capsys):
     """`--assert` is a pre-flight for one actor: it must not run the completeness
     audit or check the other repos, both of which file bugs."""
-    _repo(tmp_path, "convivy-app-kit", branch="feat/x")
+    _repo(tmp_path, "foundry-kit", branch="feat/x")
     _repo(tmp_path, "agent-platform", branch="feat/also-broken")
-    rc = cpc.main(["--convivy-root", str(tmp_path), "--assert", "convivy-app-kit",
+    rc = cpc.main(["--convivy-root", str(tmp_path), "--assert", "foundry-kit",
                    "--actor", "the hourly pull"])
     assert rc == cpc.EXIT_ASSERT_BREACH
     err = capsys.readouterr().err
-    assert "convivy-app-kit" in err
+    assert "foundry-kit" in err
     assert "agent-platform" not in err       # the other breach is not this call's business
 
 
@@ -957,27 +1142,53 @@ def test_assert_exit_code_is_distinct_from_the_sweep_codes(cpc):
     assert cpc.EXIT_ASSERT_BREACH not in (0, 1, 2, 3)
 
 
-def test_the_actor_asserts_the_repo_it_acts_on(cpc):
-    """The wiring, pinned. The actor names a repo that is actually in the table,
-    and the ONE it touches — an assertion against the wrong repo passes forever
-    and guards nothing.
+def test_the_actor_asserts_the_repo_it_acts_on(monkeypatch, tmp_path):
+    """The repo `primary-checkout-autoupdate`'s `--assert` call names must be
+    exactly one `projects.live_checkout_readers()` also declares live — both
+    read from the SAME registry now, so a fixture that opted a repo into
+    `primary_checkout_autoupdate_repos` without declaring it in
+    `live_checkout_readers`, or the reverse, would be a drift this closes.
 
-    `launch-overnight` was the other actor (asserting `agent-platform`) until it
-    was retired with the rest of the autonomous overnight cron fleet
-    (issue_01M2GDVPR81Z0X991Z7XD3VR0M, the operator's 2026-09-14 ruling); this guard's
-    `agent-platform` half went with it, leaving `appkit-autoupdate` the only
-    caller of `--assert`.
+    Runs the real, unchanged script end to end, with a stub
+    check-primary-checkouts that records the repo name it was asked to
+    `--assert` — there is no hard-coded argument left to read out of the
+    script's source, so this drives it instead.
     """
-    autoupdate = (REPO / "bin" / "appkit-autoupdate").read_text()
-    assert "--assert convivy-app-kit" in autoupdate
-    assert "convivy-app-kit" in cpc._LIVE_CHECKOUTS
+    import os
+    repo = _AUTOUPDATE_REPO
+    root = tmp_path / "Convivy"
+    _repo(root, repo)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    _link_lib(tmp_path)
+    marker = tmp_path / "assert-arg.log"
+    (fake_bin / "check-primary-checkouts").write_text(
+        f'#!/bin/bash\necho "$2" > {marker}\nexit 4\n')
+    (fake_bin / "check-primary-checkouts").chmod(0o755)
+    registry = tmp_path / "autoupdate-registry.json"
+    _write_autoupdate_registry(registry, repo=repo)
+    env = dict(os.environ, HOME=str(tmp_path), PROJECTS_JSON=str(registry))
+    script = fake_bin / "primary-checkout-autoupdate"
+    script.write_text(AUTOUPDATE.read_text())
+    script.chmod(0o755)
+    _root_stub(fake_bin, root)
+    subprocess.run([str(script)], capture_output=True, text=True, env=env)
+    assert marker.read_text().strip() == repo, \
+        "the script asserted a different repo than the one it was told to act on"
+
+    import projects
+    monkeypatch.setattr(projects, "PROJECTS_JSON", registry)
+    projects._load_raw.cache_clear()
+    mod = _load()
+    assert repo in mod._LIVE_CHECKOUTS, \
+        "the repo the actor asserted is not one check-primary-checkouts itself recognizes as live"
 
 
 def test_neither_actor_hard_fails_when_the_check_is_missing(cpc):
     """Refusing because the GUARD is absent turns a broken install into a silent
     no-pull — the failure this guard exists to prevent, inverted. The actor
     degrades to its pre-ARCH-441 behaviour and says so."""
-    for name in ("appkit-autoupdate",):
+    for name in ("primary-checkout-autoupdate",):
         text = (REPO / "bin" / name).read_text()
         assert "not found" in text and "WARNING" in text, name
 
@@ -1001,14 +1212,48 @@ def test_a_real_detached_head_still_says_detached_head(cpc, tmp_path):
 
 
 def _root_stub(fake_bin, root):
-    """appkit-autoupdate finds the app kit under the machine's root, printed by
-    the builder-root beside its own real path (company/decisions/0008), and HOME
-    no longer moves it. Each copy of the script below gets a stub sibling that
-    prints the fixture root, the same sibling resolution these tests pin for
-    check-primary-checkouts."""
+    """primary-checkout-autoupdate finds a checkout under the machine's root,
+    printed by the builder-root beside its own real path (company/decisions/0008),
+    and HOME no longer moves it. Each copy of the script below gets a stub
+    sibling that prints the fixture root, the same sibling resolution these
+    tests pin for check-primary-checkouts."""
     stub = fake_bin / "builder-root"
     stub.write_text(f'#!/bin/bash\n[ "${{1:-}}" = "--root" ] || exit 2\necho "{root}"\n')
     stub.chmod(0o755)
+
+
+def _write_autoupdate_registry(path, repo=_AUTOUPDATE_REPO):
+    """A registry opting `repo` into bin/primary-checkout-autoupdate's own
+    `primary_checkout_autoupdate_repos` field, and declaring the matching
+    `live_checkout_readers` entry check-primary-checkouts's `--assert` needs —
+    both keyed on the same invented repo name, so a test exercising the real,
+    unchanged scripts names no real repository."""
+    path.write_text(json.dumps({
+        "autoupdate-test-unit": {
+            "class": "project", "display": "Autoupdate Test Unit", "owner": "test-owner",
+            "home_dir": f"<root>/{repo}", "dirs": [],
+            "repos": [repo], "aliases": [],
+            "crew": "autoupdate-test-unit", "lifecycle": "active", "products": [],
+            "kb": "local",
+            "primary_checkout_autoupdate_repos": [repo],
+            "live_checkout_readers": {
+                repo: {
+                    "reads": "a deploy job runs against this checkout",
+                    "adr": "ADR-0000 (made up, not a real decision)",
+                },
+            },
+        },
+    }))
+
+
+def _link_lib(tmp_path):
+    """Symlinks the real lib/agent-platform beside `tmp_path`'s fake `bin/`,
+    the sibling layout `primary-checkout-autoupdate` resolves its own
+    registry read (`PYTHONPATH=<its bin's sibling>/lib/agent-platform`)
+    against — the same deploy-area shape `install-agent-platform-shared`
+    builds in production."""
+    (tmp_path / "lib").mkdir(exist_ok=True)
+    (tmp_path / "lib" / "agent-platform").symlink_to(REPO / "lib" / "agent-platform")
 
 
 def test_the_autoupdate_script_refuses_end_to_end_against_a_real_checkout(
@@ -1018,10 +1263,12 @@ def test_the_autoupdate_script_refuses_end_to_end_against_a_real_checkout(
     (security-reviewer, #354). This runs the real script against a real off-main
     checkout and checks it does not reach the pull."""
     import os
+    repo = _AUTOUPDATE_REPO
     root = tmp_path / "Convivy"          # the script reads <root>/<repo>; _root_stub prints it
-    _repo(root, "convivy-app-kit", branch="feat/x")
+    _repo(root, repo, branch="feat/x")
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    _link_lib(tmp_path)
     # Stand in for the installed check, pointed at the fixture root, so the script
     # under test runs its REAL assertion path against a REAL breach.
     (fake_bin / "check-primary-checkouts").write_text(
@@ -1030,16 +1277,25 @@ def test_the_autoupdate_script_refuses_end_to_end_against_a_real_checkout(
     # A git that fails loudly if the script ever reaches the pull.
     (fake_bin / "git-should-not-run").write_text("#!/bin/bash\nexit 99\n")
 
-    env = dict(os.environ, HOME=str(tmp_path))
+    # check-primary-checkouts reads `_LIVE_CHECKOUTS` from the registry
+    # (projects.live_checkout_readers) at import, in the subprocess below; with
+    # PROJECTS_JSON unset it reaches the Library's registry endpoint instead of a
+    # local file (CQ·563), which CI has no token for. Pointed at a registry built
+    # just for this one invented repo (_write_autoupdate_registry) rather than
+    # the shared rich test fixture, which names no real repository.
+    autoupdate_registry = tmp_path / "autoupdate-registry.json"
+    _write_autoupdate_registry(autoupdate_registry, repo=repo)
+    env = dict(os.environ, HOME=str(tmp_path), PROJECTS_JSON=str(autoupdate_registry))
     (tmp_path / ".local").mkdir(exist_ok=True)
     (tmp_path / ".local" / "bin").symlink_to(fake_bin)
-    # appkit-autoupdate resolves CHECK relative to its OWN location (platform/
-    # decisions/0059 rule 1), not $HOME/.local/bin, so the stub above must sit
-    # beside a COPY of the script under test rather than being invoked via
-    # REPO/bin directly — otherwise CHECK resolves to REPO/bin/check-primary-
-    # checkouts, the real script, and the stub is never executed.
-    script = fake_bin / "appkit-autoupdate"
-    script.write_text((REPO / "bin" / "appkit-autoupdate").read_text())
+    # primary-checkout-autoupdate resolves CHECK (and its own registry read)
+    # relative to its OWN location (platform/decisions/0059 rule 1), not
+    # $HOME/.local/bin, so the stub above must sit beside a COPY of the
+    # script under test rather than being invoked via REPO/bin directly —
+    # otherwise CHECK resolves to REPO/bin/check-primary-checkouts, the real
+    # script, and the stub is never executed.
+    script = fake_bin / "primary-checkout-autoupdate"
+    script.write_text(AUTOUPDATE.read_text())
     script.chmod(0o755)
     _root_stub(fake_bin, root)
     proc = subprocess.run([str(script)],
@@ -1054,23 +1310,29 @@ def test_the_autoupdate_script_pulls_when_the_checkout_is_on_main(
     """The other direction, which matters more: a guard that refused always would
     stop the hourly update forever and look like a working guard."""
     import os
+    repo = _AUTOUPDATE_REPO
     root = tmp_path / "Convivy"
-    d = _repo(root, "convivy-app-kit")
+    d = _repo(root, repo)
     subprocess.run(["git", "-C", str(d), "remote", "add", "origin", str(d)],
                    check=True, capture_output=True)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    _link_lib(tmp_path)
     (fake_bin / "check-primary-checkouts").write_text(
         f'#!/bin/bash\nexec {CHECK} --convivy-root {root} "$@"\n')
     (fake_bin / "check-primary-checkouts").chmod(0o755)
-    env = dict(os.environ, HOME=str(tmp_path))
+    # Same registry dependency as the refusal test above — see its comment.
+    autoupdate_registry = tmp_path / "autoupdate-registry.json"
+    _write_autoupdate_registry(autoupdate_registry, repo=repo)
+    env = dict(os.environ, HOME=str(tmp_path), PROJECTS_JSON=str(autoupdate_registry))
     (tmp_path / ".local").mkdir(exist_ok=True)
     (tmp_path / ".local" / "bin").symlink_to(fake_bin)
-    # Same reason as the refusal test above: CHECK resolves relative to the
-    # script's OWN location, so the stub must sit beside a COPY of the script
-    # under test rather than being invoked via REPO/bin directly.
-    script = fake_bin / "appkit-autoupdate"
-    script.write_text((REPO / "bin" / "appkit-autoupdate").read_text())
+    # Same reason as the refusal test above: CHECK (and the registry read)
+    # resolve relative to the script's OWN location, so the stub must sit
+    # beside a COPY of the script under test rather than being invoked via
+    # REPO/bin directly.
+    script = fake_bin / "primary-checkout-autoupdate"
+    script.write_text(AUTOUPDATE.read_text())
     script.chmod(0o755)
     _root_stub(fake_bin, root)
     proc = subprocess.run([str(script)],
@@ -1087,23 +1349,31 @@ def test_the_autoupdate_script_pulls_when_the_check_cannot_RUN(cpc, tmp_path):
     not resolve the check's `python3.11`, so the guard exited 127 and the pull
     refused every hour (ARCH-441 follow-up)."""
     import os
+    repo = _AUTOUPDATE_REPO
     root = tmp_path / "Convivy"
-    d = _repo(root, "convivy-app-kit")
+    d = _repo(root, repo)
     subprocess.run(["git", "-C", str(d), "remote", "add", "origin", str(d)],
                    check=True, capture_output=True)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
+    _link_lib(tmp_path)
     # exit 127 is what a shell reports for "command not found" — the real symptom.
     (fake_bin / "check-primary-checkouts").write_text("#!/bin/bash\nexit 127\n")
     (fake_bin / "check-primary-checkouts").chmod(0o755)
-    # appkit-autoupdate resolves CHECK relative to its OWN location (platform/
-    # decisions/0059 rule 1), not $HOME, so the broken-check stub must sit
-    # beside a COPY of the script under test rather than at $HOME/.local/bin.
-    script = fake_bin / "appkit-autoupdate"
-    script.write_text((REPO / "bin" / "appkit-autoupdate").read_text())
+    # The script's own registry read (for which repo to act on) must still
+    # succeed here — only the branch CHECK is the thing that cannot run — so
+    # this needs the same registry fixture as the two tests above.
+    autoupdate_registry = tmp_path / "autoupdate-registry.json"
+    _write_autoupdate_registry(autoupdate_registry, repo=repo)
+    # primary-checkout-autoupdate resolves CHECK relative to its OWN location
+    # (platform/decisions/0059 rule 1), not $HOME, so the broken-check stub
+    # must sit beside a COPY of the script under test rather than at
+    # $HOME/.local/bin.
+    script = fake_bin / "primary-checkout-autoupdate"
+    script.write_text(AUTOUPDATE.read_text())
     script.chmod(0o755)
     _root_stub(fake_bin, root)
-    env = dict(os.environ, HOME=str(tmp_path))
+    env = dict(os.environ, HOME=str(tmp_path), PROJECTS_JSON=str(autoupdate_registry))
     proc = subprocess.run([str(script)],
                           capture_output=True, text=True, env=env)
     assert "REFUSED" not in proc.stderr
@@ -1118,7 +1388,7 @@ def test_the_autoupdate_plist_carries_the_path_its_check_needs(cpc):
     which review did not catch, because the check is a second hop."""
     import plistlib
     d = plistlib.loads((REPO / "launchd" /
-                        "com.convivy.appkit.autoupdate.plist").read_bytes())
+                        "com.convivy.primary-checkout-autoupdate.plist").read_bytes())
     path = d["EnvironmentVariables"]["PATH"]
     assert "/opt/homebrew/bin" in path, "python3.11 lives here"
     # Templated: install.sh renders __HOME__ to the installing user's $HOME.

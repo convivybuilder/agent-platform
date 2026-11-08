@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.11
-"""velocity-report — Convivy engineering velocity, total + by product/bucket.
+"""velocity-report — Builder engineering velocity, total + by product/bucket.
 
 A read-only harvester that rolls up throughput / volume / stability / decisions
 metrics per repo, maps each repo to a product or engineering bucket, and writes a
@@ -12,7 +12,7 @@ Metrics (per 7/30/90-day window, per bucket + a grand total):
   • Volume     — net lines changed (added − removed), generated/lockfiles excluded.
   • Stability  — reverts → change-failure rate (reverts ÷ merges); plus CI-first-pass%
                  and 7-day survival% read from the model-scorecard ledgers where they
-                 exist (dev-crew repos + PA).
+                 exist (dev-crew repos and selected product repos).
   • Decisions  — ADRs minted (knowledge, attributed to the ADR's project) + ARCH
                  entries (substrate decisions.md).
 
@@ -20,9 +20,10 @@ Sources, by what each repo has:
   • local git clone → commits, net LOC, reverts (all cloned repos).
   • GitHub (gh)     → PRs merged + features (best-effort; skipped if the repo doesn't
                       resolve, e.g. the local-only *-commercial sites).
-  • The three NYH projects live under the <root>/nyh-architecture/ umbrella (mapped by
-    REPO_SUBPATH): nyh-arch-tools at the operator's personal GitHub account (PRs via gh + local commits/LOC),
-    nyh-etc + nyh-park-villa local-only (commits/LOC, no PRs). One bucket each.
+  • A project whose home directory isn't flat under <root>/ (several projects
+    today are cloned a level down under a shared umbrella directory) resolves
+    through the registry's own home_dir rather than a name list here — see
+    `_repo_subpaths()`.
 
 LOC is a deliberately weak signal kept as one input among several — never read alone.
 """
@@ -46,6 +47,8 @@ class FetchError(Exception):
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import builder_root as BR  # noqa: E402
 import operator_config  # noqa: E402
+import projects  # noqa: E402
+import github_app as GA  # noqa: E402
 # The repos root, where every bucket's checkout lives (builder_root.root(),
 # company/decisions/0008); run records come from data_root() below.
 CONVIVY = BR.root()
@@ -56,135 +59,62 @@ BASELINE_PATH = RUNS_ROOT / "velocity" / "velocity-baseline.json"
 SCORECARD_DIR = RUNS_ROOT / "scorecard"
 WINDOWS = (7, 30, 90)
 
-# bucket → repos. Order is display order. (operator 2026-06-15.)
-BUCKETS: dict[str, list[str]] = {
-    "Vivy": ["vivy", "vivy-ownerrez-sandbox-tools", "vivy-commercial", "vivy-landing"],
-    "Constance": ["constance", "constance-landing", "constance-commercial", "constance-updates"],
-    "Sous Chef": ["sous-chef"],
-    "Hollis": ["hollis"],
-    # placard (2026-09-05): property instruction pages reached by a QR code at
-    # the property. Added in the same change as its config/projects.json entry,
-    # because tests/test_projects.py::test_repos_match_velocity_buckets fails red
-    # when the two disagree — the one drift check in this project's registration
-    # chain, and the reason this site did not become a sixth forgotten copy.
-    "Placard": ["placard"],
-    # shipwright (2026-09-06): the crew working the company bead. Same rule as
-    # placard: added with its registry entry, because test_repos_match_velocity_buckets
-    # goes red when the two disagree. Its ADRs file under the `company` KB slice,
-    # which is unmapped below and counts in the Engineering-internal fallback.
-    # homebrew-tap (2026-10-13): shipwright's public Homebrew formula, added
-    # with its registry entry for the same reason — it lives under
-    # convivybuilder on GitHub, not convivy (gh_full's GH_OWNER table below is
-    # unaware of that split and still reads convivy/homebrew-tap; this bucket
-    # entry is what the drift test requires, not a claim that the gh-backed
-    # PR/feature metrics below resolve against the right repo).
-    "Shipwright": ["shipwright", "homebrew-tap"],
-    # Signals (2026-09-16), the internal product crew writing derived signal to the
-    # Archives. tests/test_projects.py holds this table to the registry.
-    "Signals": ["signals"],
-    # Selector spans two repos — one product over a frontend and a backend, which
-    # issue_api's own comment already assumed ("the 'selector' product covers both
-    # convivy/selector and convivy/selector-backend").
-    "Selector": ["selector", "selector-backend"],
-    # App Kit is ONE project over two tightly-coupled repos: the on-device kit and
-    # the backend commercial server (ARCH-426 amendment). Repo count says nothing
-    # about project count.
-    "App Kit": ["convivy-app-kit", "convivy-services"],
-    "Orient": ["convivy-orient", "www"],
-    # NYH Studio (Now You're Here) is THREE PROJECTS, one per bucket (ARCH-426
-    # amendment) — shared tooling on GitHub, plus two per-property projects on
-    # local-only clones. They were one bucket while the umbrella directory was the
-    # only thing holding them together; per-property velocity is the useful view.
-    # All three live one level down under the umbrella, so repo_path maps them via
-    # REPO_SUBPATH. NYH Studio survives as the PRODUCT all three build.
-    "NYH Arch Tools": ["nyh-arch-tools"],
-    "East Texas Circle": ["nyh-etc"],
-    "Park Villa": ["nyh-park-villa"],
-    "Convivy general": ["convivy-commercial"],
-    # Archy (2026-10-02): the small-business agentic ops product. Added with its
-    # config/projects.json entry — test_repos_match_velocity_buckets holds this
-    # table to the registry.
-    "Archy": ["archy"],
-    # The Keel, split out of the old "Engineering-internal" lump (ARCH-426) and
-    # then RE-MERGED on 2026-08-06 when the steward was retired and the Keel became
-    # one project. ARCH-426 split it into four buckets on the reasoning that they
-    # were four projects sharing the steward co; the correction is that they were
-    # never four projects — one co, one crew, one thing being built, which is the
-    # same work test that split NYH Studio three ways below. Orient keeps its own
-    # bucket above because it IS a separate project: it becomes a client of the
-    # Library rather than the place Library functions live.
-    # The Keel's two halves, each with its own crew since 2026-08-17 (the operator), so
-    # they can move in parallel rather than queueing behind one co. The Library
-    # holds the vaults and serves them; the Bosun dispatches, coordinates and
-    # measures the crews. `knowledge` rides with the Library because the KB is a
-    # vault. The Keel itself is a SCOPE now, not a bucket — nothing is built at
-    # it, so nothing rolls up to it.
-    "Library": ["library", "knowledge"],
-    "Bosun": ["agent-platform"],
-    # The steward's cockpit: charter, build plan, backlog, handoffs, and the ARCH
-    # log. It ships no product code, so its velocity is deliberately thin; it
-    # keeps a bucket because `decisions.md` lives here and the ARCH count has to
-    # land somewhere real.
-    "Steward": ["substrate"],
-    "Deck": ["convivy-deck"],
-    "Write Better": ["write-better"],
-    # Kept with NO repos, deliberately. It is no longer a PR bucket — every repo it
-    # held is now named above, and the two it also held (multitenant-registry,
-    # multi-agent-slack-bot-kit) were sunsetted and archived out of <root>/
-    # entirely (ARCH-427). It survives ONLY as the ADR fallback below, for a KB
-    # project slug that maps to no bucket (`shared`, `engineering`, `convivy`,
-    # `utility`). Deleting it would silently drop those ADRs from the report.
-    "Engineering-internal": [],
-}
-# repo → GitHub owner (default "convivy"). nyh is the org-move exception. The
-# owner login comes from the operator config file's `github_login` key, never
-# a hardcoded default; a report that can't read it falls back to "convivy"
-# for this one mapping rather than refusing the whole run.
-try:
-    GH_OWNER = {"nyh-arch-tools": operator_config.get("github_login")}
-except operator_config.OperatorConfigError:
-    GH_OWNER = {}
-# ADR project slug → bucket, so a constance ADR counts for Constance, not for the
-# knowledge repo's bucket. Unmapped slugs fall through to "Engineering-internal".
-ADR_PROJECT_BUCKET = {
-    "vivy": "Vivy", "constance": "Constance", "sous-chef": "Sous Chef",
-    "hollis": "Hollis", "convivy-orient": "Orient",
-    "selector": "Selector",
-    # placard (2026-09-05). THE THIRD velocity list this one project needed, and
-    # the only one with no test behind it: BUCKETS and the bucket-name set are
-    # both held by tests/test_projects.py and tests/test_velocity_report.py, but
-    # nothing asserts this map's keys cover the registered projects. An ADR under
-    # knowledge/projects/placard/decisions/ would have fallen through the
-    # "Engineering-internal" default below and miscounted silently — a wrong
-    # number rather than an error, which is the shape that survives longest.
-    "placard": "Placard",
-    # The three NYH projects share ONE KB slice (`nyh-studio`), so an ADR written
-    # there cannot be attributed to a single property. It counts for the
-    # studio-wide project. Splitting the slice belongs with the KB re-filing pass
-    # (Phase 0 step 5), where the scope vocabulary is being reworked anyway.
-    "nyh-studio": "NYH Arch Tools",
-    # the Keel and the interfaces onto it, so their ADRs count for themselves
-    # rather than landing in the fallback (ARCH-426). These are VALUES that must be
-    # live BUCKETS keys, and leaving a stale display name here makes every ADR under
-    # that slug count zero in the per-bucket breakdown while the grand total stays
-    # right — which is why the 2026-08-17 split re-points all of them rather than
-    # only the slugs whose names changed.
-    "substrate": "Steward", "agent-platform": "Bosun",
-    "knowledge": "Library", "library": "Library",
-    # `keel` is a scope now, and the documents already written under the slug stay
-    # where they are. They count for the Bosun, which inherits the Keel's platform
-    # work; the same reasoning puts the `keel` cost alias there.
-    "keel": "Bosun",
-    # `platform` is deliberately UNMAPPED, so it falls through to
-    # Engineering-internal with the other no-owner scopes. The steward's own future
-    # documents land there, which is why mapping it to Steward was tempting and
-    # wrong: the scope already holds 41 ADRs written by whichever crew was doing
-    # that cross-cutting work at the time, and it exists precisely because the work
-    # belongs to no single crew. Mapping it would credit every one of those to a
-    # crew that ships no product code and did not write them (reviewer, PR #402).
-    "deck": "Deck", "svc": "App Kit",
-    "convivy-app-kit": "App Kit", "convivy-services": "App Kit",
-}
+# bucket → repos, read live from the install registry (`projects.velocity_buckets()`)
+# rather than hand-maintained here — every non-private unit's own `display` and
+# `repos`, in the order its own `velocity_order` sets. `Engineering-internal` is
+# the one entry with no backing registry unit: it is no longer a PR bucket, every
+# repo it once held is now named on its own unit, and it survives ONLY as the ADR
+# fallback below, for a KB project slug that maps to no bucket (`shared`,
+# `engineering`, `convivy`, `utility`). Deleting it would silently drop those
+# ADRs from the report.
+BUCKETS: dict[str, list[str]] = projects.velocity_buckets()
+BUCKETS["Engineering-internal"] = []
+
+
+def _gh_owners() -> dict[str, str]:
+    """repo → GitHub owner (default "convivy" in `gh_full`), built from the
+    registry. A unit whose `repos` is a single entry and whose own
+    `github_owner` differs from "convivy" gets that owner here, EXCEPT a unit
+    asking for `github_owner_private` — its real owner belongs in the
+    operator's own local config rather than in this checked-in file (a unit
+    whose real owner is a personal GitHub account, not something to ship), and a
+    unit that asks and finds no local config is left out of this table rather
+    than falling back to a likely-wrong "convivy". A multi-repo unit
+    (shipwright's `homebrew-tap`, under `convivybuilder` rather than its own
+    `shipwright`) is deliberately left unresolved here, matching every call
+    site's behaviour before this table existed — nothing fetches its PR
+    metrics through `gh_full` today, so widening this to `repo_owners` is a
+    separate change with its own output to verify."""
+    out: dict[str, str] = {}
+    private = projects.private_slugs()
+    for slug, unit in projects.load().items():
+        if slug in private:
+            continue
+        if unit.get("github_owner_private"):
+            try:
+                login = operator_config.get("github_login")
+            except operator_config.OperatorConfigError:
+                continue
+            for repo in unit.get("repos", []):
+                out[repo] = login
+            continue
+        repos = unit.get("repos", [])
+        owner = unit.get("github_owner")
+        if owner and len(repos) == 1:
+            out[repos[0]] = owner
+    return out
+
+
+GH_OWNER: dict[str, str] = _gh_owners()
+# ADR project slug → bucket, read live from the registry (`projects.
+# kb_project_bucket_map()`): an ADR filed under a product's own KB slug counts
+# for that product's bucket, not for whichever bucket happens to hold the
+# knowledge repo. Unmapped slugs fall through to "Engineering-internal" —
+# `platform`, the steward's own cross-cutting catch-all, is deliberately among
+# them, since crediting it to one crew would misattribute every other crew's
+# cross-cutting ADRs filed there (reviewer, PR #402; the registry field this
+# reads, `adr_kb_projects`, carries the same restriction forward).
+ADR_PROJECT_BUCKET: dict[str, str] = projects.kb_project_bucket_map()
 # net-LOC excludes: generated / vendored / lockfiles / built artifacts / PROSE.
 #
 # MARKDOWN IS NOT A LINE OF CODE (the operator, 2026-09-05): "LOC is rough anyway, but
@@ -204,7 +134,7 @@ ADR_PROJECT_BUCKET = {
 #
 # THE SHARE OF ADDED LINES THIS REMOVES, measured per repo on 2026-09-05 through
 # this file's own pathspec, is the check that it takes prose and leaves code:
-# knowledge 93%, substrate 91%, selector 16%, vivy 4%, convivy-orient 3%,
+# knowledge 93%, substrate 91%, two product repos 16% and 4%, convivy-orient 3%,
 # convivy-deck 2%, agent-platform 1%, library 0%. `substrate` nearly vanishing is
 # correct — it is a cockpit holding documents, not a codebase. The service repos
 # barely moving is the signal that the exclusion is landing where it should.
@@ -231,18 +161,62 @@ _FEAT_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)?feat(?:\([^)]*\))?\s*[:!]", re.IGN
 _REVERT_RE = re.compile(r"^Revert\b", re.IGNORECASE)
 
 
-# Repos that don't live flat under <root>/ — the NYH Studio projects are cloned
-# one level down under the <root>/nyh-architecture/ umbrella. Without this the harvest
-# looks in <root>/nyh-arch-tools (nonexistent) and reads 0 commits/LOC.
-REPO_SUBPATH = {
-    "nyh-arch-tools": "nyh-architecture/nyh-arch-tools",
-    "nyh-etc": "nyh-architecture/nyh-etc",
-    "nyh-park-villa": "nyh-architecture/nyh-park-villa",
-}
+def _repo_subpaths() -> dict[str, str]:
+    """repo → path relative to <root>, for a single-repo project whose registered
+    home directory isn't flat under <root>/<repo> — several projects today are
+    cloned a level down under a shared umbrella directory. Without this the
+    harvest looks in <root>/<repo> directly (nonexistent) and reads 0 commits/LOC.
+
+    Derived from the registry rather than named here, so a newly registered
+    project with a non-flat home needs no edit to this file: a project with
+    exactly one repo whose own `home_dir` resolves outside <root>/<repo-name>
+    gets an entry mapping its repo to that resolved, root-relative path."""
+    out: dict[str, str] = {}
+    for slug, unit in projects.load().items():
+        repos = unit.get("repos", [])
+        if len(repos) != 1:
+            continue
+        repo = repos[0]
+        home = projects.home_path(slug)
+        if home is None:
+            continue
+        try:
+            rel = home.relative_to(CONVIVY)
+        except ValueError:
+            continue
+        if str(rel) != repo:
+            out[repo] = str(rel)
+    return out
+
+
+REPO_SUBPATH = _repo_subpaths()
+
+# A bare repo NAME, never a path — the same shape bin/trial-escaped-defects's
+# `_SAFE_REPO_RE`/`_safe_bare_repo` refuse, reimplemented rather than imported
+# (bin/ CLIs are extension-less and not meant to import one another's
+# internals). Every BUCKETS entry traces back to some unit's registry `repos`
+# list (projects.velocity_buckets()), a field crew_registration.build_row()
+# only requires to be a non-empty string — a registry write, not reviewed
+# source, can put '/' or '..' there and point repo_path() outside CONVIVY
+# (security-reviewer, PR #987).
+_SAFE_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _safe_bare_repo(repo) -> bool:
+    return (isinstance(repo, str) and bool(repo) and "/" not in repo
+            and repo not in (".", "..") and bool(_SAFE_REPO_RE.match(repo)))
+
+
+_INSTALL_ROOT = CONVIVY.resolve()
 
 
 def repo_path(repo: str) -> Path:
-    return CONVIVY / REPO_SUBPATH.get(repo, repo)
+    if not _safe_bare_repo(repo):
+        raise ValueError(f"{repo!r} is not a bare repo name")
+    resolved = (CONVIVY / REPO_SUBPATH.get(repo, repo)).resolve()
+    if not resolved.is_relative_to(_INSTALL_ROOT):
+        raise ValueError(f"{repo!r} resolves to {resolved}, outside {_INSTALL_ROOT}")
+    return resolved
 
 
 def gh_full(repo: str) -> str:
@@ -303,16 +277,20 @@ def shallow_repos() -> list[str]:
     return sorted({r for repos in BUCKETS.values() for r in repos if is_shallow(r)})
 
 
-def _gh_json(args: list[str], tries: int = 3):
+def _gh_json(args: list[str], env: dict, tries: int = 3):
     """Run a gh command and return parsed JSON, or None after all retries fail.
+
+    `env` is the one `read`-scoped token's environment minted for this call's
+    repo (company/decisions/0027) — one mint per repo per call, never minted
+    in here.
 
     Retries a transient failure (network blip, rate-limit, timeout, a non-zero exit)
     with backoff, so one bad moment at generation time doesn't poison the daily
-    snapshot — the concrete bug that showed Vivy 0 merged for a whole day. A 0-exit
-    with unparseable output is NOT transient, so it returns immediately."""
+    snapshot — the concrete bug that once showed a bucket 0 merged for a whole day.
+    A 0-exit with unparseable output is NOT transient, so it returns immediately."""
     for attempt in range(tries):
         try:
-            r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+            r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60, env=env)
         except (OSError, subprocess.SubprocessError):
             r = None
         if r is not None and r.returncode == 0:
@@ -329,7 +307,7 @@ def _is_on_github(repo: str) -> bool:
     """Whether the repo resolves on GitHub — the authoritative, offline no-GitHub
     signal, kept separate from 'the query failed.' A cloned repo is on GitHub iff its
     origin remote is github.com (so the local-only *-commercial sites read false); a
-    repo not cloned locally (nyh, gh-only by design) is assumed on GitHub, so a failed
+    repo not cloned locally (gh-only by design) is assumed on GitHub, so a failed
     query for it is treated as a transient error to carry forward, not a false 'no
     remote' that would zero its count."""
     p = repo_path(repo)
@@ -441,15 +419,20 @@ def gh_pr_metrics(repo: str, since_date: str, until_date: str | None = None) -> 
     Returns None when the repo genuinely has no GitHub remote (the local-only
     *-commercial sites), which the caller records as no_gh. Raises FetchError when the
     repo IS on GitHub but the query failed after retries — the caller then carries the
-    last-known-good value forward rather than writing a false 0 (the bug that showed
-    Vivy 0 merged in the 30-day window while 7d/90d were fine). `until_date` upper-bounds
-    the merged range for as-of history reconstruction; omit it for the live window."""
+    last-known-good value forward rather than writing a false 0 (the bug that once
+    showed a bucket 0 merged in the 30-day window while 7d/90d were fine). `until_date`
+    upper-bounds the merged range for as-of history reconstruction; omit it for the
+    live window."""
     if not _is_on_github(repo):
         return None
-    search = f"merged:{since_date}..{until_date}" if until_date else f"merged:>={since_date}"
-    rows = _gh_json(["pr", "list", "--repo", gh_full(repo), "--state", "merged",
-                     "--search", search, "--limit", "500",
-                     "--json", "number,title,mergedAt"])
+    try:
+        with GA.read_token_env(gh_full(repo)) as env:
+            search = f"merged:{since_date}..{until_date}" if until_date else f"merged:>={since_date}"
+            rows = _gh_json(["pr", "list", "--repo", gh_full(repo), "--state", "merged",
+                             "--search", search, "--limit", "500",
+                             "--json", "number,title,mergedAt"], env)
+    except GA.Unreadable as e:
+        raise FetchError(f"cannot mint a GitHub token for {gh_full(repo)} ({e})") from e
     if rows is None:
         raise FetchError(f"gh pr list failed for {gh_full(repo)} after retries")
     merged = len(rows)
@@ -494,7 +477,11 @@ def prs_total(repo: str) -> int | None:
     owner, _, name = gh_full(repo).partition("/")
     q = ('{repository(owner:"%s",name:"%s"){pullRequests(states:MERGED){totalCount}}}'
          % (owner, name))
-    data = _gh_json(["api", "graphql", "-f", f"query={q}"])
+    try:
+        with GA.read_token_env(gh_full(repo)) as env:
+            data = _gh_json(["api", "graphql", "-f", f"query={q}"], env)
+    except GA.Unreadable as e:
+        raise FetchError(f"cannot mint a GitHub token for {gh_full(repo)} ({e})") from e
     try:
         return data["data"]["repository"]["pullRequests"]["totalCount"]
     except (TypeError, KeyError):
@@ -566,8 +553,9 @@ def _load_jsonl(path: Path) -> list[dict]:
 
 def scorecard_quality(since_date: str, until_date: str | None = None) -> dict[str, dict]:
     """Per-repo CI-first-pass and 7d-survival, read from the model-scorecard
-    ledgers (it already harvests these daily for dev-crew repos + PA). Keyed by
-    repo; repos without ledger rows in-window simply get no quality figures.
+    ledgers (it already harvests these daily for dev-crew repos and selected
+    product repos). Keyed by repo; repos without ledger rows in-window simply
+    get no quality figures.
     `until_date` upper-bounds the window for as-of history reconstruction."""
     rows: list[dict] = []
     rows += _load_jsonl(SCORECARD_DIR / "scorecard.jsonl")
@@ -907,17 +895,19 @@ def build_window(days: int, now: datetime, prev: dict | None = None,
 
 
 # Caveats the dashboard renders as footnotes (decided with the operator 2026-06-15).
+# Deliberately generic: a footnote narrating one install's own history by bucket
+# name would be wrong the moment an adopter's registry names different buckets,
+# which is exactly the per-install baking this list used to do before the two
+# that named buckets outright were retired (their events — the knowledge-repo
+# genesis, the 2026-07-31 umbrella-organization split — are now well in the
+# past and recorded in ADR history, not something a live dashboard footnote
+# needs to keep repeating).
 NOTES = [
     "LOC is a weak signal kept as one input among several — read it alongside the rest.",
-    "The substrate + knowledge repos began 2026-05-16/21, so their 30/90-day windows "
-    "still include the doc-migration genesis (inflating ADRs/ARCH + engineering-internal "
-    "counts); the 7-day window is already clean and the longer windows normalize as the "
-    "repos age.",
-    "The NYH Studio product is built by three projects, each reporting for itself: NYH "
-    "Arch Tools (shared tooling, on GitHub → PRs counted), East Texas Circle and Park "
-    "Villa (per-property, local-only clones → commits/LOC counted, no PRs). They were one "
-    "bucket until 2026-07-31, so a window reaching back past that date reads as three "
-    "rows where the archive holds one.",
+    "A bucket whose repos are all young can show an inflated ADRs/ARCH or "
+    "engineering-internal count in its 30/90-day windows from migration or genesis "
+    "activity; the 7-day window is already clean and the longer windows normalize as "
+    "the repos age.",
     "The velocity index scores throughput/features against a frozen per-bucket baseline "
     "(the 90-day pace at launch); a young bucket ramping fast can pin at 100 (≥2× its "
     "baseline pace) with no quality ledger to temper it — that reads as real high "

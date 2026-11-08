@@ -102,6 +102,15 @@ def _run(home, payload, *, tmux="/tmp/tmux-test,1,0", agentctl_run_id=None, raw_
          extra_env=None):
     env = dict(os.environ)
     env["HOME"] = str(home)
+    # `private_crew.py`'s default (no `_REGISTRY` override) reads through
+    # `projects.py` (CQ-565), which asks the Library unless `PROJECTS_JSON`
+    # names a file — so this subprocess needs it pointed at the same path
+    # `_crews_root`/`_park_in` write the test's own registry to, or an
+    # ambient `PROJECTS_JSON` (a real ask, a stray value from the host
+    # environment this test run inherited via `dict(os.environ)` above) would
+    # override this test's own fixture, or an unset one would reach the
+    # Library instead of it.
+    env["PROJECTS_JSON"] = str(home / "Convivy" / "agent-platform" / "config" / "projects.json")
     if tmux is None:
         env.pop("TMUX", None)
     else:
@@ -277,9 +286,9 @@ def _park_in(home, cwd, *, registry_text):
 def test_a_park_inside_a_black_box_crew_logs_no_signal_and_the_state_says_why(tmp_path):
     """ADR-0043: a black box crew logs no signals. This hook is registered globally, so a session in a
     private crew reaches it; its own words stay out of the shared store, and the park still happens."""
-    crew = tmp_path / "Convivy" / "CFO"
+    crew = tmp_path / "Convivy" / "LEDGER"
     (crew / "sub").mkdir(parents=True)
-    registry = json.dumps({"cfo": {"private": True, "home_dir": "<root>/CFO"}})
+    registry = json.dumps({"ledger": {"private": True, "home_dir": "<root>/LEDGER"}})
     captured, state = _park_in(tmp_path, crew / "sub", registry_text=registry)
 
     assert captured == [], "a black box session's text reaches no signal"

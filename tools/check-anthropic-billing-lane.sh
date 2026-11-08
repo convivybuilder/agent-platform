@@ -24,7 +24,7 @@
 # block at bin/co:96-97 is the only place base URL gets set). A SessionStart hook
 # fires inside Claude Code on EVERY launch path — co, raw claude, FleetView,
 # agentctl-spawned workers — so it covers the path co cannot. The custom
-# Anthropic-SDK apps (PA, the constance/vivy answers bots) are NOT Claude Code and
+# Anthropic-SDK apps (PA, the product answer bots) are NOT Claude Code and
 # do not run Claude Code hooks, so they are excluded automatically — correctly, as
 # an SDK app MUST use a raw API key and legitimately bills the API.
 #

@@ -6,7 +6,12 @@ THE ACCEPTANCE TEST is `test_a_throwaway_crew_passes_crew_doctor_with_no_other_e
 It runs the real command, the real `crew register`, the real `knowledge-ctx use`,
 the real `co --resolve` and the real doctor, against:
 
-  - a temporary registry (PROJECTS_JSON, a copy of the checked-in file),
+  - a temporary registry file (PROJECTS_JSON, a copy of the checked-in file) that
+    every READ in this sandbox goes through `projects.py` to reach — CQ·564 moved
+    `crew register`'s WRITE off this file entirely, onto `_StubLibrary`'s own
+    `POST /registry/crews` below, which stores the accepted row into this same
+    file so the two sides of the sandbox keep seeing one answer, the way the
+    Library's own single store does in production,
   - a temporary crews root, pinned through a temporary session-agent.env (the
     machine's root is read from that file and has no environment override, so
     the sandbox reaches `co` and `knowledge-ctx` through their own root seams:
@@ -14,7 +19,11 @@ the real `co --resolve` and the real doctor, against:
   - a temporary knowledge checkout, where the simulated merge writes the profile,
   - a temporary Deck crews.d,
   - a stub Library on a loopback port (the one the `vault_plane` default points
-    at is never reached),
+    at is never reached), serving `GET /profiles*`, the one document read and
+    `POST /registry/crews`,
+  - a registry-writer token file under the sandbox's own `$HOME`, and a stub for
+    `crew_registration._repo_ci_workflows` so registering the crew needs no real
+    (or fake) GitHub App call,
   - a private tmux socket, with the pane's `co` replaced by a sleeping stub.
 
 The run is two invocations, because that is what the Library's load makes true:
@@ -49,6 +58,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "lib" / "agent-platform"))
 import crew_create as CC  # noqa: E402
 import crew_doctor as CD  # noqa: E402
+import crew_registration as CR  # noqa: E402
 import projects  # noqa: E402
 import vault_plane as VP  # noqa: E402
 
@@ -63,15 +73,25 @@ TOKEN = "crew-create-test-token"
 # --- the stub Library -------------------------------------------------------
 
 class _StubLibrary:
-    """Serves the three routes the crew path reads: a profile, the profile
-    listing and a document body. `loaded` is the Library's load: until it flips,
-    `GET /profiles/<crew>/daytime` answers 404, which is what a merged but not yet
-    loaded profile looks like (epic comment 2842)."""
+    """Serves the routes the crew path reads — a profile, the profile
+    listing, a document body — and, now that CQ·564 moved `crew register`'s
+    write onto the Library, `POST /registry/crews` too. `loaded` is the
+    Library's load: until it flips, `GET /profiles/<crew>/daytime` answers
+    404, which is what a merged but not yet loaded profile looks like (epic
+    comment 2842).
 
-    def __init__(self, crew: str):
+    `registry_path` is this stub's OWN backing store for the registration
+    route — a real Library persists crews somewhere of its own; this test's
+    stand-in persists them into the same file `PROJECTS_JSON` already points
+    `projects.py`'s reads at, so a read right after a registration in this
+    sandbox sees it, the same guarantee production gets from both routes
+    being the one real store."""
+
+    def __init__(self, crew: str, registry_path: Path):
         self.crew = crew
         self.loaded = False
         self.requests: list[str] = []
+        self.registry_path = registry_path
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -85,12 +105,43 @@ class _StubLibrary:
                 self.end_headers()
                 self.wfile.write(raw)
 
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw_in = self.rfile.read(length) if length else b"{}"
+                try:
+                    payload = json.loads(raw_in or b"{}")
+                except ValueError:
+                    payload = {}
+                outer.requests.append(self.path)
+                code, body = outer.answer_post(self.path, payload)
+                raw = json.dumps(body).encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
             def log_message(self, *a):
                 pass
 
         self.srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}"
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def answer_post(self, path: str, payload: dict) -> tuple[int, dict]:
+        if path != "/registry/crews":
+            return 404, {"error": "not found"}
+        slug = payload.get("slug")
+        data = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        if not slug or slug in data:
+            return 409, {"error": f"{slug!r} already claimed"}
+        row = {k: v for k, v in payload.items() if k != "slug"}
+        row["updated_at"] = "2026-10-26T00:00:00Z"
+        row["updated_by"] = "person_01TESTBOSUNWRITER00000000"
+        data[slug] = row
+        self.registry_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        return 201, {**row, "slug": slug}
 
     def answer(self, path: str) -> tuple[int, dict]:
         parts = [urllib.parse.unquote(p) for p in path.split("?")[0].split("/") if p]
@@ -157,12 +208,14 @@ def _write_exec(path: Path, text: str) -> Path:
 def sandbox(tmp_path, monkeypatch, agentctl):
     root = tmp_path / "Convivy"
     root.mkdir()
+    registry = tmp_path / "projects.json"
     cfg = tmp_path / "session-agent.env"
-    cfg.write_text(f"CREWS_ROOT={root}\n", encoding="utf-8")
+    cfg.write_text(f"CREWS_ROOT={root}\nPROJECTS_REGISTRY={registry}\n", encoding="utf-8")
 
     home = tmp_path / "home"
     (home / ".library").mkdir(parents=True)
-    (home / ".library" / "client-tokens.json").write_text(
+    client_tokens = home / ".library" / "client-tokens.json"
+    client_tokens.write_text(
         json.dumps({TOKEN: {"name": "bosun"}}), encoding="utf-8")
     index = home / ".knowledge-index" / "index.db"
     index.parent.mkdir(parents=True)
@@ -178,9 +231,9 @@ def sandbox(tmp_path, monkeypatch, agentctl):
     knowledge = root / "knowledge"
     (knowledge / "projects").mkdir(parents=True)
 
-    registry = tmp_path / "projects.json"
-    registry.write_text((REPO / "config" / "projects.json").read_text(encoding="utf-8"),
-                        encoding="utf-8")
+    registry.write_text(
+        (REPO / "tests" / "fixtures" / "rich_registry.json").read_text(encoding="utf-8"),
+        encoding="utf-8")
     crews_dir = tmp_path / "deck" / "crews.d"
     crews_dir.mkdir(parents=True)
 
@@ -195,9 +248,10 @@ def sandbox(tmp_path, monkeypatch, agentctl):
         "script = sys.argv[1]\n"
         "sys.argv = sys.argv[1:]\n"
         "runpy.run_path(script, run_name='__main__')\n"))
-    # `co` reads its registry from `config/projects.json` beside its own file, and it has
-    # no environment override, so the sandbox gives it a checkout of its own: a copy of
-    # bin/co whose config is the temp registry, with lib and builder-root shared back.
+    # `co` resolves PROJECTS_REGISTRY from `cfg`'s `--root-config` (set above), so it
+    # reads the same temp registry this fixture builds. It still gets a checkout of its
+    # own — a copy of bin/co, with lib and builder-root shared back — because sibling
+    # lookups (`../builder-root`, `../lib/agent-platform`) resolve against that copy.
     co_checkout = tmp_path / "co-checkout"
     (co_checkout / "bin").mkdir(parents=True)
     (co_checkout / "config").mkdir()
@@ -212,11 +266,24 @@ def sandbox(tmp_path, monkeypatch, agentctl):
         "#!/bin/sh\n"
         f"exec {sys.executable!r} {str(driver)!r} {str(REPO / 'bin' / 'knowledge-ctx')!r} \"$@\"\n"))
 
-    library = _StubLibrary(CREW)
+    library = _StubLibrary(CREW, registry)
     socket = f"crew-create-{uuid.uuid4().hex[:8]}"
     # Every subprocess (knowledge-ctx, co) reads its Library address from the environment,
     # so the stub is named there too. Without this, knowledge-ctx reached the live Library.
     monkeypatch.setenv("LIBRARY_BASE_URL", library.url)
+    # `knowledge-ctx`'s client-token lookup resolves through `BR.real_account_home()`
+    # (the passwd home), not `$HOME` (issue_01M6A7CBACJG5XTR1JK4WH6PRQ) — deliberately,
+    # so a dispatched run's redirected HOME can't shadow the operator's real credential.
+    # This sandbox's `home` is neither, so the subprocess needs the override env var to
+    # find the planted token file at all.
+    monkeypatch.setenv("LIBRARY_CLIENT_TOKENS", str(client_tokens))
+
+    # The registry-writer credential `crew_registration._post_crew_row` reads
+    # (CQ·564) — under this sandbox's own $HOME, never the real
+    # ~/.orient-control.
+    (home / ".orient-control").mkdir(parents=True)
+    (home / ".orient-control" / "agent-platform-registry-writer-token").write_text(
+        "crew-create-test-writer-token\n", encoding="utf-8")
 
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
@@ -233,6 +300,13 @@ def sandbox(tmp_path, monkeypatch, agentctl):
     monkeypatch.setattr(agentctl, "KNOWLEDGE_ROOT", knowledge)
     monkeypatch.setattr(CD, "DEFAULT_INDEX_DB", index)
     monkeypatch.setattr(VP, "base_url", lambda: library.url)
+    # `crew_registration._post_crew_row` builds its URL through
+    # `vault_plane.library_url`, which reads `LIBRARY_BASE_URL` directly
+    # rather than through `base_url()` — both need the stub's address.
+    monkeypatch.setattr(VP, "LIBRARY_BASE_URL", library.url)
+    # No real (or fake) GitHub App call: CQ·564's ci_workflows fill is a
+    # live GitHub read this sandbox has no need to exercise.
+    monkeypatch.setattr(CR, "_repo_ci_workflows", lambda repo, row, **kw: ["ci.yml"])
     monkeypatch.setattr(CD, "_own_bin", lambda name, base: {
         "co": co_wrap, "knowledge-ctx": kctx_wrap}[name])
 
@@ -273,14 +347,9 @@ def _create_args(box, **over) -> argparse.Namespace:
 
 # --- the acceptance test ----------------------------------------------------
 
-# The one site that keeps the full pass out of reach, and why. bin/co answers `--resolve`
-# only from a styling arm (`_apply_co_style`), and a registry crew with no arm falls
-# through to `_co_exec_claude`, which reports "no crew resolves". Positive control: the
-# same sandboxed co resolves `signals`, which has an arm. The fix is a bin/co change,
-# outside this slice, and it is named in the PR body.
+# The doctor's line for `check_co_resolves`, which runs the real `co --resolve`
+# against the finished crew's directory.
 CO_SITE = "co -r resolves the crew"
-CO_GAP = ("bin/co answers --resolve only from a styling arm; a registry crew with none "
-          "reports 'no crew resolves' (PR body names the fix)")
 
 # Both tests below need the doctor's `check_co_resolves` to actually run `bin/co`, a
 # `#!/bin/zsh` script, through `sandbox`'s `co_wrap` → `co_checkout/bin/co`. `ci1`
@@ -322,12 +391,11 @@ def _create_twice(box, capsys):
 
 
 @pytest.mark.skipif(shutil.which("zsh") is None, reason=_NO_ZSH_REASON)
-def test_a_second_run_finishes_every_step_and_the_doctor_fails_only_on_the_co_site(sandbox,
-                                                                                    capsys):
+def test_a_second_run_finishes_every_step_and_the_doctor_passes(sandbox, capsys):
     box = sandbox
     rc, out = _create_twice(box, capsys)
 
-    assert rc == 1, out
+    assert rc == 0, out
     assert "step 1 register — done: already registered" in out
     assert "step 4 profile proposal — done: " in out and "in the knowledge checkout" in out
     assert "step 5 knowledge-ctx use — done: individuated" in out
@@ -338,10 +406,11 @@ def test_a_second_run_finishes_every_step_and_the_doctor_fails_only_on_the_co_si
     doctor = [line for line in out.splitlines() if line.lstrip().startswith(
         ("PRESENT", "MISSING", "UNKNOWN", "N/A"))]
     missing = [line for line in doctor if line.lstrip().startswith("MISSING")]
-    assert len(missing) == 1 and CO_SITE in missing[0], out
-    assert "no crew resolves" in missing[0], out
-    assert all(line.lstrip().startswith("PRESENT") or "N/A" in line for line in doctor
-               if CO_SITE not in line), out
+    assert missing == [], out
+    co_lines = [line for line in doctor if CO_SITE in line]
+    assert len(co_lines) == 1 and co_lines[0].lstrip().startswith("PRESENT"), out
+    assert "crew=" in co_lines[0], out
+    assert all(line.lstrip().startswith("PRESENT") or "N/A" in line for line in doctor), out
 
     # The rest of the finished crew is in place, checked on disk and in the session.
     assert (box.working / ".git").is_dir()
@@ -354,11 +423,10 @@ def test_a_second_run_finishes_every_step_and_the_doctor_fails_only_on_the_co_si
 
 
 @pytest.mark.skipif(shutil.which("zsh") is None, reason=_NO_ZSH_REASON)
-@pytest.mark.xfail(strict=True, reason=CO_GAP)
 def test_a_throwaway_crew_passes_crew_doctor_with_no_other_edit(sandbox, capsys):
-    """The acceptance bar of issue_01M4AB9X62112MCG8B5501CMKV. It fails only on the co site
-    named by CO_GAP. Strict: the xfail turns into a failure when bin/co is fixed, so the
-    marker comes off with the fix."""
+    """The acceptance bar of issue_01M4AB9X62112MCG8B5501CMKV: the second run's doctor
+    pass, including the co site (`PRESENT  co -r resolves the crew`), with no edit
+    to the crew beyond the two create runs."""
     box = sandbox
     rc, out = _create_twice(box, capsys)
     assert rc == 0, out
@@ -397,8 +465,7 @@ def test_a_rerun_refuses_a_registry_row_it_would_not_write(sandbox, capsys):
     registry[CREW] = {"class": "project", "display": "Something Else", "owner": "convivy",
                       "home_dir": f"<root>/{CREW}", "dirs": [], "repos": [CREW],
                       "aliases": [], "crew": CREW, "lifecycle": "active", "products": [],
-                      "kb": "central", "kb_project": CREW, "task_text_public": False,
-                      "overnight": False}
+                      "kb": "central", "kb_project": CREW, "task_text_public": False}
     box.registry.write_text(json.dumps(registry, indent=2), encoding="utf-8")
     projects._load_raw.cache_clear()
 
@@ -407,6 +474,50 @@ def test_a_rerun_refuses_a_registry_row_it_would_not_write(sandbox, capsys):
     assert rc == 1
     assert "step 1 register — refused" in out and "display" in out
     assert not (box.crews_dir / f"{CREW}.json").exists()
+
+
+# --- step 1's own comparison: the fields the Library adds on write ---------
+
+def _unused(*a, **kw):
+    raise AssertionError("step 1 register must not reach this")
+
+
+def _register_env(emit):
+    return CC.Env(crews_dir=Path("/unused"), knowledge_ctx=Path("/unused"),
+                 knowledge_root=Path("/unused"), library_loader=Path("/unused"),
+                 host="unused-host", propose=_unused, served=_unused, doctor=_unused,
+                 emit=emit)
+
+
+_BUILT_ROW = {"class": "project", "display": "Sample Crew", "owner": "convivy",
+             "home_dir": "<root>/sample-crew", "dirs": [], "repos": ["sample-crew"],
+             "aliases": [], "crew": "sample-crew", "lifecycle": "active", "products": [],
+             "kb": "central", "kb_project": "sample-crew", "task_text_public": False,
+             "ci_workflows": {"sample-crew": ["ci.yml"]}}
+
+
+def test_a_stored_row_differing_only_in_fields_the_library_adds_is_already_registered(monkeypatch):
+    """§6.8: a 201 is "the row, as stored, with `slug`, `updated_at` and `updated_by`
+    added". A rerun's built row never carries those three, so a stored row that
+    differs only in them is the same registration, not a different one."""
+    stored = {**_BUILT_ROW, "slug": "sample-crew", "updated_at": "2026-10-26T00:00:00Z",
+             "updated_by": "person_01SAMPLEWRITER0000000000"}
+    monkeypatch.setattr(projects, "get", lambda slug: stored)
+    out = []
+    result = CC._step_register(_register_env(out.append), "sample-crew", object(), _BUILT_ROW)
+    assert result is None
+    assert any("already registered" in line for line in out), out
+
+
+def test_a_stored_row_differing_in_another_field_still_refuses(monkeypatch):
+    stored = {**_BUILT_ROW, "display": "A Different Display Name",
+             "updated_at": "2026-10-26T00:00:00Z", "updated_by": "person_01SAMPLEWRITER0000000000"}
+    monkeypatch.setattr(projects, "get", lambda slug: stored)
+    out = []
+    result = CC._step_register(_register_env(out.append), "sample-crew", object(), _BUILT_ROW)
+    assert result == 1
+    refusal = next(line for line in out if "refused" in line)
+    assert "display" in refusal and "updated_at" not in refusal and "updated_by" not in refusal
 
 
 def test_a_working_directory_outside_the_crews_root_is_refused_before_any_write(sandbox, capsys,
@@ -442,8 +553,8 @@ def test_tmux_is_run_on_the_socket_with_TMUX_stripped(monkeypatch):
 
 def test_the_default_profile_gives_the_crew_its_review_agents_and_scout():
     yaml = pytest.importorskip("yaml")
-    body = yaml.safe_load(CC.default_profile("archy"))
-    assert body["profile"] == "archy/daytime"
+    body = yaml.safe_load(CC.default_profile("cart"))
+    assert body["profile"] == "cart/daytime"
     audience = body["include"][0]["audience_contains"]
     assert audience == ["reviewer", "security-reviewer", "scout"]
     assert body["include"][0]["kind"] == "agent"

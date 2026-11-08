@@ -13,12 +13,20 @@ their own. Its absence falls back to `config_path()`'s default, this
 machine's `$HOME/.config/convivy/operator.json` — never a path inside this
 repo, so the file itself is never a candidate for export.
 
-Every key is required and there is no in-repo default value for any of
-them: a fallback here would let an unset key silently reach the wrong
-operator identity, crew, or host into a scan, an archive job, or a published
-document. `get()` raises `OperatorConfigError` naming the missing key and the
-file read; each caller decides its own fail-closed shape (refuse to run,
-report "unconfigured", skip the step) on top of that.
+Most keys are required and have no in-repo default value: a fallback here
+would let an unset key silently reach the wrong operator identity, crew, or
+host into a scan, an archive job, or a published document. `get()` raises
+`OperatorConfigError` naming the missing key and the file read; each caller
+decides its own fail-closed shape (refuse to run, report "unconfigured",
+skip the step) on top of that.
+
+A key that names something only SOME installs have (a crew that exists on
+this machine but not every fork) is not required in that sense: there,
+"missing" is a valid install shape, not a misconfiguration, and the right
+read is `get_optional()`, which returns `None` for a missing key rather than
+raising. It still raises on an unreadable file or invalid JSON, same as
+`get()` — those are never "this install has none of it", they are "this
+file can't be trusted".
 
 See `config/operator.example.json` for the full key list, with synthetic
 values.
@@ -69,3 +77,12 @@ def get(key: str) -> Any:
     if key not in data:
         raise OperatorConfigError(f"operator config at {path} has no key {key!r}")
     return data[key]
+
+
+def get_optional(key: str, default: Any = None) -> Any:
+    """The configured value for *key*, or *default* when the file simply has
+    no such key — for a key that names something only some installs have.
+    Still raises `OperatorConfigError`, exactly as `get()` does, when the
+    file itself is missing, unreadable, or not valid JSON: that failure means
+    the file can't be trusted, not that this install has none of *key*."""
+    return _load(config_path()).get(key, default)

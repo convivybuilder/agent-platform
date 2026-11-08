@@ -137,8 +137,25 @@ from pathlib import Path
 
 import dispatch_env as DE
 import github_app as GA
+import projects
 import review_protocol as RP
 import run_sandbox as RS  # the sandbox every reviewer session runs under (Option A, Slate a-ow0q4o)
+
+# Soft import, mirroring `bin/agentctl`'s own try/except around this exact module
+# (ARCH-346's deploy-window lesson): `install.sh` links `lib/agent-platform/*.py` as
+# individual symlinks, so a checkout can carry a `tool_policy.py` newer than what is
+# linked for a window after `git pull` and before someone runs it. `bin/agentctl`
+# imports THIS module unconditionally at its own top level (`import review_launch as
+# RL`), so a hard import here would make a missing `tool_policy.py` crash `agentctl
+# --help` itself, not just this launcher — exactly the fleet-wide availability bug
+# ARCH-346 exists to prevent. `main`, below, refuses outright when `TP is None`,
+# before the approver key is ever read: this launcher's whole point, after
+# platform/specs/reviewers-run-under-their-allow-list, is running every session
+# under the resolved policy, so there is no open-settings fallback to degrade to.
+try:
+    import tool_policy as TP
+except ImportError:
+    TP = None
 
 ROLES = ("reviewer", "security-reviewer")
 VERDICTS = ("APPROVE", "REQUEST_CHANGES")
@@ -347,7 +364,8 @@ def _mkdir_owned(dir_fd: int, name: str, *, owner: "tuple[int, int]", fchown) ->
         os.close(fd)
 
 
-def prepare_run_dir(run_dir: Path, record: PRRecord, diff_text: str, *,
+def prepare_run_dir(run_dir: Path, record: PRRecord, diff_text: str,
+                    registry_document: dict, *,
                     owner: "tuple[int, int]", fchown=os.fchown) -> None:
     """The PR as files, at the fixed head this run fetched — what the
     reviewer persona reads instead of a live `gh` call, so a session steered
@@ -355,6 +373,16 @@ def prepare_run_dir(run_dir: Path, record: PRRecord, diff_text: str, *,
     Also creates `worktree/` (the session's cwd) and `claude/`
     (`CLAUDE_CONFIG_DIR`), so the session never needs write access to
     `run_dir` itself to create either one.
+
+    `registry_document` is the project registry this run's own environment
+    names as `PROJECTS_JSON` (`session_env`'s `registry_path`, the SAME
+    `run_dir / "registry.json"` written here) — CQ·563: the session's sandbox
+    denies `~/.orient-control/`, the registry token's home, so a process
+    inside this run (an in-run `agentctl`, a reviewer's own tools) reads the
+    registry from this file rather than asking the Library itself. `main`
+    reads it once, through `projects.raw_document()`, before `run_dir` even
+    exists, and refuses the whole launch on `projects.RegistryUnavailable`
+    rather than start a session with no registry to read.
 
     `owner` is `(uid, gid)` for the account the session will run as
     (`bin/review-launch`'s `ClaudeSession.owner()`); `fchown` is injected so
@@ -408,13 +436,23 @@ def prepare_run_dir(run_dir: Path, record: PRRecord, diff_text: str, *,
         _create_owned_file(run_fd, "pr.json", json.dumps(asdict(record), indent=2) + "\n",
                            owner=owner, fchown=fchown)
         _create_owned_file(run_fd, "diff.patch", diff_text, owner=owner, fchown=fchown)
+        _create_owned_file(run_fd, "registry.json", json.dumps(registry_document) + "\n",
+                           owner=owner, fchown=fchown)
         _mkdir_owned(run_fd, "worktree", owner=owner, fchown=fchown)
         _mkdir_owned(run_fd, "claude", owner=owner, fchown=fchown)
+        # The session's draft directory (platform/specs/reviewers-run-under-their-
+        # allow-list): once the session's settings stop granting the shared temp
+        # root (`main`'s own `RS.settings_json` call, below), this is where its
+        # `Write` reaches instead — same shape as `worktree`/`claude` above, created
+        # and chowned the same way, before the session's claude process ever starts.
+        _mkdir_owned(run_fd, "draft", owner=owner, fchown=fchown)
     finally:
         os.close(run_fd)
 
 
-def session_env(*, claude_config_dir: Path, oauth_token: str, home: Path) -> "dict[str, str]":
+def session_env(*, claude_config_dir: Path, oauth_token: str, home: Path,
+                repo: str, review_sha: str, draft_dir: Path,
+                registry_path: Path) -> "dict[str, str]":
     """The reviewer session's entire environment. No key path, no write-scoped
     GitHub token, no variable this process inherited from its caller — the
     launcher mints the write token AFTER the session ends (`main`, step 4),
@@ -428,13 +466,61 @@ def session_env(*, claude_config_dir: Path, oauth_token: str, home: Path) -> "di
     anyway, for the file-based route alone (`GIT_CONFIG_SYSTEM` pointed at
     `/dev/null` means git never reads the system gitconfig's
     `credential.helper=osxkeychain` line in the first place) — see
-    `dispatch_env`'s own docstring for the mechanism."""
-    return DE.git_credential_guard_env({
+    `dispatch_env`'s own docstring for the mechanism.
+
+    `repo` and `review_sha` go in as `AGENTCTL_REPO`/`AGENTCTL_REVIEW_SHA`
+    (platform/specs/reviewers-run-under-their-allow-list Handoff): the same
+    two variables `bin/agentctl`'s dispatch path exports for a pinned
+    reviewer, and what `agentctl review-ci` reads to resolve the repo (via
+    `projects.repo_github_slug`, which passes an already-`owner/name` value
+    like `repo` here through unchanged) and the commit. Without them,
+    `review-ci` has nothing to read on this launch path.
+
+    `draft_dir` goes in as `AGENTCTL_REVIEW_DRAFT_DIR` (round 2 of #925,
+    the same Handoff: "exported to the run in an env var... The recovery
+    instruction block names that variable") — `main` passes the SAME
+    `run_dir / "draft"` this call's caller also hands to
+    `run_sandbox.settings_json`'s `draft_dir` parameter, so the variable
+    this session reads can never name a directory other than the one its
+    own settings grant `Write` into. At head 33991502a this call carried no
+    such key at all: the recovery instruction block's fallback (`git
+    rev-parse --git-path review-comment.md`) names a path outside both
+    write roots this launch path's settings grant, so a reviewer that
+    crashed mid-review and tried that fallback here had nowhere to write
+    its draft back to.
+
+    `registry_path` goes in as `PROJECTS_JSON` (CQ·563): the SAME
+    `run_dir / "registry.json"` `prepare_run_dir` already wrote, read from
+    the project registry `main` fetched once, before `run_dir` existed, and
+    refused the whole launch on a failed read — the session's sandbox denies
+    `~/.orient-control/`, the registry token's home, so this is how a process
+    inside this run (an in-run `agentctl`, a reviewer's own tools) gets the
+    registry at all, the same way `bin/agentctl`'s own dispatch path gives a
+    run its own copy rather than the live token.
+
+    `DE.deny_push_env` is applied UNCONDITIONALLY (round 3 of #925) — every
+    session this launcher runs is `reviewer`/`security-reviewer` (`ROLES`),
+    so there is no agent-name check to gate it on here the way `bin/agentctl`'s
+    dispatch path gates `dispatch_env(deny_push=_is_review_agent(args.agent))`.
+    Before this round, this launcher's own `git` had no push refusal at all —
+    the one git-credential redirection it did carry, `git_credential_guard_env`,
+    closes a different gap (the FILE-based credential-helper route to the
+    operator's keyring) and never touches `git push`'s destination. Applied
+    before `git_credential_guard_env` so both end up in the same returned
+    dict; the two write disjoint keys (`GIT_CONFIG_*` vs. `GH_CONFIG_DIR`/
+    `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM`/`GIT_CONFIG_NOSYSTEM`/
+    `GIT_TERMINAL_PROMPT`), so the order between them cannot matter."""
+    env = DE.deny_push_env({
         "HOME": str(home),
         "PATH": "/opt/builder/reviewers/bin:/opt/homebrew/bin:/usr/bin:/bin",
         "CLAUDE_CONFIG_DIR": str(claude_config_dir),
         "CLAUDE_CODE_OAUTH_TOKEN": oauth_token,
+        "AGENTCTL_REPO": repo,
+        "AGENTCTL_REVIEW_SHA": review_sha,
+        "AGENTCTL_REVIEW_DRAFT_DIR": str(draft_dir),
+        "PROJECTS_JSON": str(registry_path),
     })
+    return DE.git_credential_guard_env(env)
 
 
 # The fixed personas the launcher runs a session under. Round 2 of #732,
@@ -571,10 +657,12 @@ def session_command(*, claude_bin: str = REVIEWERS_CLAUDE_BIN, prompt: str,
     isolation line (platform/specs/builder-runs-as-two-accounts, "How a review
     is requested and run"): it stops Claude Code from loading the checked-out
     PR's OWN `.claude/settings.json`, so a PR that ships a `SessionStart` hook
-    cannot run it against the reviewer account. Contrast `bin/agentctl`'s
-    `_spawn_claude`, which carries no such flag — a reviewer dispatched under
-    TODAY's path (the launcher not installed) still loads worktree-local
-    hooks exactly as a coder does, which is the gap this flag closes.
+    cannot run it against the reviewer account. `bin/agentctl`'s own
+    `_spawn_claude` carries the same flag now (CQ·551); unlike this launcher's
+    worktree, which `prepare_run_dir` fetches fresh with no individuation
+    step, `_spawn_claude`'s worktree IS individuated, so it also hands its run
+    back the project memory and skills text `--setting-sources user` would
+    otherwise cost it — nothing this launcher's own worktree ever had to lose.
 
     `prompt` (from `build_prompt`) is passed as the final positional
     argument, the same way `bin/agentctl`'s direct dispatch passes
@@ -592,11 +680,22 @@ def session_command(*, claude_bin: str = REVIEWERS_CLAUDE_BIN, prompt: str,
     `PATH` of the `env=` dict it was given (the same rule `github_app.py`'s
     module docstring relies on for `OPENSSL`); an executable path containing
     a `/`, like this default, is never looked up on `PATH` at all, so this is
-    immune to whatever that variable carries."""
+    immune to whatever that variable carries.
+
+    `--permission-mode TP.MODE_ENFORCE` (round 4 of #925, security-reviewer,
+    blocking): the allow-list this PR installs only binds under that mode —
+    under Claude Code's default mode a tool outside the allow-list is a
+    prompt rather than a refusal, and under `-p` what happens to that prompt
+    rests on the default instead of on the policy. `bin/agentctl`'s direct
+    dispatch path sets this same `TP.MODE_ENFORCE` unconditionally for every
+    spawn; reading it from `tool_policy` here, rather than writing a second
+    `"dontAsk"` literal, is what keeps the two launch paths from drifting on
+    which mode a review session runs under."""
     # `settings_json` is the sandbox (run_sandbox.settings_json). It is required:
     # a session built without it would run unsandboxed, and no default is offered.
     # `--` keeps the prompt positional even when the PR text starts with a flag.
     return [claude_bin, "-p", "--output-format", "stream-json", "--verbose",
+            "--permission-mode", TP.MODE_ENFORCE,
             "--setting-sources", "user", "--settings", settings_json, "--", prompt]
 
 
@@ -857,11 +956,16 @@ def main(argv: "list[str]", *, gate, session, run_dir_for, main_branch: str = "m
     `post_check(repo, token, *, head_sha, role, run_id, conclusion,
     summary)`, `revoke(token)`.
 
-    `session` needs: `env(claude_config_dir, home) -> dict` (the oauth token
-    is the session's own secret, not this function's), `run(cmd, env, cwd) ->
-    (exit_code, verdict)` (round 4 of #732, finding 2 — the subprocess's exit
-    code AND its own verdict, read from its stdout by `extract_verdict`,
-    never a file under `run_dir`), `home()` to place the session's files, and
+    `session` needs: `env(claude_config_dir, home, repo, review_sha, draft_dir,
+    registry_path) -> dict` (the oauth token is the session's own secret, not this
+    function's; `repo` and `review_sha` are threaded straight into
+    `session_env`'s own `AGENTCTL_REPO`/`AGENTCTL_REVIEW_SHA`, and
+    `draft_dir` into `AGENTCTL_REVIEW_DRAFT_DIR` — platform/specs/reviewers-
+    run-under-their-allow-list Handoff; `draft_dir` is the SAME `run_dir /
+    "draft"` passed to `run_sandbox.settings_json` below, round 2 of #925),
+    `run(cmd, env, cwd) -> (exit_code, verdict)` (round 4 of #732, finding 2 — the subprocess's exit code AND
+    its own verdict, read from its stdout by `extract_verdict`, never a file
+    under `run_dir`), `home()` to place the session's files, and
     `owner() -> (uid, gid)` for `prepare_run_dir` to chown the run's fixed
     children to. For `main`'s purposes a `verdict` is trusted only when
     `session.run` also returned exit code 0 — the real one runs `claude -p`;
@@ -870,14 +974,21 @@ def main(argv: "list[str]", *, gate, session, run_dir_for, main_branch: str = "m
     Returns 0 for an APPROVE, 1 for anything else (REQUEST_CHANGES, a
     session that exited non-zero, no verdict written, or a refusal after the
     key was already read — a closed/merged PR included); 2 for a malformed
-    invocation OR a `--run-id` whose run directory already exists, both
-    refused before the key is read at all.
+    invocation, a `--run-id` whose run directory already exists, or an
+    unreadable registry (CQ·563), all refused before the key is read at all.
     """
     try:
         parsed = parse_args(argv)
     except ArgError as e:
         print(f"review-launch: {e}", file=stderr)
         return 2
+
+    if TP is None:
+        print("review-launch: tool_policy did not import on this machine — the "
+              "review allow-list lives there, and this launcher has no open-settings "
+              "fallback to run a session under. Run install.sh to link it.",
+              file=stderr)
+        return 1
 
     # A reused run-id must never inherit an earlier invocation's verdict
     # (round 2 of #732, finding 3): refusing while the directory already
@@ -887,6 +998,18 @@ def main(argv: "list[str]", *, gate, session, run_dir_for, main_branch: str = "m
     if run_dir.exists():
         print(f"review-launch: run directory for --run-id {parsed.run_id!r} already "
               f"exists ({run_dir}); refusing to reuse it", file=stderr)
+        return 2
+
+    # CQ·563: this run's own registry, read once, before any key is minted —
+    # a failed read refuses the whole launch, the same way a malformed
+    # invocation does, rather than start a session with no registry for a
+    # process inside it (an in-run `agentctl`, a reviewer's own tools) to
+    # read. See `prepare_run_dir` and `session_env`'s own docstrings for
+    # where this document goes next.
+    try:
+        registry_document = projects.raw_document()
+    except projects.RegistryUnavailable as e:
+        print(f"review-launch: registry unavailable: {e}", file=stderr)
         return 2
 
     try:
@@ -910,12 +1033,24 @@ def main(argv: "list[str]", *, gate, session, run_dir_for, main_branch: str = "m
     # of #732, finding 3) must be absent from both before it is ever used —
     # checked here, once, rather than inside `build_prompt` itself.
     marker = _fresh_marker(text_fields=[record.title, record.body])
-    prepare_run_dir(run_dir, record, diff_text, owner=session.owner())
+    prepare_run_dir(run_dir, record, diff_text, registry_document, owner=session.owner())
     prompt = build_prompt(role=parsed.role, record=record, run_dir=run_dir, marker=marker)
 
-    env = session.env(claude_config_dir=run_dir / "claude", home=session.home())
+    # platform/specs/reviewers-run-under-their-allow-list: `ROLES` names only
+    # `reviewer`/`security-reviewer` (`parse_args`'s own validation), so every
+    # session this launcher runs is review-class — the allow-list carve-out always
+    # applies here, with no `_is_review_agent` branch to take. `denied=[]`: this
+    # launcher has no Library policy-page integration of its own to merge in.
+    policy = TP.resolve(parsed.role, TP.AUTONOMOUS, parsed.repo, denied=[])
+    # One value, used for both the settings grant and the env var that names it
+    # (round 2 of #925) — so the two can never name different directories.
+    draft_dir = run_dir / "draft"
+    env = session.env(claude_config_dir=run_dir / "claude", home=session.home(),
+                      repo=parsed.repo, review_sha=record.head_sha, draft_dir=draft_dir,
+                      registry_path=run_dir / "registry.json")
     cmd = session_command(prompt=prompt, settings_json=RS.settings_json(
-        home=session.home(), worktree=run_dir / "worktree"))
+        home=session.home(), worktree=run_dir / "worktree",
+        review_allowed=tuple(policy.allowed), draft_dir=draft_dir))
     exit_code, verdict = session.run(cmd=cmd, env=env, cwd=run_dir / "worktree")
 
     # A session that did not itself exit 0 never gets its verdict trusted,

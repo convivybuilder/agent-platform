@@ -27,12 +27,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import signal_client
+import projects
 
 import builder_root as BR
 SCORECARD_DIR = BR.runs_root() / "scorecard"
 HEALTH_SNAPSHOT = SCORECARD_DIR / "health.json"
 SCORECARD = SCORECARD_DIR / "scorecard.jsonl"
-PA_LEDGER = SCORECARD_DIR / "hollis.jsonl"
+# Own-coverage products (ARCH-358) are too telemetry-thin for the
+# shared SCORECARD pipeline and carry their own per-product scorecard file,
+# <slug>.jsonl, alongside it (model-scorecard's --repo-scorecard). `valid_name`
+# filters a slug shaped to escape SCORECARD_DIR before it is ever joined — this
+# registry KEY carries no `home_dir` of its own, so `home_path()` does not
+# apply (reviewer, PR #985 round 2).
+OWN_COVERAGE_LEDGERS = [SCORECARD_DIR / f"{slug}.jsonl" for slug in projects.own_coverage_products()
+                        if projects.valid_name(slug)]
 KB_EVAL = SCORECARD_DIR / "kb-eval.json"
 STATE = SCORECARD_DIR / "alert-state.json"
 
@@ -86,7 +94,9 @@ KB_MRR_FLOOR = 0.70         # kb-eval MRR below this → alert (baseline ~0.81, 
 AGENTS_DIR = BR.root() / "knowledge" / "projects" / "agent-platform" / "agents"
 MODEL_ALIASES = {  # frontmatter alias → resolved id (mirrors agentctl.MODEL_ALIASES; ids match scorecard rows)
     "opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5",
-    "gpt5": "openai/gpt-5", "deepseek": "deepseek/deepseek-v4-flash",
+    "haiku-5-5": "claude-haiku-5-5",
+    "gpt5": "openai/gpt-5", "deepseek": "deepseek/deepseek-flash",
+    "deepseek-pro": "deepseek/deepseek-v4-pro",
     "kimi": "moonshot/kimi-k2.6", "kimi-code": "moonshot/kimi-k2.7-code",
 }
 
@@ -358,6 +368,15 @@ def _load_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def _own_drain_rows() -> list[dict]:
+    """Rows from every own-coverage product's separate scorecard file
+    (OWN_COVERAGE_LEDGERS), unioned the way the shared SCORECARD's own rows are."""
+    rows: list[dict] = []
+    for ledger in OWN_COVERAGE_LEDGERS:
+        rows += _load_jsonl(ledger)
+    return rows
+
+
 def load_health(path: Path = HEALTH_SNAPSHOT) -> list[dict]:
     try:
         return json.loads(path.read_text()).get("repos", [])
@@ -400,7 +419,7 @@ def _post(channel: str, header: str, new_: list[dict], recovered: list[str]) -> 
 def run(*, dry_run: bool) -> int:
     now = datetime.now(timezone.utc)
     health = load_health()
-    cq_rows = _load_jsonl(SCORECARD) + _load_jsonl(PA_LEDGER)
+    cq_rows = _load_jsonl(SCORECARD) + _own_drain_rows()
 
     ch_alerts = code_health_alerts(health)
     # KB retrieval-quality breaches ride the cost/perf channel (an agent-performance
@@ -456,7 +475,7 @@ def main(argv=None) -> int:
     if args.report:
         now = datetime.now(timezone.utc)
         for a in (code_health_alerts(load_health())
-                  + cost_quality_alerts(_load_jsonl(SCORECARD) + _load_jsonl(PA_LEDGER), now, configured_models())
+                  + cost_quality_alerts(_load_jsonl(SCORECARD) + _own_drain_rows(), now, configured_models())
                   + kb_eval_alerts(load_kb_eval())):
             print(f"{a['severity']:<5} {a['key']:<32} {a['text']}")
         return 0

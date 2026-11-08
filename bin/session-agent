@@ -244,9 +244,11 @@ def main() -> int:
                    help="every non-scratch tmux session on this host, for "
                         "grouping under a project")
     sub.add_parser("ensure-server",
-                   help="make sure the default tmux server is running, started "
-                        "by the GUI-session keeper job. Exits 1 with the reason "
-                        "when it cannot be; a server already running passes")
+                   help="make sure the default tmux server is running: on "
+                        "macOS, started by the GUI-session keeper job; off "
+                        "macOS, forked directly, there being no keeper job to "
+                        "start it. Exits 1 with the reason when it cannot be; "
+                        "a server already running passes")
 
     sub.add_parser("crews",
                    help="the crew specs new-crew writes, as one envelope for Deck")

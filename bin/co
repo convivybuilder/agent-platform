@@ -1,5 +1,5 @@
 #!/bin/zsh
-# co — convivy orchestrate.
+# co — crew orchestrator.
 #
 # Launch `claude` in a specific agent's context. Default is the
 # planning-orchestrator (ARCH-008 daytime dispatch entry point). Pass a
@@ -41,7 +41,7 @@
 #                             `claude --model` Anthropic-direct (fail-closed,
 #                             same property as agentctl). Combines with -r and
 #                             works in every co context (products, steward,
-#                             PA, commercial, NYH).
+#                             PA, commercial, the business-area umbrella).
 #   co plan | co p         -> planner                 (vague intent, pre-architect)
 #   co coder | co c        -> coder
 #   co bug | co b          -> bug-investigator
@@ -72,12 +72,12 @@ set -eu
 # BELOW CAN EXEC ANYTHING (round 3, PR #574). `co_rollover.spawn_successor`
 # sets CO_ROLLOVER_SUCCESSOR=1 for every rollover regardless of which product
 # directory it starts from, and `_co_reindividuate` further down is called by
-# only about half the launch branches (substrate, the crew dirs,
-# `convivy-commercial`, the generic `*-commercial` branch, the generic
-# product tail) — hollis, selector, convivy-app-kit, convivy-deck,
-# write-better, the nyh-architecture umbrella, Cookbook/cookbook-app, and the
-# brand-new-project generic tail all `exec claude` directly and never called
-# that helper, so a rollover from any of those directories rode the marker
+# only about half the launch branches (the crew-cockpit branch, the
+# company-level and the generic `*-commercial` branches, the generic product
+# tail) — every self-contained crew, the writing guide, the business-area
+# umbrella, Cookbook/cookbook-app, and the brand-new-project generic tail all
+# `exec claude` directly and never called that helper, so a rollover from any
+# of those directories rode the marker
 # straight into the successor's whole `claude` process tree. Reading it into
 # a private variable and unsetting the environment variable in the same
 # breath, before any branch runs, closes the class rather than the branch:
@@ -172,9 +172,14 @@ fi
 # instead of the reminder silently reappearing fleet-wide.
 export CLAUDE_CODE_THRIFTY_SONIC=0
 
-# The co-only credential's location (ops-co). bin/mcp-ops-server presents the token in
-# this file for item creation, which only a co session may do. The path is not a secret.
-# The dispatch sandbox (agent-platform#793) denies a dispatched run read access to the
+# This crew's co-only credential (ops-co): $HOME/.orient-control/ops-co-<slug>-token,
+# named for THIS launch's crew once its registry slug is known (resolved right after
+# `_co_self_dir` is set, below — repo_root is already read by then). bin/mcp-ops-server
+# presents whichever file --mcp-config names on every call it makes, read and write
+# alike; item creation succeeds under this file because the Library minted this
+# entry with the extra `item.create` grant the crew's own ops-<slug>-token
+# lacks, not because the server tells the two apart. The path is not a secret. The
+# dispatch sandbox (agent-platform#793) denies a dispatched run read access to the
 # whole .orient-control directory the file lives in. NOT EXPORTED. Whatever a
 # process exports reaches all its descendants: the co's Bash tool, its `claude -p`
 # children and every tmux server it starts (probed 2026-10-06: a server started with the
@@ -186,8 +191,9 @@ export CLAUDE_CODE_THRIFTY_SONIC=0
 # name (probed 2026-10-06 on 2.1.292: one ops connection, the flag's). A private crew's
 # launch clears the path and passes no config. lib/agent-platform/dispatch_env.py strips
 # it from every spawn. The Library issues the file; co does not create it. While it is
-# missing, item creation refuses and names it.
-_co_ops_co_token_file="$HOME/.orient-control/ops-co-token"
+# missing, a call under it refuses and names it, and that refusal never stops the
+# launch itself.
+_co_ops_co_token_file=""
 
 # The picker row's title, passed to `claude --name` at every exec site below.
 #
@@ -239,14 +245,15 @@ co_model=""
 co_root_config=""
 # `--resolve` answers "would `co -r` launch a crew here, and which one" and exits
 # without starting anything. It exists so `agentctl crew doctor` can CHECK this
-# site by asking co, instead of reading `_co_crew_dirs` out of this file.
+# by asking co itself, rather than parsing any list out of this file.
 #
-# READING THE ARRAY GIVES THE WRONG ANSWER IN BOTH DIRECTIONS, which is the whole
-# reason for the flag. `selector` and `hollis` are absent from it and launch fine,
-# through a dedicated branch further down — a checker parsing the array calls two
-# healthy crews broken, and shipwright's interim checker does exactly that today.
-# There is no list of exceptions that stays right either, because the exception is
-# a code path, not a name. Asking co covers every path it has by construction.
+# PARSING A LIST GIVES THE WRONG ANSWER IN BOTH DIRECTIONS, which is the whole
+# reason for the flag. A self-contained crew is absent from the crew-cockpit
+# registry read and launches fine through its own dedicated branch — a checker
+# that only read that one list would call a healthy crew broken, and a prior
+# interim checker did exactly that. There is no list of exceptions that stays
+# right either, because the exception is a code path, not a name. Asking co
+# covers every path it has by construction.
 co_resolve=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -288,11 +295,11 @@ _co_crews_root=$("${0:A:h}/builder-root" "${_co_root_args[@]}") \
 
 # `PROJECTS_REGISTRY=<path>` in the --root-config file (tests only), the same
 # session-agent.env `co --root-config` already reads for CREWS_ROOT. Every site
-# below that resolves config/projects.json honours this first, so a test can hand
-# `co` a fixture registry without ever touching the operator's own checked-in
-# file (`tests/bash/lib.sh`'s `co_root_config` is the only writer). Absent the
-# key — every real launch — this stays empty and each site keeps the fallback
-# chain it already had.
+# below that resolves the crew registry honours this first, so a test can hand
+# `co` a fixture registry without ever touching the Library
+# (`tests/bash/lib.sh`'s `co_root_config` is the only writer). Absent the
+# key — every real launch — this stays empty and each site reads the
+# Library instead (CQ·565; there is no file to fall back to any more).
 _co_registry_override=""
 if [[ -n $co_root_config ]]; then
     while IFS='=' read -r _co_ro_key _co_ro_val; do
@@ -343,51 +350,58 @@ if [[ -n $co_model ]]; then
     esac
 fi
 
-# THE CREW COCKPITS: the directories where `co -r` pulls the knowledge repo and
-# re-runs `knowledge-ctx use daytime --force`. A crew individuated from the
-# central KB belongs here, Keel or not, AND THIS IS THE SITE NEW CREWS KEEP
-# MISSING. Registering a crew in config/projects.json and the product tables makes
-# `knowledge-ctx list` succeed in its directory, so co stops taking the generic
-# tail and falls to the agent `case` instead, where `co -r` dies with "cwd is not a
-# recognized product repo". `shipwright` and `placard` hit that on 2026-09-08;
-# `signals` joined on 2026-09-16 in the same change that registered it, so it
-# never did. tests/bash/test_co_crew_refresh.sh runs `co -r` from shipwright,
-# placard, signals and library; tests/bash/test_co_crew_cockpits.sh covers the
-# bare launch and the absolute-path gate for library, agent-platform and orient.
+# A helper beside co's own tree, else the crews-root deploy sibling — the same
+# fallback chain the crew-cockpit, sonnet-tier and private-crew lookups below
+# each re-derive. `_co_lib_dir`/`_co_registry_path` centralise it for the
+# callers added after this point; every one of them resolves its lib and
+# registry path through these two rather than repeating the chain.
 #
-# Absolute `:A`-resolved paths rather than basenames: a stray `git clone`/`git
-# worktree add ../library` anywhere on disk has a matching basename and is not
-# idiosyncratic the way `hollis`/`selector`/`convivy-deck` are (PR #404, reviewer
-# on PR #422). The full rationale for resolving both sides lives at this array's
-# use in the crew-cockpit branch further down.
-_co_crew_dirs=("$_co_crews_root/library" "$_co_crews_root/agent-platform" "$_co_crews_root/convivy-orient"
-               "$_co_crews_root/placard" "$_co_crews_root/shipwright"
-               "$_co_crews_root/signals" "$_co_crews_root/archy")
-_co_crew_dirs=("${(@)_co_crew_dirs:A}")
+# READS `$_co_self_dir`, NOT `${0:A:h}`: zsh sets `$0` to the FUNCTION's own
+# name inside a function (FUNCTION_ARGZERO, on by default), so `${0:A:h}`
+# here would resolve to a directory under `$PWD` rather than this script's own
+# — the exact bug `_co_self_dir`'s own definition, above, exists to avoid.
+# `_co_self_dir` is captured at top level before either function below is ever
+# called, so it names this script's real directory regardless of which
+# function reads it.
+_co_lib_dir() {
+    local lib=$_co_self_dir/../lib/agent-platform
+    [[ -d $lib ]] || lib=$_co_crews_root/agent-platform/lib/agent-platform
+    print -r -- "$lib"
+}
+# Empty, every real launch: the registry has no file to resolve by default
+# any longer (CQ·565 — `config/projects.json` is gone, and the Library
+# serves the registry over the wire instead). The python callers below leave
+# `projects.PROJECTS_JSON` unset when handed an empty string, which reads
+# the Library the same way every other reader does.
+# `PROJECTS_REGISTRY` in a --root-config file (tests only) is the one case
+# with an actual path to hand down.
+_co_registry_path() {
+    print -r -- "$_co_registry_override"
+}
 
-# REGISTRY-DERIVED COCKPITS (issue_01M3YN6857H5J541G73Y9P3KA1, crew-creation
-# epic). The six literals above are UNCHANGED by this block — it only
-# APPENDS, so it cannot regress any of the three sites their own comment
-# names (the styling case below, the refresh case further down, the bash
-# tests). A crew `agentctl crew register` marks `crew_cockpit: true`
-# (`crew_registration`'s default for a new `kb: central` crew with no
-# dedicated branch of its own, below) reaches `co -r` here with no further
-# edit to this file — the same move `_co_sonnet_crews` below already made
-# for `model_tier`, applied to the array this comment block calls "THE SITE
-# NEW CREWS KEEP MISSING".
-#
-# `2>/dev/null` and `|| true` are load-bearing for the same reason the
-# sonnet block below gives: co must launch even when the registry cannot be
-# read, and a read failure here costs ONLY a registry-registered crew its
-# cockpit treatment, never one of the six literals above.
-{
-    _co_cc_self=${0:A:h}
-    _co_cc_lib=$_co_cc_self/../lib/agent-platform
-    [[ -d $_co_cc_lib ]] || _co_cc_lib=$_co_crews_root/agent-platform/lib/agent-platform
-    _co_cc_registry=$_co_cc_self/../config/projects.json
-    [[ -f $_co_cc_registry ]] || _co_cc_registry=$_co_crews_root/agent-platform/config/projects.json
-    [[ -n $_co_registry_override ]] && _co_cc_registry=$_co_registry_override
-    _co_cc_names=(${(f)"$(python3 - "$_co_cc_lib" "$_co_cc_registry" "$_co_crews_root" 2>/dev/null <<'PY' || true
+# Applies a PRODUCT's own registry styling (`co_accent`/`co_style_id`/
+# `co_label`/`co_fg`, the same fields the crew-cockpit branch reads), and
+# returns 0, when the product has one; returns 1 and applies nothing
+# otherwise, so a caller with its own fallback for that case (the generic
+# daytime branch's raw-basename styling arm) can tell the two apart. `<name>`
+# reaches `projects.co_style()` as a bare basename — the commercial branch
+# below has already stripped `-commercial` off it, but it may still name a
+# secondary checkout of some product's repo (a satellite repo the registry
+# lists only under that product's own `repos`, never under its own slug or
+# home-directory basename). `projects.co_style()` resolves that case itself,
+# by the unit whose `repos` lists the name, the same join `fold_map` makes
+# for a trusted repo name — NEVER through `projects.project_for_repo`, whose
+# case-insensitive join also
+# counts aliases and answers a different question (which project's KNOWLEDGE
+# a repo reads; `knowledge` itself resolves there to `library`, which owns
+# the KB repo, not a styling verdict for a `knowledge` checkout). Shared by
+# the generic daytime fallback's own styling branch and the per-product
+# commercial branch, which used to carry two copies of the same hardcoded
+# case between them.
+_co_apply_product_style() {  # <name>
+    local style
+    style=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" "$1" \
+        2>/dev/null <<'PY' || true
 import sys
 from pathlib import Path
 
@@ -395,26 +409,49 @@ sys.path.insert(0, sys.argv[1])
 try:
     import projects
 
-    projects.PROJECTS_JSON = Path(sys.argv[2])
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
     projects.ROOT_OVERRIDE = sys.argv[3]
     projects._load_raw.cache_clear()
-    for name in projects.crew_cockpit_dirs():
-        print(name)
+    slug = sys.argv[4]
+    style = projects.co_style(slug)
+    if style:
+        style_id, accent, label, fg = style
+        print("\t".join([style_id, accent, label or "", fg]))
 except Exception:
-    # Print nothing: the caller reads an empty list as "no registry-derived
-    # cockpits", which leaves the six literals above as the whole set.
-    sys.exit(0)
+    pass
 PY
-)"})
-    for _co_cc_name in $_co_cc_names; do
-        _co_crew_dirs+=("$_co_crews_root/$_co_cc_name")
-    done
-    unset _co_cc_self _co_cc_lib _co_cc_registry _co_cc_names _co_cc_name
-} always { : }
-# Re-resolved over the WHOLE array, literals and appended names alike — a
-# no-op on the already-resolved six, and what makes the appended ones
-# comparable to `${repo_root:A}` at this array's two uses below.
-_co_crew_dirs=("${(@)_co_crew_dirs:A}")
+    )
+    [[ -n $style ]] || return 1
+    local -a fields=("${(@ps:\t:)style}")
+    _apply_co_style "$fields[1]" "$fields[2]" "$fields[3]" "$fields[4]"
+    return 0
+}
+
+# Whether `<name>` is one of the slugs/aliases/repos of an active unit flagged
+# `co_generic_refresh: true` (`projects.generic_refresh_names()`) — the
+# registry's own record of which products reach `co -r` through the
+# least-restricted, no-dedicated-branch path rather than failing the way an
+# unrecognized directory does.
+_co_generic_refresh_allowed() {  # <name>
+    python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" "$1" \
+        2>/dev/null <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    sys.exit(0 if sys.argv[4] in projects.generic_refresh_names() else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
 
 # The co main-loop model. OPUS IS THE DEFAULT, and a crew is on Sonnet only when
 # `_co_sonnet_crews` names it (the operator, 2026-09-16: "Can we pin COs to Opus as the
@@ -422,10 +459,10 @@ _co_crew_dirs=("${(@)_co_crew_dirs:A}")
 #
 # THE DEFAULT USED TO BE THE OTHER WAY ROUND, and it failed the same way three
 # times. A crew reached Opus only through one of three lists (a `$PWD` test for
-# ask, EA or the operator's personal crew, `_co_crew_dirs`, a brand `case`), and anything else fell to a
-# silent Sonnet `*)`. `placard` (2026-09-05) and `shipwright` (2026-09-08) each
-# launched on Sonnet until the operator noticed the model, and Signals did on 2026-09-16:
-# its `sig-` directory was in no registry the registration test reads, so no test
+# the walled-off crew or a private crew, a hardcoded crew-cockpit array, a brand
+# `case`), and anything else fell to a silent Sonnet `*)`. Three different crews each
+# launched on Sonnet until the operator noticed the model, one of them because
+# its own directory was in no registry the registration test read, so no test
 # fired. Inverting the default makes forgetting a new crew cost Opus rather than
 # judgement, and leaves ONE list anyone maintains: the deliberate exceptions.
 #
@@ -440,10 +477,6 @@ _co_crew_dirs=("${(@)_co_crew_dirs:A}")
 # reverse collision (a stray `../library` billed Opus) is what the old absolute-path
 # rules existed to prevent, and there is nothing left for it to prevent.
 #
-# `_co_crew_dirs` stays, for its other job: it is what makes `co -r` pull the
-# knowledge repo and re-individuate a crew cockpit (see its use further down).
-# Nothing reads it for the model any more.
-#
 # ARCH-134's protection is intact: co NEVER inherits the CLI's built-in default
 # (which became Fable 5, $10/$50 per Mtok, and burned $100+/subscription in a day
 # on 2026-06-11); every path below names an explicit, non-Fable model. Per-session
@@ -451,14 +484,15 @@ _co_crew_dirs=("${(@)_co_crew_dirs:A}")
 # both tiers. The gateway/explicit branches above already populated
 # claude_model_args and skip this entirely.
 
-# The crews DELIBERATELY on the cheaper tier. `write-better` is the writing guide,
-# and the three `nyh-*` projects are physical-architecture work that is not
-# software. Each was on Sonnet before this became the only list; moving one to
-# Opus is a spend decision for the operator and a one-word removal here.
+# The crews DELIBERATELY on the cheaper tier: the internal writing-guide crew,
+# and the business-area umbrella's own projects (physical-architecture work
+# that is not software). Each was on Sonnet before this became the only
+# list; moving one to Opus is a spend decision for the operator and a
+# one-word removal here.
 # tests/test_co_crew_registration.py fails on a name here that is not an active
-# crew in config/projects.json, so the list cannot quietly outlive its crews.
+# crew in the registry, so the list cannot quietly outlive its crews.
 # DERIVED FROM THE REGISTRY, not enumerated here (crew-creation epic slice 2).
-# A crew's `model_tier: "sonnet"` in config/projects.json is the only place the
+# A crew's `model_tier: "sonnet"` in the registry is the only place the
 # exception is written, so registering a crew and pinning its model are one act
 # rather than two that can disagree.
 #
@@ -467,7 +501,7 @@ _co_crew_dirs=("${(@)_co_crew_dirs:A}")
 # leaves this array empty and the `else` arm below bills Opus. That is the same
 # direction the operator's 2026-09-16 inversion chose: forgetting costs money rather than
 # judgement, and a co silently dropped to Sonnet is the failure that went
-# unnoticed three times (placard, shipwright, Signals). The reverse fail-safe
+# unnoticed three times across three different crews. The reverse fail-safe
 # would reintroduce exactly that.
 #
 # BUT THAT SENTENCE IS ABOUT THIS ARRAY, NOT ABOUT WHAT THE PROGRAM DOES, and
@@ -499,9 +533,9 @@ _co_sonnet_crews=()
     _co_mt_self=${0:A:h}
     _co_mt_lib=$_co_mt_self/../lib/agent-platform
     [[ -d $_co_mt_lib ]] || _co_mt_lib=$_co_crews_root/agent-platform/lib/agent-platform
-    _co_mt_registry=$_co_mt_self/../config/projects.json
-    [[ -f $_co_mt_registry ]] || _co_mt_registry=$_co_crews_root/agent-platform/config/projects.json
-    [[ -n $_co_registry_override ]] && _co_mt_registry=$_co_registry_override
+    # Empty, every real launch — see `_co_registry_path`'s own comment:
+    # the registry has no file to resolve by default any longer (CQ·565).
+    _co_mt_registry=$_co_registry_override
     _co_sonnet_crews=(${(f)"$(python3 - "$_co_mt_lib" "$_co_mt_registry" "$_co_crews_root" 2>/dev/null <<'PY' || true
 import sys
 from pathlib import Path
@@ -510,7 +544,8 @@ sys.path.insert(0, sys.argv[1])
 try:
     import projects
 
-    projects.PROJECTS_JSON = Path(sys.argv[2])
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
     projects.ROOT_OVERRIDE = sys.argv[3]
     projects._load_raw.cache_clear()
     for name in projects.sonnet_crew_dirs():
@@ -540,16 +575,100 @@ if (( ${#claude_model_args[@]} == 0 )); then
     fi
 fi
 
-# True in <root>/ask and in any directory under it. Every site that identifies ask by its
-# directory asks this, so a subdirectory of ask gets ask's treatment: no co credential, the
-# tool denial, and the sandboxed ask branch. Without it, a subdirectory of ask (e.g.
-# <root>/ask/handoffs, read on every ask session start) reaches the generic tail, which
-# execs claude with bypassPermissions and none of ask's settings — a sibling directory such
-# as <root>/ask-notes is NOT ask and must not match.
-_co_in_ask_tree() {
-    local ask=${${:-"$_co_crews_root/ask"}:A}
-    [[ ${PWD:A} == "$ask" || ${PWD:A} == "$ask"/* ]]
-}
+# THE WALLED-OFF CREW (platform/decisions/0100): the operator's own private use of
+# the platform, registered so the platform knows it exists with none of its own
+# install data carried in this repository — the Bosun copies its CLAUDE.md, its
+# launch script and its skills into the live install itself. Every site that used
+# to identify it by a hardcoded directory now reads the registry's `walled_off`
+# field instead, keyed on the unit's `home_dir` the same way the private-crew wall
+# a few hundred lines down is keyed. COMPUTED ONCE HERE, before any site below can
+# ask it, since the registry read it needs is no longer free the way a plain
+# directory-string comparison was.
+#
+# Reuses `private_crew`'s own inode-comparison, upward-walking machinery
+# (`walled_off_home_for`, mirroring `private_home_for` exactly) rather than a
+# second registry reader: a subdirectory of the walled-off crew's home matches,
+# the same way a subdirectory of a black box does, but a sibling directory that
+# merely starts with the same name (`<root>/ask-notes`, say) does not, since the
+# comparison is by inode and the walk stops at the first directory that is not a
+# real ancestor.
+#
+# `${0:A:h}`, NOT `$_co_lib_dir`: this runs before `_co_self_dir` is set (below,
+# just past the private-crew machinery), the same reason the Sonnet-tier block
+# just above resolves its own lib path rather than calling that helper.
+#
+# FAILS CLOSED, THE SAME DIRECTION ADR-0043 REQUIRES FOR THE BLACK-BOX WALL. An
+# unreadable registry, a missing lib, or no python3 on PATH must refuse to launch
+# rather than let the walled-off crew's directory fall through to the generic
+# tail below, which execs claude with bypassPermissions and none of this crew's
+# settings — the exact gap the previous directory-literal check never had to
+# worry about, because it needed no registry at all.
+_co_wc_self=${0:A:h}
+_co_wc_lib=$_co_wc_self/../lib/agent-platform
+[[ -d $_co_wc_lib ]] || _co_wc_lib=$_co_crews_root/agent-platform/lib/agent-platform
+_co_wc_registry=$_co_registry_override
+_co_walled_rc=0
+_co_walled=$(python3 - "$_co_wc_lib" "$PWD" "$_co_wc_registry" "$_co_crews_root" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import private_crew
+    import projects
+
+    if sys.argv[3]:
+        private_crew._REGISTRY = sys.argv[3]
+        projects.PROJECTS_JSON = Path(sys.argv[3])
+    projects.ROOT_OVERRIDE = sys.argv[4]
+    home = private_crew.walled_off_home_for(sys.argv[2])
+    if home is private_crew.UNKNOWN:
+        sys.exit(3)
+    if home is None:
+        sys.exit(1)
+    for slug in projects.walled_off_slugs():
+        hp = projects.home_path(slug)
+        if hp is None or not os.path.isdir(hp):
+            continue
+        try:
+            same = os.path.samefile(hp, home)
+        except OSError:
+            continue
+        if same:
+            unit = projects.get(slug) or {}
+            style_id = unit.get("co_style_id") or slug
+            accent = unit.get("co_accent") or ""
+            label = unit.get("co_label") or ""
+            fg = unit.get("co_fg") or "#ffffff"
+            print(f"{slug}\t{style_id}\t{accent}\t{label}\t{fg}")
+            sys.exit(0)
+    sys.exit(3)
+except SystemExit:
+    raise
+except Exception:
+    sys.exit(3)
+PY
+) || _co_walled_rc=$?
+unset _co_wc_self _co_wc_lib _co_wc_registry
+
+_co_walled_slug="" _co_walled_style_id="" _co_walled_accent="" _co_walled_label="" _co_walled_fg=""
+if (( _co_walled_rc == 0 )); then
+    _co_walled_fields=("${(@ps:\t:)_co_walled}")
+    _co_walled_slug=$_co_walled_fields[1]
+    _co_walled_style_id=$_co_walled_fields[2]
+    _co_walled_accent=$_co_walled_fields[3]
+    _co_walled_label=$_co_walled_fields[4]
+    _co_walled_fg=$_co_walled_fields[5]
+    unset _co_walled_fields
+elif (( _co_walled_rc != 1 )); then
+    print -u2 "co: cannot tell whether ${(V)PWD} is inside the walled-off crew (the"
+    print -u2 "    project registry or the platform lib could not be read), so refusing"
+    print -u2 "    to launch rather than risk the generic tail, which execs claude with"
+    print -u2 "    bypassPermissions and none of that crew's settings."
+    exit 1
+fi
+unset _co_walled_rc _co_walled
 
 # Per-product visual styling (ARCH-077). Sets:
 #   - iTerm2 tab color via OSC 6 (the colored tab strip = the at-a-glance
@@ -579,6 +698,23 @@ _co_in_ask_tree() {
 # Reaching here under `--resolve` means no arm claimed this directory: co would
 # launch the generic agent rather than a crew, which is a real answer and the
 # one the doctor needs.
+#
+# Extracts <path> from a SINGLE argv element matching the literal
+# `/handoff-pickup <path>` prompt `co_rollover.spawn_successor` builds — one
+# shlex-quoted shell word, so it reaches every launch branch's "$@" as one
+# element even though it contains a space. Prints the path and returns 0 on
+# a match; returns 1 with nothing printed otherwise (an ordinary launch, or
+# a rollover successor given some other prompt).
+_co_rollover_prompt_handoff_path() {
+    local arg
+    for arg in "$@"; do
+        if [[ $arg == "/handoff-pickup "* ]]; then
+            print -r -- "${arg#/handoff-pickup }"
+            return 0
+        fi
+    done
+    return 1
+}
 _co_exec_claude() {
     if ${co_resolve:-false}; then
         # ${(V)}: PWD is cwd-derived and reaches this print whether or not any
@@ -588,27 +724,91 @@ _co_exec_claude() {
         print -u2 -- "co: no crew resolves for ${(V)PWD:A}"
         exit 1
     fi
-    # The co-only credential's path reaches the ops server through the --mcp-config this
-    # shell gives the claude it becomes, and that config is claude's argv, where `ps` shows
-    # it. The path is not a secret. A hand export puts it in claude's environment, which the
-    # crew and generic-tail launches do not unset; the ask and private launches do. A private
-    # crew empties _co_ops_co_token_file before it calls here.
-    # ASK IS EXCLUDED HERE BY THE SAME DIRECTORY-TREE TEST THE ASK BRANCH USES
-    # (_co_in_ask_tree: <root>/ask and anything under it). Ask is a black-box crew, but the
-    # registry does not mark it private, so the private check cannot see it. The steward
-    # ruled on 2026-10-06 that a black box holds no kb or
-    # ops tools. The 2026-09-12 transcript capture missed ask the same way; this is the
-    # second occurrence. `unset` drops a value the operator's shell exported.
-    # Ask's global mcpServers entry still loads the ops and kb servers, and --strict-mcp-config
-    # would strip the account connectors ask needs, so the launch denies their tools instead.
-    # Claude Code honours a server-level deny (verified on Claude Code 2.1.292).
+    # A ROLLOVER SUCCESSOR'S PICKUP IS RECORDED BY CO ITSELF, not left to the
+    # successor's model choosing to run `/handoff-pickup`'s own `co-rollover
+    # --picked-up` — twice it did not (2026-10-01, 2026-10-24), leaving the
+    # predecessor's pane fenced and alive until the operator ran the command
+    # by hand. Only a rollover successor whose prompt is the exact
+    # `/handoff-pickup <path>` co_rollover.spawn_successor builds qualifies;
+    # every other launch (including a plain `co -r` with no such prompt) is
+    # unchanged below — no --session-id, no watch started.
+    #
+    # THE SESSION ID IS CO'S OWN INVENTION. `co-rollover --picked-up` refuses
+    # to run without `CLAUDE_CODE_SESSION_ID` set (`_require_session_id`),
+    # but co runs before claude exists, so there is no session id yet to
+    # read. Generating one here and handing it to `claude --session-id`
+    # makes it real — the successor's Claude Code session really does come
+    # up under this id — so the detached watch below can set the same id for
+    # the `co-rollover --picked-up` call it makes once the successor is up.
+    # `--session-id` conflicts with `--resume`/`--continue` (`claude --help`);
+    # a rollover successor's "$@" never carries either (its prompt is always
+    # the literal `/handoff-pickup <path>` built above, never `--resume`),
+    # so that conflict cannot arise here.
+    if [[ -n $_co_rollover_successor ]]; then
+        local _co_pickup_handoff_path
+        if _co_pickup_handoff_path=$(_co_rollover_prompt_handoff_path "$@"); then
+            local _co_pickup_session_id
+            _co_pickup_session_id=$(uuidgen | tr '[:upper:]' '[:lower:]')
+            if [[ -n $_co_pickup_session_id ]]; then
+                set -- --session-id "$_co_pickup_session_id" "$@"
+                # Resolved via PATH, the same convention `knowledge-ctx`/
+                # `issues-waiting` already use in this file (`$+commands[...]`)
+                # — install.sh symlinks every bin/ file, including this one,
+                # into ~/.local/bin, so a real session finds it there. A test
+                # stubs it the same way it stubs `claude`/`knowledge-ctx`: a
+                # fixture on PATH ahead of the real one.
+                if (( $+commands[co-rollover-pickup-watch] )); then
+                    # Backgrounded with every std fd redirected before `exec claude`
+                    # below claims the pane, so the watch outlives the exec holding
+                    # no terminal of its own; `disown` drops it from this shell's job
+                    # table so no later wait/signal here can touch it. The script's
+                    # own `main` additionally calls `os.setsid()` on start, best-effort,
+                    # to leave this shell's process group entirely. A failure anywhere
+                    # in this block (uuidgen missing, the watch binary absent) only
+                    # loses the automatic pickup — it must never block or delay the
+                    # launch below.
+                    co-rollover-pickup-watch --handoff-path "$_co_pickup_handoff_path" \
+                        --claude-pid $$ --session-id "$_co_pickup_session_id" \
+                        </dev/null >/dev/null 2>&1 &
+                    disown
+                    print -u2 -- "co: rollover successor — recording the pickup" \
+                        "automatically once this session comes up (failure log:" \
+                        "$HOME/.cache/co-session-health/co-rollover-close-out.log)."
+                else
+                    print -u2 -- "co: rollover successor — co-rollover-pickup-watch not" \
+                        "found on PATH; record the pickup by hand: co-rollover --picked-up" \
+                        "$_co_pickup_handoff_path"
+                fi
+            else
+                print -u2 -- "co: rollover successor — uuidgen produced nothing;" \
+                    "the pickup will not be recorded automatically."
+            fi
+        fi
+    fi
+    # This crew's co-only credential path reaches the ops server through the
+    # --mcp-config this shell gives the claude it becomes, and that config is claude's
+    # argv, where `ps` shows it. The path is not a secret. A hand export puts it in
+    # claude's environment, which the crew and generic-tail launches do not unset; the
+    # walled-off and private launches do. A private crew empties _co_ops_co_token_file
+    # before it calls here.
+    # THE WALLED-OFF CREW IS EXCLUDED HERE BY THE EARLY CHECK ABOVE (_co_walled_slug,
+    # walled_off_home_for: its home and anything under it). It is a black-box crew by
+    # role, but the registry does not mark it private, because the account connectors
+    # it needs are stripped by --strict-mcp-config — so the private check cannot see
+    # it. The steward ruled on 2026-10-06 that a black box holds no kb or ops tools.
+    # The 2026-09-12 transcript capture missed it the same way; this is the second
+    # occurrence. `unset` drops a value the operator's shell exported.
+    # Its global mcpServers entry still loads the ops and kb servers, and
+    # --strict-mcp-config would strip the account connectors it needs, so the launch
+    # denies their tools instead. Claude Code honours a server-level deny (verified on
+    # Claude Code 2.1.292).
     # The config names the command the user-scope entry names, plus the pinned plane
     # (VAULTS_ON_LIBRARY=1), because --mcp-config replaces that entry rather than adding to it.
-    if _co_in_ask_tree; then
-        unset ORIENT_OPS_CO_TOKEN_FILE
+    if [[ -n $_co_walled_slug ]]; then
+        unset ORIENT_OPS_CREW_TOKEN_FILE
         set -- --disallowedTools=mcp__ops,mcp__kb "$@"
     elif [[ -n ${_co_ops_co_token_file:-} ]]; then
-        set -- --mcp-config "{\"mcpServers\":{\"ops\":{\"type\":\"stdio\",\"command\":\"$HOME/.local/bin/mcp-ops-server\",\"args\":[],\"env\":{\"VAULTS_ON_LIBRARY\":\"1\",\"ORIENT_OPS_CO_TOKEN_FILE\":\"$_co_ops_co_token_file\"}}}}" "$@"
+        set -- --mcp-config "{\"mcpServers\":{\"ops\":{\"type\":\"stdio\",\"command\":\"$HOME/.local/bin/mcp-ops-server\",\"args\":[],\"env\":{\"VAULTS_ON_LIBRARY\":\"1\",\"ORIENT_OPS_CREW_TOKEN_FILE\":\"$_co_ops_co_token_file\"}}}}" "$@"
     fi
     exec claude "$@"
 }
@@ -617,11 +817,12 @@ _apply_co_style() {
     # style_id keys the iTerm profile (co-<style_id>) and must match the deploy +
     # ssh-alias names. label is the human-facing display (tab title, tmux status-left,
     # window name); it defaults to style_id, so a project whose pretty name differs
-    # from its repo id (e.g. nyh-park-villa -> "Park Villa") passes label as $3.
+    # from its repo id (a business-area project named for its street address, say)
+    # passes label as $3.
     # NB: two statements, not one. Under `set -u`, a default that references an
     # earlier-in-the-same-`local` parameter (`label=${3:-$style_id}`) trips zsh
     # nounset — $style_id isn't visible yet within its own declaration — which
-    # broke every 2-arg caller (substrate, personal-assistant, the commercial
+    # broke every 2-arg caller (the steward, a self-contained crew, the commercial
     # product calls) while 4-arg callers that pass label explicitly slipped by.
     local style_id=$1 accent_hex=$2
     local label=${3:-$style_id} status_fg=${4:-#ffffff}
@@ -641,8 +842,8 @@ _apply_co_style() {
     # early and lets the rest of the value reach the terminal as its own
     # escape sequence. #709 closed this for the one caller that was known to
     # reach here with a bare, unvalidated git-toplevel basename (the generic
-    # `*)` daytime arm) by gating THAT CALL SITE; the nyh-architecture arm
-    # reaches here with the same kind of value and had no gate of its own —
+    # `*)` daytime arm) by gating THAT CALL SITE; the business-area umbrella
+    # arm reaches here with the same kind of value and had no gate of its own —
     # the demonstration that a per-caller gate gets missed (security-reviewer,
     # PR #709 round 2: https://github.com/convivy/agent-platform/pull/709
     # #issuecomment-5895015209). Gating here instead covers every caller,
@@ -657,16 +858,34 @@ _apply_co_style() {
     # to the broader charset the OSC-0 `title` below already allows
     # (letters, digits, space, `.`, `_`, the middle dot, `-`) rather than the
     # same identifier rule, because a caller's hardcoded label legitimately
-    # carries a space or a middle dot ("Park Villa", "Ask · <topic>") and
-    # must keep styling; what it must not carry is a control byte, which
+    # carries a space or a middle dot ("Acme East", a walled-off crew's own
+    # "<label> · <topic>") and must keep styling; what it must not carry is a
+    # control byte, which
     # that charset already excludes.
     #
-    # A NAME THAT FAILS LAUNCHES UNSTYLED: no OSC, no tmux write, nothing
-    # printed. This runs before the `--resolve` short-circuit below too, so
-    # `--resolve` reports no crew resolving rather than echoing back a name
-    # it never validated.
-    if [[ ! $style_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
-       || [[ $label != ${label//${~_CO_LABEL_OK}/} ]]; then
+    # A BAD STYLE_ID LAUNCHES UNSTYLED, under --resolve too: no OSC, no tmux
+    # write, nothing printed — there is no safe identifier to key a profile,
+    # a tmux session name or a --resolve answer on, so this is "no crew
+    # resolves" in every caller, exactly as before this comment.
+    if [[ ! $style_id =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        return 0
+    fi
+    # A BAD LABEL ALONE IS A STYLING PROBLEM, NOT A "THIS ISN'T A CREW" ONE —
+    # and --resolve must not conflate the two. `style_id` is already proven
+    # gate-clean above, so under --resolve this still answers with it,
+    # substituted for the label too (crew-doctor's `co -r resolves the crew`
+    # site read a correctly-registered private crew as MISSING because the
+    # registry's own `display` field carried an apostrophe — platform/
+    # decisions/0043 work item. The private-crew branch's style_id is always
+    # the registry's slug, held to _NAME_OK at registration time, so it is
+    # always a safe fallback label here). A REAL (non-resolve) launch is
+    # UNCHANGED: still no OSC, no tmux write, nothing printed — only the
+    # --resolve answer is decoupled from the label gate.
+    if [[ $label != ${label//${~_CO_LABEL_OK}/} ]]; then
+        if ${co_resolve:-false}; then
+            print -r -- "crew=$style_id label=$style_id dir=${(V)PWD:A}"
+            exit 0
+        fi
         return 0
     fi
     # `--resolve` answers here rather than at any one branch, because EVERY path
@@ -697,8 +916,9 @@ _apply_co_style() {
         # corrupted tab title.
         #
         # THE SINK CARRIES ITS OWN FLOOR RATHER THAN TRUSTING ITS CALLERS. Today
-        # the only dynamic label is the ask topic, already held to ^[a-z0-9-]+$
-        # at the source — but that is one caller's discipline, and this function
+        # the only dynamic label is the walled-off crew's own topic, already
+        # held to ^[a-z0-9-]+$ at the source — but that is one caller's
+        # discipline, and this function
         # is reached from fifteen launch paths. `status-left` got the same
         # treatment via `##`; this is the matching guarantee for OSC-0.
         # `rename-window` needs neither: tmux does not re-parse a stored window
@@ -722,9 +942,9 @@ _apply_co_style() {
             # `new-session -d`) to the CURRENT session and its ACTIVE window,
             # not to the pane the command runs in — so a co launched that way
             # restyled a session it was not in and renamed a window it was not
-            # in. On 2026-09-06 a spawned Back chat renamed the operator's main Ask
-            # window out from under him, which Deck drew as the session being
-            # lost (issue_01M1VTRHKRERY7MJEYCF4WR2G2). `$TMUX_PANE` is the one
+            # in. On 2026-09-06 a spawned Back chat renamed the operator's main
+            # walled-off-crew window out from under him, which Deck drew as the
+            # session being lost (issue_01M1VTRHKRERY7MJEYCF4WR2G2). `$TMUX_PANE` is the one
             # target every call can share: tmux resolves a session option set
             # against a pane to that pane's session, and a window option or
             # rename to that pane's window (confirmed on 3.6a, both branches of
@@ -779,9 +999,9 @@ _apply_co_style() {
             # STRING: `#(cmd)` inside one is run through /bin/sh whenever the
             # status line redraws with a client attached, and `##` is how tmux
             # spells a literal `#`. Every label was a hardcoded literal until
-            # the ask topic became environment-derived, which is what made this
-            # reachable — so the escape lives HERE rather than only at that one
-            # caller, and any future label is safe by construction.
+            # the walled-off crew's own topic became environment-derived, which
+            # is what made this reachable — so the escape lives HERE rather
+            # than only at that one caller, and any future label is safe by construction.
             #
             # Confirmed by experiment, and three earlier probes of mine all
             # "passed" without exercising it: a detached session never renders
@@ -1130,8 +1350,8 @@ _co_reindividuate() {  # <profile> [failure-hint]
 # (issue_01M4GJRCDNKCV4QREH68KSRS3W). Before this, only `-r` ever re-rendered
 # a workspace — a plain `co` execed claude on whatever `.claude/` was already
 # on disk, however old, and nobody could be relied on to remember to pass
-# `-r`. On 2026-10-09 vivy-commercial was still running a review-round rule
-# platform/decisions/0083 had replaced three days earlier, from a render
+# `-r`. On 2026-10-09 a product's commercial workspace was still running a
+# review-round rule platform/decisions/0083 had replaced three days earlier, from a render
 # dated 2026-09-27; four other crews were caught in the same state.
 #
 # `knowledge-ctx check` is read-only and resolves the current profile the
@@ -1147,7 +1367,7 @@ _co_reindividuate() {  # <profile> [failure-hint]
 # round 1's blocking finding. The first cut passed `<profile> [hint]` straight
 # through to `_co_pull_knowledge && _co_reindividuate "$@"`, which reimplemented
 # the `-r` branch's refresh WITHOUT whatever gate that branch wraps it in —
-# substrate, selector and deck each refuse to call `knowledge-ctx use --force`
+# the steward and a product crew each refuse to call `knowledge-ctx use --force`
 # off a basename match alone (GATED ON THE FULL PATH, see each branch's own
 # comment), and the profiled-dirs branch refuses to render at all when git does
 # not ignore `.claude/` there. A plain launch in an off-path clone sharing one
@@ -1216,18 +1436,15 @@ fi
 # Remote-control slug prefix (ARCH-238). The phone Code list names each session
 # from CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX; unset, claude falls back to the
 # hostname, so every session showed as `mini-…` and the list was unreadable. Give
-# each launch a per-context prefix so it reads `vivy` / `steward` / `ask-new-session`.
+# each launch a per-context prefix so it reads `<product>` / `steward` /
+# `<co_style_id>-new-session`.
 # Set ONLY when unset, so a caller that pre-set it wins — the rollover skill exports
-# `<product>-rollover` and /newchat exports `ask-new-session[-topic]` before exec'ing
-# co. The bridge appends a unique suffix, so same-prefix sessions stay distinct.
+# `<product>-rollover` and the walled-off crew's own /newchat skill exports
+# `<co_style_id>-new-session[-topic]` before exec'ing co. The bridge appends a
+# unique suffix, so same-prefix sessions stay distinct.
 if [[ -z ${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX:-} ]]; then
-    # Resolved on both sides for the reason the CFO branch below spells out: `$PWD` is
-# logical, so a symlink or a differently-cased path reaches this directory without
-# matching a literal. Ask carries no transport wall, so the consequence here is a
-# session missing its styling and its namespace rather than a privacy failure — but
-# the shape is the one that gets copied, and it was copied into the CFO branch.
-if _co_in_ask_tree; then
-        export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=ask-new-session
+    if [[ -n $_co_walled_slug ]]; then
+        export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=${_co_walled_style_id}-new-session
     elif [[ -n $repo_root && $(basename "$repo_root") == substrate ]]; then
         export CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX=steward
     elif [[ -n $repo_root ]]; then
@@ -1237,20 +1454,20 @@ fi
 
 # BLACK BOX crews (platform/decisions/0043): registered so the platform knows they
 # exist, with none of their content reaching the Library and none of their agents
-# visible to Orient. CFO is Convivy's own finance work; EA is the operator's personal
-# correspondence archive. KEYED ON THE REGISTRY, not on a literal path per crew:
-# `private: true` in config/projects.json is already the field the transport wall
-# in agentctl, the Library's resolution map and the KB slice set key on, so co
-# reading it too makes one source of truth. The CFO arm used to be a hardcoded
-# `$PWD` comparison, and the fourth black box would have missed it the way the
-# second one nearly did — the gap this closes is the arm nobody adds.
+# visible to Orient. Today they are the registry's private crews, read live from
+# `projects.private_slugs()`. KEYED ON THE REGISTRY, not on a literal path per
+# crew: `private: true` in the registry is already the field the transport
+# wall in agentctl, the Library's resolution map and the KB slice set key on, so co
+# reading it too makes one source of truth. The first black box's arm used to be a
+# hardcoded `$PWD` comparison, and the second would have missed it the way one
+# nearly did — the gap this closes is the arm nobody adds.
 #
 # `--strict-mcp-config` IS THE PRIVACY CONTROL, and nothing softer works here.
 # `kb` and `ops` are configured in the GLOBAL mcpServers block of ~/.claude.json, so
-# every session in every directory gets them: a CFO session ran for 20 hours with
-# `issue_create` and `kb_create` in reach (nothing leaked — the directory was private
-# by convention, which is the gap ADR-0043 closes). This flag starts the session with
-# ZERO MCP servers, so those tools are not in the session at all.
+# every session in every directory gets them: a black-box session ran for 20 hours
+# with `issue_create` and `kb_create` in reach (nothing leaked — the directory was
+# private by convention, which is the gap ADR-0043 closes). This flag starts the
+# session with ZERO MCP servers, so those tools are not in the session at all.
 #
 # A `permissions.deny` rule would be the WRONG instrument. The exec below passes
 # `--permission-mode $_co_permission_mode`, bypassPermissions in every case except a
@@ -1260,32 +1477,39 @@ fi
 # outermost and calls the Library-side check defence in depth rather than the primary
 # control.
 #
-# A black box can take the blunt instrument because it needs no connectors: CFO is
-# a local finance database with four repo-local agents, EA syncs by mbsync and
-# notmuch. **`ask` cannot**, and must never get this flag — it strips the
-# account-level claude.ai connectors too (Gmail and Calendar both verified absent
-# under it), and those connectors are the point of Ask. Ask's wall is the inverted
-# MCP default in ADR-0043, not yet built. ASK IS EXCLUDED BY NAME, below, and this
-# block sits BEFORE ask's own branch so that the exclusion is a line a reviewer can
-# point at rather than an order nobody moves. A positional guarantee has no failing
-# state anyone can see (steward, 2026-09-06): a reorder or a refactor folding the
-# ask arm into this path would have handed ask the flag silently. If the registry
-# ever marks ask private, co refuses to launch there at all rather than pick a side
-# — launching with the flag breaks ask, launching without it inside a directory the
-# registry calls private is the fail-open direction — and says which file to fix.
+# A black box can take the blunt instrument because it needs no connectors: one
+# is a local finance database with four repo-local agents, another syncs personal
+# correspondence by mbsync and notmuch. **THE WALLED-OFF CREW CANNOT**, and must
+# never get this flag — it strips the account-level claude.ai connectors too
+# (Gmail and Calendar both verified absent under it), and those connectors are
+# the point of that crew. Its wall is the inverted MCP default in ADR-0043, not
+# yet built. IT IS EXCLUDED BY THE EARLY `_co_walled_slug` CHECK, computed well
+# above this comment, and this block sits BEFORE that crew's own launch branch so
+# that the exclusion is a line a reviewer can point at rather than an order nobody
+# moves. A positional guarantee has no failing state anyone can see (steward,
+# 2026-09-06): a reorder or a refactor folding the walled-off crew's own arm into
+# this path would have handed it the flag silently. `validate_registry` refuses a
+# unit carrying both `walled_off` and `private` outright, and the private-crew
+# block below checks `_co_walled_slug` again regardless — so even a registry
+# that somehow got past that refusal cannot pick a side by accident. Launching
+# with the flag breaks the walled-off crew's connectors; launching without it
+# inside a directory the registry calls private is the fail-open direction —
+# either way co refuses rather than guess, and says which file to fix.
 #
-# No agent, no KB pull, no worktree: like ask, co here is the launch ergonomic and the
-# directory's CLAUDE.md supplies the role. -r is a no-op, since there is no KB to pull.
+# No agent, no KB pull, no worktree: like the walled-off crew, co here is the
+# launch ergonomic and the directory's CLAUDE.md supplies the role. -r is a
+# no-op, since there is no KB to pull.
 #
 # THE COMPARISON IS BY INODE, in `private_crew.private_home_for`, and that is the
 # whole gate rather than a detail. `$PWD` is the LOGICAL path: zsh does not resolve
 # symlinks into it on a plain `cd`, and on this machine's default case-insensitive
-# APFS a `cd ~/convivy/cfo` leaves `$PWD` in the case the operator typed. Either way
-# a session sits in the real directory while a string comparison fails, and the wall
-# silently does not apply — demonstrated both ways by security-reviewer on PR #409
-# against the literal form this replaces. `samefile` asks the filesystem instead. It
-# also walks UP, so a co opened in a subdirectory of a black box gets the wall too;
-# the literal form did not, and a session in CFO/2025/ was as much inside CFO's data
+# APFS a differently-cased `cd` into a black box's directory leaves `$PWD` in the
+# case the operator typed. Either way a session sits in the real directory while a
+# string comparison fails, and the wall silently does not apply — demonstrated
+# both ways by security-reviewer on PR #409 against the literal form this
+# replaces. `samefile` asks the filesystem instead. It also walks UP, so a co
+# opened in a subdirectory of a black box gets the wall too; the literal form did
+# not, and a session in a black box's own subdirectory was as much inside its data
 # as one at its root.
 #
 # FAILS CLOSED. When the helper cannot tell — the registry unreadable, the lib
@@ -1293,8 +1517,8 @@ fi
 # might be inside a black box with the shared servers attached. That costs every
 # launch a dependency on the registry being readable, and ADR-0043 is explicit that
 # a privacy control must not be the thing that fails open. A gate that fails open is
-# worse here than elsewhere, because the registry entry makes `resolve('cfo')`
-# succeed — so a missed gate turns "leaks but is refused downstream" into "leaks and
+# worse here than elsewhere, because the registry entry makes `resolve()` on a
+# black-box crew's own slug succeed — so a missed gate turns "leaks but is refused downstream" into "leaks and
 # is filed".
 #
 # `_co_self_dir` is captured at TOP LEVEL, not inside the function that uses it:
@@ -1304,6 +1528,41 @@ fi
 # every launch. Caught by the whole bash suite going red, not by reading the code.
 _co_self_dir=${0:A:h}
 
+# THIS LAUNCH'S CREW SLUG, resolved from `repo_root` (already read above) via
+# `projects.crew_for_repo` — the CREW a repo belongs to, not the project slug: a
+# repo's crew is not always its own project's name (agent-platform's crew is
+# bosun), the same distinction bin/agentctl's `_dispatch_mcp_config_json` resolves
+# a dispatch's own ops token by, from the same function. Empty when there is no
+# repo, or no crew claims it (the walled-off crew, a crew whose registry row names
+# a different directory basename, or a directory the registry does not know at
+# all) — the walled-off and private-crew branches below clear
+# `_co_ops_co_token_file` regardless of what this resolves to, and every other
+# branch simply gets no --mcp-config override for ops when it is empty, the zero
+# this variable already defaulted to.
+_co_ops_crew_slug=""
+if [[ -n $repo_root ]]; then
+    _co_ops_crew_slug=$(python3 - "$(_co_lib_dir)" "$(basename "$repo_root")" \
+            "$(_co_registry_path)" "$_co_crews_root/knowledge" \
+            2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+    if sys.argv[3]:
+        projects.PROJECTS_JSON = Path(sys.argv[3])
+    projects._load_raw.cache_clear()
+    print(projects.crew_for_repo(sys.argv[2], sys.argv[4]) or "", end="")
+except Exception:
+    pass
+PY
+    )
+fi
+if [[ -n $_co_ops_crew_slug ]]; then
+    _co_ops_co_token_file="$HOME/.orient-control/ops-co-${_co_ops_crew_slug}-token"
+fi
+
 _co_private_crew() {
     # -> prints "<slug>\t<display>" and returns 0 when $PWD is inside a crew the
     #    registry marks private; returns 1 when it is not; returns 3 when it
@@ -1312,14 +1571,12 @@ _co_private_crew() {
     #    reaches its deploy sibling (the same rule bin/knowledge-autopull states).
     local lib=$_co_self_dir/../lib/agent-platform
     [[ -d $lib ]] || lib=$_co_crews_root/agent-platform/lib/agent-platform
-    # The registry beside co's own tree when there is one, else the operator's
-    # live file (the deploy copy carries no config/). Handed to private_crew
-    # explicitly rather than changing that module's default: the session-event
-    # hook's tests simulate an unreadable registry through a fake $HOME, and a
-    # module that resolved its own tree first could never be unreadable there.
-    local registry=$_co_self_dir/../config/projects.json
-    [[ -f $registry ]] || registry=$_co_crews_root/agent-platform/config/projects.json
-    [[ -n $_co_registry_override ]] && registry=$_co_registry_override
+    # Empty, every real launch — see `_co_registry_path`'s own comment: the
+    # registry has no file to resolve by default any longer (CQ·565), and
+    # both `private_crew.py` and `projects.py` read the Library instead.
+    # `PROJECTS_REGISTRY` in a --root-config file (tests only) is the one
+    # case with an actual path, handed to BOTH modules explicitly below.
+    local registry=$_co_registry_override
     # The root co resolved (_co_crews_root) goes in explicitly, so the registry's
     # crew homes resolve against the same root as everything else co decides, and
     # --root-config reaches the black-box match (company/decisions/0008).
@@ -1333,23 +1590,22 @@ try:
     import private_crew
     import projects
 
-    private_crew._REGISTRY = sys.argv[3]
-    # `projects.private_slugs()`/`home_path()` below read `projects.PROJECTS_JSON`,
-    # a SEPARATE variable from `private_crew._REGISTRY` above — both must name the
-    # same file, or `home` resolves against one registry while the slug loop
-    # searches another and never finds the match. The two coincide by
-    # construction when `registry` took its default (today's only case): fixing
-    # this in only the override case would leave it silently reading the wrong
-    # file the day that stops being true.
-    projects.PROJECTS_JSON = Path(sys.argv[3])
+    # `private_crew._REGISTRY` and `projects.PROJECTS_JSON` are SEPARATE
+    # variables that must name the same file, or `home` resolves against one
+    # registry while the slug loop below searches another and never finds
+    # the match — both stay unset (reading the Library) on a real launch,
+    # and both take the same override path on a test one.
+    if sys.argv[3]:
+        private_crew._REGISTRY = sys.argv[3]
+        projects.PROJECTS_JSON = Path(sys.argv[3])
     projects.ROOT_OVERRIDE = sys.argv[4]
     home = private_crew.private_home_for(sys.argv[2])
     if home is private_crew.UNKNOWN:
         sys.exit(3)
     if home is None:
         sys.exit(1)
-    # A registered crew whose directory does not exist yet (EA, before the
-    # steward creates it) must not decide anything: `samefile` raises on a
+    # A registered crew whose directory does not exist yet (a private crew,
+    # before the steward creates it) must not decide anything: `samefile` raises on a
     # missing path, and a blanket except turned that into "cannot tell" for
     # whichever crew the set happened to iterate first — half of all launches,
     # since a set's order follows the per-process hash seed. Caught by CI, not
@@ -1363,7 +1619,14 @@ try:
         except OSError:
             continue
         if same:
-            print(f"{slug}\t{projects.get(slug)['display']}")
+            # The accent/fg bin/co's own styling call needs travel in the same
+            # record: absent co_accent reads as the slate fallback every
+            # unstyled private crew already took, computed here rather than
+            # needing a second round-trip from the caller.
+            style = projects.co_style(slug)
+            accent = style[1] if style else "#5b6b7a"
+            fg = style[3] if style else "#ffffff"
+            print(f"{slug}\t{projects.get(slug)['display']}\t{accent}\t{fg}")
             sys.exit(0)
     # Inside a private home the registry names, but no entry maps back to it:
     # cannot tell, so cannot launch.
@@ -1378,26 +1641,30 @@ PY
 _co_private_rc=0
 _co_private=$(_co_private_crew) || _co_private_rc=$?
 if (( _co_private_rc == 0 )); then
-    _co_private_slug=${_co_private%%$'\t'*}
-    _co_private_display=${_co_private#*$'\t'}
-    # Ask, by name and by directory — the registry has no say here. See above.
-    if [[ $_co_private_slug == ask ]] || _co_in_ask_tree; then
-        print -u2 "co: the project registry marks ask private, but ask must never get"
-        print -u2 "    --strict-mcp-config: it strips the Gmail and Calendar connectors that"
-        print -u2 "    are the point of Ask. Refusing to launch either way; fix the entry in"
-        print -u2 "    $_co_crews_root/agent-platform/config/projects.json (ADR-0043)."
+    _co_private_fields=("${(@ps:\t:)_co_private}")
+    _co_private_slug=$_co_private_fields[1]
+    _co_private_display=$_co_private_fields[2]
+    # A WALLED HOME NEVER TAKES THE PRIVATE PATH, by directory — the early check
+    # above already resolved this, so there is no second registry round-trip here.
+    # `validate_registry` refuses a unit carrying both `walled_off` and `private`
+    # outright, so this unit's own slug cannot legitimately match BOTH
+    # `private_slugs()` (above, via `_co_private_crew`) and `walled_off_slugs()`
+    # (the early check) at once — this is the belt-and-suspenders check for a
+    # registry that got past that refusal some other way, same as ADR-0043 ruled
+    # for the directory-literal form this replaces.
+    if [[ -n $_co_walled_slug ]]; then
+        print -u2 "co: the project registry marks the walled-off crew private, but it must"
+        print -u2 "    never get --strict-mcp-config: it strips the Gmail and Calendar"
+        print -u2 "    connectors that are the point of that crew. Refusing to launch either"
+        print -u2 "    way; fix the crew registry's entry via the Library (ADR-0043)."
         exit 1
     fi
-    # The accent keys the iTerm profile (co-<slug>) and the tmux status colour.
-    # CFO is ledger green. EA is gold with brown text (the operator, 2026-09-06: "gold and
-    # brown"; the hex values are mine), an explicit foreground for the same reason
-    # Orient and Library pass one — the default white is unreadable on a light
-    # accent. A crew without a colour of its own takes slate until the operator picks one.
-    case $_co_private_slug in
-        cfo) _co_private_accent="#2e7d5b"; _co_private_fg="#ffffff" ;;
-        ea)  _co_private_accent="#c8a24a"; _co_private_fg="#5a3e1b" ;;
-        *)   _co_private_accent="#5b6b7a"; _co_private_fg="#ffffff" ;;
-    esac
+    # The accent keys the iTerm profile (co-<slug>) and the tmux status colour —
+    # the registry's own `co_accent`/`co_fg` on this crew's unit, read by
+    # `_co_private_crew`'s own python call above. A crew without a colour of its
+    # own takes the slate fallback that same call already computed.
+    _co_private_accent=$_co_private_fields[3]
+    _co_private_fg=$_co_private_fields[4]
     # A SUBCREW IS NAMED FOR ITS OWN tmux SESSION. Every session under one black box
     # took the crew's display name, so the picker showed four rows reading
     # `<personal-crew>`. The app sessions are named `<slug>--<sub>` (`<personal-crew>--back`),
@@ -1422,7 +1689,7 @@ if (( _co_private_rc == 0 )); then
     # A private crew launches with --strict-mcp-config and loads no ops server, so it has no
     # use for the co credential. Clearing the path also drops one a parent shell exported.
     _co_ops_co_token_file=
-    unset ORIENT_OPS_CO_TOKEN_FILE
+    unset ORIENT_OPS_CREW_TOKEN_FILE
     _co_exec_claude --remote-control $_co_name_args $claude_model_args --strict-mcp-config \
         --permission-mode $_co_permission_mode "$@"
 elif (( _co_private_rc != 1 )); then
@@ -1430,50 +1697,55 @@ elif (( _co_private_rc != 1 )); then
     print -u2 "co: cannot tell whether ${(V)PWD} is inside a black-box crew (the project"
     print -u2 "    registry or the platform lib could not be read), so refusing to launch"
     print -u2 "    rather than risk a session inside one with the shared MCP servers attached."
-    print -u2 "    Check $_co_crews_root/agent-platform/config/projects.json and lib/agent-platform."
+    print -u2 "    Check that the Library's registry (GET /registry) can be read and that"
+    print -u2 "    $_co_crews_root/agent-platform/lib/agent-platform is intact."
     exit 1
 fi
 unset _co_private _co_private_rc
 
-# Ask path: <root>/ask/ is the operator's general personal-assistant surface — his
-# Claude.ai substitute (PA ADR-0027), NOT a product and NOT a repo. It's a bare,
-# repo-free directory (no git toplevel, so the repo-based branches below never
-# match it), keyed on $PWD here. co is purely the launch ergonomic: a
-# remote-control session in this dir so its transcripts namespace to their own
-# ~/.claude/projects/<ask-slug>/ folder, which the PA adapter ingests. No agent,
-# no KB pull, no worktree, no handoff. The dir's CLAUDE.md supplies the
+# The walled-off crew's own launch: its home is the operator's general personal
+# assistant surface — his Claude.ai substitute (PA ADR-0027), NOT a product and
+# NOT a repo. It's a bare, repo-free directory (no git toplevel, so the
+# repo-based branches below never match it), keyed on `_co_walled_slug` (the
+# early check, above) rather than $PWD directly. co is purely the launch
+# ergonomic: a remote-control session in this dir so its transcripts namespace
+# to their own ~/.claude/projects/<slug>/ folder, which the PA adapter ingests.
+# No agent, no KB pull, no worktree, no handoff. The dir's CLAUDE.md supplies the
 # general-assistant framing; the personal MCP connectors come from the account.
 # -r is accepted but adds nothing here: there is no KB to pull, and this
 # branch execs claude with no pickup prompt, so no /handoff-pickup ever runs.
-# Handoff pickup still works in ask — it's delivered by the ask directory's
-# own SessionStart hook (<root>/ask/.claude/ask-topic-context.sh, wired in
-# <root>/ask/.claude/settings.json), which injects the topic and the
-# handoff text from <root>/ask/handoffs/ unconditionally on every session
-# start, -r or not.
+# Handoff pickup still works here — it's delivered by the crew's own directory's
+# own SessionStart hook (its own `.claude/*-topic-context.sh`, wired in its own
+# `.claude/settings.json`), which injects the topic and the handoff text from
+# its own `handoffs/` unconditionally on every session start, -r or not.
 #
-# THE SETTINGS THIS LAUNCH PASSES WITH --settings. Ask launches with bypassPermissions,
-# so its tools can read and write any file this account can, including the Library and
-# gateway credentials below. Two layers cover the two ways to reach a file:
+# THE SETTINGS THIS LAUNCH PASSES WITH --settings. This crew launches with
+# bypassPermissions, so its tools can read and write any file this account can,
+# including the Library and gateway credentials below. Two layers cover the two
+# ways to reach a file:
 #   - sandbox.filesystem.denyRead/denyWrite confine Bash at the OS level, under any
 #     permission mode. Neither reaches the in-process tools below.
 #   - permissions.deny covers those in-process tools: Read and Write for the paths
 #     below, scoped to each path, and Edit, Grep and Glob outright for every path,
-#     since ask's Bash already covers whatever local search and local edit it needs.
-#     On Claude Code 2.1.292 a probe showed the Read tool reading a file the sandbox
-#     refused to Bash, and a token the Read tool returns can be pasted into a Bash
-#     command, so Bash alone does not hold. A path-scoped `Edit(<path>)` deny rule was
-#     tried first and probed as inert — a direct Edit call overwrote a denied stand-in
-#     file with no refusal — matching lib/agent-platform/tool_policy.py's documented
-#     case of a path-scoped non-Read rule not binding; denying the whole tool is what
-#     the probe confirmed actually refuses it.
+#     since this crew's own Bash already covers whatever local search and local
+#     edit it needs. On Claude Code 2.1.292 a probe showed the Read tool reading a
+#     file the sandbox refused to Bash, and a token the Read tool returns can be
+#     pasted into a Bash command, so Bash alone does not hold. A path-scoped
+#     `Edit(<path>)` deny rule was tried first and probed as inert — a direct Edit
+#     call overwrote a denied stand-in file with no refusal — matching
+#     lib/agent-platform/tool_policy.py's documented case of a path-scoped
+#     non-Read rule not binding; denying the whole tool is what the probe
+#     confirmed actually refuses it.
 # Neither layer touches the claude.ai account connectors (Gmail, Calendar): they are not
-# Bash and not file reads or writes, and ask depends on them.
+# Bash and not file reads or writes, and this crew depends on them.
 #
 # The denied paths are the credentials this platform reads from the account, or acts as
 # the co or the Library with:
 #   - `~/.orient-control/` (agent-platform-token, library-token, ops-mcp-token and the
 #     capture tokens, read by bin/agentctl and lib/agent-platform/signal_client.py)
 #   - `~/.library/` (the Library's own control-plane data, including client-tokens.json)
+#   - `~/.local/state/library/` (the same client-tokens.json, plus api-tokens.json, on an
+#     install where the Library moved its state here instead of ~/.library)
 #   - `~/.config/convivy/library-app.pem` and `library-app.json` (the Library's GitHub
 #     App key and config; lib/agent-platform/kb_merge.py CONFIG_PATH and the key beside
 #     it — the credential that performs the Library's one standing merge exception to
@@ -1487,273 +1759,205 @@ unset _co_private _co_private_rc
 # allowUnsandboxedCommands false closes the retry path. A sandbox denial makes the Bash
 # tool offer `dangerouslyDisableSandbox`, which runs the command outside the sandbox and
 # skips the deny. failIfUnavailable makes a sandbox that cannot start refuse the launch
-# rather than run ask unsandboxed.
-_co_ask_sandbox_settings() {
-    local -a _co_ask_deny_dirs=("$HOME/.orient-control" "$HOME/.library")
-    local -a _co_ask_deny_files=(
+# rather than run this crew unsandboxed.
+_co_walled_sandbox_settings() {
+    local -a _co_wc_deny_dirs=("$HOME/.orient-control" "$HOME/.library" "$HOME/.local/state/library")
+    local -a _co_wc_deny_files=(
         "$HOME/.config/convivy/litellm-keys.json"
         "$HOME/.config/convivy/library-app.pem"
         "$HOME/.config/convivy/library-app.json"
         "$_co_crews_root/convivy-orient/api-tokens.json"
     )
-    local -a _co_ask_fs_paths=("${_co_ask_deny_dirs[@]}" "${_co_ask_deny_files[@]}")
-    local -a _co_ask_rules=()
-    local _co_ask_p
-    for _co_ask_p in "${_co_ask_deny_dirs[@]}"; do
-        _co_ask_rules+=("Read(/$_co_ask_p/**)" "Write(/$_co_ask_p/**)")
+    local -a _co_wc_fs_paths=("${_co_wc_deny_dirs[@]}" "${_co_wc_deny_files[@]}")
+    local -a _co_wc_rules=()
+    local _co_wc_p
+    for _co_wc_p in "${_co_wc_deny_dirs[@]}"; do
+        _co_wc_rules+=("Read(/$_co_wc_p/**)" "Write(/$_co_wc_p/**)")
     done
-    for _co_ask_p in "${_co_ask_deny_files[@]}"; do
-        _co_ask_rules+=("Read(/$_co_ask_p)" "Write(/$_co_ask_p)")
+    for _co_wc_p in "${_co_wc_deny_files[@]}"; do
+        _co_wc_rules+=("Read(/$_co_wc_p)" "Write(/$_co_wc_p)")
     done
-    _co_ask_rules+=("Edit" "Grep" "Glob")
+    _co_wc_rules+=("Edit" "Grep" "Glob")
 
-    local _co_ask_fs_json _co_ask_deny_json
-    _co_ask_fs_json=$(printf '"%s",' "${_co_ask_fs_paths[@]}")
-    _co_ask_fs_json="[${_co_ask_fs_json%,}]"
-    _co_ask_deny_json=$(printf '"%s",' "${_co_ask_rules[@]}")
-    _co_ask_deny_json="[${_co_ask_deny_json%,}]"
+    local _co_wc_fs_json _co_wc_deny_json
+    _co_wc_fs_json=$(printf '"%s",' "${_co_wc_fs_paths[@]}")
+    _co_wc_fs_json="[${_co_wc_fs_json%,}]"
+    _co_wc_deny_json=$(printf '"%s",' "${_co_wc_rules[@]}")
+    _co_wc_deny_json="[${_co_wc_deny_json%,}]"
 
-    print -r -- "{\"permissions\":{\"deny\":$_co_ask_deny_json},\"sandbox\":{\"enabled\":true,\"failIfUnavailable\":true,\"allowUnsandboxedCommands\":false,\"filesystem\":{\"denyRead\":$_co_ask_fs_json,\"denyWrite\":$_co_ask_fs_json}}}"
+    print -r -- "{\"permissions\":{\"deny\":$_co_wc_deny_json},\"sandbox\":{\"enabled\":true,\"failIfUnavailable\":true,\"allowUnsandboxedCommands\":false,\"filesystem\":{\"denyRead\":$_co_wc_fs_json,\"denyWrite\":$_co_wc_fs_json}}}"
 }
 
-if _co_in_ask_tree; then
-    # ASK IS THE ONE PLACE A CREW NAME DOES NOT IDENTIFY A SESSION. The eight
-    # crews get one row each; ask gets one per topic, and four rows all reading
-    # "ask" is the problem this change exists to fix, reproduced one level down.
-    # /newchat already carries the topic in the session-name prefix it exports
-    # (`ask-new-session-<topic>`), so use it when it is there.
-    # MATCHED, NOT STRIPPED. `${VAR#ask-new-session}` returns VAR unchanged when
-    # the prefix is absent, so an INHERITED value — co launched from inside
+if [[ -n $_co_walled_slug ]]; then
+    # THE WALLED-OFF CREW IS THE ONE PLACE A CREW NAME DOES NOT IDENTIFY A
+    # SESSION. Every other crew gets one row each; this one gets one per topic,
+    # and four rows all reading the same bare name is the problem this change
+    # exists to fix, reproduced one level down. Its own /newchat skill already
+    # carries the topic in the session-name prefix it exports
+    # (`<co_style_id>-new-session-<topic>`), so use it when it is there.
+    # MATCHED, NOT STRIPPED. `${VAR#<prefix>-new-session}` returns VAR unchanged
+    # when the prefix is absent, so an INHERITED value — co launched from inside
     # another co session, where this variable is already `agent-platform` — was
-    # read as a topic and produced "Ask · agent platform". Caught by the test on
-    # its first run. Only a value that really is the /newchat form carries one.
-    _co_ask_topic=""
-    if [[ ${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX:-} == ask-new-session-* ]]; then
-        _co_ask_topic=${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX#ask-new-session-}
+    # read as a topic and produced "<label> · agent platform". Caught by the
+    # test on its first run. Only a value that really is the /newchat form
+    # carries one.
+    _co_walled_topic=""
+    if [[ ${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX:-} == ${_co_walled_style_id}-new-session-* ]]; then
+        _co_walled_topic=${CLAUDE_REMOTE_CONTROL_SESSION_NAME_PREFIX#${_co_walled_style_id}-new-session-}
         # A SLUG OR NOTHING. /newchat's own instruction to slugify is prose
-        # addressed to an assistant, not a guard — and the ask surface reads
-        # Gmail, Calendar, Drive, Notion and Slack into the same session that
-        # runs /newchat, so the value can be shaped by content someone else
-        # wrote. Enforced here in code so it does not matter whether an upstream
+        # addressed to an assistant, not a guard — and this crew reads Gmail,
+        # Calendar, Drive, Notion and Slack into the same session that runs
+        # /newchat, so the value can be shaped by content someone else wrote.
+        # Enforced here in code so it does not matter whether an upstream
         # skill slugified correctly.
         # `=~`, not a glob: zsh's `##` quantifier needs EXTENDED_GLOB, which this
         # script does not set, so the glob form silently matched nothing and
         # rejected every legitimate topic. Caught by the test going red.
-        [[ $_co_ask_topic =~ ^[a-z0-9-]+$ ]] || _co_ask_topic=""
+        [[ $_co_walled_topic =~ ^[a-z0-9-]+$ ]] || _co_walled_topic=""
     fi
-    if [[ -n $_co_ask_topic ]]; then
-        _apply_co_style ask "#7b61ff" "Ask · ${_co_ask_topic//-/ }"
-    else
-        _apply_co_style ask "#7b61ff"   # periwinkle — distinct from the product palettes
+    # A matched crew with no co_accent of its own falls back to no styling at
+    # all, the same convention the crew-cockpit branch below takes for a unit
+    # nobody has picked a colour for.
+    if [[ -n $_co_walled_accent && -n $_co_walled_topic ]]; then
+        _apply_co_style "$_co_walled_style_id" "$_co_walled_accent" \
+            "${_co_walled_label:-$_co_walled_style_id} · ${_co_walled_topic//-/ }" "$_co_walled_fg"
+    elif [[ -n $_co_walled_accent ]]; then
+        _apply_co_style "$_co_walled_style_id" "$_co_walled_accent" "$_co_walled_label" "$_co_walled_fg"
     fi
-    unset _co_ask_topic
+    unset _co_walled_topic
     _co_exec_claude --remote-control $_co_name_args $claude_model_args \
-        --settings "$(_co_ask_sandbox_settings)" --permission-mode $_co_permission_mode "$@"
+        --settings "$(_co_walled_sandbox_settings)" --permission-mode $_co_permission_mode "$@"
 fi
 
-# SUBSTRATE DOES HAVE A PROFILE, AND THIS BRANCH USED TO SAY IT DID NOT.
-# The comment here read "No worktree to re-individuate"; the shared
-# `projects.EXPLICIT_PROJECT_BY_NAME` carries
-# `"substrate": "platform"`, so `platform/daytime` is substrate's
-# profile and it renders `platform/agents/scout` plus five skills. The
-# premise expired when substrate gained that mapping; the skip outlived
-# it, so the steward cockpit has been running whatever is in git rather
-# than what the KB says.
+# CREW-COCKPIT CREWS: every active crew the registry marks `crew_cockpit: true`
+# re-individuates its own `daytime` profile on `co -r` (`--force`, since
+# knowledge-ctx silently skips a file that already exists) and launches bare
+# `claude`, no --agent — the crew's own `.claude/CLAUDE.md` supplies the role,
+# the same way a crew co holds the dispatch role itself rather than handing it
+# to an orchestrator.
 #
-# THAT IS NOT HYPOTHETICAL. On 2026-08-26 substrate's tracked
-# `/start-overnight` still sent a co to
-# `knowledge/projects/shared/agents/overnight-orchestrator.md` for the
-# playbook it deliberately does not duplicate. That document moved to
-# `projects/agent-platform/agents/` in the re-file and the dead path was
-# corrected in the KB (knowledge#289); nothing propagated it here,
-# because nothing here individuates. The drift this whole migration
-# exists to end was sitting in the cockpit that runs it.
+# ONE BRANCH FOR WHAT USED TO BE SEVERAL. The steward's own cockpit and two
+# product crews each carried this exact sequence — pull knowledge,
+# `--force`-reindividuate daytime, launch bare claude, resume the latest
+# handoff on `-r` with no prompt — behind their own name and their own styling
+# literal; the registry-appended crews shared a fourth copy behind an array and
+# a case. `co takes its crew layout from the registry and names no crew` reads
+# that layout instead: `projects.cockpit_gate(slug)` ("path", the default, or
+# "basename" — see its own docstring for what each means and why a handful of
+# crews are allowed the weaker one) decides how this branch is ENTERED, and
+# `projects.co_style(slug)` supplies the iTerm/tmux style, accent and label.
+# `--force` rmtrees `.claude/agents` and `.claude/skills`, which is why a
+# generic-enough basename (`library`'s own scratch-clone risk, PR #404) must
+# not reach it off a stray same-named directory elsewhere on disk — the "path"
+# gate is the default for exactly that reason, and even a "basename"-gated
+# crew only re-individuates once bin/co has also verified the exact path, the
+# same safety net its dedicated branch carried before this merge.
 #
-# THE SAME SEQUENCE RUNS ON `-r` AND ON THE AUTOMATIC STALENESS PATH
-# (_co_refresh_if_stale), by calling this one function from both — see that
-# function's own comment for why (reviewer, PR #835 round 1).
-#
-# GATED ON THE FULL PATH even though the branch below matches a
-# basename, and the asymmetry is deliberate. `--force` rmtrees
-# `.claude/agents` and `.claude/skills` before rewriting, so running it
-# off a basename would let any directory named `substrate` anywhere on
-# disk have those two trees deleted. Launching Claude in the wrong
-# `substrate` is the pre-existing risk this branch already accepts;
-# DELETING files in one is a new one, and it does not have to be
-# accepted to fix the drift. Same `:A`-on-both-sides resolution the crew
-# branch documents at `_co_crew_dirs`.
-_co_substrate_refresh() {
-    print -u2 "co: refresh (substrate steward) — pulling $_co_crews_root/knowledge"
-    _co_pull_knowledge || {
-        print -u2 "co: refresh — knowledge pull failed."
-        return 1
-    }
-    if [[ ${repo_root:A} == ${${:-"$_co_crews_root/substrate"}:A} ]]; then
-        _co_reindividuate daytime
-    fi
-}
+# `_co_cockpit_match` is computed by one python subprocess call that checks
+# every crew-cockpit unit's own gate against `$repo_root` and its basename and
+# prints the first match — empty when none match, read as "this directory is
+# not a crew cockpit" the way an empty crew-cockpit path list used to be.
+# `2>/dev/null` and `|| true` are load-bearing for the same reason every other
+# registry read in this file gives: co must launch even when the registry
+# cannot be read, and a read failure here costs only a crew-cockpit launch its
+# cockpit treatment.
+_co_cockpit_match=""
+if [[ -n $repo_root ]]; then
+    _co_cockpit_match=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+        "${repo_root:A}" "$(basename "${repo_root:A}")" 2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
 
-if [[ -n $repo_root && $(basename "$repo_root") == substrate ]]; then
-    if $refresh; then
-        _co_substrate_refresh || exit 1
-        # If no prompt was passed, resume from the most recent handoff — same
-        # default as the orchestrator -r path.
-        [[ $# -eq 0 ]] && set -- /handoff-pickup
-    fi
-    _co_refresh_if_stale _co_substrate_refresh
-    _apply_co_style convivy "#f4604c"
-    _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    want_path = Path(sys.argv[4])
+    want_basename = sys.argv[5]
+    for slug, u in projects.load().items():
+        if u.get("lifecycle") != "active" or u.get("crew_cockpit") is not True:
+            continue
+        home = projects.home_path(slug)
+        if home is None:
+            continue
+        exact = home == want_path
+        matched = exact if projects.cockpit_gate(slug) == "path" else home.name == want_basename
+        if not matched:
+            continue
+        # A matched crew with no co_accent falls back to the directory
+        # basename for both style_id and label, not to its own slug (which
+        # may differ, e.g. bosun/agent-platform) — so `--resolve` reports it
+        # as present rather than missing, same as every other unstyled crew.
+        style_id, accent, label, fg = projects.co_style(slug) or (want_basename, "", "", "#ffffff")
+        print("\t".join([slug, style_id, accent, label or "", fg, "1" if exact else "0"]))
+        break
+except Exception:
+    # Print nothing: the caller reads an empty match as "not a crew cockpit",
+    # so a registry read failure costs only this launch its cockpit treatment.
+    pass
+PY
+    )
 fi
 
-# Crew-cockpit paths: library, agent-platform (the Bosun) and convivy-orient.
-# Added 2026-08-17, when the Keel split into two crews and Orient took its own,
-# giving three directories somebody would reasonably open with `co` and which had
-# no branch here. Without one they fall past every branch into the generic path,
-# which selects `planning-orchestrator` and fails — none of them individuates it,
-# deliberately, because a crew co holds the dispatch role itself rather than
-# handing it to an orchestrator. The generic `-r` path would not have caught them
-# either: its own product allowlist exits 1 on anything outside
-# constance|vivy|vivy-ownerrez-sandbox-tools|sous-chef|knowledge|dev-setup.
-#
-# They launch bare `claude` with NO --agent, the same as the substrate, hollis,
-# selector and convivy-app-kit branches: the crew charter in
-# .claude/CLAUDE.md supplies the role.
-#
-# THEY INDIVIDUATE ON -r, THE SAME AS SUBSTRATE. This paragraph used to open
-# "THEY DIFFER FROM SUBSTRATE IN ONE WAY THAT MATTERS. Substrate has no
-# knowledge-ctx profile, so its -r deliberately skips `knowledge-ctx use`."
-# That was true once and has not been since the substrate branch gained its own
-# `knowledge-ctx use daytime --force` — see that branch's comment, which opens
-# "SUBSTRATE DOES HAVE A PROFILE, AND THIS BRANCH USED TO SAY IT DID NOT" and
-# records the project table (`projects.EXPLICIT_PROJECT_BY_NAME`) carrying
-# `"substrate": "platform"`.
-#
-# **SO THIS FILE HELD TWO COMMENTS THIRTY LINES APART THAT CONTRADICTED EACH
-# OTHER**, one describing the code and one describing what it replaced. The fix
-# there corrected the branch it changed and left this one standing, which is the
-# same drift the `*)` note below is about: a premise expires, and the sentence
-# built on it outlives it because nothing fails.
-#
-# These three have a profile each (library/daytime, agent-platform/daytime,
-# convivy-orient/daytime), so -r must re-individuate or a crew keeps running a
-# stale charter and stale agents after a KB change — which is the whole reason -r
-# exists on the product path. --force is required: without it knowledge-ctx
-# reports "wrote N files" while silently skipping every file that already exists.
-#
-# ARCH-023's live-process pre-flight will refuse the re-individuate if a prior
-# session is still running in the directory. That refusal is the safety net —
-# `--force` rmtrees .claude/agents and .claude/skills before rewriting — so exit
-# the old session rather than reaching past it.
-#
-# No styling yet: every other branch carries a colour and these three are left
-# for the operator to pick rather than invented here.
-#
-# GATED ON THE FULL PATH, NOT THE BASENAME, which is stricter than the sibling
-# branches and deliberately so (security-reviewer, PR #404). Every named branch
-# here authorizes a bypassPermissions launch off `basename "$repo_root"` alone,
-# so any git repo anywhere on disk with a matching toplevel name takes the
-# branch. `hollis`, `selector`, `convivy-deck` and `convivy-app-kit` are
-# idiosyncratic enough that the coincidence is unlikely; **`library` is not** —
-# a scratch clone or a `git worktree add ../library` would collide, and the
-# bare-`co` path has no location floor at all to catch it. (The `-r` path
-# inherits one for free, because knowledge-ctx's `detect_project` dies outside
-# <root> and the `|| exit 1` below catches that before the exec.)
-#
-# So the closed set here is three absolute paths rather than three names. It
-# follows the nyh branch below, which already gates on a location rather than a
-# basename, and it matches the floor knowledge-ctx enforces anyway.
-# BOTH SIDES ARE FULLY RESOLVED WITH `:A` BEFORE COMPARING, and "fully" is the
-# load-bearing word. `git rev-parse --show-toplevel` returns a REALPATH with no
-# symlink segments anywhere in it, so any segment left unresolved on this side
-# makes two spellings of one directory compare unequal, and the branch silently
-# never fires — the gate failing OPEN onto the generic path. Safe direction,
-# still wrong.
-#
-# Resolving `$HOME` alone is NOT enough, which is how this was got wrong once
-# already: `"${HOME:A}/Convivy"` appends the rest as a literal, so a symlink at
-# <root> — an external volume, a bind mount, a relocate-for-space move —
-# reproduces the identical bug one segment lower (security-reviewer, PR #404).
-# `${(@)array:A}` applies the modifier to every element, resolving the whole
-# path rather than its first component.
-#
-# `_co_crew_dirs` ITSELF IS DEFINED UP AT THE MODEL-PIN BLOCK, not here — the
-# model-pin block needed the same safe check before this branch runs, so the
-# array moved up rather than being defined twice (reviewer, PR #422). This is
-# the same variable, already `:A`-resolved.
-#
-# No extra gate inside this one (unlike substrate/selector/deck below): the
-# outer `if` above already matches the full, `:A`-resolved path, so both the
-# `-r` call and the automatic staleness call below are already covered by
-# the same check — nothing for `_co_crew_cockpit_refresh` to re-apply.
-_co_crew_cockpit_refresh() {
-    # ${(V)}: $repo_root's basename is cwd-derived (issue_01M3Q2DJMB5R37HZD9SMVTS323
-    # round 2), despite this branch matching a closed, hardcoded _co_crew_dirs set —
-    # the safety here must not depend on reasoning about which arm reaches it.
-    print -u2 "co: refresh (${(V)$(basename "$repo_root")} crew) — pulling $_co_crews_root/knowledge"
-    _co_pull_knowledge || {
-        print -u2 "co: refresh — knowledge pull failed."
-        return 1
+if [[ -n $_co_cockpit_match ]]; then
+    _co_ck=("${(@ps:\t:)_co_cockpit_match}")
+    _co_ck_style_id=$_co_ck[2] _co_ck_accent=$_co_ck[3] _co_ck_label=$_co_ck[4]
+    _co_ck_fg=$_co_ck[5] _co_ck_reindividuate=$_co_ck[6]
+    _co_cockpit_refresh() {
+        # ${(V)}: $repo_root's basename is cwd-derived (issue_01M3Q2DJMB5R37HZD9SMVTS323
+        # round 2), despite this branch matching a registry-driven, already-gated set —
+        # the safety here must not depend on reasoning about which crew reached it.
+        print -u2 "co: refresh (${(V)$(basename "$repo_root")} crew) — pulling $_co_crews_root/knowledge"
+        _co_pull_knowledge || {
+            print -u2 "co: refresh — knowledge pull failed."
+            return 1
+        }
+        # Independent of which gate let the branch fire: a "basename"-gated
+        # crew whose directory is NOT the exact registered home still gets
+        # knowledge pulled and a styled bare launch, same as its own dedicated
+        # branch did before this merge — just no destructive --force against
+        # the wrong directory.
+        if [[ $_co_ck_reindividuate == 1 ]]; then
+            _co_reindividuate daytime
+        else
+            return 0
+        fi
     }
-    _co_reindividuate daytime
-}
+    # STYLE_ID/ACCENT/LABEL/FG ARE ALREADY CHOSEN ABOVE, AHEAD OF ANYTHING WITH
+    # A SIDE EFFECT, so `--resolve` can answer and exit before
+    # `_co_cockpit_refresh`, `_co_refresh_if_stale`, `_co_set_name` or any
+    # styling run. A crew whose registry row carries no `co_accent` falls
+    # back to its directory basename for both style_id and label (set in the
+    # python match above) — the fallback `--resolve` and `_co_set_name` both
+    # need, not a styling call that paints the terminal (`_co_ck_accent`
+    # empty gates the actual `_apply_co_style` call below).
+    #
+    # `--resolve` answers and exits here, before the refresh, the name or any
+    # styling runs. `_apply_co_style` holds both outcomes already: a name that
+    # passes its gate prints `crew=... label=... dir=...` and exits 0 itself
+    # (its own `--resolve` branch); a name that fails the gate (the basename
+    # fallback can carry a character the gate rejects) returns here instead,
+    # so the `_co_exec_claude` call right after reports "no crew resolves" —
+    # the same answer an unmatched directory already gets.
+    if ${co_resolve:-false}; then
+        _apply_co_style "$_co_ck_style_id" "$_co_ck_accent" "$_co_ck_label" "$_co_ck_fg"
+        _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
+    fi
 
-if [[ -n $repo_root && ${_co_crew_dirs[(Ie)${repo_root:A}]} -ne 0 ]]; then
     if $refresh; then
-        _co_crew_cockpit_refresh || exit 1
+        _co_cockpit_refresh || exit 1
         [[ $# -eq 0 ]] && set -- /handoff-pickup
     fi
-    _co_refresh_if_stale _co_crew_cockpit_refresh
-    # Colours picked by the operator 2026-08-17 (Orient sunrise, Library tan, Bosun
-    # olive), chosen against the eleven already in the palette. Orient and
-    # Library pass an explicit status_fg because both are light enough that the
-    # default white is unreadable on them — the same reason `deck` and
-    # `convivy-commercial` pass one. Bosun's olive is dark enough to take the
-    # two-argument form.
-    #
-    # The style_id is the FIRST argument and is not cosmetic: it keys the iTerm
-    # profile (co-<style_id>) and must match the deploy and ssh-alias names, so
-    # these are `orient` and `bosun` rather than the repo basenames
-    # `convivy-orient` and `agent-platform`.
-    #
-    # Known and accepted: Orient's sunrise is the closest neighbour to
-    # sous-chef's amber #d98c1f. The operator compared them side by side and kept it;
-    # #ff8a72 is the pinker alternative if anything downstream ever needs more
-    # separation.
-    # This case must cover every one of `_co_crew_dirs`'s six LITERAL entries. It
-    # warned that nothing enforced that, and on 2026-09-08 the array gained two
-    # entries — so the arms for them are below, and
-    # tests/test_co_crew_registration.py now asserts the correspondence rather
-    # than leaving it to whoever edits the array next. That test reads only the
-    # array's first assignment (the literals), so a crew appended later from the
-    # registry (`crew_cockpit: true`, issue_01M3YN6857H5J541G73Y9P3KA1) is not
-    # checked against this case and gets no styling arm — cosmetic only
-    # (`_apply_co_style` just doesn't fire); the knowledge-pull-and-reindividuate
-    # `_co_crew_dirs` exists for still runs.
-    #
-    # `signals` cyan-teal (#0e9aa7, 2026-09-16) is provisional the same way, picked
-    # to stay clear of write-better's green-teal #2f7e68 and svc's blue #0284c7.
-    #
-    # `archy` brick-red (#c0392b, 2026-10-02) is provisional the same way, picked
-    # clear of convivy's #f4604c and hollis's #d6457f, the nearest warm reds.
-    #
-    # `placard` plum and `shipwright` hull-blue are PROVISIONAL, picked against
-    # the thirteen accents already in the file rather than by the operator, who chose
-    # every other colour here. They are cosmetic and one edit each to change.
-    # Neither has an iterm/co-<style_id>.json, which is the same state
-    # `orient`/`library`/`bosun` are in — the tmux status colour works without
-    # one, and `_apply_co_style` is `|| true` throughout.
+    _co_refresh_if_stale _co_cockpit_refresh
     _co_set_name "$(basename "${repo_root:A}")"
-    case ${repo_root:A} in
-        */convivy-orient)  _apply_co_style orient  "#ff9e5c" "Orient"  "#4a2a10" ;;
-        */library)         _apply_co_style library "#c19a6b" "Library" "#33240f" ;;
-        */agent-platform)  _apply_co_style bosun   "#6f8140" "Bosun" ;;
-        */placard)         _apply_co_style placard "#7d5ba6" "Placard" ;;
-        */shipwright)      _apply_co_style shipwright "#4a6d8c" "Shipwright" ;;
-        */signals)         _apply_co_style signals "#0e9aa7" "Signals" ;;
-        */archy)           _apply_co_style archy "#c0392b" "Archy" ;;
-    esac
+    [[ -n $_co_ck_accent ]] && _apply_co_style "$_co_ck_style_id" "$_co_ck_accent" "$_co_ck_label" "$_co_ck_fg"
     _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
 fi
+unset _co_cockpit_match _co_ck _co_ck_style_id _co_ck_accent _co_ck_label _co_ck_fg _co_ck_reindividuate
 
 # PROFILED CHECKOUTS THAT NEVER RENDERED (floor slice 5). `knowledge-ctx list`
 # resolves a `daytime` profile in each of these, yet no branch above or below ever
@@ -1762,51 +1966,83 @@ fi
 # re-individuates, then launches bare `claude` with no --agent, as the crew branch
 # above does.
 #
-# FOUR CHECKOUTS ARE DELIBERATELY NOT HERE, and the reason is `--force`, which
-# rmtrees `.claude/agents` and `.claude/skills` before rewriting: `convivy-app-kit`
-# and `convivy-services` (git-tracked svc-* agents), `hollis` (git-tracked
-# hollis-* agents and skills), and `write-better` (gitignored hand-written editor,
-# rhetorician, reviewer and instructional-designer agents, no `.materialized`).
-# Adding one is a decision to replace its hand-written trees with the render.
-# Checked 2026-09-24; re-check before adding any of them.
+# SOME SELF-CONTAINED AND CREW-COCKPIT CHECKOUTS ARE DELIBERATELY NOT HERE,
+# and the reason is `--force`, which rmtrees `.claude/agents` and
+# `.claude/skills` before rewriting: a few crews keep git-tracked or
+# gitignored hand-written agent/skill trees this render would destroy.
+# Registered via a unit's own `profiled_dirs` list (`projects.profiled_dirs()`)
+# is an opt-IN, so adding one is a decision to replace its hand-written trees
+# with the render, never a default a new entry falls into.
 #
-# Full `:A`-resolved paths, never a basename, for the same reason as the crew
-# branch: a stray directory named `www` anywhere on disk must not have its
-# `.claude/agents` and `.claude/skills` cleared.
-_co_profiled_dirs=("$_co_crews_root/constance-landing" "$_co_crews_root/constance-updates"
-                   "$_co_crews_root/selector-backend" "$_co_crews_root/www")
-_co_profiled_dirs=("${(@)_co_profiled_dirs:A}")
+# Full `:A`-resolved, absolute paths, never a basename, for the same reason as
+# the crew-cockpit branch above: a stray directory sharing one of these names
+# anywhere on disk must not have its `.claude/agents` and `.claude/skills`
+# cleared. `projects.profiled_dirs()` already resolves and refuses anything
+# outside this user's home (`_expand_own_home`'s own guard), so no further
+# resolution is needed here beyond the registry read itself.
+_co_profiled_dirs=(${(f)"$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+    2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    for p in projects.profiled_dirs():
+        print(p)
+except Exception:
+    # Print nothing: the caller reads an empty list as "no profiled dirs",
+    # which costs only this branch's treatment of them, never a launch.
+    pass
+PY
+)"})
 #
 # ONLY A BARE `co`, A `/`-PROMPT OR A `--resume` ENTERS, the same test the agent
-# `case` below uses. `co coder` in selector-backend launched `--agent coder` before
-# this branch existed, and catching every argument sent "coder" to claude as a prompt.
-# `co --resume` is what `co restore` types for a crew with no agent, so it must enter
-# here as a bare launch of that crew did.
+# `case` below uses. `co coder` in a profiled satellite directory launched
+# `--agent coder` before this branch existed, and catching every argument sent
+# "coder" to claude as a prompt. `co --resume` is what `co restore` types for a
+# crew with no agent, so it must enter here as a bare launch of that crew did.
 #
 # THE RENDER NEEDS GIT TO IGNORE `.claude/`, checked at run time. knowledge-ctx
-# writes no ignore entry, and constance-landing and constance-updates publish
+# writes no ignore entry, and harbor-landing and harbor-updates publish
 # sites, so an unignored render leaves agent prompts and instruction blocks
 # untracked, one `git add -A` or deploy from shipping. Those repos are not the
 # Bosun's to edit, so the render is skipped until their owners ignore `.claude/`.
 #
+# Shared by the profiled-checkout branch and the business-area-umbrella branch
+# below: true when
+# git in <repo> ignores every path a `knowledge-ctx use --force` render
+# writes, false otherwise — the gate that keeps `--force`'s
+# `.claude/agents`/`.claude/skills` rmtree away from a repo that still tracks
+# hand-written files there.
+#
+# `core.excludesFile=/dev/null` so only the repo's OWN rules count: the
+# global ignore file here carries `**/.claude/settings.local.json`, and a
+# fresh clone or CI runner has no such file. Every path the render writes
+# is tested, not the directory.
+# One call per path: `check-ignore -q` with several paths exits 0 when ANY
+# is ignored, which would let a single matching rule pass the rest.
+_co_claude_render_ignored() {  # <repo>
+    local _co_p
+    for _co_p in .claude/CLAUDE.md .claude/agents/x.md .claude/skills/x/SKILL.md; do
+        git -C "$1" -c core.excludesFile=/dev/null check-ignore -q "$_co_p" 2>/dev/null \
+            || return 1
+    done
+    return 0
+}
+
 # `_co_profiled_dirs_rendered` lets the `-r` block, below, tell apart "rendered"
 # from "skipped, not ignored" without re-running the ignore check — only a
 # rendered checkout has the skill /handoff-pickup names. Reset per invocation
 # of this script, never across one, so no state survives between launches.
 _co_profiled_dirs_rendered=false
 _co_profiled_dirs_refresh() {
-    # `core.excludesFile=/dev/null` so only the repo's OWN rules count: the
-    # global ignore file here carries `**/.claude/settings.local.json`, and a
-    # fresh clone or CI runner has no such file. Every path the render writes
-    # is tested, not the directory.
-    # One call per path: `check-ignore -q` with several paths exits 0 when ANY
-    # is ignored, which would let a single matching rule pass the rest.
-    local _co_all_ignored=true _co_p
-    for _co_p in .claude/CLAUDE.md .claude/agents/x.md .claude/skills/x/SKILL.md; do
-        git -C "$repo_root" -c core.excludesFile=/dev/null check-ignore -q "$_co_p" 2>/dev/null \
-            || _co_all_ignored=false
-    done
-    if ! $_co_all_ignored; then
+    if ! _co_claude_render_ignored "$repo_root"; then
         print -u2 "co: refresh — skipping the render in ${(V)$(basename "$repo_root")}: git does not ignore .claude/ there, so rendered agents and CLAUDE.md would be left untracked. The repo owner needs to add .claude/ to its .gitignore."
         return 0
     fi
@@ -1834,212 +2070,310 @@ if [[ -n $repo_root && ${_co_profiled_dirs[(Ie)${repo_root:A}]} -ne 0 ]] \
     _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
 fi
 
-# Hollis path: <root>/hollis — the operator's personal organizer (email triage,
-# calendar, daily to-dos, travel), formerly "personal-assistant" (renamed
-# 2026-07-01, ARCH-290). A self-contained lab deployment (ARCH-243): its own
-# crew in .claude/agents/, local data edited in place, the dir's CLAUDE.md
-# supplies the role. co here is the launch ergonomic + handoff muscle memory;
-# -r with no prompt resumes from the latest handoff. Pink styling (ARCH-077);
-# the iTerm DynamicProfile co-hollis.json deploys laptop-side (ARCH-078) — the
-# tmux status color works from the mini regardless.
-if [[ -n $repo_root && $(basename "$repo_root") == hollis ]]; then
+# SELF-CONTAINED CREWS: every active crew the registry marks
+# `co_self_contained: true` has its own hand-written `.claude/agents/`,
+# dispatched off the shared KB index (`agentctl --agents-dir`) rather than a
+# knowledge-ctx profile — local data edited in place, the directory's own
+# CLAUDE.md supplies the role. co here is purely the launch ergonomic and the
+# handoff-resume muscle memory: no knowledge pull, no re-individuation, ever,
+# because there is no profile to pull one from. Matched on basename alone —
+# `--force` is never called on this path, so the scratch-clone risk the
+# crew-cockpit branch's "path" gate exists for does not apply here.
+#
+# ONE BRANCH FOR WHAT USED TO BE TWO (today: a personal-organizer crew and a
+# shared infrastructure crew whose session alias differs from its own
+# directory's basename — `co_style_id` on its unit carries that, the same
+# field the crew-cockpit branch above reads for the same reason).
+_co_self_contained_match=""
+if [[ -n $repo_root ]]; then
+    _co_self_contained_match=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+        "$(basename "${repo_root:A}")" 2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    want_basename = sys.argv[4]
+    for slug, u in projects.load().items():
+        if u.get("lifecycle") != "active" or u.get("co_self_contained") is not True:
+            continue
+        home = projects.home_path(slug)
+        if home is not None and home.name == want_basename:
+            style_id, accent, label, fg = projects.co_style(slug) or (slug, "", "", "#ffffff")
+            print("\t".join([style_id, accent, label or "", fg]))
+            break
+except Exception:
+    pass
+PY
+    )
+fi
+
+if [[ -n $_co_self_contained_match ]]; then
+    _co_sc=("${(@ps:\t:)_co_self_contained_match}")
     if $refresh && [[ $# -eq 0 ]]; then
         set -- /handoff-pickup
     fi
-    _apply_co_style hollis "#d6457f"
+    [[ -n $_co_sc[2] ]] && _apply_co_style "$_co_sc[1]" "$_co_sc[2]" "$_co_sc[3]" "$_co_sc[4]"
     _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
 fi
+unset _co_self_contained_match _co_sc
 
-# selector path: <root>/selector/ is the music lab product — an owned taste KB
-# (Spotify a substitutable source) with a trust-boundary API to PA. The sel-
-# crew renders into .claude/agents/ and .claude/skills/ from the
-# selector/daytime KB profile: selector#472 (merged 2026-09-14) stopped
-# tracking those two trees in git, and agentctl resolves the crew through the
-# shared KB index too, since selector left LOCAL_AGENT_REPOS on 2026-08-25.
+# convivy-deck's `-r` re-individuation (issue_01M35K490CAR4Q69B9TAR7Z39X) and
+# styling are now the crew-cockpit branch above — the registry marks
+# it `crew_cockpit: true` with `co_cockpit_gate: "basename"` (preserving the
+# pre-existing risk its own basename match already accepted), `co_style_id:
+# "deck"`, `co_accent: "#d4af37"` (gold on a pale-yellow ground, brown status
+# text since gold is a bright accent) and `co_label: "Deck"`.
+
+# writing-guide path: a self-contained crew for Convivy's own internal style
+# guide (ARCH-101): its own crew lives in .claude/agents/ and is dispatched
+# via the Task tool, NOT the substrate KB index — no knowledge-ctx profile,
+# no KB pull, no agent individuation. The repo's CLAUDE.md supplies the
+# orchestrating role. co here is the launch ergonomic + handoff muscle
+# memory; -r with no prompt resumes the latest handoff. Editor's-ink green
+# styling (ARCH-077); the iTerm DynamicProfile deploys laptop-side (ARCH-078)
+# — the tmux status color works from the mini regardless.
 #
-# SO -r MUST RE-INDIVIDUATE, the same as the crew-cockpit and substrate
-# branches above. Before this fix it didn't: selector's own deploy job
-# (com.selector.deploy) periodically pulls selector's checkout, and once
-# selector#472 removed .claude/agents/ and .claude/skills/ from git tracking,
-# that pull removed the now-untracked files from a working tree that still had
-# them — same as any git pull removing files a merge commit deleted.
-# knowledge-autopull is not the mechanism: it only ever touches
-# $_co_crews_root/knowledge, never a product checkout. A relaunched session
-# found .claude/ empty and `co -r` launched claude with /handoff-pickup into a
-# session with no skills or agents at all — "Unknown command".
+# Kept as its OWN branch rather than folded into the `co_self_contained`
+# crews above: this crew resolves through its own `co_writing_guide: true`
+# flag (`projects.writing_guide_dirname()`) rather than through
+# `co_self_contained`, so a registry edit to one never silently changes the
+# other's membership.
+_co_writing_guide_dir=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+    2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    print(projects.writing_guide_dirname() or "")
+except Exception:
+    pass
+PY
+)
+if [[ -n $repo_root && -n $_co_writing_guide_dir \
+   && $(basename "$repo_root") == $_co_writing_guide_dir ]]; then
+    if $refresh && [[ $# -eq 0 ]]; then
+        set -- /handoff-pickup
+    fi
+    _apply_co_style "$_co_writing_guide_dir" "#2f7e68"
+    _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
+fi
+unset _co_writing_guide_dir
+
+# business-area-umbrella path: a configured directory (the registry's own
+# top-level `_business_umbrella_dir`, `projects.business_umbrella_dirname()`)
+# holds one git repo per project for a side business of the operator's own —
+# physical-world projects (floorplans -> SketchUp -> Layout) plus the
+# business-area crews (guest tech, marketing) alongside them. NOT a Convivy
+# product: no agent (local git; each dir's CLAUDE.md supplies the role). co
+# here is the launch ergonomic + handoff muscle memory; -r with no prompt
+# resumes the latest handoff. Per-project styling (ARCH-077): each project
+# carries its own iTerm DynamicProfile (deploys laptop-side, ARCH-078) and an
+# accent below; the tmux status color works from the mini regardless. Adding
+# a project needs no change here, nor an absent umbrella — see
+# `_co_umbrella_refresh`'s own gate.
 #
-# Indigo styling; the iTerm DynamicProfile co-selector.json deploys
-# laptop-side (ARCH-078) — the tmux status color works from the mini
-# regardless. -r with no prompt resumes from the latest handoff (Selector
-# carries handoff skills since 2026-06-27).
-# GATED ON THE FULL PATH, not the basename match below — the same
-# guard the substrate branch uses. `--force` rmtrees
-# `.claude/agents` and `.claude/skills` before rewriting, so running it
-# off a basename would let any directory named `selector` anywhere on
-# disk have those two trees deleted. Launching claude in the wrong
-# `selector` is the pre-existing risk this branch already accepts;
-# deleting files in one is a new one, and it does not have to be
-# accepted to fix the drift. Shared between `-r` and the automatic
-# staleness path for the same reason as substrate's own function —
-# see `_co_refresh_if_stale`'s comment (reviewer, PR #835 round 1).
-_co_selector_refresh() {
-    print -u2 "co: refresh (selector) — pulling $_co_crews_root/knowledge"
+# A PROJECT IS INDIVIDUATED FROM THE CENTRAL KB ONLY ONCE IT IS READY FOR IT,
+# per `_co_umbrella_refresh` below: `co -r` pulls the knowledge repo and
+# renders a daytime profile when, and only when, this repo's git ignores
+# `.claude/` AND a daytime profile actually resolves for it. Some of these
+# side-business repos are built that way from the start (a `.gitignore` with
+# `.claude/`, a daytime profile in the knowledge repo); others track a
+# hand-written example-reviewer agent and skills under `.claude/` in git and
+# do not ignore it — `use --force` rmtrees `.claude/agents` and
+# `.claude/skills` before writing, which would destroy that tracked work, so
+# the ignore check keeps them unrendered exactly as before this existed.
+# Matches any repo directly under the umbrella directory; absent, the branch
+# never fires.
+_umbrella_dirname=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+    2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    print(projects.business_umbrella_dirname() or "")
+except Exception:
+    pass
+PY
+)
+_umbrella_dir=""
+[[ -n $_umbrella_dirname ]] && _umbrella_dir="$_co_crews_root/$_umbrella_dirname"
+
+# Renders only when BOTH hold: git ignores `.claude/` in this repo (the
+# shared check above, same gate the profiled-checkout branch applies), and a
+# daytime profile resolves for this directory. `knowledge-ctx list` is the
+# read-only way to answer the second question — it only reads the registry
+# and the knowledge index, never writes anything, so this can be checked
+# before committing to a pull and a `--force` render. Either check failing
+# is not an error: one stderr line names the repo and which condition
+# failed, and the launch proceeds unrendered, exactly as every repo under
+# this umbrella does today.
+#
+# `_co_umbrella_rendered` lets the launch below tell apart "rendered this
+# run" from "skipped" without re-running either check — the same reasoning
+# as `_co_profiled_dirs_rendered` above, and set the same way: only once
+# `_co_reindividuate` completes. Reset per invocation of this script, never
+# across one, so no state survives between launches.
+_co_umbrella_rendered=false
+_co_umbrella_refresh() {
+    # ${(V)}: same reasoning as the crew and profiled-checkout branches above
+    # — cwd-derived, escaped regardless of this branch's closed-set gate.
+    if ! _co_claude_render_ignored "$repo_root"; then
+        print -u2 "co: refresh — skipping the render in ${(V)$(basename "$repo_root")}: git does not ignore .claude/ there, so rendered agents and CLAUDE.md would be left untracked."
+        return 0
+    fi
+    if ! knowledge-ctx list 2>/dev/null | grep -qx '  daytime'; then
+        print -u2 "co: refresh — skipping the render in ${(V)$(basename "$repo_root")}: no daytime profile resolves for this directory."
+        return 0
+    fi
+    print -u2 "co: refresh (${(V)$(basename "$repo_root")} business-area umbrella) — pulling $_co_crews_root/knowledge"
     _co_pull_knowledge || {
         print -u2 "co: refresh — knowledge pull failed."
         return 1
     }
-    if [[ ${repo_root:A} == ${${:-"$_co_crews_root/selector"}:A} ]]; then
-        _co_reindividuate daytime
-    fi
+    _co_reindividuate daytime || return 1
+    _co_umbrella_rendered=true
 }
 
-if [[ -n $repo_root && $(basename "$repo_root") == selector ]]; then
-    if $refresh; then
-        _co_selector_refresh || exit 1
-        [[ $# -eq 0 ]] && set -- /handoff-pickup
+if [[ -n $repo_root && -n $_umbrella_dir && $(dirname "$repo_root") == $_umbrella_dir ]]; then
+    # Same prompt gate the profiled-checkout branch uses for its render: a
+    # named agent/prompt (`co coder`, `co "fix X"`) must reach claude as an
+    # argument rather than trigger a render no profile has ever needed here.
+    if [[ $# -eq 0 || $1 == /* || $1 == --resume ]]; then
+        if $refresh; then
+            _co_umbrella_refresh || exit 1
+        fi
+        _co_refresh_if_stale _co_umbrella_refresh
     fi
-    _co_refresh_if_stale _co_selector_refresh
-    _apply_co_style selector "#2f9e44"
-    _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
-fi
-
-# svc path: <root>/convivy-app-kit/ is the shared kit suite (svc- crew) that
-# platformizes per-app infrastructure (PA's cost guard extracted first, ARCH-249).
-# Self-contained like hollis: the svc- crew lives in .claude/agents/, dispatched
-# via agentctl with --agents-dir, off the shared KB index. Azure styling; the iTerm
-# DynamicProfile co-svc.json deploys laptop-side (ARCH-078) — the tmux status color
-# works from the mini regardless. -r with no prompt resumes from the latest handoff
-# (svc carries handoff skills since 2026-06-27). The session/alias is `svc`; the dir
-# is convivy-app-kit.
-if [[ -n $repo_root && $(basename "$repo_root") == convivy-app-kit ]]; then
-    if $refresh && [[ $# -eq 0 ]]; then
+    # /handoff-pickup names a skill, so sending it needs the skill to actually
+    # be there: either this render just wrote it (`_co_umbrella_rendered`,
+    # the same rule `_co_profiled_dirs_rendered` applies above), or it never
+    # renders here but ships hand-tracked in git already. A repo with
+    # neither — a new project whose .gitignore lands before its daytime
+    # profile does — launches with no prompt instead of an "Unknown command"
+    # failure.
+    if $refresh && [[ $# -eq 0 ]] \
+       && { [[ $_co_umbrella_rendered == true ]] \
+            || [[ -f "$repo_root/.claude/skills/handoff-pickup/SKILL.md" ]]; }; then
         set -- /handoff-pickup
     fi
-    _apply_co_style svc "#0284c7"
-    _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
-fi
+    umbrella_proj=$(basename "$repo_root")
+    # Per-project accent/label/fg now come from that project's own registry row
+    # (`co_accent`/`co_label`/`co_fg`, read by `projects.co_style_by_basename`
+    # — the generalised form of the per-crew styling case this umbrella used to
+    # carry here) when one exists; a project under the umbrella with no row of
+    # its own yet, or none at all, takes the same default brown + raw repo name
+    # every unregistered project here always has.
+    umbrella_accent="#6F4E37" umbrella_label=$umbrella_proj umbrella_fg="#ffffff"
+    _umbrella_style_match=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+        "$umbrella_proj" 2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
 
-# deck path: <root>/convivy-deck/ is the deck lab product (ARCH-382). PR #446
-# took convivy-deck out of LOCAL_AGENT_REPOS, so `agentctl spawn` resolves
-# deck's agents THROUGH the shared KB index like every other product, and
-# `deck/daytime` renders all three plus its skills — this half of the old note
-# was correct and is why a DISPATCHED deck agent has always gotten the
-# profile.
-#
-# -r NOW RE-INDIVIDUATES, the same as the selector and substrate branches
-# above. It didn't before this fix: this branch only set /handoff-pickup and
-# exec'd claude, so the interactive session never called `_co_pull_knowledge`
-# or `_co_reindividuate` and `.claude/` here carried only whatever agents and
-# skills were last hand-placed or checked into git. On 2026-09-22 that gap was
-# what left Deck's interactive session on the pre-rename skill set after every
-# other crew's `co -r` picked up the rename (issue_01M35K490CAR4Q69B9TAR7Z39X).
-#
-# GATED ON THE FULL PATH, not the basename match above — the same guard the
-# selector and substrate branches use. `--force` clears `.claude/agents` and
-# `.claude/skills` before rewriting (preserving git-tracked orphans, but not a
-# git-tracked file the profile's plan still calls for by name — see
-# convivy-deck#270, which untracks the five deck files that are in-plan so
-# this force stops leaving them modified), so running it off a basename would
-# let any directory named `convivy-deck` anywhere on disk have those two trees
-# cleared. Launching claude in the wrong `convivy-deck` is the pre-existing
-# risk this branch already accepts; individuating into one is a new one, and
-# it does not have to be accepted to fix the drift.
-#
-# Gold styling on a pale-yellow ground with brown type (the operator's pick); the iTerm
-# DynamicProfile co-deck.json deploys laptop-side (ARCH-078) — the tmux status
-# color works from the mini regardless. Gold is a bright accent, so the status
-# bar uses brown text (like the commercial/nyh-etc light-accent calls) rather
-# than the default white. -r with no prompt resumes the latest handoff. The
-# session/alias is `deck`; the dir is convivy-deck.
-#
-# Shared between `-r` and the automatic staleness path for the same reason as
-# substrate's own function — see `_co_refresh_if_stale`'s comment (reviewer,
-# PR #835 round 1).
-_co_deck_refresh() {
-    print -u2 "co: refresh (deck) — pulling $_co_crews_root/knowledge"
-    _co_pull_knowledge || {
-        print -u2 "co: refresh — knowledge pull failed."
-        return 1
-    }
-    if [[ ${repo_root:A} == ${${:-"$_co_crews_root/convivy-deck"}:A} ]]; then
-        _co_reindividuate daytime
-    fi
-}
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
 
-if [[ -n $repo_root && $(basename "$repo_root") == convivy-deck ]]; then
-    if $refresh; then
-        _co_deck_refresh || exit 1
-        [[ $# -eq 0 ]] && set -- /handoff-pickup
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    style = projects.co_style_by_basename(sys.argv[4])
+    if style:
+        style_id, accent, label, fg = style
+        print("\t".join([accent, label or style_id, fg]))
+except Exception:
+    pass
+PY
+    )
+    if [[ -n $_umbrella_style_match ]]; then
+        _umbrella_fields=("${(@ps:\t:)_umbrella_style_match}")
+        umbrella_accent=$_umbrella_fields[1] umbrella_label=$_umbrella_fields[2] umbrella_fg=$_umbrella_fields[3]
     fi
-    _co_refresh_if_stale _co_deck_refresh
-    _apply_co_style deck "#d4af37" "Deck" "#4a341d"
-    _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
-fi
-
-# write-better path: <root>/write-better/ is Convivy's public writing guide
-# (the Write Better product). Self-contained like personal-assistant (ARCH-101):
-# its own crew lives in .claude/agents/ and is dispatched via the Task tool, NOT
-# the substrate KB index — no knowledge-ctx profile, no KB pull, no agent
-# individuation. The repo's CLAUDE.md supplies the orchestrating role. co here
-# is the launch ergonomic + handoff muscle memory; -r with no prompt resumes the
-# latest handoff. Editor's-ink green styling (ARCH-077); the iTerm DynamicProfile
-# co-write-better.json deploys laptop-side (ARCH-078) — the tmux status color
-# works from the mini regardless.
-if [[ -n $repo_root && $(basename "$repo_root") == write-better ]]; then
-    if $refresh && [[ $# -eq 0 ]]; then
-        set -- /handoff-pickup
-    fi
-    _apply_co_style write-better "#2f7e68"
-    _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
-fi
-
-# NYH-architecture path: the <root>/nyh-architecture/ umbrella holds one git repo
-# per physical-architecture project for NYH (Now You're Here, the operator's short-term-rental
-# company): floorplans -> SketchUp -> Layout. NOT Convivy products and NOT software:
-# no knowledge-ctx profile, no agent, no KB pull (local git; each dir's CLAUDE.md
-# supplies the role). co here is the launch ergonomic + handoff muscle memory; -r with
-# no prompt resumes the latest handoff. Per-project styling (ARCH-077): each project
-# carries its own iTerm DynamicProfile co-<project>.json (deploys laptop-side, ARCH-078)
-# and an accent below; the tmux status color works from the mini regardless. Adding a
-# project = add a case arm here + an iterm/co-<project>.json.
-# Matches any repo directly under <root>/nyh-architecture/.
-_nyh_umbrella="$_co_crews_root/nyh-architecture"
-if [[ -n $repo_root && $(dirname "$repo_root") == $_nyh_umbrella ]]; then
-    if $refresh && [[ $# -eq 0 ]]; then
-        set -- /handoff-pickup
-    fi
-    nyh_proj=$(basename "$repo_root")
-    nyh_fg="#ffffff"   # status-bar foreground; override for light/bright accents
-    case $nyh_proj in
-        nyh-park-villa) nyh_accent="#6F4E37"; nyh_label="Park Villa" ;;                          # brown
-        nyh-etc)        nyh_accent="#1bb5ad"; nyh_label="East Texas Circle"; nyh_fg="#0b2e2b" ;; # turquoise (Tucson); dark fg for the bright accent
-        *)              nyh_accent="#6F4E37"; nyh_label="$nyh_proj" ;;                            # default brown + raw repo name until the project gets its own
-    esac
-    # $nyh_proj is a bare git-toplevel basename with no check of its own —
-    # the `*)` sub-arm above also hands it straight to $nyh_label — and
+    unset _umbrella_style_match _umbrella_fields
+    # $umbrella_proj is a bare git-toplevel basename with no check of its own —
+    # the `*)` sub-arm above also hands it straight to $umbrella_label — and
     # reaches `_apply_co_style` unconditionally. Safe because the name gate
     # lives in `_apply_co_style` itself (issue_01M3Q2DJMB5R37HZD9SMVTS323):
     # an unsafe name launches unstyled rather than reaching any OSC/tmux
     # write.
-    _apply_co_style "$nyh_proj" "$nyh_accent" "$nyh_label" "$nyh_fg"
+    _apply_co_style "$umbrella_proj" "$umbrella_accent" "$umbrella_label" "$umbrella_fg"
     _co_exec_claude --remote-control $_co_name_args $claude_model_args --permission-mode $_co_permission_mode "$@"
 fi
+unset _umbrella_dirname _umbrella_dir
 
-# Company-level commercial path: <root>/convivy-commercial — Convivy's company
-# positioning + commercial presentation (ARCH-124), the altitude ABOVE the
-# per-product <product>-commercial workspaces (ARCH-049). Default agent is the
-# positioning-strategist; `writer` starts the commercial-writer it dispatches for
-# decks/copy, `pa` the product-analyst it reuses for data. Lemon styling. The
-# convivy-commercial → convivy map in `projects.EXPLICIT_PROJECT_BY_NAME` means
-# `knowledge-ctx use commercial` activates the convivy/commercial profile. This
-# branch must precede the generic `*-commercial` branch below (convivy-commercial
-# matches that glob too, but needs its own agents + project, not product-manager).
+# Company-level commercial path: the one crew the registry flags
+# `company_workspace: true` — company positioning + commercial
+# presentation (ARCH-124), the altitude ABOVE the per-product
+# <product>-commercial workspaces below. Default agent is the crew's own
+# `co_default_agent` registry field (positioning-strategist when absent —
+# platform decision 0100: a crew's settings come from the registry, not a
+# name in bin/co's own source); `writer` starts the commercial-writer it
+# dispatches for decks/copy, `pa` the product-analyst it reuses for data,
+# `pm` the product-manager. This branch must precede the generic
+# `*-commercial` branch below (this crew's own directory matches that glob
+# too, but needs its own agents + project, not necessarily product-manager)
+# — resolving it by registry FLAG rather than by name is what lets it keep
+# that precedence with no name of its own in this file.
 #
-# No full-path gate here (unlike substrate/selector/deck above): this branch
+# No full-path gate here (unlike the crew-cockpit branch above): this branch
 # never had one, even on `-r`, so there is nothing for the shared function
 # below to reapply — it is a basename-only match in both places, unchanged.
+_co_company_workspace_fields=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+    2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    slug = projects.company_workspace_slug()
+    if slug:
+        home = projects.home_path(slug)
+        if home is not None:
+            print("\t".join([str(home), projects.co_default_agent(slug) or ""]))
+except Exception:
+    pass
+PY
+)
+_co_company_workspace_home=""
+_co_company_default_agent=""
+if [[ -n $_co_company_workspace_fields ]]; then
+    _co_cw_fields=("${(@ps:\t:)_co_company_workspace_fields}")
+    _co_company_workspace_home=$_co_cw_fields[1]
+    _co_company_default_agent=$_co_cw_fields[2]
+fi
+unset _co_company_workspace_fields _co_cw_fields
+
 _co_convivy_commercial_refresh() {
-    print -u2 "co: refresh (convivy-commercial) — pulling $_co_crews_root/knowledge"
+    # ${(V)}: the directory's basename is cwd-derived, escaped regardless of
+    # this branch's closed-set (registry-resolved, exact-literal) gate.
+    print -u2 "co: refresh (${(V)$(basename "$repo_root")}) — pulling $_co_crews_root/knowledge"
     _co_pull_knowledge || {
         print -u2 "co: refresh — knowledge pull failed."
         return 1
@@ -2047,23 +2381,34 @@ _co_convivy_commercial_refresh() {
     _co_reindividuate commercial "Common cause: a prior \`claude\` session still running here. Exit it first."
 }
 
-if [[ -n $repo_root && $(basename "$repo_root") == convivy-commercial ]]; then
-    agent=positioning-strategist
+if [[ -n $repo_root && -n $_co_company_workspace_home \
+      && $(basename "$repo_root") == $(basename "$_co_company_workspace_home") ]]; then
+    # Re-checked against the same bare-name shape validate_registry holds
+    # co_default_agent to (lib/agent-platform/projects.py's _AGENT_NAME_OK,
+    # `^[a-z0-9-]+$`) before it is joined into agent_file below — a value
+    # that bypassed that check (a hand-edited registry, never run through
+    # crew_registration.register) falls back to this branch's own hardcoded
+    # default rather than reaching .claude/agents/<name>.md unchecked.
+    _co_cw_default=$_co_company_default_agent
+    [[ -n $_co_cw_default && $_co_cw_default =~ ^[a-z0-9-]+$ ]] || _co_cw_default=positioning-strategist
+    agent=$_co_cw_default
     case "${1:-}" in
-        ""|ps|strategist|positioning-strategist)  [[ -n ${1:-} ]] && shift ;;
+        "")                                        [[ -n ${1:-} ]] && shift ;;
+        ps|strategist|positioning-strategist)     agent=positioning-strategist; shift ;;
         w|writer|commercial-writer)               agent=commercial-writer; shift ;;
         pa|analyst|product-analyst)               agent=product-analyst; shift ;;
+        pm|product-manager)                       agent=product-manager; shift ;;
         # A leading `/` is a prompt (e.g. rollover's `/handoff-pickup <path>`,
         # spawn_successor's `co -r "/handoff-pickup <path>"`), not an agent
         # name — no agent name here starts with `/`. Leave it in place as the
-        # positional prompt and keep the branch's default agent. `--resume` is
-        # the same, for `co restore`'s typed resume line.
+        # positional prompt and keep the branch's resolved default agent.
+        # `--resume` is the same, for `co restore`'s typed resume line.
         /*|--resume)                               ;;
         *)                                        agent=$1; shift ;;
     esac
     if $refresh; then
         _co_convivy_commercial_refresh || exit 1
-        [[ $agent == positioning-strategist && $# -eq 0 ]] && set -- /handoff-pickup
+        [[ $agent == $_co_cw_default && $# -eq 0 ]] && set -- /handoff-pickup
     fi
     _co_refresh_if_stale _co_convivy_commercial_refresh
     agent_file=".claude/agents/${agent}.md"
@@ -2074,13 +2419,39 @@ if [[ -n $repo_root && $(basename "$repo_root") == convivy-commercial ]]; then
         print -u2 "    Activate the company commercial profile first:  knowledge-ctx use commercial"
         exit 1
     fi
-    # Lemon: light-yellow accent ($2) with a dark status foreground ($4 — white,
-    # the default, is unreadable on lemon); "Convivy Commercial" is the display
-    # label ($3). The iTerm profile co-convivy-commercial uses a pale-lemon bg.
-    # Distinct from the steward `convivy` coral (#f4604c).
-    _apply_co_style convivy-commercial "#e6ce00" "Convivy Commercial" "#26240a"
+    # Style comes from this crew's own registry row (co_accent/co_label/co_fg)
+    # via the same `co_style` helper the crew-cockpit branch reads — a lemon
+    # accent with a dark status foreground, distinct from the steward's coral.
+    _co_cc_style=$(python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" \
+        2>/dev/null <<'PY' || true
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    slug = projects.company_workspace_slug()
+    style = projects.co_style(slug) if slug else None
+    if style:
+        style_id, accent, label, fg = style
+        print("\t".join([style_id, accent, label or "", fg]))
+except Exception:
+    pass
+PY
+    )
+    if [[ -n $_co_cc_style ]]; then
+        _co_cc_fields=("${(@ps:\t:)_co_cc_style}")
+        _apply_co_style "$_co_cc_fields[1]" "$_co_cc_fields[2]" "$_co_cc_fields[3]" "$_co_cc_fields[4]"
+    fi
+    unset _co_cc_style _co_cc_fields
     _co_exec_claude --remote-control $_co_name_args $claude_model_args --agent "$agent" --permission-mode $_co_permission_mode "$@"
 fi
+unset _co_company_workspace_home _co_company_default_agent _co_cw_default
 
 # Commercial path: the <root>/<product>-commercial/ workspaces (ARCH-049) —
 # commercial-side product-manager sessions on the `commercial` profile, distinct
@@ -2088,8 +2459,8 @@ fi
 # starts the product-analyst it dispatches for data. `-r` pulls knowledge,
 # re-individuates the commercial profile, and resumes from the latest handoff.
 #
-# No full-path gate here either (same note as convivy-commercial above): a
-# basename-only match in both places, unchanged.
+# No full-path gate here either (same note as the company-level commercial
+# branch above): a basename-only match in both places, unchanged.
 _co_commercial_refresh() {
     print -u2 "co: refresh (commercial) — pulling $_co_crews_root/knowledge"
     _co_pull_knowledge || {
@@ -2126,20 +2497,23 @@ if [[ -n $repo_root && $(basename "$repo_root") == *-commercial ]]; then
         print -u2 "    Activate the commercial profile first:  knowledge-ctx use commercial"
         exit 1
     fi
-    # Commercial workspaces share the product's brand styling (vivy-commercial
-    # → vivy palette, constance-commercial → constance palette).
+    # Commercial workspaces share their product's own brand styling — the
+    # registry row for the product this workspace strips `-commercial` off of.
     commercial_product=$(basename "$repo_root")
     commercial_product=${commercial_product%-commercial}
-    # Same shape as the case at the end of this file, and the same fallback for
-    # the same reason. Not reachable today — the only `*-commercial` directories
-    # on disk are vivy- and constance-, both covered, and convivy-commercial is
-    # intercepted earlier — but a third commercial workspace would launch
-    # unnamed without this.
+    # Same helper the generic daytime fallback's own styling case calls at the
+    # end of this file, and the same fallback reasoning: a commercial
+    # workspace for a product with no `co_accent` of its own, or for a name
+    # the registry does not resolve to any product, launches unnamed-but-set
+    # rather than crashing. `_co_apply_product_style` returns 1 on that path
+    # (`set -eu` would otherwise end the whole launch here), so `|| true`
+    # carries it — unlike that other caller's own no-style path, nothing else
+    # runs: `agent_file` above already confirmed this directory is an
+    # individuated commercial crew, and `_co_set_name` already gave it a
+    # title, so there's no "might not even be a crew" case left to signal
+    # with a fallback accent.
     _co_set_name "$commercial_product"
-    case $commercial_product in
-        constance) _apply_co_style constance "#5B2A86" ;;
-        vivy)      _apply_co_style vivy      "#1F4E79" ;;
-    esac
+    _co_apply_product_style "$commercial_product" || true
     _co_exec_claude --remote-control $_co_name_args $claude_model_args --agent "$agent" --permission-mode $_co_permission_mode "$@"
 fi
 
@@ -2257,16 +2631,49 @@ esac
 _co_is_an_adopter_crew() {  # <name>
     local lib=$_co_self_dir/../lib/agent-platform
     [[ -d $lib ]] || lib=$_co_crews_root/agent-platform/lib/agent-platform
-    python3 - "$lib" "$1" "$_co_crews_root/knowledge" <<'PY'
+    python3 - "$lib" "$1" "$_co_crews_root/knowledge" "$(_co_registry_path)" <<'PY'
 import sys
+from pathlib import Path
 
 sys.path.insert(0, sys.argv[1])
 try:
     import projects
+    if sys.argv[4]:
+        projects.PROJECTS_JSON = Path(sys.argv[4])
+    projects._load_raw.cache_clear()
     name, root = sys.argv[2], sys.argv[3]
     if projects.project_for_repo(name) is not None:
         sys.exit(1)
     sys.exit(0 if projects.resolve_project(name, root) == name else 1)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+# Whether the crew registry can be read and parsed at all — the Library's
+# `GET /registry` on a real launch (CQ·565; there is no file to resolve by
+# default any more). Both `_co_generic_refresh_allowed` and
+# `_co_is_an_adopter_crew` fail closed on a registry read error the same way
+# they fail closed on a genuinely unrecognized name (`|| true` / `except
+# Exception` with no distinct code), so `_co_generic_daytime_refresh`'s
+# validator cannot otherwise tell "the registry is down" apart from "this
+# directory really isn't a product" — the two cases that need different
+# responses below (skip the refresh and launch, vs. refuse to launch at all).
+_co_registry_readable() {
+    python3 - "$(_co_lib_dir)" "$(_co_registry_path)" "$_co_crews_root" <<'PY'
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+try:
+    import projects
+
+    if sys.argv[2]:
+        projects.PROJECTS_JSON = Path(sys.argv[2])
+    projects.ROOT_OVERRIDE = sys.argv[3]
+    projects._load_raw.cache_clear()
+    projects.load()
+    sys.exit(0)
 except Exception:
     sys.exit(1)
 PY
@@ -2281,6 +2688,13 @@ PY
 # This is the least-restricted launch branch in the file (no enumerated
 # directory name gates it), so letting the automatic path skip this
 # validation would have been the widest version of that same gap.
+#
+# RETURNS 2, DISTINCT FROM 1, when the registry itself cannot be read for the
+# `*)` case below — co must launch even when the registry cannot be read (see
+# the Opus-pin fallback's own comment above), and that invariant covers this
+# path too: the caller below treats 2 as "skip the refresh, launch anyway"
+# rather than the hard failure 1 still means for a name that reads cleanly
+# and simply isn't a recognized product (round 2, reviewer).
 _co_generic_daytime_refresh() {
     # Must be inside a git tree.
     repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
@@ -2290,9 +2704,17 @@ _co_generic_daytime_refresh() {
     fi
     product=$(basename "$repo_root")
     case $product in
-        constance|vivy|vivy-ownerrez-sandbox-tools|sous-chef|knowledge|dev-setup) ;;
+        # `knowledge` and `dev-setup` are two legacy workspace names with no
+        # registry unit of their own (the KB repo itself, and a frozen build
+        # workshop) — everything else reachable through this least-restricted
+        # path names itself in the registry, via `co_generic_refresh: true`.
+        knowledge|dev-setup) ;;
         *)
-            if ! _co_is_an_adopter_crew "$product"; then
+            if ! _co_registry_readable; then
+                print -u2 "co: refresh — registry is unreadable; skipping the refresh."
+                return 2
+            fi
+            if ! _co_generic_refresh_allowed "$product" && ! _co_is_an_adopter_crew "$product"; then
                 # `${(V)product}` RATHER THAN RAW: $product is an unvalidated
                 # git-toplevel basename (the same value issue_01M3Q2DJMB5R37HZD9SMVTS323
                 # gates before it reaches _apply_co_style's OSC/tmux sinks),
@@ -2302,7 +2724,8 @@ _co_generic_daytime_refresh() {
                 # the raw byte, so an ESC or BEL in the name cannot reach the
                 # terminal as its own escape sequence.
                 print -u2 "co: cwd is not a recognized product repo (got '${(V)product}')."
-                print -u2 "    Run -r from $_co_crews_root/{constance,vivy,vivy-ownerrez-sandbox-tools,sous-chef},"
+                print -u2 "    Run -r from a registered product's own directory,"
+                print -u2 "    $_co_crews_root/knowledge, $_co_crews_root/dev-setup,"
                 print -u2 "    or from a crew whose own projects/${(V)product}/ the knowledge tree resolves."
                 return 1
             fi
@@ -2327,15 +2750,28 @@ _co_generic_daytime_refresh() {
 
 if $refresh; then
     print -u2 "co: refresh — validating cwd"
-    _co_generic_daytime_refresh || exit 1
+    # `&& _co_gdr_rc=0 || _co_gdr_rc=$?`, not a bare statement followed by
+    # `$?`: under this script's `set -eu`, an unguarded nonzero return here
+    # would abort the whole script via errexit before the code could ever be
+    # captured (same pitfall as `_co_kx_status` above).
+    _co_generic_daytime_refresh && _co_gdr_rc=0 || _co_gdr_rc=$?
+    # 1 is the hard failure (not a recognized product, or the pull/
+    # reindividuate step itself failed) — unchanged, `-r` still refuses to
+    # launch. 2 is the registry-unreadable case: the function already printed
+    # why and ran neither the knowledge pull nor the reindividuate, so this
+    # falls straight through to the launch below, the same as plain `co`.
+    (( _co_gdr_rc == 1 )) && exit 1
 
     # If we're launching the default orchestrator with no positional
     # prompt, auto-add /handoff-pickup so the new session immediately
     # resumes from the most recent handoff. If the operator passed a prompt or a
-    # non-default agent, respect that intent — don't override.
-    if [[ $agent == planning-orchestrator && $# -eq 0 ]]; then
+    # non-default agent, respect that intent — don't override. Only on a
+    # completed refresh (rc 0): a skipped refresh (rc 2) launches exactly as
+    # plain `co` does, which does not add this on its own.
+    if (( _co_gdr_rc == 0 )) && [[ $agent == planning-orchestrator && $# -eq 0 ]]; then
         set -- /handoff-pickup
     fi
+    unset _co_gdr_rc
 fi
 _co_refresh_if_stale _co_generic_daytime_refresh
 
@@ -2365,42 +2801,37 @@ style_product=${product:-$(basename "${repo_root:-}")}
 # here at all means the agent_file check above already passed — this cwd IS a
 # launchable crew, named or not — so a name must be set before either can run.
 _co_set_name "$style_product"
-# THE `*)` ARM IS WHAT MAKES `--resolve` ANSWER HERE AT ALL. `_apply_co_style`
-# is the one place that intercepts `--resolve` (see its own comment): a crew
-# that reaches this case with no matching named arm — `knowledge`, `dev-setup`,
-# or a Builder adopter's own crew the knowledge tree resolves with no registry
-# row (company decision 0011) — used to fall straight to `_co_exec_claude`
-# below, which under `--resolve` reports "no crew resolves" for a directory
-# that plain `co` launches without complaint. The slate accent matches the
-# private-crew fallback's (`_co_private_accent`'s `*)` arm above); nothing
-# claims a nicer colour for a crew the operator hasn't picked one for.
-case $style_product in
-    constance) _apply_co_style constance "#5B2A86" ;;
-    vivy|vivy-ownerrez-sandbox-tools) _apply_co_style vivy "#1F4E79" ;;
-    sous-chef) _apply_co_style sous-chef "#d98c1f" ;;
-    *)
-        # GATED ON THE NAME RULE THE PLATFORM ALREADY ENFORCES ELSEWHERE
-        # (projects._NAME_OK, lib/agent-platform/projects.py:408 —
-        # ^[A-Za-z0-9][A-Za-z0-9._-]*$, literal ranges rather than a
-        # locale-dependent [[:alnum:]] class). Unlike every other arm here,
-        # $style_product reaching this one is a bare git-toplevel basename
-        # that nothing has validated — `_co_is_an_adopter_crew` only runs on
-        # the -r path — and `_apply_co_style` writes it raw as `profile_name`
-        # into an OSC 1337 SetProfile sequence (`co-$style_id`, both the tmux
-        # and non-tmux branches). A basename carrying a control byte (BEL,
-        # ESC) would close that sequence early and inject its own escapes
-        # into the terminal (security-reviewer, PR #709). $style_id also
-        # supplies `label`'s default here (no $3 passed), so gating the call
-        # itself — rather than sanitizing inside `_apply_co_style` — skips
-        # every sink fed by this value in one place: profile_name, label,
-        # title, status-left and rename-window alike. A name that fails
-        # launches unstyled, and `--resolve` correctly reports no crew
-        # resolving for it (the call that would say otherwise never runs)
-        # rather than claiming a name it never validated.
-        if [[ $style_product =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
-            _apply_co_style "$style_product" "#5b6b7a"
-        fi
-        ;;
-esac
+# `_apply_co_style` (reached here through `_co_apply_product_style`, or
+# directly in the fallback below) is the one place that intercepts
+# `--resolve` (see its own comment): a crew with no `co_accent` of its own —
+# `knowledge`, `dev-setup`, or a Builder adopter's own crew the knowledge tree
+# resolves with no registry row (company decision 0011) — used to fall
+# straight to `_co_exec_claude` below, which under `--resolve` reports "no
+# crew resolves" for a directory that plain `co` launches without complaint.
+# The slate accent in the fallback matches the private-crew fallback's own
+# slate (above); nothing claims a nicer colour for a crew the operator hasn't
+# picked one for.
+if ! _co_apply_product_style "$style_product"; then
+    # GATED ON THE NAME RULE THE PLATFORM ALREADY ENFORCES ELSEWHERE
+    # (projects._NAME_OK, lib/agent-platform/projects.py:408 —
+    # ^[A-Za-z0-9][A-Za-z0-9._-]*$, literal ranges rather than a
+    # locale-dependent [[:alnum:]] class). $style_product reaching here is a
+    # bare git-toplevel basename that nothing has validated —
+    # `_co_is_an_adopter_crew` only runs on the -r path — and `_apply_co_style`
+    # writes it raw as `profile_name` into an OSC 1337 SetProfile sequence
+    # (`co-$style_id`, both the tmux and non-tmux branches). A basename
+    # carrying a control byte (BEL, ESC) would close that sequence early and
+    # inject its own escapes into the terminal (security-reviewer, PR #709).
+    # $style_id also supplies `label`'s default here (no $3 passed), so
+    # gating the call itself — rather than sanitizing inside
+    # `_apply_co_style` — skips every sink fed by this value in one place:
+    # profile_name, label, title, status-left and rename-window alike. A name
+    # that fails launches unstyled, and `--resolve` correctly reports no crew
+    # resolving for it (the call that would say otherwise never runs) rather
+    # than claiming a name it never validated.
+    if [[ $style_product =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+        _apply_co_style "$style_product" "#5b6b7a"
+    fi
+fi
 
 _co_exec_claude --remote-control $_co_name_args $claude_model_args --agent "$agent" --permission-mode $_co_permission_mode "$@"

@@ -2,7 +2,7 @@
 # agent-postgres-provision — a dedicated Postgres cluster for dispatched runs,
 # separate from the operator's own (round-1 revise, PR #817).
 #
-# WHY A SECOND CLUSTER. Round 1 opened a vivy dispatch's sandbox to
+# WHY A SECOND CLUSTER. Round 1 opened a product crew's dispatch sandbox to
 # /tmp/.s.PGSQL.5432 — the operator's main cluster's socket. The co then checked that
 # cluster directly: pg_hba trusts every role on the local socket, the role a
 # dispatch connects as (the operator's own unix user) is a superuser there, and a superuser can

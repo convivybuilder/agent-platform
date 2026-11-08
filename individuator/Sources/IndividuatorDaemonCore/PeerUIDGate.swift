@@ -7,32 +7,40 @@ import Glibc
 
 public enum PeerUIDGateError: Error, CustomStringConvertible, Equatable {
     case getpeereidFailed(errno: Int32)
-    case uidMismatch(expected: uid_t, found: uid_t)
+    case uidNotAdmitted(found: uid_t)
 
     public var description: String {
         switch self {
         case .getpeereidFailed(let err):
             return "getpeereid failed (errno \(err))"
-        case .uidMismatch(let expected, let found):
-            return "connecting uid \(found) is not the configured operator uid \(expected)"
+        case .uidNotAdmitted(let found):
+            return "connecting uid \(found) is not an admitted account"
         }
     }
 }
 
-/// The root daemon's one access-control check (CQ·447 slice 3). A
-/// connection to the Unix socket is accepted only when its peer's REAL uid —
-/// read from the kernel via `getpeereid`, never anything the peer can claim
-/// in its request body — equals the configured operator uid. Checked before
-/// a single byte of the request is read.
+/// The root daemon's first access-control check (CQ·447 slice 3; extended
+/// by E12·2 from one admitted uid to a configured list). A connection to the
+/// Unix socket is accepted only when its peer's REAL uid — read from the
+/// kernel via `getpeereid`, never anything the peer can claim in its request
+/// body — is one of the admitted uids. Checked before a single byte of the
+/// request is read, and returns that uid so the caller can resolve which
+/// admitted account it belongs to without a second trip through
+/// `getpeereid`.
+///
+/// Shaped so a second check can be added after this one succeeds and
+/// before `check` returns — the code-signature check of E12·6 goes there.
+/// No such check exists yet.
 public enum PeerUIDGate {
-    public static func check(fileDescriptor: Int32, requiredUID: uid_t) throws {
+    public static func check(fileDescriptor: Int32, admittedUIDs: Set<uid_t>) throws -> uid_t {
         var uid: uid_t = 0
         var gid: gid_t = 0
         guard getpeereid(fileDescriptor, &uid, &gid) == 0 else {
             throw PeerUIDGateError.getpeereidFailed(errno: errno)
         }
-        guard uid == requiredUID else {
-            throw PeerUIDGateError.uidMismatch(expected: requiredUID, found: uid)
+        guard admittedUIDs.contains(uid) else {
+            throw PeerUIDGateError.uidNotAdmitted(found: uid)
         }
+        return uid
     }
 }

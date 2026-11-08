@@ -3,13 +3,22 @@ import Testing
 @testable import IndividuatorCore
 @testable import IndividuatorNetwork
 
+extension PoolBlockingIntegrationSuites {
+
 /// `CertificateGatedRegistrationTransport` is what lets the daemon start
 /// and serve its socket before a certificate has been adopted
 /// (2026-10-15) — these never open a real network connection: the config
 /// below names an address nothing listens on, so a test that reached the
 /// network by mistake would hang on a connect timeout rather than pass
 /// quickly.
-@Suite(.timeLimit(.minutes(1)))
+///
+/// `readsAnAdoptedCertificateOnTheNextRequestWithNoRestart` below is the
+/// one exception: once the certificate is adopted, it deliberately DOES
+/// reach the network, through the real `BosunRegistrationClient`, which
+/// blocks this test's own thread in NIO's `.wait()` for however long that
+/// connection attempt takes. Nested under `PoolBlockingIntegrationSuites`
+/// (round 3, PR 1121) for that reason — see that type's own doc comment.
+@Suite(.serialized, .timeLimit(.minutes(1)))
 struct CertificateGatedRegistrationTransportTests {
     private func makeTempDirectory() -> URL {
         FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -18,7 +27,7 @@ struct CertificateGatedRegistrationTransportTests {
     private func makeConfig() -> IndividuatorRootConfig {
         IndividuatorRootConfig(
             bosunHost: "bosun-test", bosunURIName: "convivy://machine/bosun-test",
-            bosunAddress: "127.0.0.1:1", rootCAPath: "/dev/null", operatorUID: getuid())
+            bosunAddress: "127.0.0.1:1", rootCAPath: "/dev/null", admittedAccounts: [AdmittedAccount(uid: getuid(), account: "operator")])
     }
 
     @Test func refusesWithCertificateMissingWhenNoCertificateHasBeenAdopted() throws {
@@ -90,3 +99,5 @@ struct CertificateGatedRegistrationTransportTests {
         }
     }
 }
+
+} // extension PoolBlockingIntegrationSuites

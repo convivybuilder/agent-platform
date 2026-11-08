@@ -6,6 +6,7 @@ the signal) and a missed one (which is the status quo it replaces).
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -13,8 +14,11 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _dir_listable
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "lib" / "agent-platform"))
 import primary_guard as PG  # noqa: E402
+import projects as PJ  # noqa: E402
 
 
 def _git(path: Path, *args: str) -> str:
@@ -62,9 +66,37 @@ def test_agent_platform_is_watched_even_though_it_is_not_a_spawn_target():
         "if this ever changes, the comment in primary_guard.discover_primaries is stale"
     # Gate on the root the guard scans, not a literal ~/Convivy: on a machine whose
     # root is elsewhere the two disagree, and the skip then fails to fire (#553).
-    if not (PG.CONVIVY_ROOT / "agent-platform" / ".git").is_dir():
-        pytest.skip("agent-platform primary not checked out under this machine's root")
+    # `.is_dir()` alone is not enough (epic E33 slice 2): a dispatched run's
+    # sandbox can leave that METADATA read open on `PG.CONVIVY_ROOT` while
+    # denying the DATA read `discover_primaries()` needs to list it, so this
+    # also checks `_dir_listable` before trusting the real checkout is usable
+    # here.
+    if not (PG.CONVIVY_ROOT / "agent-platform" / ".git").is_dir() or not _dir_listable(PG.CONVIVY_ROOT):
+        pytest.skip("agent-platform primary not checked out under this machine's root, "
+                   "or that root cannot be read here")
     assert "agent-platform" in {p.name for p in PG.discover_primaries()}
+
+
+def test_agent_platform_check_sees_a_present_but_unlistable_root_as_unusable(
+        monkeypatch, tmp_path):
+    """Before this fix, the test above's skip asked only `.git`'s `is_dir()`,
+    which a dispatched run's sandbox leaves True even when `PG.CONVIVY_ROOT`
+    itself cannot be LISTED (epic E33 slice 2) — so `discover_primaries()`
+    would have hit a loud `PermissionError` rather than the intended skip.
+    Pins the two facts the guard's `or` depends on, directly, with no literal
+    home path."""
+    root = tmp_path / "convivy-root"
+    (root / "agent-platform" / ".git").mkdir(parents=True)
+    real_listdir = os.listdir
+
+    def _denied(path="."):
+        if Path(os.fspath(path)) == root:
+            raise PermissionError(1, "Operation not permitted", str(path))
+        return real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", _denied)
+    assert (root / "agent-platform" / ".git").is_dir(), "metadata read must stay open"
+    assert _dir_listable(root) is False, "a denied data read must not look usable"
 
 
 def test_discovery_of_a_missing_root_is_empty_not_an_error(tmp_path):
@@ -74,6 +106,119 @@ def test_discovery_of_a_missing_root_is_empty_not_an_error(tmp_path):
 def test_a_non_repo_directory_is_not_a_primary(tmp_path):
     (tmp_path / "just-a-dir").mkdir()
     assert PG.discover_primaries(tmp_path) == []
+
+
+# --- nested registry homes (substrate ARCH, PR #1001) -----------------------
+
+@pytest.fixture
+def nested_registry(tmp_path, monkeypatch):
+    """A registry with one unit, "demo-nested", whose `home_dir` sits one
+    level below the root rather than as a direct child — the same shape
+    `tests/test_worktrees.py`'s fixture of the same name exercises for
+    `worktrees._registry_primary_for`. This guard reads the registry
+    independently (`primary_guard._registry_homes`), so this fixture points
+    `projects.ROOT_OVERRIDE` at *tmp_path* without touching
+    `worktrees.CONVIVY_ROOT` at all. Yields `(root, home)`."""
+    monkeypatch.setattr(PJ, "ROOT_OVERRIDE", tmp_path)
+    reg = {
+        "demo-nested": {
+            "class": "project", "display": "Demo Nested", "owner": "convivy",
+            "home_dir": "<root>/area/demo-nested", "dirs": [], "crew": "demo-nested",
+            "lifecycle": "active", "products": [], "repos": ["demo-nested"],
+            "aliases": [], "kb": "local",
+        },
+    }
+    reg_path = tmp_path / "projects.json"
+    reg_path.write_text(json.dumps(reg))
+    monkeypatch.setattr(PJ, "PROJECTS_JSON", reg_path)
+    PJ._load_raw.cache_clear()
+    home = _mk_primary(tmp_path / "area", "demo-nested")
+    yield tmp_path, home
+    PJ._load_raw.cache_clear()
+
+
+def test_discover_primaries_includes_a_nested_registry_home(nested_registry):
+    root, home = nested_registry
+    assert home in PG.discover_primaries(root)
+
+
+def test_a_depth_1_primarys_key_and_diff_are_unchanged_by_a_nested_sibling(nested_registry):
+    """A depth-1 primary's snapshot key stays its bare name, and a mutation to
+    it is still found by name, even with a nested registry home also
+    discoverable alongside it — the coexistence `_relative_key` exists for."""
+    root, _home = nested_registry
+    primary = _mk_primary(root, "alpha")
+    before = PG.snapshot(root=root)
+    assert set(before) == {"alpha", "area/demo-nested"}
+    (primary / "leak.txt").write_text("x\n")
+    after = PG.snapshot(root=root)
+    mutations = PG.diff(before, after, root=root)
+    assert [m.repo for m in mutations] == ["alpha"]
+    assert mutations[0].added == ("leak.txt",)
+
+
+def test_a_write_into_a_nested_registry_home_is_reported_as_its_own_mutation(nested_registry):
+    """The gap this PR closes: a run writing into a registry home nested
+    below the root used to be invisible to this guard entirely, because
+    `discover_primaries` never saw it in the first place."""
+    root, home = nested_registry
+    before = PG.snapshot(root=root)
+    (home / "leaked.txt").write_text("leak\n")
+    after = PG.snapshot(root=root)
+    mutations = PG.diff(before, after, root=root)
+    assert [m.repo for m in mutations] == ["area/demo-nested"]
+    assert mutations[0].added == ("leaked.txt",)
+
+
+def test_an_old_format_baseline_still_diffs_against_a_nested_aware_snapshot(nested_registry):
+    """A baseline written before nested registry homes were discoverable keys
+    a depth-1 primary on its bare name, exactly as `snapshot` still does
+    today — so a run that started under an older `agentctl` and finalizes
+    under this one still gets its depth-1 findings."""
+    root, _home = nested_registry
+    primary = _mk_primary(root, "alpha")
+    old_format_baseline = {"alpha": PG._read_repo(primary)}
+    (primary / "leak.txt").write_text("x\n")
+    after = PG.snapshot(root=root)
+    mutations = PG.diff(old_format_baseline, after, root=root)
+    assert [m.repo for m in mutations] == ["alpha"]
+
+
+def test_registry_homes_skips_a_malformed_home_dir_rather_than_raising(tmp_path, monkeypatch):
+    """`_registry_homes`'s own docstring claims a malformed `home_dir` (one
+    `projects.home_path` refuses — anything neither root-relative nor `~/`)
+    contributes nothing rather than raising."""
+    monkeypatch.setattr(PJ, "ROOT_OVERRIDE", tmp_path)
+    reg = {
+        "demo-bad": {
+            "class": "project", "display": "Demo Bad", "owner": "convivy",
+            "home_dir": "/etc/not-root-relative", "dirs": [], "crew": "demo-bad",
+            "lifecycle": "active", "products": [], "repos": ["demo-bad"],
+            "aliases": [], "kb": "local",
+        },
+    }
+    reg_path = tmp_path / "projects.json"
+    reg_path.write_text(json.dumps(reg))
+    monkeypatch.setattr(PJ, "PROJECTS_JSON", reg_path)
+    PJ._load_raw.cache_clear()
+    try:
+        assert PG._registry_homes(tmp_path) == []
+        assert PG.discover_primaries(tmp_path) == []
+    finally:
+        PJ._load_raw.cache_clear()
+
+
+def test_registry_homes_is_empty_for_an_unreadable_registry(tmp_path, monkeypatch):
+    """The other half of the same claim: a registry that cannot be read at
+    all degrades to `[]` rather than raising out of `_registry_homes` or the
+    `discover_primaries` it feeds."""
+    monkeypatch.setattr(PJ, "PROJECTS_JSON", tmp_path / "does-not-exist.json")
+    PJ._load_raw.cache_clear()
+    try:
+        assert PG._registry_homes(tmp_path) == []
+        assert PG.discover_primaries(tmp_path) == []
+    finally:
+        PJ._load_raw.cache_clear()
 
 
 # --- reading a repo must not run code from it ------------------------------
@@ -206,7 +351,7 @@ def test_a_rename_records_both_ends_as_paths(tmp_path):
 
 def test_a_file_appearing_in_a_primary_is_a_mutation(tmp_path):
     """The original incident: a worker's whole file set showed up untracked in
-    vivy's primary and blocked the operator's `git pull` after the merge."""
+    widget's primary and blocked the operator's `git pull` after the merge."""
     repo = _mk_primary(tmp_path, "alpha")
     before = PG.snapshot(root=tmp_path)
     (repo / "app" ).mkdir()
@@ -270,7 +415,7 @@ def test_an_untouched_primary_produces_no_finding(tmp_path):
 
 
 def test_pre_existing_dirt_is_not_attributed_to_the_run(tmp_path):
-    """vivy's primary legitimately carries 109 untracked files. A guard that
+    """widget's primary legitimately carries 109 untracked files. A guard that
     reported those on every run would be turned off within a day."""
     repo = _mk_primary(tmp_path, "alpha")
     (repo / "operator-scratch.txt").write_text("mine")
@@ -537,16 +682,16 @@ def test_attribution_is_absent_without_a_worktree_to_compare(tmp_path):
 
 
 def test_describe_carries_the_attribution(tmp_path):
-    m = PG.Mutation(repo="vivy", added=("a.py",), removed=(), head_before=None,
+    m = PG.Mutation(repo="widget", added=("a.py",), removed=(), head_before=None,
                     head_after=None, echoed_in_worktree=("a.py",))
     assert "THIS RUN" in m.describe()
 
 
 def test_describe_names_the_repo_and_what_changed(tmp_path):
-    m = PG.Mutation(repo="vivy", added=("app/models/flow.py",), removed=("notes.md",),
+    m = PG.Mutation(repo="widget", added=("app/models/flow.py",), removed=("notes.md",),
                     head_before="a" * 40, head_after="b" * 40)
     text = m.describe()
-    assert "vivy" in text
+    assert "widget" in text
     assert "app/models/flow.py" in text
     assert "REMOVED from the dirty set" in text
     assert "HEAD moved" in text

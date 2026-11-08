@@ -206,8 +206,8 @@ mkdir -p "$H/.local/bin"
 cat > "$H/.local/bin/agentctl" <<EOF
 #!/bin/bash
 case "\$1" in
-  list)   echo "run-deadbeef  coder  pid=1  1m  vivy  — Task: x";;
-  status) echo "worktree:     $H/Convivy/worktrees/vivy.coder-something";;
+  list)   echo "run-deadbeef  coder  pid=1  1m  cartographer  — Task: x";;
+  status) echo "worktree:     $H/Convivy/worktrees/cartographer.coder-something";;
 esac
 EOF
 chmod +x "$H/.local/bin/agentctl"
@@ -284,14 +284,14 @@ cat > "$H/.local/bin/agentctl" <<EOF
 #!/bin/bash
 case "\$1" in
   list)
-    echo "run-aaa1  coder                  pid=1  1m  vivy  — Task: x"
-    echo "run-bbb2  reviewer               pid=2  1m  vivy  — Task: x"
+    echo "run-aaa1  coder                  pid=1  1m  cartographer  — Task: x"
+    echo "run-bbb2  reviewer               pid=2  1m  cartographer  — Task: x"
     echo "run-ccc3  planning-orchestrator  pid=3  1m  agent-platform  — Task: x"
     ;;
   status)
     case "\$2" in
       run-ccc3) echo "worktree:     $H/Convivy/agent-platform";;
-      *)        echo "worktree:     $H/Convivy/worktrees/vivy.something";;
+      *)        echo "worktree:     $H/Convivy/worktrees/cartographer.something";;
     esac
     ;;
 esac

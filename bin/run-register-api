@@ -184,6 +184,13 @@ def _run_is_private(run: dict, snapshot: "dict | None") -> bool:
     closed, so an unreadable registry, an unreadable `meta.json`, or a `repo`
     that is not even slug-shaped, excludes a row rather than serving it.
 
+    THE NAME PREDATES THE WALLED-OFF CHECK BELOW AND IS KEPT ANYWAY, the same
+    way `bin/agentctl`'s `_dispatching_crew()` kept its name once security
+    review (run-edf8f7af) extended it to gate `walled_off_slugs()` too: every
+    caller already reads this function's answer as "exclude this row," not
+    literally "this crew is marked private," and a rename would touch every
+    call site for no behavioural gain.
+
     THE `meta.json` READ BELOW GOES THROUGH `RP._read_meta_bounded`, NOT A
     PLAIN OPEN. That file sits inside the run's own writable directory —
     this daemon's ARCH-193-phase-2 review found the identical exposure in
@@ -194,8 +201,8 @@ def _run_is_private(run: dict, snapshot: "dict | None") -> bool:
     `repo` ALONE IS NOT ENOUGH — the same `--agents-dir` bypass
     `session_state._crew_is_shareable` (session_state.py) already closed one
     route over. `bin/agentctl`'s `resolve_agent()` honours `--agents-dir`
-    before it ever looks at `repo`, so `agentctl spawn <cfo-agent> --on
-    some-public-repo --agents-dir <root>/CFO/.claude/agents` writes
+    before it ever looks at `repo`, so `agentctl spawn <acme-agent> --on
+    some-public-repo --agents-dir <root>/ACME/.claude/agents` writes
     `repo: "some-public-repo"` into the registry while loading a black-box
     crew's agent. The first round of this PR checked only `repo`
     (`private_crew.is_private_slug`) and missed exactly this
@@ -207,8 +214,9 @@ def _run_is_private(run: dict, snapshot: "dict | None") -> bool:
     `run_id` or no readable `meta.json`.
 
     **THE SLUG-SHAPE GUARD BELOW RUNS BEFORE EITHER HALF OF THAT CHECK, AND
-    IS NOT OPTIONAL.** A `repo` like `"../CFO"` or `"cfo "` fails
-    `dispatch_is_private`'s exact `repo.lower() in private_slugs()` match, so
+    IS NOT OPTIONAL.** A `repo` like `"../ACME"` or `"acme "` fails
+    `dispatch_is_private`'s repo-string match (`projects.repo_is_private_unit`,
+    checked against every private unit's own key, `repos` and `aliases`), so
     the repo-only half never fires; with no `run_id` (or an unreadable
     `meta.json`) `agent_source` is `None` too, so the agent_source half
     answers `False` — a CLEAN return, not an exception. `_run_is_private`'s
@@ -234,12 +242,28 @@ def _run_is_private(run: dict, snapshot: "dict | None") -> bool:
     registry, a malformed entry — is treated as private, never let propagate
     and take the whole `/runs` route down, and never defaulted to public.
 
+    CALLED TWICE, ONCE PER SET — `projects.dispatch_is_private` itself knows
+    nothing of `walled_off_slugs()` (`platform/decisions/0100`, the operator's
+    own crew); it is a repo/agent_source match against whatever slug set and
+    snapshots it is handed, never hard-coded to `private_slugs()`. Passing it
+    `snapshot["walled_off_slugs"]`/`["walled_off_unit_repos"]` the same way a
+    second time reuses that exact comparison rather than re-deriving a second
+    one in this file — the identical repo-vs-key/repos/aliases match and the
+    identical agent_source-vs-home_path() containment check, just judged
+    against the walled-off set instead of the private one. A live gap this
+    closes: before this fix only `private_slugs()` was checked here, so a
+    walled-off crew's run — real `repo`, real `agent_source`, same shape as
+    any other dispatch — read as a confirmed-public row on `/runs`,
+    `/runs/<id>/facts`, `/runs/<id>/docs_fetched` and `/runs/<id>/docs_given`
+    alike, since all four route through this one function.
+
     `snapshot` is the per-request registry snapshot `Handler.do_GET` resolves
     once via `_resolve_registry_snapshot` — see that function's docstring for
-    why a fresh `private_slugs()`/`home_path()` read per row is unsafe under
-    this server's `ThreadingMixIn` concurrency. `None` means the registry
-    itself was unreadable at snapshot time, which fails closed the same as
-    any other unreadable-registry case: this run cannot be confirmed public.
+    why a fresh `private_slugs()`/`walled_off_slugs()`/`home_path()` read per
+    row is unsafe under this server's `ThreadingMixIn` concurrency. `None`
+    means the registry itself was unreadable (or either slug-set call raised)
+    at snapshot time, which fails closed the same as any other
+    unreadable-registry case: this run cannot be confirmed public.
     """
     repo = run.get("repo")
     if not isinstance(repo, str) or not SS._REPO_SLUG_RE.match(repo):
@@ -262,10 +286,17 @@ def _run_is_private(run: dict, snapshot: "dict | None") -> bool:
         meta = RP._read_meta_bounded(meta_path) if meta_path is not None else None
         agent_source = meta.get("agent_source") if isinstance(meta, dict) else None
     try:
+        if PJ.dispatch_is_private(
+                repo, agent_source,
+                private_slugs_snapshot=snapshot["private_slugs"],
+                home_paths_snapshot=snapshot["homes"],
+                private_unit_repos_snapshot=snapshot["private_unit_repos"]):
+            return True
         return PJ.dispatch_is_private(
             repo, agent_source,
-            private_slugs_snapshot=snapshot["private_slugs"],
-            home_paths_snapshot=snapshot["homes"])
+            private_slugs_snapshot=snapshot["walled_off_slugs"],
+            home_paths_snapshot=snapshot["homes"],
+            private_unit_repos_snapshot=snapshot["walled_off_unit_repos"])
     except Exception:
         return True
 
@@ -313,10 +344,31 @@ def _reload_project_registry() -> None:
 
 
 def _resolve_registry_snapshot() -> "dict | None":
-    """Read `projects.private_slugs()` and `projects.home_path()` ONCE per
+    """Read `projects.private_slugs()`, `projects.walled_off_slugs()`,
+    `projects.home_path()` and `projects.private_unit_repo_names()` ONCE per
     request, right after `_reload_project_registry`, and hand the SAME plain
     dict to every payload builder — and, under `/sessions`, on down into
     `_project_slug_for_cwd`.
+
+    `walled_off_slugs` (`platform/decisions/0100`, the operator's own crew)
+    is read and failed-closed exactly the way `private_slugs` is, immediately
+    beside it: `validate_registry` keeps the two fields mutually exclusive, so
+    this is a second, separate set, never a subset of `private_slugs`, and a
+    crew excluded from one response by `private_slugs` is never assumed to be
+    caught by the other. The live gap this closes: a walled-off crew's `repo`
+    or `home_dir` matches neither `private_slugs` nor anything that set's
+    aliases cover, so `_run_is_private` and `_sessions_payload`'s row filter
+    served it like any other public crew until both read this set too.
+
+    `private_unit_repos`/`walled_off_unit_repos` (each
+    `projects.private_unit_repo_names(...)`, called once per set) are built
+    from the SAME `private_slugs`/`walled_off_slugs` this function already
+    resolved, never a fresh call — `_run_is_private` hands each pair to
+    `dispatch_is_private` as its own `private_unit_repos_snapshot`, so the
+    repo-string half of that check (a unit's own `repos`/`aliases`, not only
+    its registry key — security-reviewer, PR #1015 round 1) is judged against
+    the same registry generation as the key half, for the identical reason the
+    `homes`/`homes_on_disk` dicts below are.
 
     EVERY PRIVACY DECISION THAT REACHES THIS RESPONSE reads this snapshot:
     `_run_is_private` and `_sessions_payload`'s own row filter both take
@@ -379,24 +431,26 @@ def _resolve_registry_snapshot() -> "dict | None":
     A slug whose `home_path()` cannot be resolved — for ANY reason, whether
     it RAISES (a malformed `home_dir`) or returns `None` (a registered
     project missing its `home_dir` entirely) — is dropped from both dicts,
-    and if that slug is itself private, fails the WHOLE snapshot closed:
-    returns `None`, the same as an unreadable registry, rather than silently
-    proceeding with that one crew's containment check skipped while every
-    other slug's still applies. Enumerating the raise case and the
-    None-return case as two separate rules is what let the None-return case
-    ship unguarded the first time (security-reviewer, round 5; round 6 for
-    the None case). An unresolved home on a public slug only drops it from
-    `homes`/`homes_on_disk`, under-reporting a `/sessions` row the same way a
-    missing directory does, and affects no privacy decision.
+    and if that slug is itself private OR walled off, fails the WHOLE
+    snapshot closed: returns `None`, the same as an unreadable registry,
+    rather than silently proceeding with that one crew's containment check
+    skipped while every other slug's still applies. Enumerating the raise
+    case and the None-return case as two separate rules is what let the
+    None-return case ship unguarded the first time (security-reviewer, round
+    5; round 6 for the None case). An unresolved home on a public slug only
+    drops it from `homes`/`homes_on_disk`, under-reporting a `/sessions` row
+    the same way a missing directory does, and affects no privacy decision.
 
     `None` means the registry read itself failed (missing or corrupt
-    `config/projects.json`) — every caller downstream fails closed on that
-    the same way it already failed closed on the equivalent per-call
-    exception before this change: `_run_is_private` treats it as "cannot
-    confirm public," `_sessions_payload` serves an empty list.
+    local file, an unreachable Library, or `private_slugs()`/
+    `walled_off_slugs()` itself raising) — every caller downstream fails
+    closed on that the same way it already failed closed on the equivalent
+    per-call exception before this change: `_run_is_private` treats it as
+    "cannot confirm public," `_sessions_payload` serves an empty list.
     """
     try:
         private_slugs = PJ.private_slugs()
+        walled_off_slugs = PJ.walled_off_slugs()
         homes: dict[str, Path] = {}
         homes_on_disk: dict[str, Path] = {}
         for slug in PJ.load():
@@ -405,14 +459,19 @@ def _resolve_registry_snapshot() -> "dict | None":
             except Exception:
                 home = None
             if home is None:
-                if slug in private_slugs:
+                if slug in private_slugs or slug in walled_off_slugs:
                     return None
                 continue
             homes[slug] = home
             if home.is_dir():
                 homes_on_disk[slug] = home
+        private_unit_repos = PJ.private_unit_repo_names(private_slugs)
+        walled_off_unit_repos = PJ.private_unit_repo_names(walled_off_slugs)
         return {"private_slugs": private_slugs, "homes": homes,
-                "homes_on_disk": homes_on_disk}
+                "homes_on_disk": homes_on_disk,
+                "private_unit_repos": private_unit_repos,
+                "walled_off_slugs": walled_off_slugs,
+                "walled_off_unit_repos": walled_off_unit_repos}
     except Exception:
         return None
 
@@ -443,13 +502,23 @@ _FACTS_PATH_RE = re.compile(r"^/runs/(.+)/facts$")
 
 
 def _facts_payload(run_id: str, snapshot: "dict | None") -> dict:
-    """`{found, agent, repo, review_sha, pr, review_role}`, read from `run_id`'s
-    own meta.json — covering an ENDED run as well as a live one, unlike `/runs`
-    (`registry.list_runs()`), which drops a run the moment it ends
-    (`registry.remove_run`). By the time the Library writes a review record
-    the reviewer run has almost always already finished, so this route
-    resolves the run directory directly rather than going through the
-    register.
+    """`{found, agent, repo, review_sha, pr, review_role, posted_verdict,
+    posted_pr}`, read from `run_id`'s own meta.json — covering an ENDED run as
+    well as a live one, unlike `/runs` (`registry.list_runs()`), which drops a
+    run the moment it ends (`registry.remove_run`). By the time the Library
+    writes a review record the reviewer run has almost always already
+    finished, so this route resolves the run directory directly rather than
+    going through the register.
+
+    `posted_verdict` and `posted_pr` are the verdict and PR this run itself
+    posted (meta.json's `review_verdict`/`review_pr`), empty for a run that
+    has not posted or is not review-class — so the Library can compare a
+    review record's claimed verdict against what the named run actually
+    posted, rather than trusting the record (issue_01M5FM2A102PKMQVKFE7HM30F0).
+    Both are written by `agentctl`'s `_record_posted_review` (bin/agentctl:9814),
+    called from `cmd_review_post` (bin/agentctl:19024) when the reviewer run
+    itself calls `agentctl review-post` — the same self-report every other
+    field here already is, not a second source of truth.
 
     EVERY FIELD BELOW IS SELF-REPORTED. `meta.json` is written inside the
     run's own writable directory, by the run it describes — `found` plus a
@@ -466,8 +535,8 @@ def _facts_payload(run_id: str, snapshot: "dict | None") -> dict:
     `review_role` is `facts.agent`'s role base (`review_protocol._review_base`)
     when it is review-class by exactly the rule `review_protocol.authenticate`
     applies (`review_protocol.is_review_class`, the same `REVIEW_AGENTS` +
-    `INTERNAL_APP_PREFIXES` handling), else the empty string — so a
-    crew-prefixed reviewer (`hollis-reviewer`) reports the same role a bare
+    `review_protocol.internal_app_prefixes()` handling), else the empty string — so a
+    crew-prefixed reviewer (`widget-reviewer`) reports the same role a bare
     one does (`reviewer`), and a non-review agent (a coder) reports `""`. The
     Library needs this to compare against a review record's own `role` field
     without re-deriving the review-class test itself; computed via the shared
@@ -493,10 +562,10 @@ def _facts_payload(run_id: str, snapshot: "dict | None") -> dict:
     function's own docstring: it re-derives `agent_source` from `run_id` +
     `started_at` via `session_state._run_meta_path`, the `--agents-dir`
     bypass check). A private crew's run answers ONLY `{"found": true,
-    "private": true}` — no agent, repo, review_sha, pr or review_role — so
-    the Library stores the record `unverified` without ever learning a
-    private crew's repository name, even indirectly through a field this
-    route would otherwise serve.
+    "private": true}` — no agent, repo, review_sha, pr, review_role,
+    posted_verdict or posted_pr — so the Library stores the record
+    `unverified` without ever learning a private crew's repository name,
+    even indirectly through a field this route would otherwise serve.
     """
     facts = RP.resolve_run_facts(run_id)
     if not facts.found:
@@ -508,7 +577,8 @@ def _facts_payload(run_id: str, snapshot: "dict | None") -> dict:
                    if RP.is_review_class(facts.agent, RP.REVIEW_AGENTS) else "")
     return {"found": True, "agent": facts.agent, "repo": facts.repo,
             "review_sha": facts.review_sha, "pr": facts.pr,
-            "review_role": review_role}
+            "review_role": review_role, "posted_verdict": facts.posted_verdict,
+            "posted_pr": facts.posted_pr}
 
 
 # --- /runs/<run_id>/docs_fetched: the documents a dispatch run has read so
@@ -669,7 +739,7 @@ def _docs_given_payload(run_id: str, snapshot: "dict | None") -> dict:
 # The data is already collected — `session_lifecycle.sessions()` for the tmux
 # roster, `session_state.session_state()` for one session's state — so this is
 # a new projection over existing collectors, not a new collection mechanism.
-SESSION_FIELDS = ("session", "state", "alive", "progressing", "last_event_age",
+SESSION_FIELDS = ("session", "crew", "state", "alive", "progressing", "last_event_age",
                   "ctx_pct", "agent_run_count", "working_on")
 WORKING_ON_FIELDS = ("text", "age", "since", "stale")
 
@@ -733,7 +803,7 @@ def _project_slug_for_cwd(cwd, homes: "dict[str, Path]") -> "str | None":
     return None
 
 
-def _session_row(name: str) -> dict:
+def _session_row(name: str, crew: str) -> dict:
     """One session's Orient-facing row, built field by field from
     `session_state()`'s output — never a spread, never a nested sub-object,
     never a forwarded array. `session_state()`'s own payload carries the
@@ -745,6 +815,14 @@ def _session_row(name: str) -> dict:
     Naming every scalar here, one at a time, means a field left out of this
     builder cannot appear in the response at all, and a field forgotten from
     `SESSION_FIELDS` is a blank column in Orient rather than a silent leak.
+
+    `crew` is the slug `_sessions_payload`'s own row filter already resolved
+    via `_project_slug_for_cwd` — passed in rather than re-resolved here, so
+    this route never asks "which project" twice for the one session, and
+    never risks the two answers disagreeing under this server's threaded
+    concurrency (see `_resolve_registry_snapshot`'s docstring on why a second,
+    unsnapshotted resolve would be the same staleness window that function
+    exists to close).
 
     `working_on`, not `working_on_derived`: a working-on line is text the co
     wrote about itself for someone watching its pane — authored for display.
@@ -769,6 +847,7 @@ def _session_row(name: str) -> dict:
     working_on = state.get("working_on") or {}
     return {
         "session": name,
+        "crew": crew,
         "state": state.get("state"),
         "alive": state.get("alive"),
         "progressing": state.get("progressing"),
@@ -785,19 +864,31 @@ def _session_row(name: str) -> dict:
 
 
 def _sessions_payload(snapshot: "dict | None") -> dict:
-    """Every session backing a registered, non-private project — an
-    ALLOWLIST, not an exclusion of black-box crews, and the two are not the
-    same filter here. The live tmux session list also holds the operator's
-    personal-assistant surfaces (`ask`, `ask--audio`, `Car`, `Tennis`) —
-    not projects at all, and for these the session NAME is itself the
-    content (`ask--audio` names its own topic). `is_private_slug` answers
-    `False`, not `UNKNOWN`, for a name that is not in the registry at all —
-    an "exclude when private" filter would read that `False` as "safe to
-    serve" and pass every one of these straight through. So a row is served
-    only when the session's cwd resolves (via `_project_slug_for_cwd`, by
-    `home_dir`, not by matching the tmux session name to a slug) to a slug
-    that IS in the registry, and that slug is not in `projects.
-    private_slugs()`.
+    """Every session backing a registered, non-private, non-walled-off
+    project — an ALLOWLIST, not an exclusion of black-box crews, and the two
+    are not the same filter here. The live tmux session list also holds the
+    operator's own personal surfaces, one per topic and named for it (`Car`,
+    `Tennis`) — not projects at all, and absent from the registry, so
+    `_project_slug_for_cwd` answers `None` for them and this filter never
+    reaches a slug lookup. `is_private_slug` answers `False`, not `UNKNOWN`,
+    for a name that is not in the registry at all — an "exclude when
+    private" filter would read that `False` as "safe to serve" and pass
+    every one of these straight through.
+
+    THE WALLED-OFF CREW ITSELF IS A DIFFERENT CASE FROM THE PERSONAL-TOPIC
+    SESSIONS ABOVE: it IS a registered project (`platform/decisions/0100`
+    requires it, so the platform knows it exists), with its own `home_dir` —
+    so a `co` session whose cwd is that crew's home DOES resolve to a real
+    slug via `_project_slug_for_cwd`, and was served with that slug as its
+    `crew` field until this filter also excluded `projects.
+    walled_off_slugs()` (live read 2026-11-02 against main 17d979579). So a
+    row is served only when the session's cwd resolves (via
+    `_project_slug_for_cwd`, by `home_dir`, not by matching the tmux session
+    name to a slug) to a slug that IS in the registry, and that slug is in
+    neither `projects.private_slugs()` nor `projects.walled_off_slugs()`.
+    That same resolved slug is handed to `_session_row` as `crew` — the
+    row's own source-stated attribution — rather than resolved a second time
+    there.
 
     A session whose cwd cannot be resolved to a registered project is
     OMITTED, not served as an unscoped row. This can under-report: an idle
@@ -807,22 +898,25 @@ def _sessions_payload(snapshot: "dict | None") -> dict:
     looser filter here — left to whoever hits it.
 
     `snapshot` is the per-request registry snapshot `Handler.do_GET` resolves
-    once via `_resolve_registry_snapshot` — `private_slugs` for the row
-    filter below, `homes_on_disk` threaded on into `_project_slug_for_cwd`,
-    so both the cwd resolution and the privacy check for every row in this
-    one response are judged against the SAME registry generation (round 4,
-    reviewer + security-reviewer; see `_resolve_registry_snapshot`'s
-    docstring for the staleness window that closed, and for why cwd
-    resolution reads the on-disk subset rather than the same `homes` dict
-    the privacy check uses). `None` means the registry read itself failed —
-    an unreadable registry means NO row can be confirmed non-private, so
-    this answers an empty list rather than letting the exception crash the
-    request or, worse, skipping the filter and serving every session
-    unfiltered. This function makes no `projects.py` call of its own.
+    once via `_resolve_registry_snapshot` — `private_slugs`/`walled_off_slugs`
+    for the row filter below, `homes_on_disk` threaded on into
+    `_project_slug_for_cwd`, so both the cwd resolution and the privacy check
+    for every row in this one response are judged against the SAME registry
+    generation (round 4, reviewer + security-reviewer; see
+    `_resolve_registry_snapshot`'s docstring for the staleness window that
+    closed, and for why cwd resolution reads the on-disk subset rather than
+    the same `homes` dict the privacy check uses). `None` means the registry
+    read itself failed, including `private_slugs()` or `walled_off_slugs()`
+    itself raising — an unreadable registry means NO row can be confirmed
+    non-private and non-walled-off, so this answers an empty list rather than
+    letting the exception crash the request or, worse, skipping the filter
+    and serving every session unfiltered. This function makes no
+    `projects.py` call of its own.
     """
     if snapshot is None:
         return {"generated_at": T.now_iso(), "sessions": []}
     private = snapshot["private_slugs"]
+    walled_off = snapshot["walled_off_slugs"]
     homes = snapshot["homes_on_disk"]
     listed = SL.sessions().get("sessions") or []
     rows = []
@@ -833,10 +927,10 @@ def _sessions_payload(snapshot: "dict | None") -> dict:
         if not isinstance(name, str) or not name:
             continue
         slug = _project_slug_for_cwd(entry.get("path"), homes)
-        if slug is None or slug in private:
+        if slug is None or slug in private or slug in walled_off:
             continue
         try:
-            rows.append(_session_row(name))
+            rows.append(_session_row(name, slug))
         except Exception:  # noqa: BLE001 — one bad session must not sink the batch
             continue
     return {"generated_at": T.now_iso(), "sessions": rows}

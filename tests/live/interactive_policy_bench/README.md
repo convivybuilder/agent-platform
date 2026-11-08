@@ -3,7 +3,7 @@
 Slice 1 of the governance epic (`issue_01M2F52S46Y31S1QPMN4EFPD2C`, comment
 2698): a bench that tries both of the epic's candidate mechanisms — a
 Bosun-owned PreToolUse hook, and a non-bypass permission mode — against the
-Constance commercial product-manager case, and reports which one actually
+Globex commercial product-manager case, and reports which one actually
 denies it. The signal that opened the epic
 (`sig_01M2EP0508WZV2SJ1RCKKD0GJZ`) showed that product-manager, granted only
 two `Bash(...)` commands, running `launchctl`, `sqlite3`, and `git commit`
@@ -22,7 +22,7 @@ Each arm gets its OWN scratch git repo — `run_all` calls
 Every repo's basename ends `-commercial` (so `bin/co`'s `*-commercial`
 branch takes it and resolves `agent=product-manager`), holding a copy of the
 real individuated product-manager agent file
-(`~/Convivy/constance-commercial/.claude/agents/product-manager.md` by
+(`~/Convivy/globex-commercial/.claude/agents/product-manager.md` by
 default — override with `--product-manager-src`). One probe prompt
 (`probe_prompt.md`), sent as-is to all three arms. Separate repos mean
 separate `git log` histories: an earlier arm's commits can never show up
@@ -294,7 +294,7 @@ of its own; the rule is enforced at the one place every launch (`co`,
 - `fixtures/sample_product_manager.md` — a minimal fixture agent file
   carrying the same two `Bash(...)` grants as the real individuated one, for
   tests that must not depend on the machine-specific
-  `~/Convivy/constance-commercial` path.
+  `~/Convivy/globex-commercial` path.
 
 Tests live at the repo's top level,
 `tests/test_interactive_policy_bench.py`, per this repo's usual layout

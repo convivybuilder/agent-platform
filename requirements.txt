@@ -8,7 +8,7 @@
 #   knowledge.py       → PyYAML
 #   knowledge-ctx      → PyYAML
 #   mcp-kb-server      → mcp
-#   notion-migrate     → requests (Notion API)
+#   lib/agent-platform/notify.py → requests
 #   lib/agent-platform/deck_signature.py (agentctl `kb apply`, a Deck-signed
 #   save, library-protocol.md §2.2) → cryptography
 #   agentctl, slack.py, registry.py, telemetry.py, worktrees.py, budget.py,
@@ -21,3 +21,6 @@ PyYAML==6.0.3
 mcp==1.28.1
 requests==2.34.2
 cryptography==50.0.1
+# Floor, not a pin: requests pulls certifi in transitively, and this floor
+# drops the eMudhra roots the Render advisory reports compromised.
+certifi>=2026.10.23

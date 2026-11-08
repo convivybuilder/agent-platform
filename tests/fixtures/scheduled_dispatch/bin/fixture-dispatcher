@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# A committed, always-present stand-in for a real scheduled dispatcher.
+#
+# tests/test_scheduled_dispatch_origin.py's
+# test_a_real_dispatchers_origin_reaches_a_child_process runs against every
+# plist its sweep finds dispatching agents outside KNOWN_UNFIXED. Once
+# platform/decisions/0102 and 0103 retired com.convivy.weekly-consulting.plist
+# — the one plist that used to be that list's sole non-excluded member — the
+# list emptied out and the parametrized test silently SKIPPED rather than
+# failed (security review, round 1). This script and the plist beside it give
+# that test a real file to run so it can never go empty again.
+#
+# Never installed, scheduled, or run by anything but that one test.
+set -euo pipefail
+
+export AGENT_RUN_ORIGIN=scheduled
+
+# Real code, not a comment, so _dispatches_agents() classifies this file the
+# same way it classifies a genuine shell launcher — but never reached: the
+# test truncates this file right after the export above and runs only that
+# prelude.
+agentctl spawn fixture-agent --on fixture-repo --foreground --task "synthetic fixture dispatcher, never actually invoked"

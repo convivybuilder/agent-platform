@@ -155,7 +155,7 @@ def test_a_handoff_in_a_bucket_past_the_thin_window_survives_thinning(R, tmp_pat
     in a bucket 35+ days old. Thinning must keep it; the 100-day prune still bounds it."""
     old_day = TODAY - datetime.timedelta(days=36)
     day_dir = _day(tmp_path, old_day.isoformat())
-    run_dir = _run_dir(day_dir, "co-vivy-0914", {"handoff.md": "# handoff\n",
+    run_dir = _run_dir(day_dir, "co-widget-0914", {"handoff.md": "# handoff\n",
                                                  "transcript.jsonl": "x\n"})
 
     R.apply_thin(tmp_path, TODAY, days=R.THIN_DAYS)

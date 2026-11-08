@@ -125,7 +125,7 @@ def test_record_appends_idempotently_and_drops_tools(orchestrator_tokens, tmp_pa
     monkeypatch.setenv("AGENTCTL_SLACK_DRY_RUN", "1")
     monkeypatch.setattr(orchestrator_tokens, "HISTORY", tmp_path / "history.jsonl")
     rec = {"date": "2026-06-28", "run": "run-orch", "model": "claude-sonnet-4-6",
-           "product": "vivy", "usd": 2.5, "api_requests": 120,
+           "product": "widget", "usd": 2.5, "api_requests": 120,
            "cache_read_tokens": 5_000_000, "uncached_input_tokens": 100_000,
            "output_tokens": 40_000, "avg_context_tokens": 42_500,
            "tool_calls": 30, "tools": {"Bash": 20, "Read": 10}}
@@ -147,7 +147,7 @@ def test_record_writes_history_for_every_night(orchestrator_tokens, tmp_path, mo
     def rec(run, usd):
         monkeypatch.setattr(orchestrator_tokens, "HISTORY", tmp_path / f"{run}.jsonl")
         return [{"date": "2026-07-04", "run": run, "usd": usd, "api_requests": 100,
-                 "cache_read_tokens": 1_000_000, "product": "sous-chef",
+                 "cache_read_tokens": 1_000_000, "product": "initech",
                  "agent": "overnight-triage"}]
 
     # Under any baseline: history is written.

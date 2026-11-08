@@ -106,9 +106,11 @@ itself.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import subprocess
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -137,8 +139,97 @@ FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 SEVEN_DAY_WINDOW_SECONDS = 7 * 24 * 60 * 60
 _RESETS_AT_SLACK_SECONDS = 60 * 60
 
+# WHICH ACCOUNT WROTE A READING (CQ·517, issue_01M5A9TV4BDFNKX4698V5YV4TV). A
+# reading carries no account id, so after the operator switched subscriptions
+# on 2026-10-19 the hold kept reading the old account's 99% seven-day window
+# and held every dispatch until that account's reset, while the new account
+# sat at 1%. No run could start to write a fresher reading, because the hold
+# blocked every start. Each run now records the live account in its own
+# directory at spawn (`record_account`), and a reader given the live account
+# skips every candidate that recorded another one, or none: the first run
+# under a new account is what writes its next reading.
+#
+# `claude-sub use` swaps the live Keychain credential without refreshing
+# ~/.claude.json's cached `oauthAccount` (claude-sub's own verify step says so),
+# so `claude-sub current` is asked first; it matches the live refresh token
+# against each saved slot offline. A `/login` to an account with no saved slot
+# leaves it empty, and that `/login` is also what refreshes `oauthAccount`, so
+# `oauthAccount.emailAddress` is the fallback. The account is stored as a
+# sha256 digest of the lower-cased email, so run records carry no address.
+ACCOUNT_FILE = "claude_account"
+CLAUDE_SUB_CMD = "claude-sub"
+CLAUDE_SUB_TIMEOUT_SECONDS = 5
+CLAUDE_JSON_PATH: Path | None = None  # None: Path.home() / ".claude.json", at call time
 
-def read_five_hour_window(runs_root: Path, now: float | None = None) -> dict | None:
+
+def _account_digest(email: object) -> str | None:
+    if not isinstance(email, str) or "@" not in email:
+        return None
+    return hashlib.sha256(email.strip().lower().encode()).hexdigest()
+
+
+def _claude_sub(*args: str) -> str:
+    try:
+        r = subprocess.run([CLAUDE_SUB_CMD, *args], capture_output=True, text=True,
+                           timeout=CLAUDE_SUB_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _claude_sub_email() -> str | None:
+    slot = _claude_sub("current").strip()
+    if not slot:
+        return None
+    for line in _claude_sub("list").splitlines():
+        sid, _, email = line.partition("\t")
+        if sid.strip() == slot:
+            return email.strip()
+    return None
+
+
+def _oauth_account_email() -> str | None:
+    path = CLAUDE_JSON_PATH or Path.home() / ".claude.json"
+    try:
+        data = json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return None
+    account = data.get("oauthAccount") if isinstance(data, dict) else None
+    return account.get("emailAddress") if isinstance(account, dict) else None
+
+
+def live_account() -> str | None:
+    """The digest of the Claude account new runs bill, or `None` when neither
+    source names one. Never raises."""
+    return _resolve_live_account()
+
+
+def _resolve_live_account() -> str | None:
+    try:
+        return _account_digest(_claude_sub_email()) or _account_digest(_oauth_account_email())
+    except Exception:
+        return None
+
+
+def record_account(run_dir: Path, account: str | None) -> None:
+    """Write *account* to the run's own `ACCOUNT_FILE`; nothing for `None`."""
+    if account is None:
+        return
+    try:
+        (Path(run_dir) / ACCOUNT_FILE).write_text(account + "\n")
+    except OSError:
+        pass
+
+
+def _recorded_account(transcript: Path) -> str | None:
+    try:
+        return (transcript.parent / ACCOUNT_FILE).read_text().strip() or None
+    except OSError:
+        return None
+
+
+def read_five_hour_window(runs_root: Path, now: float | None = None,
+                          account: str | None = None) -> dict | None:
     """The freshest recorded five-hour window reading under *runs_root* that
     has not yet reset, or `None` when nothing has ever recorded one.
 
@@ -154,6 +245,9 @@ def read_five_hour_window(runs_root: Path, now: float | None = None) -> dict | N
     transcript with no matching event at all. Callers that need a fixed
     clock (tests) pass it explicitly.
 
+    *account*, when given (the digest `live_account` returns), skips every
+    candidate whose run recorded a different account or none at all.
+
     A reading is kept only if its `utilization` is finite and not below 0
     (no upper bound: it can exceed 1.0) and its `resetsAt` passes
     `resets_at_is_plausible`.
@@ -165,10 +259,11 @@ def read_five_hour_window(runs_root: Path, now: float | None = None) -> dict | N
     spawn preflight, a per-tool-call hook) that must never block or crash on
     a scan that came up empty.
     """
-    return _read_window(runs_root, _tail_five_hour_reading, now)
+    return _read_window(runs_root, _tail_five_hour_reading, now, account)
 
 
-def read_seven_day_window(runs_root: Path, now: float | None = None) -> dict | None:
+def read_seven_day_window(runs_root: Path, now: float | None = None,
+                          account: str | None = None) -> dict | None:
     """The seven-day twin of `read_five_hour_window`: the freshest recorded
     `unifiedWindows.seven_day` reading that has not yet reset, or `None`.
 
@@ -178,10 +273,11 @@ def read_seven_day_window(runs_root: Path, now: float | None = None) -> dict | N
     its plausibility bound is `SEVEN_DAY_WINDOW_SECONDS`, not the five-hour
     one. A transcript carrying only a five-hour reading is no seven-day
     reading, and the scan moves on to the next candidate."""
-    return _read_window(runs_root, _tail_seven_day_reading, now)
+    return _read_window(runs_root, _tail_seven_day_reading, now, account)
 
 
-def _read_window(runs_root: Path, tail, now: float | None) -> dict | None:
+def _read_window(runs_root: Path, tail, now: float | None,
+                 account: str | None = None) -> dict | None:
     """The shared candidate walk behind both window readers: the first
     candidate, freshest-mtime first, whose `tail(path, now, per_file_budget)`
     reading has not yet reset. `tail` is one of the `_tail_*_reading`
@@ -205,6 +301,8 @@ def _read_window(runs_root: Path, tail, now: float | None) -> dict | None:
     for path in candidates:
         if budget <= 0:
             break
+        if account is not None and _recorded_account(path) != account:
+            continue
         per_file_budget = min(MAX_BYTES_READ_PER_FILE, budget)
         try:
             reading, consumed = tail(path, now, per_file_budget)

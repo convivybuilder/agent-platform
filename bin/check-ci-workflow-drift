@@ -1,0 +1,769 @@
+#!/usr/bin/env python3.11
+"""check-ci-workflow-drift — reports a registered repo whose declared
+`ci_workflows` (the project registry) differ from the pull-request workflow
+files GitHub actually lists for it (CQ·570, issue_01M5VPQ9Z92C58R3MPGDNCA7JM).
+
+WHY. CQ·569 (issue_01M5VPJEV6F0XDSJX64TY5MRAV) found five registered repos
+declaring `ci_workflows: {<repo>: []}` though each had a real
+`.github/workflows/ci.yml` — nothing noticed, so their pull requests were
+never CI-captured. This is the standing check that catches the next one:
+read-only, run daily, reporting drift rather than fixing it.
+
+AUTHENTICATES AS THE INSTALL'S OWN GITHUB APP, the same App
+`bin/ci-result-capture` already mints through (`github_app.installed_app()`)
+— see `_load_ci_result_capture` below for exactly what is reused from it and
+why this never mints a second credential path of its own.
+
+WHAT COUNTS AS A REPO TO CHECK: every repo of every registry unit that is
+`lifecycle: active` and not `private` — `projects.load`'s own filter,
+mirrored here rather than called through `ci_result_capture.tracked_pairs`.
+See `declared_rows`'s own docstring for why that function, despite doing
+almost this same walk, cannot be reused for the walk itself: it would hide
+exactly the bug CQ·569 found.
+
+HOW RUNS ON PULL_REQUEST IS READ FROM GITHUB. There is no GitHub endpoint
+that lists a repo's workflows by trigger event — `GET
+.../actions/workflows` lists registered workflows with no trigger info, and
+`GET .../actions/workflows/{id}/runs?event=pull_request` only reflects runs
+that have already happened, which a correctly configured but rarely
+triggered workflow might not have any of. This instead reads each workflow
+file's own `on:` key directly (the Contents API, decoding its base64 body,
+the same two-call shape `kb_audit.audit_access`'s own workflow-files surface
+already uses against this org) and parses it with `yaml.safe_load` —
+checking BOTH the string key `"on"` and the boolean key `True`, because
+unquoted YAML 1.1 (what `safe_load` implements) reads a bare `on:` scalar
+key as the boolean `True`, not the string `"on"` — the well known GitHub
+Actions YAML gotcha.
+
+Each workflow file is then classified into exactly one of three classes
+(`_pull_request_trigger_class`), not a single yes/no: `"every_pr"` (a
+`pull_request` trigger with neither `paths` nor `paths-ignore` — every pull
+request runs it, including one that also carries `branches`,
+`branches-ignore` or `types`, since none of those skip a pull request based
+on what it changed), `"filtered_pr"` (a `pull_request` trigger carrying
+either of those two keys — some pull requests never run it), or `"not_pr"`
+(no `pull_request` trigger at all, including `pull_request_target` — a
+different trigger this check is not asked to fold in, and including a
+`schedule`- or `workflow_dispatch`-only workflow). A string or list `on:`
+form names events only and carries no filter keys, so a `pull_request`
+found there is always `"every_pr"`.
+
+A registered repo's `declared` workflow list and GitHub's own files compare
+like with like: an `"every_pr"` file is exactly what `declared` is meant to
+list, a `"not_pr"` file (declared or not) is irrelevant to drift either way,
+and a `"filtered_pr"` file (declared or not) is never drift — it gets its
+own `path_filtered` finding instead, since requiring it on every pull
+request would leave a pull request outside its path filter waiting on a
+check that never runs (issue_01M5Z5EN8TP04QBFM2Z7X8MPSJ: the first
+post-merge run after PR #1046, main e956dfc6f, 2026-10-27, read two false
+drift rows this way — a repo declaring `ci.yml` whose schedule-only second
+workflow GitHub does not expect declared at all, and a repo declaring
+`ci.yml` whose second workflow's `pull_request` trigger was narrowed to one
+path, which every pull request outside that path would otherwise wait on
+forever). The same issue's first post-merge run after PR #1047, main
+f1a280bbe, 2026-10-27, then read four DECLARED workflows as `path_filtered`
+for a reason that was never real: each one's `pull_request` trigger was
+only `{branches: [main]}`, and `main` is each of those repos' default
+branch, so every pull request the check is about already ran it. `branches`
+and `branches-ignore` were in that run's filter-key list by the earlier
+brief's own error, not because either can skip a pull request based on
+what it changed; dropping those four required workflows out of the drift
+comparison on account of a key that cannot do that is why only `paths` and
+`paths-ignore` count as a filter below.
+
+REPORTING, NEVER FIXING. For a repo this run disagrees with the registry, it
+prints one line to stdout (always — this is this check's own dry-run/stdout
+mode, `--no-report` makes it the ONLY output) and posts one `kind: alert`
+signal through `signal_client.post_alert` (the same surface
+`bin/ci1-heartbeat` and `bin/check-kb-guards` — this platform's other
+scheduled anomaly checks — already report through; `mcp__ops__signal_log` is
+the MCP tool a live agent session calls, and this is a standalone launchd
+process with no such session). `dedup_key` is scoped to the UTC day, so a
+breach that persists logs once a day, not once a run, and a breach whose
+own shape changes (a different declared or GitHub list) logs again under a
+new key even within the same day.
+
+FIVE FINDING KINDS, reported through the same `_report` path:
+
+  - DRIFT: the declared list and GitHub's `"every_pr"`-classified list
+    disagree — a declared name with no file on GitHub at all, or an
+    undeclared `"every_pr"` file. A declared name whose file is `"not_pr"`
+    or `"filtered_pr"` is never drift on its own.
+  - PATH FILTERED: a `"filtered_pr"` workflow file, declared or not. Never
+    drift, and never changes the exit code — reported so the declared list
+    and GitHub's files stay visibly accounted for, one line per file naming
+    whether it is declared.
+  - NOT ON GITHUB: the repo is registered but is not one the owner's
+    convivy-bosun installation covers — read from `GET
+    /installation/repositories` with a metadata-only token (CQ·576), never
+    from a scoped `contents: read` mint's own refusal; today's two
+    local-only registered repos, with no remote yet, are exactly this case.
+    Reported, never a failure, and never folds the rest of that owner's
+    covered repos into "unchecked" — they are still minted for and checked.
+    A repo this read believed covered that still answers a repo-level 404
+    (renamed or deleted between the listing read and this pass's own
+    request) is reported the same way, through `repo_listing`'s own 404
+    handling.
+  - UNCHECKED: the repo's owner has no convivy-bosun installation this
+    pass (`GA.NotInstalled`), the owner's installation lookup or
+    installation-repository listing could not be read at all (neither a
+    confirmed installation nor a confirmed absence), or the `contents:
+    read` mint — scoped to exactly the repos that listing confirmed
+    covered — was itself refused for any other reason. Reported
+    as unchecked, never folded into "matching". The alert line names "no
+    convivy-bosun installation" only for the confirmed-no-installation case
+    (`GA.NotInstalled`); every other mint failure's alert instead names the
+    owner and the mint failure itself (round 2 of CQ·570 — a scoped-mint
+    refusal for a repo the installation does not cover used to be reported
+    with the no-installation sentence, sending the operator to install an
+    App that was already installed; CQ·576 stops that refusal from
+    happening at all, by never scoping a mint to an uncovered repo).
+  - COULD NOT BE CHECKED: GitHub's own listing failed for a reason that is
+    neither 200 nor 404 — a 403, a transient 5xx, a malformed response, a
+    workflow file that failed to parse. Reported with its reason, through
+    `_report`, same as the other kinds; never only logged to stderr, since
+    a silent skip here is exactly the failure mode CQ·570 exists to end.
+
+EXIT CODE. Non-zero (1) in three cases, 0 otherwise:
+
+  1. The check itself could not run at all — the App key is unusable, the
+     App JWT could not be minted, or the project registry could not be
+     read.
+  2. There was at least one repo to check (`rows`) and none of them got a
+     real HTTP 200 listing of its workflow directory — every one came back
+     "not on GitHub" or "could not be checked", or every owner's mint
+     itself failed so none was even attempted, "unchecked" across the
+     board. Neither proves anything about whether the mint still carries
+     `contents: read` — a silent permission regression (the mint accepted,
+     every listing call then refused with 403) must fail exactly this
+     loudly, not read as a quiet, empty-looking pass.
+  3. Any repo ended "unchecked" or "could not be checked" this pass for
+     any reason OTHER than GitHub confirming its owner has no
+     convivy-bosun installation at all (`GA.NotInstalled`): a failed or
+     ambiguous installation lookup (neither a confirmed installation nor
+     a confirmed absence — a 5xx on both the org and user lookup, say), a
+     failed installation-repositories listing, a refused or failed
+     contents mint (422 included), or a refused or failed workflow
+     listing (403 included). A failed read fails the run; only a
+     confirmed absence does not. Case 2 alone misses this: a run that
+     read 4 of 34 repos has at least one 200 listing, so case 2 never
+     triggers, even though 30 repos under installed owners went unchecked
+     (the steward, 2026-10-27).
+
+Never failed by a repo reported "registered but not on GitHub" (not in the
+installation's own repository list, or a repo-level 404) or by an owner
+GitHub confirms has no installation at all (`GA.NotInstalled`) — both are
+reported as findings, never as a failure, under case 2 and case 3 alike. An
+owner with no installation, or whose installation-repository listing or
+contents mint GitHub refused, is never "attempted" in case 2's sense — it
+is only ever reported unchecked. Drift and path-filtered findings never
+change the exit code: a declared-versus-GitHub difference, or a
+path-filtered file, is reported, never a reason to fail the run.
+
+This is the inverse of `check-kb-guards`'s own exit-code table (which maps
+a breach to 2) because the two checks answer different questions for their
+callers: `check-kb-guards`'s caller treats a breach as the thing
+`launchctl`'s own status should surface; here the schedule owns no gate a
+drift or not-found finding would feed, and a non-zero "it found something"
+would have launchd's own failure accounting (and anyone paging on it) treat
+an expected, reportable finding as an operational fault. A run that checked
+nothing, or whose repos went substantially unchecked for a reason other
+than a confirmed-no-installation owner, is different: nobody should read
+that as "nothing is wrong."
+
+Usage:
+    check-ci-workflow-drift [--no-report]
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import importlib.util
+import sys
+import urllib.request
+from importlib.machinery import SourceFileLoader
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
+
+import github_app as GA  # noqa: E402
+import projects as PR  # noqa: E402
+import signal_client as SC  # noqa: E402
+import yaml  # noqa: E402
+
+_APP_LABEL = "the install's GitHub App"
+
+_WORKFLOW_FILE_SUFFIXES = (".yml", ".yaml")
+
+# This script's own permission grant — distinct from `CRC._READ_ONLY_PERMISSIONS`,
+# which `ci-result-capture` mints with and which has no `contents` scope because
+# that script never reads a file's content. This one does (the Contents API,
+# `repo_listing` below), so it mints its own token with its own grant rather
+# than widen the shared constant for a script that does not need the scope.
+_DRIFT_READ_PERMISSIONS = {"actions": "read", "contents": "read", "metadata": "read"}
+
+
+def _load_ci_result_capture():
+    """`bin/ci-result-capture` itself — this check reuses its
+    `_READ_ONLY_PERMISSIONS`, its `GhTokenRefresher` class and its
+    `_pair_owner` helper rather than re-deriving any of them, so there is
+    exactly one place this platform mints a read token for the install's own
+    GitHub App from. `bin/` CLIs are extension-less and not importable as a
+    normal module — the same reason `bin/model-scorecard` loads
+    `bin/agentctl` this way."""
+    path = Path(__file__).resolve().parent / "ci-result-capture"
+    loader = SourceFileLoader("ci_result_capture", str(path))
+    mod = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("ci_result_capture", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+CRC = _load_ci_result_capture()
+
+
+# --- which repos to check, and what they declare ----------------------------
+
+
+def declared_rows() -> tuple[dict, ...]:
+    """One row per active, non-private registry unit's repo: `repo`
+    (owner/repo, via `projects.repo_github_slug`), `product` (the unit's own
+    slug) and `declared` (the unit's own `ci_workflows[repo]`, or the
+    `ci.yml` default — `projects.ci_workflows`'s own rule).
+
+    WALKS THE REGISTRY DIRECTLY, NOT THROUGH `ci_result_capture.tracked_pairs`,
+    even though the two walks are otherwise the same (active, not private;
+    `projects.repo_github_slug` for the owner) and `tracked_pairs` already
+    exists: that function emits one entry per TRACKED workflow FILE, built by
+    iterating `projects.ci_workflows(repo)` and appending one pair per name in
+    it — a repo whose own `ci_workflows` field is `[]` iterates zero times and
+    emits NO row there at all. That is the exact shape of the bug CQ·569
+    found (five repos declaring `ci_workflows: {repo: []}`): a walk that
+    skips a repo with nothing declared would skip precisely the repos this
+    check exists to catch. This walk keeps every repo regardless of how many
+    workflows it declares, including none.
+
+    Raises whatever `projects.load()` raises when the registry cannot be
+    read — the caller must refuse the run rather than check an empty or
+    partial list (see `main()`)."""
+    rows: list[dict] = []
+    for slug, unit in PR.load().items():
+        if unit.get("lifecycle") != "active" or unit.get("private") is True:
+            continue
+        for repo in unit.get("repos", []):
+            full_repo = PR.repo_github_slug(repo, unit=unit)
+            rows.append({"repo": full_repo, "product": slug,
+                        "declared": tuple(PR.ci_workflows(repo))})
+    return tuple(rows)
+
+
+# --- per-owner token minting (reused from ci-result-capture) ----------------
+
+
+def _owner_repos(rows: tuple[dict, ...]) -> dict[str, list[str]]:
+    """Which bare repo names (no owner prefix) this pass will check,
+    grouped by owner — the full candidate scope `mint_tokens` filters
+    against the installation's own coverage (`_installation_repos`) before
+    passing what survives to GitHub's `repositories=`. *rows* is already
+    `declared_rows()`'s own output, so it already excludes a skipped unit's
+    repo; an owner all of whose units were skipped has no entry here at
+    all, and `mint_tokens` mints nothing for it. This is why a public and a
+    `private: true` unit sharing one `github_owner` cannot both end up on
+    the same token: the private one's repo was never in *rows* to begin
+    with."""
+    owner_repos: dict[str, set[str]] = {}
+    for row in rows:
+        owner = CRC._pair_owner(row)
+        _, _, repo_name = row["repo"].partition("/")
+        owner_repos.setdefault(owner, set()).add(repo_name)
+    return {owner: sorted(names) for owner, names in owner_repos.items()}
+
+
+# The grant `_installation_repos` mints with, to learn which of an owner's
+# registered repos the installation actually covers — unscoped (no
+# `repositories=`, since that is exactly what this call is finding out) and
+# metadata-only, the same low-sensitivity grant this script held before
+# #1045 added the owner-scoped `contents: read` mint below it. Kept
+# distinct from `_DRIFT_READ_PERMISSIONS`: this token never reads a repo's
+# contents, only the installation's own repository list.
+_INSTALLATION_LIST_PERMISSIONS = {"metadata": "read"}
+
+
+def _installation_repos(jwt: str, installation_id: str, *,
+                        opener=urllib.request.urlopen) -> set[str]:
+    """Every repo (`"owner/repo"`) the convivy-bosun App's installation
+    *installation_id* actually covers — read through `GET
+    /installation/repositories` with a metadata-only, unscoped token
+    (`_INSTALLATION_LIST_PERMISSIONS`), paging through every page GitHub
+    reports (`per_page=100`, continuing while a page still came back
+    non-empty and the accumulated count is still under that page's own
+    `total_count` — `GA.request` carries no response headers, so there is
+    no `Link` header here to page by instead).
+
+    Raises `GA.Unreadable` when the token cannot be minted or any page's
+    listing call fails to answer 200 with a `repositories` list —
+    `mint_tokens` catches this exactly like a failed
+    `installation_for_owner` lookup, folding the whole owner into
+    "unchecked" (CQ·576: this is a failed READ, never a confirmed absence,
+    so it must never be read as "none of this owner's repos are
+    covered")."""
+    payload = GA.installation_token_payload(
+        jwt, installation_id, permissions=_INSTALLATION_LIST_PERMISSIONS, opener=opener)
+    token = payload["token"]
+    names: set[str] = set()
+    page = 1
+    while True:
+        code, listing = GA.request(
+            "GET", f"{GA.API}/installation/repositories?per_page=100&page={page}",
+            token, None, opener=opener)
+        if code != 200 or not isinstance(listing, dict):
+            raise GA.Unreadable(
+                f"the installation's repository list could not be read ({code})")
+        repos = listing.get("repositories")
+        if not isinstance(repos, list):
+            raise GA.Unreadable(
+                "the installation's repository list response carried no repositories")
+        for entry in repos:
+            full_name = entry.get("full_name") if isinstance(entry, dict) else None
+            if full_name:
+                names.add(full_name)
+        total_count = listing.get("total_count")
+        if not repos or not isinstance(total_count, int) or len(names) >= total_count:
+            break
+        page += 1
+    return names
+
+
+def mint_tokens(jwt: str, owner_repos: dict[str, list[str]]):
+    """For each owner in *owner_repos*: first learns which of its repos the
+    convivy-bosun installation actually covers (`_installation_repos`,
+    CQ·576), then mints one read-only `CRC.GhTokenRefresher` scoped to
+    exactly the covered ones — the same per-owner-installation mint shape
+    `ci_result_capture.main()` performs (`GA.installation_for_owner`,
+    `CRC.GhTokenRefresher`), reused here rather than re-derived so this
+    check authenticates through the same App and the same key
+    `ci-result-capture` already does — never a second credential path. The
+    grant differs: `_DRIFT_READ_PERMISSIONS`, not `CRC._READ_ONLY_PERMISSIONS`,
+    because `repo_listing` reads file content through the Contents API and
+    that needs `contents: read`, a scope `ci-result-capture` has no reason
+    to hold.
+
+    Each owner's contents-read token is ALSO scoped to the covered subset
+    of `owner_repos[owner]` via `GhTokenRefresher`'s own `repositories=`
+    (the same `installation_token_payload` parameter `github_app.mint` uses
+    to scope a token to one repo). Without this, `contents: read` would let
+    the token minted to check one repo under an owner read every OTHER
+    repo that owner's installation can see, including one `declared_rows`
+    deliberately excluded (a `private: true` unit sharing a `github_owner`
+    with an active public one). A repo in `owner_repos[owner]` the
+    installation does NOT cover is never placed in that `repositories=`
+    list at all — GitHub refuses the WHOLE mint with 422 the moment one
+    listed repo is not accessible to the installation (the production
+    failure this fix answers, PR #1045's post-merge run on 2026-10-27),
+    so leaving an uncovered repo out is what lets every covered repo under
+    the same owner still be minted for and checked.
+
+    The refresher itself, never a token string, is what this function
+    stores and returns: `repo_listing` resolves each refresher's own
+    current token immediately before every GitHub call it makes, through
+    `CRC._resolve_gh_token` — never once here at mint time, since an
+    installation token can expire partway through a run that reads many
+    repos.
+
+    Returns `(tokens, unchecked, not_found)`. `tokens` maps an owner to its
+    minted refresher — absent for an owner none of whose repos the
+    installation covers; no contents mint is attempted for one. `unchecked`
+    maps an owner this pass could not learn coverage for, or could not mint
+    a contents-read token for, to the `GA.Unreadable` raised while trying —
+    `GA.NotInstalled` (a subclass of it; GitHub's own confirmation the App
+    has no installation there) or any other `GA.Unreadable`. Keeping the
+    raised exception rather than just the owner's name is what lets
+    `finding_line` tell the confirmed-no-installation case from every other
+    failure apart (round 2 of CQ·570) rather than reporting one sentence
+    for both. `not_found` maps an owner to the bare names of its repos the
+    installation's own listing confirmed it does NOT cover — CQ·576's own
+    fix: these are reported `not_found` ("registered but not on GitHub"),
+    never folded into `unchecked` and never the reason a contents mint for
+    the REST of that owner's repos is skipped or fails."""
+    tokens: dict[str, object] = {}
+    unchecked: dict[str, GA.Unreadable] = {}
+    not_found: dict[str, set[str]] = {}
+    for owner in sorted(owner_repos):
+        try:
+            inst = GA.installation_for_owner(jwt, owner, label=_APP_LABEL)
+            inst_id = str(inst.get("id") or "")
+            if not inst_id:
+                raise GA.Unreadable("the installation carries no id")
+            covered = _installation_repos(jwt, inst_id)
+        except GA.Unreadable as e:
+            print(f"check-ci-workflow-drift: {owner}: the convivy-bosun installation "
+                 f"could not be confirmed, or its repository list could not be read "
+                 f"({e}); every {owner} repo is reported unchecked this pass",
+                 file=sys.stderr)
+            unchecked[owner] = e
+            continue
+
+        present = [name for name in owner_repos[owner] if f"{owner}/{name}" in covered]
+        missing = [name for name in owner_repos[owner] if f"{owner}/{name}" not in covered]
+        if missing:
+            not_found[owner] = set(missing)
+        if not present:
+            continue
+        try:
+            refresher = CRC.GhTokenRefresher(jwt, inst_id,
+                                             permissions=_DRIFT_READ_PERMISSIONS,
+                                             repositories=present)
+            refresher.token()
+            tokens[owner] = refresher
+        except GA.Unreadable as e:
+            print(f"check-ci-workflow-drift: {owner}: convivy-bosun installation "
+                 f"token could not be minted ({e}); {owner}'s covered repos are "
+                 f"reported unchecked this pass", file=sys.stderr)
+            unchecked[owner] = e
+    return tokens, unchecked, not_found
+
+
+# --- reading GitHub's own pull-request-triggered workflow list --------------
+
+
+# The two `pull_request` sub-keys that narrow which pull requests a
+# workflow runs on by what changed. A `pull_request` trigger carrying
+# either of these is "filtered_pr", never "every_pr" — requiring it on
+# every pull request would leave one outside the filter waiting on a
+# check that never runs. `branches`/`branches-ignore` narrow by target
+# branch, not by change, and every PR this check is about targets the
+# repo's default branch, so they leave a trigger "every_pr".
+_PR_FILTER_KEYS = ("paths", "paths-ignore")
+
+EVERY_PR = "every_pr"
+FILTERED_PR = "filtered_pr"
+NOT_PR = "not_pr"
+
+
+def _pull_request_trigger_class(doc) -> str:
+    """Classifies a parsed workflow document's `on:` trigger into exactly
+    one of `EVERY_PR`, `FILTERED_PR` or `NOT_PR` — never a plain yes/no,
+    since a `pull_request` trigger narrowed by `_PR_FILTER_KEYS` answers a
+    different question to a bare one. `pull_request_target` is `NOT_PR`,
+    like any other non-`pull_request` trigger — a different trigger this
+    check is not asked to fold in.
+
+    Checks both the string key `"on"` and the boolean key `True`: PyYAML's
+    `safe_load` (YAML 1.1) reads an unquoted `on:` scalar key as the boolean
+    `True`, not the string `"on"` — the GitHub Actions YAML gotcha every
+    workflow file is written against without knowing it. A string or list
+    `on:` form names events only and carries no filter keys, so a
+    `pull_request` found there is always `EVERY_PR`. A document missing
+    `on` entirely, or whose value is none of a string/list/mapping, is
+    `NOT_PR`."""
+    if not isinstance(doc, dict):
+        return NOT_PR
+    on = doc.get("on", doc.get(True))
+    if isinstance(on, str):
+        return EVERY_PR if on == "pull_request" else NOT_PR
+    if isinstance(on, list):
+        return EVERY_PR if "pull_request" in on else NOT_PR
+    if isinstance(on, dict):
+        if "pull_request" not in on:
+            return NOT_PR
+        filters = on["pull_request"]
+        if isinstance(filters, dict) and any(k in filters for k in _PR_FILTER_KEYS):
+            return FILTERED_PR
+        return EVERY_PR
+    return NOT_PR
+
+
+def repo_listing(full_repo: str, token, *, opener=urllib.request.urlopen):
+    """GitHub's own answer for *full_repo*: `("ok", classified, listed)`
+    where *classified* maps every workflow file's own name to its
+    `_pull_request_trigger_class` (`EVERY_PR`, `FILTERED_PR` or `NOT_PR`) —
+    never a bare name list, since the caller (`main()`) needs each file's
+    class to compare like with like rather than fold a schedule-only or
+    path-filtered file into the same bucket as one that runs on every pull
+    request. `("not_found", None, False)` when GitHub answers 404 for the
+    repo itself — the confirmed-absent case CQ·570 asks be reported, never
+    failed, since two registered repos have no GitHub remote today — or
+    `("error", reason, listed)` for any other failed read, which the caller
+    now reports as its own "could not be checked" finding, through
+    `_report`, rather than only logging it.
+
+    *listed* is `True` only when the workflow-directory contents listing
+    itself (the `GET .../contents/.github/workflows?ref=...` call below)
+    answered HTTP 200 — never for a repo-level 404, an absent-directory 404,
+    or a 403/5xx anywhere in the walk. This is the one signal `main()` uses
+    to tell a real, permission-working read from a run that minted a token
+    GitHub accepted but then refused every listing call: a confirmed-absent
+    repo or workflow directory proves nothing about whether `contents: read`
+    is still granted, so neither counts. A workflow FILE read failing after a
+    200 directory listing still leaves *listed* `True` — the directory read
+    that matters already succeeded.
+
+    *token* is a plain token string or a `CRC.GhTokenRefresher` — either way,
+    `CRC._resolve_gh_token(token)` is called again immediately before EVERY
+    `GA.request` below, never once at the top of this function: an
+    installation token can expire partway through a run that reads many
+    repos' workflow files, and a token resolved once here and reused would
+    repeat the exact 401-on-every-real-call bug `ci_result_capture.main()`
+    measured on 2026-10-25 (see `CRC.GhTokenRefresher`'s own docstring).
+
+    Reads the Contents API at the repo's own default branch, the same
+    two-call shape (`GET /repos/{repo}` for `default_branch`, then `GET
+    .../contents/.github/workflows?ref=<it>`) `kb_audit.audit_access`'s own
+    workflow-files surface already uses against this org — never the `git`
+    binary, never a clone."""
+    bearer, _ = CRC._resolve_gh_token(token)
+    code, payload = GA.request("GET", f"{GA.API}/repos/{full_repo}", bearer, None,
+                               opener=opener)
+    if code == 404:
+        return "not_found", None, False
+    default_branch = payload.get("default_branch") if code == 200 and isinstance(payload, dict) else None
+    if code != 200 or not default_branch:
+        return "error", f"repo could not be read ({code})", False
+
+    bearer, _ = CRC._resolve_gh_token(token)
+    code, payload = GA.request(
+        "GET", f"{GA.API}/repos/{full_repo}/contents/.github/workflows?ref={default_branch}",
+        bearer, None, opener=opener)
+    if code == 404:
+        return "ok", {}, False
+    if code != 200 or not isinstance(payload, list):
+        return "error", f"workflow directory could not be listed ({code})", False
+
+    names = sorted(
+        entry["name"] for entry in payload
+        if isinstance(entry, dict) and entry.get("type") == "file"
+        and str(entry.get("name", "")).endswith(_WORKFLOW_FILE_SUFFIXES))
+
+    classified: dict[str, str] = {}
+    for name in names:
+        bearer, _ = CRC._resolve_gh_token(token)
+        code, file_payload = GA.request(
+            "GET", f"{GA.API}/repos/{full_repo}/contents/.github/workflows/{name}"
+                  f"?ref={default_branch}",
+            bearer, None, opener=opener)
+        if code != 200 or not isinstance(file_payload, dict) or "content" not in file_payload:
+            return "error", f"{name} could not be read ({code})", True
+        try:
+            text = base64.b64decode(file_payload["content"]).decode("utf-8", "replace")
+            doc = yaml.safe_load(text)
+        except Exception as e:  # noqa: BLE001 — content this job did not author
+            return "error", f"{name} could not be parsed ({type(e).__name__})", True
+        classified[name] = _pull_request_trigger_class(doc)
+    return "ok", classified, True
+
+
+def _compare(declared: set[str] | tuple[str, ...], classified: dict[str, str]):
+    """Compares *declared* against GitHub's own *classified* files (the
+    `("ok", classified, ...)` `repo_listing` returns) like with like:
+    returns `(github_list, filtered_names)`.
+
+    `github_list` is the sorted list `main()` compares `sorted(declared)`
+    against, and is also what a `drift` finding's own alert line shows —
+    every `EVERY_PR` file (whether declared or not, so an undeclared one
+    still surfaces as a mismatch), plus any declared name that does have a
+    file on GitHub regardless of its class (so a declared `NOT_PR` or
+    `FILTERED_PR` file reads as accounted for, never as drift, while a
+    declared name with NO file on GitHub at all is left out and so still
+    mismatches). A plain `sorted(declared) != github_list` is therefore
+    drift exactly when some declared name has no file on GitHub at all, or
+    some undeclared file is `EVERY_PR` — never for a declared or undeclared
+    `FILTERED_PR` or `NOT_PR` file.
+
+    `filtered_names` is the sorted list of every `FILTERED_PR` file,
+    declared or not — `main()` reports each as its own `path_filtered`
+    finding, never as drift."""
+    github_list = sorted(
+        name for name, cls in classified.items()
+        if cls == EVERY_PR or name in declared)
+    filtered_names = sorted(name for name, cls in classified.items() if cls == FILTERED_PR)
+    return github_list, filtered_names
+
+
+# --- reporting ---------------------------------------------------------------
+
+
+def _utc_today() -> str:
+    return dt.datetime.now(dt.timezone.utc).date().isoformat()
+
+
+def finding_line(row: dict, kind: str, detail, owner: str) -> str:
+    """*detail* carries a different shape per *kind*: `drift`'s own
+    sorted GitHub list (the `EVERY_PR` files, plus any declared file that
+    is present under any class — what the comparison actually used),
+    `path_filtered`'s own `{"file": name, "declared": bool}` mapping,
+    `error`'s own reason string, the `GA.Unreadable` `mint_tokens` caught
+    for `unchecked` (see below), or `None` for `not_found`.
+
+    For `unchecked`, `detail` is the exception `mint_tokens` raised while
+    minting that owner's token. Only `GA.NotInstalled` — GitHub's own
+    confirmation the App has no installation on the owner — gets the "no
+    convivy-bosun installation" sentence; every other `GA.Unreadable`
+    (a failed or ambiguous installation lookup itself, the installation's
+    own repository list could not be read, an installation with no id, or
+    the contents-read mint itself refused) instead names the owner and
+    `str(detail)`, the mint failure's own
+    reason (round 2 of CQ·570 — the blanket "no installation" sentence was
+    false for every one of those causes and sent the operator to install
+    an App that was already installed, rather than to fix the registry
+    entry or the installation's repo selection; CQ·576 additionally stops
+    a repo the installation does not cover from ever reaching `unchecked`
+    at all — that case is `not_found` instead). `str(detail)`
+    never carries a token, JWT or key: every `GA.Unreadable` reachable here
+    is built from an HTTP status code, an owner name, or GitHub's own
+    `message` field on a REFUSED token-creation call, which by definition
+    never echoes a token nobody was issued (see `mint_tokens`'s own
+    docstring)."""
+    declared = sorted(row["declared"])
+    if kind == "drift":
+        return f"{row['repo']}: declared {declared} != GitHub {detail}"
+    if kind == "path_filtered":
+        declared_word = "declared" if detail["declared"] else "undeclared"
+        return (f"{row['repo']}: {detail['file']} is {declared_word} and runs on "
+                f"pull_request with a path filter; never compared for drift")
+    if kind == "not_found":
+        return f"{row['repo']}: registered but not on GitHub (declared {declared})"
+    if kind == "unchecked":
+        if isinstance(detail, GA.NotInstalled):
+            return (f"{row['repo']}: unchecked — no convivy-bosun installation for "
+                    f"{owner!r}; a person must install the convivy-bosun App on "
+                    f"{owner!r} (declared {declared})")
+        return (f"{row['repo']}: unchecked — {owner!r}'s convivy-bosun installation "
+                f"could not be used to read this repo this pass ({detail}) "
+                f"(declared {declared})")
+    if kind == "error":
+        return f"{row['repo']}: could not be checked ({detail})"
+    raise AssertionError(f"unknown finding kind: {kind!r}")
+
+
+def _dedup_key(repo: str, kind: str, detail: str, day: str) -> str:
+    digest = hashlib.sha256(detail.encode()).hexdigest()[:16]
+    return f"ci-workflow-drift:{repo}:{kind}:{digest}:{day}"
+
+
+def _report(row: dict, kind: str, detail, owner: str, day: str,
+           *, dry_run: bool) -> None:
+    line = finding_line(row, kind, detail, owner)
+    print(line)
+    if dry_run:
+        return
+    dedup_detail = f"{sorted(row['declared'])}|{detail}|{owner}"
+    title = f"[ci-workflow-drift] {line}"
+    body = (f"**Registry/GitHub CI-workflow drift.** {line}\n\n"
+           f"The crew registry's own `ci_workflows` field for `{row['repo']}` "
+           f"is what `bin/ci-result-capture` reads to know what to track; a "
+           f"wrong value here means a pull request's CI silently stops being "
+           f"captured (CQ·569).")
+    SC.post_alert("ci-workflow-drift", SC.sanitise_body(f"{title}\n\n{body}"),
+                 product=row["product"],
+                 dedup_key=_dedup_key(row["repo"], kind, dedup_detail, day),
+                 meta={"severity": "medium", "finding": kind})
+
+
+# --- entry point --------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="check-ci-workflow-drift",
+        description="Report a registered repo whose declared ci_workflows "
+                    "differ from GitHub's own pull-request workflow list.")
+    parser.add_argument("--no-report", action="store_true",
+                        help="print findings to stdout; do not post alert "
+                             "signals (dry run, safe to run by hand)")
+    opts = parser.parse_args(argv)
+
+    try:
+        app = GA.installed_app()
+    except GA.Unreadable as e:
+        print(f"check-ci-workflow-drift: {e}", file=sys.stderr)
+        return 1
+
+    problem = GA.key_problem(app.key_path, label=_APP_LABEL)
+    if problem:
+        print(f"check-ci-workflow-drift: {problem}", file=sys.stderr)
+        return 1
+
+    try:
+        rows = declared_rows()
+    except Exception as ex:
+        print(f"check-ci-workflow-drift: the project registry could not be "
+             f"read ({type(ex).__name__}: {ex}); refusing this run",
+             file=sys.stderr)
+        return 1
+
+    try:
+        jwt = GA.app_jwt(app.key_path, app.app_id)
+    except GA.Unreadable as e:
+        print(f"check-ci-workflow-drift: {e}", file=sys.stderr)
+        return 1
+
+    tokens, unchecked_owners, not_found_owners = mint_tokens(jwt, _owner_repos(rows))
+
+    day = _utc_today()
+    findings = 0
+    listed = 0
+    # A repo that still ends "unchecked" or "could not be checked" for any
+    # reason other than a confirmed `GA.NotInstalled` (exit-code case 3,
+    # module docstring): a failed or ambiguous installation lookup, a
+    # failed installation-repository listing, a 422 on the contents mint,
+    # or a refused/failed workflow listing. `rows and not listed` alone
+    # (case 2) misses this the moment even one other repo got a real 200
+    # listing — the production shape that read 4 of 34 repos and exited 0
+    # regardless (the steward, 2026-10-27). Never counts a `GA.NotInstalled`
+    # owner or a `not_found` repo — neither is a failure, under either exit
+    # case.
+    blocking = 0
+    for row in rows:
+        owner = CRC._pair_owner(row)
+        _, _, repo_name = row["repo"].partition("/")
+        if repo_name in not_found_owners.get(owner, ()):
+            _report(row, "not_found", None, owner, day, dry_run=opts.no_report)
+            findings += 1
+            continue
+        if owner in unchecked_owners:
+            detail = unchecked_owners[owner]
+            _report(row, "unchecked", detail, owner, day, dry_run=opts.no_report)
+            findings += 1
+            if not isinstance(detail, GA.NotInstalled):
+                blocking += 1
+            continue
+        status, detail, row_listed = repo_listing(row["repo"], tokens[owner])
+        if row_listed:
+            listed += 1
+        if status == "not_found":
+            _report(row, "not_found", None, owner, day, dry_run=opts.no_report)
+            findings += 1
+        elif status == "error":
+            _report(row, "error", detail, owner, day, dry_run=opts.no_report)
+            findings += 1
+            blocking += 1
+        else:
+            declared = set(row["declared"])
+            github_list, filtered_names = _compare(declared, detail)
+            if sorted(row["declared"]) != github_list:
+                _report(row, "drift", github_list, owner, day, dry_run=opts.no_report)
+                findings += 1
+            for name in filtered_names:
+                _report(row, "path_filtered", {"file": name, "declared": name in declared},
+                        owner, day, dry_run=opts.no_report)
+                findings += 1
+
+    print(f"check-ci-workflow-drift: {findings} finding(s) across {len(rows)} repo(s)")
+    if rows and not listed:
+        print("check-ci-workflow-drift: no repo's workflow directory could be "
+             "listed this pass; this run proved nothing, refusing it",
+             file=sys.stderr)
+        return 1
+    if blocking:
+        print(f"check-ci-workflow-drift: {blocking} repo(s) ended unchecked "
+             "or could not be checked this pass for a reason other than "
+             "GitHub confirming the owner has no installation; refusing "
+             "this run", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

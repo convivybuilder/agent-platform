@@ -47,19 +47,19 @@ def _init_repo(path):
 
 
 def test_resolve_repo_plain_repo(tmp_path):
-    repo = tmp_path / "vivy"
+    repo = tmp_path / "widget"
     _init_repo(repo)
-    assert hook._resolve_repo(str(repo)) == "vivy"
+    assert hook._resolve_repo(str(repo)) == "widget"
 
 
 def test_resolve_repo_worktree_resolves_to_primary(tmp_path):
     """A worktree named `agent-<hex>` resolves to its primary repo's product, not the
     worktree basename — the actual bug the operator saw on /activity."""
-    repo = tmp_path / "personal-assistant"
+    repo = tmp_path / "demo-assistant"
     _init_repo(repo)
     wt = tmp_path / "worktrees" / "agent-a562bc71051ec4c2d"
     _git(repo, "worktree", "add", "-b", "b1", str(wt))
-    assert hook._resolve_repo(str(wt)) == "personal-assistant"
+    assert hook._resolve_repo(str(wt)) == "demo-assistant"
 
 
 def test_resolve_repo_non_git_falls_back_to_basename(tmp_path):

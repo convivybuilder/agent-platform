@@ -407,14 +407,23 @@ def _config_deployments():
     return out
 
 
+# Keys pinned for a model id config.yaml no longer deploys, retained only so a
+# gateway_spend.jsonl row recorded under the old id still prices (ARCH-280-style
+# rename). Exempt from the config-mirror check below; each has its own
+# same-rates-as-the-current-id test.
+_RETIRED_PINNED_KEYS = {"deepseek-v4-flash"}
+
+
 def test_pinned_table_rates_match_config(spend_callback_mod):
-    """Every _PINNED_PRICES entry must mirror the matching config.yaml model_info
-    rates exactly — catches drift between the fallback table and the config. Runs
-    in any venv (no litellm needed)."""
+    """Every live _PINNED_PRICES entry must mirror the matching config.yaml
+    model_info rates exactly — catches drift between the fallback table and the
+    config. Runs in any venv (no litellm needed)."""
     table = spend_callback_mod._PINNED_PRICES
     by_basename = {lp.split("/")[-1]: rates
                    for _name, lp, rates in _config_deployments() if lp and rates}
     for key, prices in table.items():
+        if key in _RETIRED_PINNED_KEYS:
+            continue
         assert key in by_basename, f"_PINNED_PRICES[{key!r}] has no config.yaml model_info to mirror"
         for field in ("in", "cache_read", "out"):
             assert prices[field] == by_basename[key][field], \
@@ -443,6 +452,97 @@ def test_pinned_table_covers_every_litellm_unpriced_model(spend_callback_mod):
             assert key in table, (
                 f"{name} ({lp_model}) is not priced by LiteLLM but has no "
                 f"_PINNED_PRICES entry (key {key!r}) — its real spend would log $0")
+
+
+def test_fallback_prices_deepseek_from_pinned_table(spend_callback_mod, tmp_path):
+    """DeepSeek's pinned peak rates (CQ·515) must be in the fallback table too,
+    so a deepseek record prices correctly even on a request LiteLLM itself
+    left at response_cost 0."""
+    cb = spend_callback_mod.SpendCallback()
+    kwargs = _priced_kwargs(model="deepseek/deepseek-flash", cost=0.0, run_dir=str(tmp_path))
+    # 4,869,628 cache-miss + 320,668,926 cache-hit + 4,821,470 output tokens
+    cb._record(kwargs, _MockResponse(usage=_MockUsageCached(
+        prompt_tokens=4869628 + 320668926, completion_tokens=4821470,
+        cached_tokens=320668926)))
+    row = json.loads((tmp_path / "gateway_spend.jsonl").read_text().strip())
+    # 320668926*6e-9 + 4869628*3e-7 + 4821470*1.2e-6
+    expected = 320668926 * 0.000000006 + 4869628 * 0.0000003 + 4821470 * 0.0000012
+    assert row["usd"] == pytest.approx(round(expected, 6), rel=1e-6)
+    assert row["usd"] > 0
+
+
+def test_fallback_prices_deepseek_legacy_id_from_pinned_table(spend_callback_mod, tmp_path):
+    """`deepseek-v4-flash` has no stated retirement date, so a request LiteLLM
+    still echoes under it must price identically to the current id."""
+    cb = spend_callback_mod.SpendCallback()
+    kwargs = _priced_kwargs(model="deepseek/deepseek-v4-flash", cost=0.0, run_dir=str(tmp_path))
+    cb._record(kwargs, _MockResponse(usage=_MockUsageCached(
+        prompt_tokens=4869628 + 320668926, completion_tokens=4821470,
+        cached_tokens=320668926)))
+    row = json.loads((tmp_path / "gateway_spend.jsonl").read_text().strip())
+    expected = 320668926 * 0.000000006 + 4869628 * 0.0000003 + 4821470 * 0.0000012
+    assert row["usd"] == pytest.approx(round(expected, 6), rel=1e-6)
+    assert row["usd"] > 0
+
+
+def test_fallback_prices_deepseek_pro_from_pinned_table(spend_callback_mod, tmp_path):
+    """CQ·524 (model trial 2's second arm). DeepSeek's pinned peak rates for
+    deepseek-v4-pro must be in the fallback table too, so a record prices
+    correctly even on a request LiteLLM itself left at response_cost 0."""
+    cb = spend_callback_mod.SpendCallback()
+    kwargs = _priced_kwargs(model="deepseek/deepseek-v4-pro", cost=0.0, run_dir=str(tmp_path))
+    cb._record(kwargs, _MockResponse(usage=_MockUsageCached(
+        prompt_tokens=4869628 + 320668926, completion_tokens=4821470,
+        cached_tokens=320668926)))
+    row = json.loads((tmp_path / "gateway_spend.jsonl").read_text().strip())
+    expected = 320668926 * 0.000000044 + 4869628 * 0.00000132 + 4821470 * 0.00000396
+    assert row["usd"] == pytest.approx(round(expected, 6), rel=1e-6)
+    assert row["usd"] > 0
+
+
+def test_deepseek_pro_pinned_table_matches_config_yaml(spend_callback_mod):
+    """config.yaml's deepseek-pro model_info and spend_callback.py's
+    deepseek-v4-pro fallback price must never drift apart; a mismatch would
+    mean the ledger and the real bill disagree on which rate is pinned."""
+    table = spend_callback_mod._PINNED_PRICES
+    by_basename = {lp.split("/")[-1]: rates
+                   for _name, lp, rates in _config_deployments() if lp and rates}
+    assert "deepseek-v4-pro" in table, (
+        "spend_callback._PINNED_PRICES must carry a deepseek-v4-pro entry "
+        "mirroring config.yaml's deepseek-pro model_info")
+    deepseek_pro_cfg = by_basename["deepseek-v4-pro"]
+    deepseek_pro_table = table["deepseek-v4-pro"]
+    for field in ("in", "cache_read", "out"):
+        assert deepseek_pro_table[field] == deepseek_pro_cfg[field], (
+            f"spend_callback._PINNED_PRICES['deepseek-v4-pro']['{field}'] "
+            f"drifted from config.yaml's deepseek-pro model_info")
+
+
+def test_deepseek_pinned_table_matches_config_yaml(spend_callback_mod):
+    """config.yaml's deepseek model_info and spend_callback.py's deepseek
+    fallback price must never drift apart; a mismatch would mean the ledger
+    and the real bill disagree on which rate is pinned."""
+    table = spend_callback_mod._PINNED_PRICES
+    by_basename = {lp.split("/")[-1]: rates
+                   for _name, lp, rates in _config_deployments() if lp and rates}
+    assert "deepseek-flash" in table, (
+        "spend_callback._PINNED_PRICES must carry a deepseek-flash entry "
+        "mirroring config.yaml's deepseek model_info")
+    deepseek_cfg = by_basename["deepseek-flash"]
+    deepseek_table = table["deepseek-flash"]
+    for field in ("in", "cache_read", "out"):
+        assert deepseek_table[field] == deepseek_cfg[field], (
+            f"spend_callback._PINNED_PRICES['deepseek-flash']['{field}'] "
+            f"drifted from config.yaml's deepseek model_info")
+    # The retired id is config.yaml's responsibility no longer, but it must
+    # still carry the same rates as the current id (ARCH-280-style rename).
+    assert "deepseek-v4-flash" in table, (
+        "spend_callback._PINNED_PRICES must keep a deepseek-v4-flash entry "
+        "so a gateway_spend.jsonl row recorded under the legacy id still prices")
+    for field in ("in", "cache_read", "out"):
+        assert table["deepseek-v4-flash"][field] == deepseek_table[field], (
+            f"spend_callback._PINNED_PRICES['deepseek-v4-flash']['{field}'] "
+            f"drifted from the current deepseek-flash pin")
 
 
 def test_fallback_prefers_deployment_model_info(spend_callback_mod, tmp_path):

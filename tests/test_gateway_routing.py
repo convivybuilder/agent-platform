@@ -7,6 +7,8 @@ Pins the three load-bearing safety properties:
 """
 from __future__ import annotations
 
+import importlib.util
+
 import yaml
 from pathlib import Path
 
@@ -14,6 +16,14 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 GATEWAY_CONFIG = REPO / "gateway" / "config.yaml"
+
+
+def _load_spend_callback():
+    spec = importlib.util.spec_from_file_location(
+        "spend_callback", REPO / "gateway" / "spend_callback.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_is_gateway_model_anthropic_returns_false(agentctl):
@@ -40,7 +50,7 @@ def test_is_gateway_model_gateway_aliases_return_true(agentctl):
     zai/ prefix). glm's presence is load-bearing: it proves GATEWAY_MODEL_PREFIXES
     was extended with "zai/", without which glm fails closed to Anthropic-direct
     and never reaches the gateway."""
-    for alias in ("gpt5", "deepseek", "kimi", "mimo", "glm"):
+    for alias in ("gpt5", "deepseek", "deepseek-pro", "kimi", "mimo", "glm"):
         resolved = agentctl.model_id(alias)
         assert agentctl.is_gateway_model(resolved) is True, (
             f"is_gateway_model({resolved!r}) should be True (alias={alias!r})"
@@ -137,6 +147,70 @@ def test_gateway_aliases_match_yaml_model_list(agentctl):
             f"config.yaml model_name={alias_key!r} has litellm_params.model="
             f"{yaml_models[alias_key]!r} — update them in sync"
         )
+
+
+@pytest.mark.skipif(
+    not GATEWAY_CONFIG.exists(),
+    reason="gateway/config.yaml not present (PR-1 not yet merged); skipped"
+)
+def test_deepseek_lane_names_the_current_model_id_everywhere(agentctl):
+    """DeepSeek's pricing page (api-docs.deepseek.com/quick_start/pricing, read
+    2026-10-20) retired `deepseek-v4-flash` to a legacy, still-accepted alias
+    served by DeepSeek-V4.1-Flash-1017 under the `deepseek-flash` id. Every map
+    naming the deepseek deployment must agree on that current id — the alias,
+    the gateway config's deployment, the gateway-group reverse map, and the
+    spend fallback's price pin — or one silently drifts from the others
+    (gateway/config.yaml's own sync note)."""
+    spend_callback = _load_spend_callback()
+    config = yaml.safe_load(GATEWAY_CONFIG.read_text())
+    deepseek_entry = next(e for e in config["model_list"] if e["model_name"] == "deepseek")
+    current_id = "deepseek/deepseek-flash"
+
+    assert agentctl.MODEL_ALIASES["deepseek"] == current_id
+    assert deepseek_entry["litellm_params"]["model"] == current_id
+    assert agentctl.GATEWAY_MODEL_GROUPS[current_id] == "deepseek"
+    assert "deepseek-flash" in spend_callback._PINNED_PRICES
+
+
+@pytest.mark.skipif(
+    not GATEWAY_CONFIG.exists(),
+    reason="gateway/config.yaml not present (PR-1 not yet merged); skipped"
+)
+def test_deepseek_legacy_id_still_resolves_and_prices(agentctl):
+    """`deepseek-v4-flash` has no stated retirement date, so a run or a
+    gateway_spend.jsonl row recorded under it before the rename must keep
+    resolving for cost/status, and keep pricing, exactly like the current id."""
+    spend_callback = _load_spend_callback()
+    legacy_id = "deepseek/deepseek-v4-flash"
+
+    assert agentctl.GATEWAY_MODEL_GROUPS[legacy_id] == "deepseek"
+    assert agentctl.claude_model_arg(legacy_id) == "deepseek"
+    assert agentctl.model_display_name(legacy_id) == "deepseek"
+    assert "deepseek-v4-flash" in spend_callback._PINNED_PRICES
+    assert (spend_callback._PINNED_PRICES["deepseek-v4-flash"]
+            == spend_callback._PINNED_PRICES["deepseek-flash"])
+
+
+@pytest.mark.skipif(
+    not GATEWAY_CONFIG.exists(),
+    reason="gateway/config.yaml not present (PR-1 not yet merged); skipped"
+)
+def test_deepseek_pro_lane_names_the_current_model_id_everywhere(agentctl):
+    """CQ·524 (model trial 2's second arm). Every map naming the deepseek-pro
+    deployment must agree on `deepseek/deepseek-v4-pro` — the alias, the
+    gateway config's deployment, the gateway-group reverse map, and the
+    spend fallback's price pin — or one silently drifts from the others
+    (gateway/config.yaml's own sync note)."""
+    spend_callback = _load_spend_callback()
+    config = yaml.safe_load(GATEWAY_CONFIG.read_text())
+    deepseek_pro_entry = next(
+        e for e in config["model_list"] if e["model_name"] == "deepseek-pro")
+    current_id = "deepseek/deepseek-v4-pro"
+
+    assert agentctl.MODEL_ALIASES["deepseek-pro"] == current_id
+    assert deepseek_pro_entry["litellm_params"]["model"] == current_id
+    assert agentctl.GATEWAY_MODEL_GROUPS[current_id] == "deepseek-pro"
+    assert "deepseek-v4-pro" in spend_callback._PINNED_PRICES
 
 
 def test_gateway_url_returns_loopback(agentctl):

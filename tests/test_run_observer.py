@@ -31,7 +31,7 @@ def _iso(dt):
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _run(root, run_id, *, day="2026-08-25", agent="reviewer", repo="vivy",
+def _run(root, run_id, *, day="2026-08-25", agent="reviewer", repo="widget",
          pr=None, pid=999999, started=None, outcome=True, lines=3, meta=True,
          extra_meta=None):
     """A run directory shaped like a real one.
@@ -292,7 +292,7 @@ def test_every_meta_field_that_is_displayed_is_sanitised(obs, tmp_path, monkeypa
     d.mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps({
         "agent": "reviewer\x1b[2Kforged-agent",
-        "repo": "vivy\x1b[1Aforged-repo",
+        "repo": "widget\x1b[1Aforged-repo",
         "pid": 999999,
         "started_at": "2026-08-25T00:00:00Z\x1b[2Kforged-date",
     }))
@@ -315,7 +315,7 @@ def test_a_dry_run_that_lost_the_concurrency_race_is_not_reported(
     d = tmp_path / "2026-08-25" / "run-ffffffff"
     d.mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps(
-        {"agent": "coder", "repo": "vivy", "pid": 999999,
+        {"agent": "coder", "repo": "widget", "pid": 999999,
          "started_at": _iso(NOW - timedelta(hours=6))}))
     import telemetry as T
     T.write_outcome(d, exit_status="capacity_refused",
@@ -333,7 +333,7 @@ def test_a_corrupt_start_time_reports_rather_than_hides_the_run(
     d = tmp_path / "2026-08-25" / "run-12121212"
     d.mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps(
-        {"agent": "coder", "repo": "vivy", "pid": 999999, "started_at": "not-a-date"}))
+        {"agent": "coder", "repo": "widget", "pid": 999999, "started_at": "not-a-date"}))
     (d / "transcript.jsonl").write_text('{"type":"system"}\n')
     _sweep(obs, monkeypatch, tmp_path)
     assert "run-12121212" in capsys.readouterr().out
@@ -352,7 +352,7 @@ def test_a_future_start_time_reports_rather_than_hides_the_run(
     d = tmp_path / "2026-08-25" / "run-13131313"
     d.mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps(
-        {"agent": "reviewer", "repo": "vivy", "pid": 999999,
+        {"agent": "reviewer", "repo": "widget", "pid": 999999,
          "started_at": "2099-01-01T00:00:00Z"}))
     (d / "transcript.jsonl").write_text('{"type":"system"}\n')
     _sweep(obs, monkeypatch, tmp_path)
@@ -387,7 +387,7 @@ def test_a_symlinked_meta_is_not_read(obs, tmp_path, monkeypatch, capsys):
     """Same rule on the meta read."""
     outside = tmp_path / "outside.json"
     outside.write_text(json.dumps(
-        {"agent": "reviewer", "repo": "vivy", "pid": 999999,
+        {"agent": "reviewer", "repo": "widget", "pid": 999999,
          "started_at": _iso(NOW - timedelta(hours=6))}))
     d = tmp_path / "2026-08-25" / "run-16161616"
     d.mkdir(parents=True)
@@ -409,7 +409,7 @@ def test_an_enormous_meta_is_bounded(obs, tmp_path, monkeypatch, capsys):
     d.mkdir(parents=True)
     monkeypatch.setattr(obs, "_MAX_META_BYTES", 128)
     (d / "meta.json").write_text(json.dumps(
-        {"agent": "reviewer", "repo": "vivy", "pid": 999999, "pad": "z" * 50_000,
+        {"agent": "reviewer", "repo": "widget", "pid": 999999, "pad": "z" * 50_000,
          "started_at": _iso(NOW - timedelta(hours=6))}))
     (d / "transcript.jsonl").write_text('{"type":"system"}\n')
     _age_dir(d, 6 * 3600)
@@ -436,7 +436,7 @@ def test_a_naive_start_time_does_not_crash_the_whole_sweep(
     d = tmp_path / "2026-08-25" / "run-18181818"
     d.mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps(
-        {"agent": "reviewer", "repo": "vivy", "pid": 999999, "started_at": stamp}))
+        {"agent": "reviewer", "repo": "widget", "pid": 999999, "started_at": stamp}))
     (d / "transcript.jsonl").write_text('{"type":"system"}\n')
     # A healthy run alongside it, so a crash cannot masquerade as "nothing found".
     _run(tmp_path, "run-19191919", outcome=False)
@@ -491,7 +491,7 @@ def test_a_meta_truncated_by_the_size_cap_is_still_reported(
     d.mkdir(parents=True)
     monkeypatch.setattr(obs, "_MAX_META_BYTES", 64)
     (d / "meta.json").write_text(json.dumps(
-        {"agent": "reviewer", "repo": "vivy", "pid": 999999, "pad": "z" * 50_000,
+        {"agent": "reviewer", "repo": "widget", "pid": 999999, "pad": "z" * 50_000,
          "started_at": _iso(NOW - timedelta(hours=6))}))
     (d / "transcript.jsonl").write_text('{"t":1}\n')
     _age_dir(d, 6 * 3600)
@@ -711,7 +711,7 @@ def test_a_symlinked_day_directory_is_not_walked(obs, tmp_path, monkeypatch, cap
     outside = tmp_path / "elsewhere"
     (outside / "run-30303030").mkdir(parents=True)
     (outside / "run-30303030" / "meta.json").write_text(json.dumps(
-        {"agent": "reviewer", "repo": "vivy", "pid": 999999,
+        {"agent": "reviewer", "repo": "widget", "pid": 999999,
          "started_at": _iso(NOW - timedelta(hours=6))}))
     (tmp_path / "2026-08-24").symlink_to(outside, target_is_directory=True)
     _sweep(obs, monkeypatch, tmp_path, days=None)
@@ -734,7 +734,7 @@ def test_a_wrong_typed_agent_field_does_not_kill_the_sweep(
     d = tmp_path / "2026-08-25" / "run-31313131"
     d.mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps(
-        {"agent": agent, "repo": "vivy", "pid": 999999,
+        {"agent": agent, "repo": "widget", "pid": 999999,
          "started_at": _iso(NOW - timedelta(hours=6))}))
     (d / "transcript.jsonl").write_text('{"t":1}\n')
     _run(tmp_path, "run-32323232", outcome=False)
@@ -1127,7 +1127,7 @@ def test_a_finished_run_that_refused_its_recovery_is_reported(
     assert rc == 0
     assert "REFUSED" in out
     assert "deepseek/deepseek-v4-flash" in out, "name the target that was refused"
-    assert "vivy#1219" in out, "and the PR that lost the work"
+    assert "widget#1219" in out, "and the PR that lost the work"
     assert "run-observer:failover-refused:run-51515151" in [k for _, k in alerts]
     assert "0 abandoned across" in out, (
         "a finished run is not abandoned; the counts are separate findings")
@@ -1304,7 +1304,7 @@ def test_a_forged_flood_cannot_push_a_genuine_finding_out_of_the_sweep(
     deliver in some order; this sweep's order is the walk order; the walk sorts
     day directories by name. So a day bucket named `1900-01-01` sorts ahead of
     every real one, costs a `mkdir`, and mints fresh never-deduped run ids every
-    night — which pushed a genuine refusal on vivy#1219 to position 60 of 61 and
+    night — which pushed a genuine refusal on widget#1219 to position 60 of 61 and
     past the budget, permanently.
 
     That is strictly worse than the flood it was fixing: a flood adds noise a

@@ -9,16 +9,20 @@ adff106) was their only dispatcher and is deleted.
 
 Two shapes, checked separately:
 
-  1. NAME_RE — one of the seven retired agent names (or the hollis-orchestrator
+  1. NAME_RE — one of the seven retired agent names (or the galley-orchestrator
      variant) used as an exact Python string literal: `== "kb-sync-verifier"`, a
      set/dict element, an argument. This is what SPECIAL-CASES an agent by name —
      dispatch, tool denial, purpose derivation. A prose mention inside a longer
      sentence ("the overnight-orchestrator's 240-min in-flight estimate") does not
      match; those are genuine incident history and are not what this guards. Three
      exceptions, each scoped to a single constant rather than a whole file:
-       - lib/knowledge/knowledge.py's ALLOWED_AUDIENCE set names all seven, as
+       - lib/knowledge/knowledge.py's ALLOWED_AUDIENCE set used to name all seven, as
          `audience` values a document can still carry (documents on knowledge/main
-         already do) — that isn't dispatch special-casing.
+         already do) — that isn't dispatch special-casing. It no longer does: that
+         literal shrank to Builder's fresh-install seed, and the Library's live
+         roster is what still accepts the seven as `audience` values. The exclusion
+         stays, scoped to the same constant, in case a historical name is ever
+         added back to it.
        - bin/orchestrator-tokens' ORCHESTRATION_STAGE_AGENTS classifies the token
          cost of runs already recorded on disk; with no dispatcher left it reads
          old data rather than producing new dispatch.
@@ -47,7 +51,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 
 NAME_RE = re.compile(
-    r'''(?<![\w-])["'](overnight-orchestrator|hollis-overnight-orchestrator|'''
+    r'''(?<![\w-])["'](overnight-orchestrator|galley-overnight-orchestrator|'''
     r'''knowledge-scribe|kb-sync-verifier|overnight-triage|overnight-fix-drain|'''
     r'''overnight-verify)["'](?![\w-])'''
 )
@@ -57,11 +61,11 @@ SCAN_DIRS = ("bin", "lib/agent-platform", "lib/knowledge")
 
 # NAME_RE exclusions, each scoped to a single constant's literal block rather
 # than a whole file:
-#   - lib/knowledge/knowledge.py's ALLOWED_AUDIENCE set names all seven
-#     strings deliberately, as legal `audience` values a document can still
-#     carry (see that file's own comment on the set). Already scoped before
-#     this PR; the three new names added to that same set are covered for
-#     free since the sub is over the whole set literal.
+#   - lib/knowledge/knowledge.py's ALLOWED_AUDIENCE literal shrank to Builder's
+#     fresh-install seed and no longer names any of the seven; the live roster
+#     is what still accepts them as `audience` values (see that file's own
+#     comment on the set). The exclusion stays scoped to the same constant in
+#     case a historical name is ever added back to it.
 #   - bin/orchestrator-tokens' ORCHESTRATION_STAGE_AGENTS sums the token cost
 #     of past runs by agent name (see that file's own comment); reading old
 #     data isn't the special-casing shape this test guards against.
@@ -89,10 +93,6 @@ NAME_SCOPED_EXCLUSIONS = {
 # needs a reason; an entry with no reason is a bug the next reader won't be able to
 # tell from a genuine exception.
 ALLOWED_CMD_MENTIONS = {
-    # The lab-app template's `<prefix>-overnight-orchestrator` grants
-    # `Bash(overnight-manifest:*)` — a known dangling reference (see this PR's body),
-    # named in the epic as the one file to leave and note rather than edit.
-    "bin/create-lab-app",
     # A still-live negative instruction to the dispatched `explainer` agent: its
     # shared roster definition grants Bash(agentctl scribe verify:*)/
     # Bash(agentctl scribe apply:*) for its OTHER invocation (KB fact-sync), and that
@@ -140,7 +140,7 @@ def _scan():
 
 def test_no_file_special_cases_a_retired_agent_by_name():
     """NAME_RE: no file under bin/ or lib/ compares, stores, or keys on
-    overnight-orchestrator / hollis-overnight-orchestrator / knowledge-scribe /
+    overnight-orchestrator / galley-overnight-orchestrator / knowledge-scribe /
     kb-sync-verifier / overnight-triage / overnight-fix-drain / overnight-verify
     as an exact string — the shape special-casing takes."""
     name_hits, _ = _scan()

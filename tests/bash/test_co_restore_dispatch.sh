@@ -18,7 +18,7 @@ CO="$REPO_ROOT/bin/co"
 
 home=$(mktemp -d)
 stubbin="$home/stubbin"
-mkdir -p "$stubbin" "$home/Convivy/vivy" "$home/projects" "$home/tmux"
+mkdir -p "$stubbin" "$home/Convivy/cartographer" "$home/projects" "$home/tmux"
 claude_log="$home/claude.log"
 ensure_log="$home/ensure.log"
 
@@ -35,13 +35,13 @@ chmod +x "$stubbin/claude" "$stubbin/session-agent"
 printf '#!/bin/sh\necho "no server running on $*" >&2\nexit 1\n' > "$stubbin/tmux"
 chmod +x "$stubbin/tmux"
 
-# One interactive transcript under the vivy directory, written now. Its project
+# One interactive transcript under the cartographer directory, written now. Its project
 # slug is the cwd with every non-alphanumeric turned into `-`, as Claude Code does.
 session_id="0a1b2c3d-0000-4000-8000-000000000001"
-vivy="$home/Convivy/vivy"
-slug=$(printf '%s' "$vivy" | sed 's/[^A-Za-z0-9]/-/g')
+cartographer="$home/Convivy/cartographer"
+slug=$(printf '%s' "$cartographer" | sed 's/[^A-Za-z0-9]/-/g')
 mkdir -p "$home/projects/$slug"
-printf '{"type":"user","entrypoint":"cli","cwd":"%s","message":"private text"}\n' "$vivy" \
+printf '{"type":"user","entrypoint":"cli","cwd":"%s","message":"private text"}\n' "$cartographer" \
     > "$home/projects/$slug/$session_id.jsonl"
 
 out="$home/out.txt"

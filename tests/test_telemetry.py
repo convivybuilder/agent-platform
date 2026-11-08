@@ -394,7 +394,7 @@ def test_write_meta_rejects_unknown_billing_source(tmp_path):
             tmp_path,
             run_id="run-x", agent="coder", task="task",
             started_at="2026-05-31T10:00:00Z",
-            repo="constance", worktree="/tmp", profile="constance/daytime",
+            repo="globex", worktree="/tmp", profile="globex/daytime",
             model="claude-sonnet-4-6",
             billing_source="not_a_real_source",
         )
@@ -440,8 +440,8 @@ def test_write_meta_persists_overnight_wave(tmp_path):
     otherwise, so cost_join can group a night's stage runs into one row."""
     T.write_meta(tmp_path, **_META_REQUIRED)
     assert json.loads((tmp_path / "meta.json").read_text())["overnight_wave"] is None
-    T.write_meta(tmp_path, **_META_REQUIRED, overnight_wave="sous-chef/2026-06-27")
-    assert json.loads((tmp_path / "meta.json").read_text())["overnight_wave"] == "sous-chef/2026-06-27"
+    T.write_meta(tmp_path, **_META_REQUIRED, overnight_wave="initech/2026-06-27")
+    assert json.loads((tmp_path / "meta.json").read_text())["overnight_wave"] == "initech/2026-06-27"
 
 
 def test_write_meta_persists_label(tmp_path):
@@ -529,8 +529,10 @@ def test_resolve_pricing_normalizes_model_variants():
     assert T.resolve_pricing("claude-sonnet-5")["cache_write_1h"] == 4.0
     assert T.resolve_pricing("claude-sonnet-5")["cache_read"] == 0.20
     assert T.resolve_pricing("claude-sonnet-5-5") == {
-        "input": 2.0, "output": 10.0, "cache_write": 2.50, "cache_write_1h": 4.0, "cache_read": 0.20}
+        "input": 2.0, "output": 10.0, "cache_write": 2.50, "cache_write_1h": 4.0, "cache_read": 0.10}
     assert T.resolve_pricing("claude-sonnet-5-5[1m]")["output"] == 10.0        # the actual co launch string
+    assert T.resolve_pricing("claude-haiku-5-5") == {
+        "input": 0.50, "output": 2.50, "cache_write": 0.625, "cache_write_1h": 1.0, "cache_read": 0.05}
     assert T.resolve_pricing("claude-opus-5-5") == {
         "input": 4.0, "output": 20.0, "cache_write": 5.00, "cache_write_1h": 8.0, "cache_read": 0.20}
     assert T.resolve_pricing("claude-opus-5-5[1m]")["output"] == 20.0          # the co launch string
@@ -551,7 +553,7 @@ def test_every_dispatchable_anthropic_model_is_priced():
     # 2026-09-28 repoint; claude-fable-5 stays dispatchable as a retired,
     # no-longer-aliased literal (`agentctl spawn --model claude-fable-5`).
     for model in ("claude-fable-5", "claude-fable-5-1", "claude-mythos-5-1", "claude-opus-5-5", "claude-opus-4-8", "claude-sonnet-5",
-                  "claude-sonnet-5-5", "claude-sonnet-4-6", "claude-haiku-4-5"):
+                  "claude-sonnet-5-5", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-haiku-5-5"):
         row = T.resolve_pricing(model)
         assert row is not None, f"{model} is dispatchable but unpriced — it would record usd=0.0"
         assert row["input"] > 0 and row["output"] > 0, f"{model} has a zero price"
@@ -589,6 +591,20 @@ def test_sonnet_5_5_usage_prices_to_a_number_not_none():
         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}})
     row = priced["claude-sonnet-5-5"]
     assert row["usd"] == 2.0 + 10.0
+    assert "unpriced" not in row
+
+
+def test_haiku_5_5_usage_prices_at_the_pinned_over_threshold_row():
+    """claude-haiku-5-5 (CQ·525) is pinned to the over-100,000-prompt-token
+    rates ($0.50/$2.50/$0.625/$1.00/$0.05 per Mtok), so a mixed usage record
+    with input, output, cache-write and cache-read tokens prices to the
+    hand-computed sum of those rates rather than the under-threshold ones."""
+    priced = T.cost_from_usage({"claude-haiku-5-5": {
+        "input_tokens": 1_000_000, "output_tokens": 1_000_000,
+        "cache_read_input_tokens": 1_000_000,
+        "cache_creation_input_tokens": 1_000_000}})
+    row = priced["claude-haiku-5-5"]
+    assert row["usd"] == 0.50 + 2.50 + 0.625 + 0.05       # input + output + cache-write (5m) + cache-read
     assert "unpriced" not in row
 
 
@@ -877,6 +893,171 @@ def test_create_run_dir_modes_under_permissive_umask(tmp_path, monkeypatch):
     assert tmp_path.stat().st_mode & 0o777 == 0o700, "RUNS_ROOT not pinned to 0700"
     assert d.stat().st_mode & 0o777 == 0o700, "run dir not 0700"
     assert (d / "prompts").stat().st_mode & 0o777 == 0o700, "prompts/ not 0700"
+
+
+# --- ADR-0043's fourth surface: a `root` other than RUNS_ROOT -----------------
+
+def test_run_dir_defaults_to_runs_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path)
+    assert T.run_dir("run-x", date="2026-07-28") == tmp_path / "2026-07-28" / "run-x"
+
+
+def test_run_dir_honours_an_explicit_root(tmp_path, monkeypatch):
+    """A caller routing a black-box crew's run into its own home (`bin/agentctl`'s
+    `_private_run_root`) passes `root=` instead — RUNS_ROOT itself is never
+    touched, so a stray monkeypatch mistake would show up as a path under the
+    WRONG root rather than silently matching it."""
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path / "shared")
+    other = tmp_path / "crew-home" / "agent-runs"
+    assert (T.run_dir("run-x", date="2026-07-28", root=other)
+           == other / "2026-07-28" / "run-x")
+
+
+def test_create_run_dir_with_an_explicit_root_never_touches_runs_root(tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    monkeypatch.setattr(T, "RUNS_ROOT", shared)
+    private_root = tmp_path / "crew-home" / "agent-runs"
+    d = T.create_run_dir("run-y", date="2026-07-28", root=private_root)
+    assert d == private_root / "2026-07-28" / "run-y"
+    assert d.is_dir()
+    assert d.stat().st_mode & 0o777 == 0o700
+    assert private_root.stat().st_mode & 0o777 == 0o700
+    assert not shared.exists(), "the shared RUNS_ROOT must not be created as a side effect"
+    # Same full shape create_run_dir always makes, just rooted elsewhere.
+    assert (d / "prompts").is_dir()
+    assert (d / "transcript.jsonl").exists()
+    assert (d / "tool_calls.jsonl").exists()
+
+
+def test_create_run_dir_with_an_explicit_root_writes_a_gitignore_that_stays_unstaged(
+        tmp_path, monkeypatch):
+    """The private run-corpus root lives inside the crew's own git working
+    tree (`bin/agentctl`'s `PRIVATE_RUN_SUBDIR` docstring), so its own
+    `git add -A` could otherwise stage the full, unredacted run corpus.
+    Checked against a real git repository, not a hand-read `.gitignore`
+    file, since that is the actual mechanism this closes."""
+    import subprocess
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path / "shared")
+    repo = tmp_path / "crew-home"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    private_root = repo / "agent-runs"
+
+    d = T.create_run_dir("run-y", date="2026-07-28", root=private_root)
+
+    assert (private_root / ".gitignore").read_text() == "*\n"
+    staged = subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    assert staged.returncode == 0
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                            check=True, capture_output=True, text=True)
+    assert status.stdout == "", f"git staged something under the private root: {status.stdout!r}"
+    assert d.is_dir()
+
+
+def test_create_run_dir_with_a_symlinked_gitignore_leaves_the_target_untouched(tmp_path, monkeypatch):
+    """`agentctl spawn`'s own process writes this `.gitignore` — not a run
+    `run_sandbox.py` has wrapped in a Seatbelt profile, since that profile
+    confines the CHILD this call creates a run directory for, not the parent
+    creating it. A private crew's own earlier, sandboxed dispatch can plant
+    `.gitignore` as a symlink under its own write grant (the same tree)
+    before a later spawn's call here ever runs; the write must refuse to
+    follow it rather than writing `*\\n` through it (security-reviewer,
+    PR #1101 round 2 — the identical gap to session-event-log.py's hook-log
+    write, one directory over)."""
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path / "shared")
+    private_root = tmp_path / "crew-home" / "agent-runs"
+    private_root.mkdir(parents=True)
+    dangling_target = tmp_path / "never-created.gitignore"
+    (private_root / ".gitignore").symlink_to(dangling_target)
+
+    d = T.create_run_dir("run-y", date="2026-07-28", root=private_root)
+
+    assert not dangling_target.exists(), "the dangling symlink's target must not have been created"
+    assert (private_root / ".gitignore").is_symlink(), "the planted symlink is left alone"
+    assert d.is_dir()
+
+
+def test_create_run_dir_refuses_a_symlinked_private_root(tmp_path, monkeypatch):
+    """Round 3's own gap: round 2's `O_EXCL|O_NOFOLLOW` fix protected only the
+    `.gitignore` file create, not the directory creation/chmod against the
+    same `root` — a private crew's own earlier, sandboxed dispatch can
+    replace `<home>/agent-runs` itself with a symlink before a later spawn's
+    `create_run_dir` call ever runs. `ensure_real_dir` must refuse rather
+    than let `mkdir`/`chmod` follow it (reviewer and security-reviewer,
+    PR #1101 round 3)."""
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path / "shared")
+    outside = tmp_path / "outside-agent-runs"
+    outside.mkdir()
+    private_root = tmp_path / "crew-home" / "agent-runs"
+    private_root.parent.mkdir(parents=True)
+    private_root.symlink_to(outside)
+
+    with pytest.raises(T.RunRootIsSymlink):
+        T.create_run_dir("run-y", date="2026-07-28", root=private_root)
+
+    assert list(outside.iterdir()) == [], "the symlink target must not have been written into"
+    assert private_root.is_symlink(), "the planted symlink itself is left alone"
+
+
+def test_create_run_dir_refuses_a_symlinked_private_date_dir(tmp_path, monkeypatch):
+    """`root` itself is real, but its date directory — equally predictable,
+    today's chosen `date` — was replaced with a symlink. Same refusal as
+    the root itself, one level down (reviewer, PR #1101 round 3)."""
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path / "shared")
+    private_root = tmp_path / "crew-home" / "agent-runs"
+    private_root.mkdir(parents=True)
+    outside = tmp_path / "outside-date-dir"
+    outside.mkdir()
+    (private_root / "2026-07-28").symlink_to(outside)
+
+    with pytest.raises(T.RunRootIsSymlink):
+        T.create_run_dir("run-y", date="2026-07-28", root=private_root)
+
+    assert list(outside.iterdir()) == [], "the symlink target must not have been written into"
+    assert (private_root / "2026-07-28").is_symlink(), "the planted symlink itself is left alone"
+    # root itself is real, so the write that IS safe still happens.
+    assert (private_root / ".gitignore").read_text() == "*\n"
+
+
+def test_create_run_dir_with_no_root_writes_no_gitignore(tmp_path, monkeypatch):
+    """RUNS_ROOT itself (the public, shared default) is never given a
+    `.gitignore` — it lives outside any tree `agentctl` dispatches into, so
+    there is no `git add -A` of its own to guard against."""
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path / "shared")
+    T.create_run_dir("run-z", date="2026-07-28")
+    assert not (tmp_path / "shared" / ".gitignore").exists()
+
+
+def test_create_accounting_stub_makes_a_bare_directory_under_runs_root(tmp_path, monkeypatch):
+    """The shared-side accounting record (ADR-0043's fourth surface) is a bare
+    directory: no prompts/, no transcript.jsonl, no tool_calls.jsonl — nothing
+    for a task string, a transcript line or a tool call to land in by accident."""
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path)
+    d = T.create_accounting_stub("run-z", date="2026-07-28")
+    assert d == tmp_path / "2026-07-28" / "run-z"
+    assert d.is_dir()
+    assert d.stat().st_mode & 0o777 == 0o700
+    assert sorted(p.name for p in d.iterdir()) == []
+    assert not (d / "prompts").exists()
+    assert not (d / "transcript.jsonl").exists()
+    assert not (d / "tool_calls.jsonl").exists()
+
+
+def test_create_accounting_stub_accepts_the_full_write_meta_write_cost_write_outcome_shape(
+        tmp_path, monkeypatch):
+    """A caller writes into the stub the same way it would any other run
+    directory — this just makes a smaller bare shape to write into."""
+    monkeypatch.setattr(T, "RUNS_ROOT", tmp_path)
+    d = T.create_accounting_stub("run-z2", date="2026-07-28")
+    T.write_meta(d, run_id="run-z2", agent="scout", task="(withheld)",
+                started_at=T.now_iso(), repo="nightjar", worktree="(withheld)",
+                profile="nightjar/none", model="claude-sonnet-5")
+    T.update_meta(d, ended_at=T.now_iso())
+    T.write_cost(d, by_model={})
+    T.write_outcome(d, exit_status="completed")
+    assert json.loads((d / "meta.json").read_text())["task"] == "(withheld)"
+    assert json.loads((d / "cost.json").read_text())["usd"] == 0.0
+    assert json.loads((d / "outcome.json").read_text())["exit_status"] == "completed"
 
 
 def test_validate_run_dir_flags_invalid_origin(tmp_path):
@@ -1187,5 +1368,65 @@ def test_a_slug_with_control_characters_is_sanitised_in_the_body(alerts):
     body = alerts[0][1]
     assert "\n" not in body and "\x1b" not in body and "\r" not in body
     assert "evil" in body
+
+
+# --- platform_day_for: bucketing a run's finish instant, not "now" -----------
+# (the spend-ledger poster's day — bin/agentctl's at-finish post and
+# bin/model-scorecard's sweep both need the run's finish day, not the moment
+# either writer happens to run)
+
+
+@pytest.fixture
+def pinned_local_tz():
+    """Pin the process's local timezone to MST, UTC-7, no daylight saving.
+    Restored after via `time.tzset()`, never left pinned for a later test —
+    the same fixture `test_tmux_transcript.py` already uses for the same
+    reason, duplicated here rather than shared, since this file has no
+    conftest import of it."""
+    import time
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = "MST7"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
+def test_platform_day_for_a_finish_at_2330_local_stays_that_day(pinned_local_tz):
+    """2026-10-20 23:30 MST (UTC-7) is 2026-10-21 06:30 UTC — a bucketing rule
+    that read the UTC digits instead of converting to local time first would
+    call this the 21st, a day later than the run actually finished."""
+    from datetime import datetime, timezone
+    finished_at_utc = datetime(2026, 10, 21, 6, 30, 0, tzinfo=timezone.utc)
+    assert T.platform_day_for(finished_at_utc) == "2026-10-20"
+
+
+def test_platform_day_for_just_after_midnight_local_rolls_to_the_next_day(pinned_local_tz):
+    """2026-10-21 00:05 MST is 2026-10-21 07:05 UTC — the same UTC calendar
+    date as the 23:30 case above would (wrongly) produce, so this is the
+    other side of the boundary: local time, not UTC, decides the day."""
+    from datetime import datetime, timezone
+    finished_at_utc = datetime(2026, 10, 21, 7, 5, 0, tzinfo=timezone.utc)
+    assert T.platform_day_for(finished_at_utc) == "2026-10-21"
+
+
+def test_platform_day_delegates_to_platform_day_for_now(monkeypatch):
+    """`platform_day()` is `platform_day_for(datetime.now(timezone.utc))` —
+    pinned here so a future edit that reintroduces a second, independent
+    local-day computation (the exact drift this delegation exists to avoid)
+    fails this test rather than only being caught by inspection."""
+    seen = {}
+
+    def fake_platform_day_for(when):
+        seen["when"] = when
+        return "2026-10-13"
+    monkeypatch.setattr(T, "platform_day_for", fake_platform_day_for)
+    assert T.platform_day() == "2026-10-13"
+    assert seen["when"].tzinfo is not None
 
 

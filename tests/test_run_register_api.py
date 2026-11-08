@@ -128,11 +128,36 @@ def test_a_private_crews_run_is_absent_from_runs_payload(
     check actually goes through."""
     import registry
     projects_registry({
-        "cfo": {"home_dir": "~/Convivy/CFO", "private": True},
+        "ledger": {"home_dir": "~/Convivy/LEDGER", "private": True},
         "agent-platform": {"home_dir": "~/Convivy/agent-platform"},
     })
     _add_run(registry, run_id="run-public", repo="agent-platform")
-    _add_run(registry, run_id="run-private", repo="cfo",
+    _add_run(registry, run_id="run-private", repo="ledger",
+             task="the private crew's actual dispatch prompt")
+
+    payload = run_register_api._runs_payload(_snapshot(run_register_api))
+
+    run_ids = {r["run_id"] for r in payload["runs"]}
+    assert run_ids == {"run-public"}
+    assert "the private crew's actual dispatch prompt" not in json.dumps(payload)
+
+
+def test_a_private_crews_run_is_absent_even_when_its_repo_differs_from_its_registry_key(
+        run_register_api, runs_root, fake_home, projects_registry):
+    """PR #1015 round 1 (security-reviewer): a private unit's `repos` can be
+    renamed to its real GitHub name without the registry KEY following along —
+    a private unit's own repo can already differ from its key in the real registry.
+    `_run_is_private` must still withhold a dispatch naming the
+    REPO, not just one naming the key — `--on acme-private-repo` is exactly
+    what a reviewer dispatched against this crew's own PRs sends."""
+    import registry
+    projects_registry({
+        "acme-private-key": {"home_dir": "~/Convivy/acme-private-key",
+                             "repos": ["acme-private-repo"], "private": True},
+        "agent-platform": {"home_dir": "~/Convivy/agent-platform"},
+    })
+    _add_run(registry, run_id="run-public", repo="agent-platform")
+    _add_run(registry, run_id="run-private", repo="acme-private-repo",
              task="the private crew's actual dispatch prompt")
 
     payload = run_register_api._runs_payload(_snapshot(run_register_api))
@@ -181,8 +206,8 @@ def test_agents_dir_bypass_is_closed_for_runs_too(
     """THE SAME BYPASS `session_state._crew_is_shareable` already closed one
     route over (agent-platform#465, round 2): `resolve_agent()` (bin/agentctl)
     honours `--agents-dir` before it ever looks at `repo`, so `agentctl spawn
-    <cfo-agent> --on some-public-repo --agents-dir
-    ~/Convivy/CFO/.claude/agents` writes `repo: "some-public-repo"` (a public
+    <ledger-agent> --on some-public-repo --agents-dir
+    ~/Convivy/LEDGER/.claude/agents` writes `repo: "some-public-repo"` (a public
     slug) into the registry while loading a black-box crew's agent. Round 1
     of this PR checked only `repo` and missed exactly this
     (security-reviewer, round 2). The real `meta.json` is written to disk
@@ -190,10 +215,10 @@ def test_agents_dir_bypass_is_closed_for_runs_too(
     actual read path `_run_is_private` now goes through."""
     import registry
     projects_registry({
-        "cfo": {"home_dir": "~/Convivy/CFO", "private": True},
+        "ledger": {"home_dir": "~/Convivy/LEDGER", "private": True},
         "some-public-repo": {"home_dir": "~/Convivy/some-public-repo"},
     })
-    private_agents_dir = fake_home / "Convivy" / "CFO" / ".claude" / "agents"
+    private_agents_dir = fake_home / "Convivy" / "LEDGER" / ".claude" / "agents"
     private_agents_dir.mkdir(parents=True)
     (fake_home / "Convivy" / "some-public-repo").mkdir(parents=True)
 
@@ -203,7 +228,7 @@ def test_agents_dir_bypass_is_closed_for_runs_too(
     run_dir = fake_home / "Convivy" / "agent-runs" / local_day / "run-bypass"
     run_dir.mkdir(parents=True)
     (run_dir / "meta.json").write_text(json.dumps(
-        {"agent_source": str(private_agents_dir / "cfo-classify.md")}))
+        {"agent_source": str(private_agents_dir / "ledger-classify.md")}))
 
     _add_run(registry, run_id="run-bypass", repo="some-public-repo",
              started_at=started_at,
@@ -220,20 +245,20 @@ def test_a_private_slug_with_no_home_directory_still_catches_the_bypass(
     """The round-5 regression: `_resolve_registry_snapshot` used to drop a
     slug from its `homes` dict whenever `home.is_dir()` was False, so
     `_run_is_private`'s call into `dispatch_is_private` got `None` back for
-    `home_paths_snapshot.get("cfo")` and skipped the agent_source
+    `home_paths_snapshot.get("ledger")` and skipped the agent_source
     containment check entirely — the exact bypass rounds 2 and 4 exist to
     close, reopened for any private slug whose `home_dir` is not on disk
-    right now (not yet created, or briefly moved). `cfo`'s home_dir is
+    right now (not yet created, or briefly moved). `ledger`'s home_dir is
     registered but its directory is never created here — every other bypass
     test in this file creates the directory first, which is why the suite
     could not see this (reviewer + security-reviewer, round 5)."""
     import registry
     projects_registry({
-        "cfo": {"home_dir": "~/Convivy/CFO", "private": True},
+        "ledger": {"home_dir": "~/Convivy/LEDGER", "private": True},
         "some-public-repo": {"home_dir": "~/Convivy/some-public-repo"},
     })
     (fake_home / "Convivy" / "some-public-repo").mkdir(parents=True)
-    private_agents_dir = fake_home / "Convivy" / "CFO" / ".claude" / "agents"
+    private_agents_dir = fake_home / "Convivy" / "LEDGER" / ".claude" / "agents"
 
     started_at = "2026-08-29T10:00:00Z"
     local_day = datetime.datetime.strptime(started_at, "%Y-%m-%dT%H:%M:%SZ").replace(
@@ -241,7 +266,7 @@ def test_a_private_slug_with_no_home_directory_still_catches_the_bypass(
     run_dir = fake_home / "Convivy" / "agent-runs" / local_day / "run-bypass"
     run_dir.mkdir(parents=True)
     (run_dir / "meta.json").write_text(json.dumps(
-        {"agent_source": str(private_agents_dir / "cfo-classify.md")}))
+        {"agent_source": str(private_agents_dir / "ledger-classify.md")}))
 
     _add_run(registry, run_id="run-bypass", repo="some-public-repo",
              started_at=started_at,
@@ -261,11 +286,11 @@ def test_a_private_slugs_unreadable_home_path_fails_the_whole_snapshot_closed(
     must fail the WHOLE snapshot instead — the same "cannot confirm public"
     answer an unreadable registry already produces — rather than serving
     `/runs` with one private crew's protection quietly missing
-    (security-reviewer, round 5). `cfo`'s `home_dir` here is not `~/`-relative,
+    (security-reviewer, round 5). `ledger`'s `home_dir` here is not `~/`-relative,
     which `projects._expand_own_home` raises on."""
     import registry
     projects_registry({
-        "cfo": {"home_dir": "not-tilde-relative", "private": True},
+        "ledger": {"home_dir": "not-tilde-relative", "private": True},
         "agent-platform": {"home_dir": "~/Convivy/agent-platform"},
     })
     (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
@@ -286,13 +311,13 @@ def test_a_private_slugs_missing_home_dir_fails_the_whole_snapshot_closed(
     `_resolve_registry_snapshot` used to `continue` past this `None` the same
     as an actually-unregistered slug, so a private slug missing `home_dir`
     landed in `private_slugs` but never in `homes`, and `dispatch_is_private`
-    read `home_paths_snapshot.get("cfo")` as `None` and skipped the
+    read `home_paths_snapshot.get("ledger")` as `None` and skipped the
     agent_source containment check — the same bypass the raise case (round 5,
     above) closes, just reached through the other branch (round 6). This must
     fail the WHOLE snapshot closed, the same as the raise case."""
     import registry
     projects_registry({
-        "cfo": {"private": True},
+        "ledger": {"private": True},
         "agent-platform": {"home_dir": "~/Convivy/agent-platform"},
     })
     (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
@@ -306,7 +331,7 @@ def test_a_private_slugs_missing_home_dir_fails_the_whole_snapshot_closed(
 def test_a_non_slug_shaped_repo_with_no_meta_is_excluded_not_served(
         run_register_api, runs_root, fake_home, projects_registry):
     """The exact non-exception path round 4's correctness review traced:
-    `repo="../CFO"` fails `dispatch_is_private`'s exact `repo.lower() in
+    `repo="../LEDGER"` fails `dispatch_is_private`'s exact `repo.lower() in
     private_slugs()` match, so the repo-only half never fires; this run
     carries no `run_id` `meta.json` either, so `agent_source` stays `None`
     and the agent_source half answers a clean `False` too — not an
@@ -316,14 +341,61 @@ def test_a_non_slug_shaped_repo_with_no_meta_is_excluded_not_served(
     private crew. `_REPO_SLUG_RE` now excludes it before `dispatch_is_private`
     is ever called."""
     import registry
-    projects_registry({"cfo": {"home_dir": "~/Convivy/CFO", "private": True}})
-    _add_run(registry, run_id="run-badslug", repo="../CFO",
+    projects_registry({"ledger": {"home_dir": "~/Convivy/LEDGER", "private": True}})
+    _add_run(registry, run_id="run-badslug", repo="../LEDGER",
              task="the private crew's actual dispatch prompt")
 
     payload = run_register_api._runs_payload(_snapshot(run_register_api))
 
     assert payload["runs"] == []
     assert "the private crew's actual dispatch prompt" not in json.dumps(payload)
+
+
+def test_a_walled_off_crews_run_is_absent_while_a_public_ones_still_served(
+        run_register_api, runs_root, fake_home, projects_registry):
+    """CQ·634: `_run_is_private` checked only `projects.private_slugs()`,
+    never `projects.walled_off_slugs()` (platform/decisions/0100, the
+    operator's own crew — `validate_registry` keeps the two fields mutually
+    exclusive, so this is a second, separate set). A live read on 2026-11-02
+    against main 17d979579 showed a walled-off crew's run served with its
+    real repo. Synthetic crew names stand in for the live one. At main this
+    test fails: `run_ids` comes back `{"run-public", "run-walled"}`, not
+    `{"run-public"}`, and the walled crew's dispatch prompt is present."""
+    import registry
+    projects_registry({
+        "test-walled-crew": {"home_dir": "~/Convivy/test-walled-crew", "walled_off": True},
+        "test-public-crew": {"home_dir": "~/Convivy/test-public-crew"},
+    })
+    _add_run(registry, run_id="run-public", repo="test-public-crew")
+    _add_run(registry, run_id="run-walled", repo="test-walled-crew",
+             task="the walled-off crew's actual dispatch prompt")
+
+    payload = run_register_api._runs_payload(_snapshot(run_register_api))
+
+    run_ids = {r["run_id"] for r in payload["runs"]}
+    assert run_ids == {"run-public"}
+    assert "the walled-off crew's actual dispatch prompt" not in json.dumps(payload)
+
+
+def test_runs_payload_is_empty_when_walled_off_slugs_raises(
+        run_register_api, runs_root, fake_home, projects_registry, monkeypatch):
+    """`_resolve_registry_snapshot` now reads `projects.walled_off_slugs()`
+    inside the same fail-closed try/except `private_slugs()` already used —
+    a raise from either answers `None` for the whole snapshot, so `/runs`
+    serves an empty list rather than falling back to a `private_slugs()`-only
+    answer that would still confirm a walled-off crew's run as public. At
+    main this test fails: nothing on this route calls `walled_off_slugs()`
+    at all, so patching it to raise has no effect and the public run below
+    is served."""
+    import registry
+    projects_registry({"test-public-crew": {"home_dir": "~/Convivy/test-public-crew"}})
+    _add_run(registry, run_id="run-public", repo="test-public-crew")
+    monkeypatch.setattr(projects, "walled_off_slugs",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    payload = run_register_api._runs_payload(_snapshot(run_register_api))
+
+    assert payload["runs"] == []
 
 
 def test_the_runs_payload_privacy_filter_is_not_stale_for_the_daemons_uptime(
@@ -397,7 +469,8 @@ def test_facts_route_serves_an_ended_runs_facts_through_the_real_handler(
     payload = _do_get(run_register_api, "/runs/run-ended1/facts")
 
     assert payload == {"found": True, "agent": "reviewer", "repo": "agent-platform",
-                       "review_sha": "a" * 40, "pr": 42, "review_role": "reviewer"}
+                       "review_sha": "a" * 40, "pr": 42, "review_role": "reviewer",
+                       "posted_verdict": "", "posted_pr": ""}
 
 
 def test_facts_route_rejects_an_unknown_id_and_every_traversal_shape(
@@ -456,15 +529,74 @@ def test_facts_route_reveals_only_found_and_private_for_a_private_crews_run(
     """Applied through `_run_is_private`, the exact function `_runs_payload`
     already filters every `/runs` row through — never a copy of that check."""
     telemetry = _facts_run_dir(fake_home, monkeypatch)
-    projects_registry({"cfo": {"home_dir": "~/Convivy/CFO", "private": True}})
-    (fake_home / "Convivy" / "CFO").mkdir(parents=True)
+    projects_registry({"ledger": {"home_dir": "~/Convivy/LEDGER", "private": True}})
+    (fake_home / "Convivy" / "LEDGER").mkdir(parents=True)
     run_dir = telemetry.create_run_dir("run-private1", date="2026-09-01")
     telemetry.write_meta(run_dir, run_id="run-private1", agent="reviewer", task="t",
-                         started_at="2026-09-01T00:00:00Z", repo="cfo",
+                         started_at="2026-09-01T00:00:00Z", repo="ledger",
                          worktree=str(run_dir), profile="p", model="claude-sonnet-4-6",
                          review_sha="b" * 40, pr=7)
 
     payload = _do_get(run_register_api, "/runs/run-private1/facts")
+
+    assert payload == {"found": True, "private": True}
+
+
+def test_facts_route_withholds_a_walled_off_run_while_still_serving_a_public_one(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """CQ·634, the `/facts` twin of
+    `test_a_walled_off_crews_run_is_absent_while_a_public_ones_still_served`
+    above: applied through `_run_is_private`, the same function `/runs`
+    filters every row through, so the gap and the fix are identical. At main
+    this test fails: `walled_payload` comes back with the walled crew's real
+    `agent`/`repo`/`review_sha`, not `{"found": True, "private": True}`."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({
+        "test-walled-crew": {"home_dir": "~/Convivy/test-walled-crew", "walled_off": True},
+        "test-public-crew": {"home_dir": "~/Convivy/test-public-crew"},
+    })
+    (fake_home / "Convivy" / "test-walled-crew").mkdir(parents=True)
+    (fake_home / "Convivy" / "test-public-crew").mkdir(parents=True)
+    walled_dir = telemetry.create_run_dir("run-walled-facts1", date="2026-09-01")
+    telemetry.write_meta(walled_dir, run_id="run-walled-facts1", agent="reviewer", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-walled-crew",
+                         worktree=str(walled_dir), profile="p", model="claude-sonnet-4-6",
+                         review_sha="b" * 40, pr=7)
+    public_dir = telemetry.create_run_dir("run-public-facts1", date="2026-09-01")
+    telemetry.write_meta(public_dir, run_id="run-public-facts1", agent="reviewer", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-public-crew",
+                         worktree=str(public_dir), profile="p", model="claude-sonnet-4-6",
+                         review_sha="d" * 40, pr=11)
+
+    walled_payload = _do_get(run_register_api, "/runs/run-walled-facts1/facts")
+    public_payload = _do_get(run_register_api, "/runs/run-public-facts1/facts")
+
+    assert walled_payload == {"found": True, "private": True}
+    assert public_payload == {"found": True, "agent": "reviewer", "repo": "test-public-crew",
+                              "review_sha": "d" * 40, "pr": 11, "review_role": "reviewer",
+                              "posted_verdict": "", "posted_pr": ""}
+
+
+def test_facts_route_withholds_a_public_run_too_when_walled_off_slugs_raises(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """The `/facts` twin of `test_runs_payload_is_empty_when_walled_off_slugs_raises`:
+    `_resolve_registry_snapshot` fails the WHOLE snapshot closed when either
+    `private_slugs()` or `walled_off_slugs()` raises, so `_run_is_private`
+    cannot confirm ANY run public — not only a walled-off one. At main this
+    test fails: nothing on this route calls `walled_off_slugs()` at all, so
+    the public run below is served in full rather than withheld."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({"test-public-crew": {"home_dir": "~/Convivy/test-public-crew"}})
+    (fake_home / "Convivy" / "test-public-crew").mkdir(parents=True)
+    run_dir = telemetry.create_run_dir("run-public-facts2", date="2026-09-01")
+    telemetry.write_meta(run_dir, run_id="run-public-facts2", agent="reviewer", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-public-crew",
+                         worktree=str(run_dir), profile="p", model="claude-sonnet-4-6",
+                         review_sha="e" * 40, pr=3)
+    monkeypatch.setattr(projects, "walled_off_slugs",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    payload = _do_get(run_register_api, "/runs/run-public-facts2/facts")
 
     assert payload == {"found": True, "private": True}
 
@@ -491,7 +623,8 @@ def test_facts_route_returns_an_empty_review_sha_for_a_legacy_meta_with_none(
     payload = _do_get(run_register_api, "/runs/run-legacy1/facts")
 
     assert payload == {"found": True, "agent": "reviewer", "repo": "agent-platform",
-                       "review_sha": "", "pr": None, "review_role": "reviewer"}
+                       "review_sha": "", "pr": None, "review_role": "reviewer",
+                       "posted_verdict": "", "posted_pr": ""}
 
 
 def _write_run(telemetry, run_id, *, agent, date="2026-09-01", repo="agent-platform"):
@@ -516,19 +649,23 @@ def test_facts_route_review_role_is_the_bare_role_for_a_bare_reviewer(
 
 def test_facts_route_review_role_is_the_base_role_for_a_crew_prefixed_reviewer(
         run_register_api, fake_home, projects_registry, monkeypatch):
-    """A crew-prefixed reviewer (`hollis-` is one of `review_protocol.
-    INTERNAL_APP_PREFIXES`) is review-class the same way `authenticate()` treats it
+    """A crew-prefixed reviewer (`galley-` is one of `review_protocol.
+    internal_app_prefixes()`) is review-class the same way `authenticate()` treats it
     (ARCH-177) — `review_role` reports the stripped BASE role, `reviewer`, not the
     prefixed run name, so the Library can compare it against the bare role
-    `evaluate_gate` and `authenticate()` both key on."""
+    `evaluate_gate` and `authenticate()` both key on. ARCH-397 Phase 2 derives that
+    set from THIS registry at call time rather than from whatever was on disk when
+    the process started, so `galley-` has to be declared here, not just assumed
+    from the real repo's own config/projects.json."""
     telemetry = _facts_run_dir(fake_home, monkeypatch)
-    projects_registry({"agent-platform": {"home_dir": "~/Convivy/agent-platform"}})
+    projects_registry({"agent-platform": {"home_dir": "~/Convivy/agent-platform"},
+                        "galley": {"agent_prefix": "galley-"}})
     (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
-    _write_run(telemetry, "run-rev2", agent="hollis-reviewer")
+    _write_run(telemetry, "run-rev2", agent="galley-reviewer")
 
     payload = _do_get(run_register_api, "/runs/run-rev2/facts")
 
-    assert payload["agent"] == "hollis-reviewer"
+    assert payload["agent"] == "galley-reviewer"
     assert payload["review_role"] == "reviewer"
 
 
@@ -554,6 +691,63 @@ def test_facts_route_review_role_is_empty_for_a_non_review_agent(
     payload = _do_get(run_register_api, "/runs/run-coder1/facts")
 
     assert payload["review_role"] == ""
+
+
+def test_facts_route_reports_posted_verdict_and_pr_for_a_review_run_that_posted(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """`agentctl review-post`'s `_record_posted_review` (bin/agentctl:9814)
+    writes `review_verdict`/`review_pr` into the posting run's own meta.json
+    (CQ·399) — this route must surface them as `posted_verdict`/`posted_pr`
+    so the Library can compare a review record's claimed verdict against
+    what the named run actually posted (issue_01M5FM2A102PKMQVKFE7HM30F0)."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({"agent-platform": {"home_dir": "~/Convivy/agent-platform"}})
+    (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
+    run_dir = telemetry.create_run_dir("run-posted1", date="2026-09-01")
+    telemetry.write_meta(run_dir, run_id="run-posted1", agent="reviewer", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="agent-platform",
+                         worktree=str(run_dir), profile="p", model="claude-sonnet-4-6",
+                         review_sha="c" * 40, pr=1)
+    telemetry.update_meta(run_dir, review_verdict="REQUEST_CHANGES", review_pr="1")
+
+    payload = _do_get(run_register_api, "/runs/run-posted1/facts")
+
+    assert payload["posted_verdict"] == "REQUEST_CHANGES"
+    assert payload["posted_pr"] == "1"
+
+
+def test_facts_route_posted_fields_are_empty_for_a_coder_run(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """A coder run never posts a review, so meta.json carries no
+    `review_verdict`/`review_pr` at all — both fields report empty, the
+    same value a run that has not yet posted reports."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({"agent-platform": {"home_dir": "~/Convivy/agent-platform"}})
+    (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
+    _write_run(telemetry, "run-coder2", agent="coder")
+
+    payload = _do_get(run_register_api, "/runs/run-coder2/facts")
+
+    assert payload["posted_verdict"] == ""
+    assert payload["posted_pr"] == ""
+
+
+def test_facts_route_posted_fields_are_empty_for_a_review_run_that_has_not_posted(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """A review-class run that hasn't called `review-post` yet carries no
+    `review_verdict`/`review_pr` in its meta.json either — `review_role` is
+    still populated (it's review-class), but `posted_verdict`/`posted_pr`
+    stay empty until the run actually posts."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({"agent-platform": {"home_dir": "~/Convivy/agent-platform"}})
+    (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
+    _write_run(telemetry, "run-unposted1", agent="reviewer")
+
+    payload = _do_get(run_register_api, "/runs/run-unposted1/facts")
+
+    assert payload["review_role"] == "reviewer"
+    assert payload["posted_verdict"] == ""
+    assert payload["posted_pr"] == ""
 
 
 # --- /runs/<run_id>/facts and /runs: a run's OWN writable directory must not
@@ -677,7 +871,8 @@ def test_a_normal_facts_request_still_succeeds_after_each_hostile_meta_json(
     payload = _do_get(run_register_api, "/runs/run-normal1/facts")
 
     assert payload == {"found": True, "agent": "reviewer", "repo": "agent-platform",
-                       "review_sha": "e" * 40, "pr": 3, "review_role": "reviewer"}
+                       "review_sha": "e" * 40, "pr": 3, "review_role": "reviewer",
+                       "posted_verdict": "", "posted_pr": ""}
 
 
 def test_runs_payload_survives_a_private_runs_symlinked_meta_json_and_still_serves_the_rest(
@@ -696,10 +891,10 @@ def test_runs_payload_survives_a_private_runs_symlinked_meta_json_and_still_serv
     import registry
     telemetry = _facts_run_dir(fake_home, monkeypatch)
     projects_registry({
-        "cfo": {"home_dir": "~/Convivy/CFO", "private": True},
+        "ledger": {"home_dir": "~/Convivy/LEDGER", "private": True},
         "agent-platform": {"home_dir": "~/Convivy/agent-platform"},
     })
-    (fake_home / "Convivy" / "CFO").mkdir(parents=True)
+    (fake_home / "Convivy" / "LEDGER").mkdir(parents=True)
     (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
 
     # `_run_meta_path` (unlike the facts route's glob-based `find_run_dir`)
@@ -711,7 +906,7 @@ def test_runs_payload_survives_a_private_runs_symlinked_meta_json_and_still_serv
         tzinfo=datetime.timezone.utc).astimezone().strftime("%Y-%m-%d")
     hostile_dir = telemetry.create_run_dir("run-hostile-symlink2", date=local_day)
     _os.symlink("/dev/zero", hostile_dir / "meta.json")
-    _add_run(registry, run_id="run-hostile-symlink2", repo="cfo",
+    _add_run(registry, run_id="run-hostile-symlink2", repo="ledger",
              started_at=started_at,
              task="the private crew's actual dispatch prompt")
     _add_run(registry, run_id="run-normal2", repo="agent-platform", started_at=started_at)
@@ -795,21 +990,85 @@ def test_a_private_runs_docs_fetched_route_serves_nothing(
     though it names no task text itself: the kb id SENTINEL below never
     reaches the response."""
     telemetry = _facts_run_dir(fake_home, monkeypatch)
-    projects_registry({"cfo": {"home_dir": "~/Convivy/CFO", "private": True}})
-    (fake_home / "Convivy" / "CFO").mkdir(parents=True)
+    projects_registry({"ledger": {"home_dir": "~/Convivy/LEDGER", "private": True}})
+    (fake_home / "Convivy" / "LEDGER").mkdir(parents=True)
     run_dir = telemetry.create_run_dir("run-private-docs1", date="2026-09-01")
     telemetry.write_meta(run_dir, run_id="run-private-docs1", agent="coder", task="t",
-                         started_at="2026-09-01T00:00:00Z", repo="cfo",
+                         started_at="2026-09-01T00:00:00Z", repo="ledger",
                          worktree=str(run_dir), profile="p", model="claude-sonnet-4-6")
     _append_tool_call_line(run_dir, json.dumps({
         "timestamp": "2026-09-01T00:01:00Z", "tool_name": "mcp__kb__kb_get",
-        "input": {"id": "SENTINEL-cfo-only-doc"}, "result_summary": "found",
+        "input": {"id": "SENTINEL-ledger-only-doc"}, "result_summary": "found",
         "duration_ms": 12, "is_error": False}) + "\n")
 
     payload = _do_get(run_register_api, "/runs/run-private-docs1/docs_fetched")
 
     assert payload == {"found": True, "private": True}
-    assert "SENTINEL-cfo-only-doc" not in json.dumps(payload)
+    assert "SENTINEL-ledger-only-doc" not in json.dumps(payload)
+
+
+def test_docs_fetched_route_withholds_a_walled_off_run_while_still_serving_a_public_one(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """CQ·634: applied through `_run_is_private`, the same function
+    `/runs` and `/facts` already filter every row through. At main this test
+    fails: `walled_payload` serves the walled crew's real fetched doc id
+    (the SENTINEL below), not `{"found": True, "private": True}`."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({
+        "test-walled-crew": {"home_dir": "~/Convivy/test-walled-crew", "walled_off": True},
+        "test-public-crew": {"home_dir": "~/Convivy/test-public-crew"},
+    })
+    (fake_home / "Convivy" / "test-walled-crew").mkdir(parents=True)
+    (fake_home / "Convivy" / "test-public-crew").mkdir(parents=True)
+    walled_dir = telemetry.create_run_dir("run-walled-docs1", date="2026-09-01")
+    telemetry.write_meta(walled_dir, run_id="run-walled-docs1", agent="coder", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-walled-crew",
+                         worktree=str(walled_dir), profile="p", model="claude-sonnet-4-6")
+    _append_tool_call_line(walled_dir, json.dumps({
+        "timestamp": "2026-09-01T00:01:00Z", "tool_name": "mcp__kb__kb_get",
+        "input": {"id": "SENTINEL-walled-only-doc"}, "result_summary": "found",
+        "duration_ms": 12, "is_error": False}) + "\n")
+    public_dir = telemetry.create_run_dir("run-public-docs1", date="2026-09-01")
+    telemetry.write_meta(public_dir, run_id="run-public-docs1", agent="coder", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-public-crew",
+                         worktree=str(public_dir), profile="p", model="claude-sonnet-4-6")
+    _append_tool_call_line(public_dir, json.dumps({
+        "timestamp": "2026-09-01T00:01:00Z", "tool_name": "mcp__kb__kb_get",
+        "input": {"id": "shared/agents/architect"}, "result_summary": "found",
+        "duration_ms": 12, "is_error": False}) + "\n")
+
+    walled_payload = _do_get(run_register_api, "/runs/run-walled-docs1/docs_fetched")
+    public_payload = _do_get(run_register_api, "/runs/run-public-docs1/docs_fetched")
+
+    assert walled_payload == {"found": True, "private": True}
+    assert "SENTINEL-walled-only-doc" not in json.dumps(walled_payload)
+    assert public_payload == {"found": True, "docs_fetched": [
+        {"id": "shared/agents/architect", "kind": "knowledge", "fetched_at": "2026-09-01T00:01:00Z"},
+    ], "searches": []}
+
+
+def test_docs_fetched_route_withholds_a_public_run_too_when_walled_off_slugs_raises(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """At main this test fails: nothing on this route calls
+    `walled_off_slugs()` at all, so the public run below is served in full
+    rather than withheld."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({"test-public-crew": {"home_dir": "~/Convivy/test-public-crew"}})
+    (fake_home / "Convivy" / "test-public-crew").mkdir(parents=True)
+    run_dir = telemetry.create_run_dir("run-public-docs2", date="2026-09-01")
+    telemetry.write_meta(run_dir, run_id="run-public-docs2", agent="coder", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-public-crew",
+                         worktree=str(run_dir), profile="p", model="claude-sonnet-4-6")
+    _append_tool_call_line(run_dir, json.dumps({
+        "timestamp": "2026-09-01T00:01:00Z", "tool_name": "mcp__kb__kb_get",
+        "input": {"id": "shared/agents/architect"}, "result_summary": "found",
+        "duration_ms": 12, "is_error": False}) + "\n")
+    monkeypatch.setattr(projects, "walled_off_slugs",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    payload = _do_get(run_register_api, "/runs/run-public-docs2/docs_fetched")
+
+    assert payload == {"found": True, "private": True}
 
 
 def test_docs_fetched_grows_when_a_line_is_appended_without_any_finalize(
@@ -1250,16 +1509,16 @@ def test_a_private_runs_answer_carries_no_searches_key(
     never served: the private answer has no `searches` key, and the sentinel
     query below reaches neither the payload nor its JSON."""
     run_dir = _docs_run_dir(fake_home, monkeypatch, projects_registry, "run-search-private1",
-                            repo="cfo", private=True)
+                            repo="ledger", private=True)
     _append_tool_call_line(run_dir, json.dumps({
         "timestamp": "2026-09-01T00:01:00Z", "tool_name": "mcp__kb__kb_search",
-        "input": {"query": "SENTINEL-cfo-search-query"}, "result_summary": "{}",
+        "input": {"query": "SENTINEL-ledger-search-query"}, "result_summary": "{}",
         "duration_ms": 30, "is_error": False}) + "\n")
 
     payload = _do_get(run_register_api, "/runs/run-search-private1/docs_fetched")
 
     assert payload == {"found": True, "private": True}
-    assert "SENTINEL-cfo-search-query" not in json.dumps(payload)
+    assert "SENTINEL-ledger-search-query" not in json.dumps(payload)
 
 
 def test_the_route_resolves_the_run_directory_once(
@@ -1275,21 +1534,21 @@ def test_the_route_resolves_the_run_directory_once(
     telemetry = _facts_run_dir(fake_home, monkeypatch)
     projects_registry({
         "agent-platform": {"home_dir": "~/Convivy/agent-platform"},
-        "cfo": {"home_dir": "~/Convivy/CFO", "private": True},
+        "ledger": {"home_dir": "~/Convivy/LEDGER", "private": True},
     })
     (fake_home / "Convivy" / "agent-platform").mkdir(parents=True)
-    (fake_home / "Convivy" / "CFO").mkdir(parents=True)
+    (fake_home / "Convivy" / "LEDGER").mkdir(parents=True)
     public_dir = telemetry.create_run_dir("run-swap-docs1", date="2026-09-01")
     telemetry.write_meta(public_dir, run_id="run-swap-docs1", agent="coder", task="t",
                          started_at="2026-09-01T00:00:00Z", repo="agent-platform",
                          worktree=str(public_dir), profile="p", model="claude-sonnet-4-6")
     private_dir = telemetry.create_run_dir("run-swap-docs1", date="2026-09-02")
     telemetry.write_meta(private_dir, run_id="run-swap-docs1", agent="coder", task="t",
-                         started_at="2026-09-02T00:00:00Z", repo="cfo",
+                         started_at="2026-09-02T00:00:00Z", repo="ledger",
                          worktree=str(private_dir), profile="p", model="claude-sonnet-4-6")
     _append_tool_call_line(private_dir, json.dumps({
         "timestamp": "2026-09-02T00:01:00Z", "tool_name": "mcp__kb__kb_search",
-        "input": {"query": "SENTINEL-cfo-swapped-query"}, "result_summary": "{}",
+        "input": {"query": "SENTINEL-ledger-swapped-query"}, "result_summary": "{}",
         "duration_ms": 30, "is_error": False}) + "\n")
 
     lookups = []
@@ -1304,7 +1563,7 @@ def test_the_route_resolves_the_run_directory_once(
 
     assert len(lookups) == 1
     assert payload == {"found": True, "docs_fetched": [], "searches": []}
-    assert "SENTINEL-cfo-swapped-query" not in json.dumps(payload)
+    assert "SENTINEL-ledger-swapped-query" not in json.dumps(payload)
 
 
 # --- /runs/<run_id>/docs_given: the documents a dispatch run was GIVEN at
@@ -1323,22 +1582,88 @@ def test_a_private_runs_docs_given_route_serves_nothing(
     and `_docs_fetched_payload` already filter every row through — never a
     copy of that check. A private crew's given document id must not leak."""
     telemetry = _facts_run_dir(fake_home, monkeypatch)
-    projects_registry({"cfo": {"home_dir": "~/Convivy/CFO", "private": True}})
-    (fake_home / "Convivy" / "CFO").mkdir(parents=True)
+    projects_registry({"ledger": {"home_dir": "~/Convivy/LEDGER", "private": True}})
+    (fake_home / "Convivy" / "LEDGER").mkdir(parents=True)
     run_dir = telemetry.create_run_dir("run-private-docs-given1", date="2026-09-01")
     telemetry.write_meta(run_dir, run_id="run-private-docs-given1", agent="coder", task="t",
-                         started_at="2026-09-01T00:00:00Z", repo="cfo",
+                         started_at="2026-09-01T00:00:00Z", repo="ledger",
                          worktree=str(run_dir), profile="p", model="claude-sonnet-4-6")
     telemetry.write_docs_consulted(
         run_dir, profile="p", individuated_agents=["coder"], individuated_skills=[],
         queried_at_runtime=[],
-        materialized_documents=[{"id": "SENTINEL-cfo-given-doc", "kind": "agent",
+        materialized_documents=[{"id": "SENTINEL-ledger-given-doc", "kind": "agent",
                                   "body_sha256": "a" * 64}])
 
     payload = _do_get(run_register_api, "/runs/run-private-docs-given1/docs_given")
 
     assert payload == {"found": True, "private": True}
-    assert "SENTINEL-cfo-given-doc" not in json.dumps(payload)
+    assert "SENTINEL-ledger-given-doc" not in json.dumps(payload)
+
+
+def test_docs_given_route_withholds_a_walled_off_run_while_still_serving_a_public_one(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """CQ·634: applied through `_run_is_private`, the same function `/runs`,
+    `/facts` and `/docs_fetched` already filter every row through. At main
+    this test fails: `walled_payload` serves the walled crew's real given
+    document id (the SENTINEL below), not `{"found": True, "private": True}`."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({
+        "test-walled-crew": {"home_dir": "~/Convivy/test-walled-crew", "walled_off": True},
+        "test-public-crew": {"home_dir": "~/Convivy/test-public-crew"},
+    })
+    (fake_home / "Convivy" / "test-walled-crew").mkdir(parents=True)
+    (fake_home / "Convivy" / "test-public-crew").mkdir(parents=True)
+    walled_dir = telemetry.create_run_dir("run-walled-given1", date="2026-09-01")
+    telemetry.write_meta(walled_dir, run_id="run-walled-given1", agent="coder", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-walled-crew",
+                         worktree=str(walled_dir), profile="p", model="claude-sonnet-4-6")
+    telemetry.write_docs_consulted(
+        walled_dir, profile="p", individuated_agents=["coder"], individuated_skills=[],
+        queried_at_runtime=[],
+        materialized_documents=[{"id": "SENTINEL-walled-given-doc", "kind": "agent",
+                                  "body_sha256": "a" * 64}])
+    public_dir = telemetry.create_run_dir("run-public-given1", date="2026-09-01")
+    telemetry.write_meta(public_dir, run_id="run-public-given1", agent="coder", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-public-crew",
+                         worktree=str(public_dir), profile="p", model="claude-sonnet-4-6")
+    telemetry.write_docs_consulted(
+        public_dir, profile="p", individuated_agents=["coder"], individuated_skills=[],
+        queried_at_runtime=[],
+        materialized_documents=[{"id": "shared/agents/coder", "kind": "agent",
+                                  "body_sha256": "b" * 64}])
+    public_on_disk = json.loads((public_dir / "docs_consulted.json").read_text())
+
+    walled_payload = _do_get(run_register_api, "/runs/run-walled-given1/docs_given")
+    public_payload = _do_get(run_register_api, "/runs/run-public-given1/docs_given")
+
+    assert walled_payload == {"found": True, "private": True}
+    assert "SENTINEL-walled-given-doc" not in json.dumps(walled_payload)
+    assert public_payload == {"found": True, "docs_consulted": public_on_disk}
+
+
+def test_docs_given_route_withholds_a_public_run_too_when_walled_off_slugs_raises(
+        run_register_api, fake_home, projects_registry, monkeypatch):
+    """At main this test fails: nothing on this route calls
+    `walled_off_slugs()` at all, so the public run below is served in full
+    rather than withheld."""
+    telemetry = _facts_run_dir(fake_home, monkeypatch)
+    projects_registry({"test-public-crew": {"home_dir": "~/Convivy/test-public-crew"}})
+    (fake_home / "Convivy" / "test-public-crew").mkdir(parents=True)
+    run_dir = telemetry.create_run_dir("run-public-given2", date="2026-09-01")
+    telemetry.write_meta(run_dir, run_id="run-public-given2", agent="coder", task="t",
+                         started_at="2026-09-01T00:00:00Z", repo="test-public-crew",
+                         worktree=str(run_dir), profile="p", model="claude-sonnet-4-6")
+    telemetry.write_docs_consulted(
+        run_dir, profile="p", individuated_agents=["coder"], individuated_skills=[],
+        queried_at_runtime=[],
+        materialized_documents=[{"id": "shared/agents/coder", "kind": "agent",
+                                  "body_sha256": "b" * 64}])
+    monkeypatch.setattr(projects, "walled_off_slugs",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    payload = _do_get(run_register_api, "/runs/run-public-given2/docs_given")
+
+    assert payload == {"found": True, "private": True}
 
 
 def test_docs_given_route_serves_the_runs_docs_consulted_json_unchanged(
@@ -1523,16 +1848,16 @@ def _register_and_place(fake_home, tmp_path, projects_registry, slug, *, private
 
 def test_a_session_resolving_to_no_registered_project_is_absent(
         run_register_api, fake_home, projects_registry, monkeypatch):
-    """`ask` is the live case: the operator's personal-assistant tmux session, whose
-    cwd (~/Convivy/ask in production) is not, and must not become, a
-    registered project home."""
-    ask_dir = fake_home / "Convivy" / "ask"
-    ask_dir.mkdir(parents=True)
+    """The walled-off crew is the live case: the operator's assistant tmux
+    session, whose cwd (~/Convivy/<its own dir> in production) is not, and
+    must not become, a registered project home."""
+    walled_dir = fake_home / "Convivy" / "parlor"
+    walled_dir.mkdir(parents=True)
     projects_registry({"agent-platform": {"home_dir": "~/Convivy/agent-platform"}})
     (fake_home / "Convivy" / "agent-platform").mkdir()
 
     monkeypatch.setattr(session_lifecycle, "sessions", lambda: {"sessions": [
-        {"name": "ask", "path": str(ask_dir), "windows": 1, "attached": True},
+        {"name": "parlor", "path": str(walled_dir), "windows": 1, "attached": True},
     ]})
     called = []
     monkeypatch.setattr(session_state, "session_state",
@@ -1549,13 +1874,69 @@ def test_a_session_resolving_to_no_registered_project_is_absent(
 
 def test_a_private_projects_session_is_absent(
         run_register_api, fake_home, tmp_path, projects_registry, monkeypatch):
-    home = _register_and_place(fake_home, tmp_path, projects_registry, "cfo", private=True)
+    home = _register_and_place(fake_home, tmp_path, projects_registry, "ledger", private=True)
     monkeypatch.setattr(session_lifecycle, "sessions", lambda: {"sessions": [
-        {"name": "cfo", "path": str(home), "windows": 1, "attached": True},
+        {"name": "ledger", "path": str(home), "windows": 1, "attached": True},
     ]})
     called = []
     monkeypatch.setattr(session_state, "session_state",
                         lambda name, **kw: called.append(name) or _fake_full_session_state(name))
+
+    payload = run_register_api._sessions_payload(_snapshot(run_register_api))
+
+    assert payload["sessions"] == []
+    assert called == []
+
+
+def test_a_walled_off_crews_session_is_absent_while_a_public_ones_still_served(
+        run_register_api, fake_home, tmp_path, projects_registry, monkeypatch):
+    """CQ·634, live read 2026-11-02 against main 17d979579: the crew the
+    registry marks `walled_off: true` (platform/decisions/0100) IS itself a
+    registered project, with its own `home_dir` — a `co` session whose cwd
+    is that crew's home DOES resolve to a real slug via
+    `_project_slug_for_cwd`, unlike `test_a_session_resolving_to_no_
+    registered_project_is_absent` above, where the cwd never registers a
+    slug at all. The filter checked only `projects.private_slugs()`, so this
+    session was served with the walled-off crew's own slug as `crew`.
+    Synthetic names stand in for the live crew. At main this test fails:
+    `by_session` comes back `{"test-public-crew": "test-public-crew",
+    "test-walled-crew": "test-walled-crew"}`, not with the walled-off entry
+    withheld."""
+    walled_home = fake_home / "Convivy" / "test-walled-crew"
+    public_home = fake_home / "Convivy" / "test-public-crew"
+    walled_home.mkdir(parents=True)
+    public_home.mkdir(parents=True)
+    projects_registry({
+        "test-walled-crew": {"home_dir": "~/Convivy/test-walled-crew", "walled_off": True},
+        "test-public-crew": {"home_dir": "~/Convivy/test-public-crew"},
+    })
+    monkeypatch.setattr(session_lifecycle, "sessions", lambda: {"sessions": [
+        {"name": "test-walled-crew", "path": str(walled_home), "windows": 1, "attached": True},
+        {"name": "test-public-crew", "path": str(public_home), "windows": 1, "attached": True},
+    ]})
+    monkeypatch.setattr(session_state, "session_state",
+                        lambda name, **kw: _fake_full_session_state(name))
+
+    payload = run_register_api._sessions_payload(_snapshot(run_register_api))
+
+    by_session = {row["session"]: row["crew"] for row in payload["sessions"]}
+    assert by_session == {"test-public-crew": "test-public-crew"}
+
+
+def test_sessions_payload_is_empty_when_walled_off_slugs_raises(
+        run_register_api, fake_home, tmp_path, projects_registry, monkeypatch):
+    """The `/sessions` twin of `test_runs_payload_is_empty_when_walled_off_slugs_raises`.
+    At main this test fails: nothing on this route calls `walled_off_slugs()`
+    at all, so the public session below is served rather than withheld."""
+    home = _register_and_place(fake_home, tmp_path, projects_registry, "test-public-crew")
+    monkeypatch.setattr(session_lifecycle, "sessions", lambda: {"sessions": [
+        {"name": "test-public-crew", "path": str(home), "windows": 1, "attached": True},
+    ]})
+    called = []
+    monkeypatch.setattr(session_state, "session_state",
+                        lambda name, **kw: called.append(name) or _fake_full_session_state(name))
+    monkeypatch.setattr(projects, "walled_off_slugs",
+                        lambda: (_ for _ in ()).throw(RuntimeError("boom")))
 
     payload = run_register_api._sessions_payload(_snapshot(run_register_api))
 
@@ -1607,21 +1988,96 @@ def test_a_public_registered_projects_session_is_present(
     assert payload["generated_at"]
 
 
-def test_the_sessions_payload_key_set_is_exactly_the_allowlist(
+def test_the_sessions_payload_serves_each_rows_own_crew_slug(
         run_register_api, fake_home, tmp_path, projects_registry, monkeypatch):
-    """So a field added to the source (session_state()'s payload) later
-    cannot appear here without a test change forcing a reviewer to look at
-    it."""
+    """CQ·631: `crew` is the registered project slug the session's cwd
+    resolves to — the same slug `_sessions_payload`'s own filter already
+    computes via `_project_slug_for_cwd`, now also served on the row rather
+    than withheld after being used only to decide whether to include it.
+    Two sessions under two different registered homes prove each row gets
+    its OWN slug, not a value shared or swapped between rows."""
+    home_a = fake_home / "Convivy" / "alpha-crew"
+    home_b = fake_home / "Convivy" / "beta-crew"
+    home_a.mkdir(parents=True)
+    home_b.mkdir(parents=True)
+    projects_registry({
+        "alpha-crew": {"home_dir": "~/Convivy/alpha-crew"},
+        "beta-crew": {"home_dir": "~/Convivy/beta-crew"},
+    })
+    monkeypatch.setattr(session_lifecycle, "sessions", lambda: {"sessions": [
+        {"name": "session-a", "path": str(home_a), "windows": 1, "attached": True},
+        {"name": "session-b", "path": str(home_b), "windows": 1, "attached": True},
+    ]})
+    monkeypatch.setattr(session_state, "session_state",
+                        lambda name, **kw: _fake_full_session_state(name))
+
+    payload = run_register_api._sessions_payload(_snapshot(run_register_api))
+
+    by_session = {row["session"]: row["crew"] for row in payload["sessions"]}
+    assert by_session == {"session-a": "alpha-crew", "session-b": "beta-crew"}
+
+
+def test_the_sessions_payload_resolves_crew_once_per_session_not_twice(
+        run_register_api, fake_home, tmp_path, projects_registry, monkeypatch):
+    """The row filter resolves `_project_slug_for_cwd` once, to decide
+    inclusion; `_session_row` must be handed that same answer rather than
+    calling it again for the field. A second, independent resolve is not
+    only wasted work — it is a second place the filter's answer and the
+    served `crew` value could disagree under a registry generation that
+    changes between the two calls (the exact staleness
+    `_resolve_registry_snapshot` exists to close elsewhere in this route)."""
     home = _register_and_place(fake_home, tmp_path, projects_registry, "bosun")
     monkeypatch.setattr(session_lifecycle, "sessions", lambda: {"sessions": [
         {"name": "bosun", "path": str(home), "windows": 1, "attached": True},
     ]})
     monkeypatch.setattr(session_state, "session_state",
                         lambda name, **kw: _fake_full_session_state(name))
+    calls = []
+    real = run_register_api._project_slug_for_cwd
+
+    def _counting(cwd, homes):
+        calls.append(cwd)
+        return real(cwd, homes)
+    monkeypatch.setattr(run_register_api, "_project_slug_for_cwd", _counting)
+
+    payload = run_register_api._sessions_payload(_snapshot(run_register_api))
+
+    assert [row["crew"] for row in payload["sessions"]] == ["bosun"]
+    assert len(calls) == 1
+
+
+def test_the_sessions_payload_key_set_is_exactly_the_allowlist(
+        run_register_api, fake_home, tmp_path, projects_registry, monkeypatch):
+    """So a field added to the source (session_state()'s payload) later
+    cannot appear here without a test change forcing a reviewer to look at
+    it. Pinned field by field, not just by key set, so a row that happens to
+    carry the right KEYS with the wrong VALUES (e.g. `crew` silently swapped
+    for another field) still fails this test."""
+    home = _register_and_place(fake_home, tmp_path, projects_registry, "bosun")
+    monkeypatch.setattr(session_lifecycle, "sessions", lambda: {"sessions": [
+        {"name": "bosun", "path": str(home), "windows": 1, "attached": True},
+    ]})
+    fake_state = _fake_full_session_state("bosun")
+    monkeypatch.setattr(session_state, "session_state", lambda name, **kw: fake_state)
 
     [row] = run_register_api._sessions_payload(_snapshot(run_register_api))["sessions"]
 
     assert set(row) == set(run_register_api.SESSION_FIELDS)
+    assert row["session"] == "bosun"
+    assert row["crew"] == "bosun"
+    assert row["state"] == fake_state["state"]
+    assert row["alive"] == fake_state["alive"]
+    assert row["progressing"] == fake_state["progressing"]
+    assert row["last_event_age"] == fake_state["last_event_age"]
+    assert row["ctx_pct"] == fake_state["vitals"]["ctx_pct"]
+    assert row["agent_run_count"] == len(fake_state["agent_runs"])
+    assert set(row["working_on"]) == set(run_register_api.WORKING_ON_FIELDS)
+    assert row["working_on"] == {
+        "text": fake_state["working_on"]["text"],
+        "age": fake_state["working_on"]["age"],
+        "since": fake_state["working_on"]["since"],
+        "stale": fake_state["working_on"]["stale"],
+    }
     assert set(row["working_on"]) == set(run_register_api.WORKING_ON_FIELDS)
 
 
@@ -1935,14 +2391,14 @@ def test_a_private_run_serves_neither_model_field(
         run_register_api, runs_root, fake_home, projects_registry):
     import registry
     projects_registry({
-        "cfo": {"home_dir": "~/Convivy/CFO", "private": True},
+        "ledger": {"home_dir": "~/Convivy/LEDGER", "private": True},
         "agent-platform": {"home_dir": "~/Convivy/agent-platform"},
     })
     started_at = "2026-09-24T10:00:00Z"
     _write_meta(fake_home, "run-priv", started_at,
                 {"model": "secret-model-x", "model_resolved": "secret-model-x",
                  "model_choice": "operator_override"})
-    _add_run(registry, run_id="run-priv", repo="cfo", started_at=started_at)
+    _add_run(registry, run_id="run-priv", repo="ledger", started_at=started_at)
 
     payload = run_register_api._runs_payload(_snapshot(run_register_api))
 

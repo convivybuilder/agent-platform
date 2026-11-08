@@ -21,6 +21,7 @@ import pytest
 
 import indexer
 import knowledge
+import projects
 
 REPO = Path(__file__).resolve().parent.parent
 SCHEMA = REPO / "lib" / "knowledge" / "schema.sql"
@@ -1274,6 +1275,29 @@ def _args(**kw):
     return Namespace(**base)
 
 
+@pytest.fixture
+def newproj_registered(monkeypatch, tmp_path):
+    """Registers `newproj` in a temporary copy of the real registry, the way
+    `agentctl crew register newproj` would — platform/decisions/0097 closes the
+    catalogue to what the registry names, so a `projects/newproj/` directory on
+    disk is no longer enough on its own (see
+    `test_kb_sync_refuses_a_document_under_an_unregistered_project`, which
+    covers that closed half with no registration)."""
+    registry = json.loads((REPO / "tests" / "fixtures" / "rich_registry.json").read_text())
+    registry["newproj"] = {
+        "class": "project", "display": "New Project", "owner": "convivy",
+        "repos": ["newproj"], "aliases": [], "kb": "central",
+        "kb_project": "newproj", "home_dir": "<root>/newproj", "dirs": [],
+        "crew": "newproj", "lifecycle": "active", "products": [],
+    }
+    path = tmp_path / "projects.json"
+    path.write_text(json.dumps(registry))
+    monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+    projects._load_raw.cache_clear()
+    yield
+    projects._load_raw.cache_clear()
+
+
 def test_kb_sync_bootstraps_before_touching_the_index(kb_repos, agentctl, monkeypatch):
     """`cmd_kb_sync` calls `venv_bootstrap.ensure` itself, as its first action,
     rather than relying on `_kb_indexer`'s import of `yaml` to be the first
@@ -1381,7 +1405,7 @@ def test_kb_sync_dry_run_when_up_to_date_reports_a_mismatch_without_healing(
 
 
 def test_kb_sync_indexes_a_doc_the_validator_newly_accepts(kb_repos, agentctl, monkeypatch):
-    """The placard case (issue_01M1TJM4D2ZMFK6NT5ZTZHXE2H). A doc the validator
+    """The signpost case (issue_01M1TJM4D2ZMFK6NT5ZTZHXE2H). A doc the validator
     rejects at index time stays absent while the rule is unchanged. Changing the
     rule changes nothing in the knowledge tree — the validator's opinion of the file
     changed, not the file — so the fast-forward path has nothing to hand the
@@ -1413,10 +1437,13 @@ def test_kb_sync_indexes_a_doc_the_validator_newly_accepts(kb_repos, agentctl, m
     assert indexer.verify_index()["ok"] is True
 
 
-def test_kb_sync_indexes_a_project_the_repo_holds_without_a_registration(
-        kb_repos, agentctl):
+def test_kb_sync_indexes_a_project_the_repo_holds_once_it_is_registered(
+        kb_repos, agentctl, newproj_registered):
     """Site 4 of the seeding item: a document under a `projects/<name>/` the
-    validator has no row for indexes on the first sync, with no registration."""
+    validator has a registry row for indexes on the first sync. Before
+    platform/decisions/0097 this needed no registration — the directory's mere
+    presence was enough — and that is now refused
+    (`test_kb_sync_refuses_a_document_under_an_unregistered_project`)."""
     rel = "projects/newproj/reference/first.md"
     path = kb_repos.seed / rel
     path.parent.mkdir(parents=True)
@@ -1424,12 +1451,34 @@ def test_kb_sync_indexes_a_project_the_repo_holds_without_a_registration(
                     .replace("id: platform/reference/first", "id: newproj/reference/first")
                     .replace("project: platform", "project: newproj"))
     _git(kb_repos.seed, "add", "-A")
-    _git(kb_repos.seed, "commit", "--quiet", "-m", "a doc under an unlisted project")
+    _git(kb_repos.seed, "commit", "--quiet", "-m", "a doc under a newly registered project")
     _git(kb_repos.seed, "push", "--quiet", "origin", "main")
 
     assert agentctl.cmd_kb_sync(_args()) == 0
     assert rel in _rows(kb_repos.db)
     assert indexer.verify_index()["ok"] is True
+
+
+def test_kb_sync_refuses_a_document_under_an_unregistered_project(kb_repos, agentctl):
+    """The closed half of platform/decisions/0097: a document under a
+    `projects/<name>/` the registry does not name is refused and never
+    indexed, even though the directory already exists on disk — the behaviour
+    `test_kb_sync_indexes_a_project_the_repo_holds_once_it_is_registered`
+    above exercised without a registration before 0097 closed the catalogue."""
+    rel = "projects/newproj/reference/first.md"
+    text = (DOC.format(slug="first", title="First", body="Under an unregistered project.")
+           .replace("id: platform/reference/first", "id: newproj/reference/first")
+           .replace("project: platform", "project: newproj"))
+    path = kb_repos.seed / rel
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
+    _git(kb_repos.seed, "add", "-A")
+    _git(kb_repos.seed, "commit", "--quiet", "-m", "a doc under an unregistered project")
+    _git(kb_repos.seed, "push", "--quiet", "origin", "main")
+
+    assert agentctl.cmd_kb_sync(_args()) == 0
+    assert rel not in _rows(kb_repos.db)
+    assert any("directory refused" in e for e in indexer.document_errors(text, rel))
 
 
 def _push_a_dropped_document(kb_repos) -> str:

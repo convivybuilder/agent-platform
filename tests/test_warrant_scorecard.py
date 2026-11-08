@@ -7,6 +7,7 @@ mis-parse or a wrong denominator would misstate the warrant axis. gh IO excluded
 """
 from __future__ import annotations
 
+import pytest
 
 # --- _parse_revert -----------------------------------------------------------
 
@@ -43,21 +44,21 @@ def _reverts():
     # PR 764 (sonnet) reverted as unwarranted; PR 712 (sonnet) reverted as a bug;
     # PR 500 (deepseek) reverted, reason unclassified.
     return [
-        {"repo": "vivy", "original_pr": 764, "revert_pr": 765, "reason": "unwarranted",
+        {"repo": "widget", "original_pr": 764, "revert_pr": 765, "reason": "unwarranted",
          "producer_model": "claude-sonnet-4-6", "revert_state": "MERGED"},
-        {"repo": "vivy", "original_pr": 712, "revert_pr": 766, "reason": "bug",
+        {"repo": "widget", "original_pr": 712, "revert_pr": 766, "reason": "bug",
          "producer_model": "claude-sonnet-4-6", "revert_state": "MERGED"},
-        {"repo": "constance", "original_pr": 500, "revert_pr": 501, "reason": "unclassified",
+        {"repo": "globex", "original_pr": 500, "revert_pr": 501, "reason": "unclassified",
          "producer_model": "deepseek/deepseek-chat", "revert_state": "MERGED"},
     ]
 
 
 def _fake_merged(monkeypatch, warrant_scorecard):
-    # 10 sonnet vivy PRs (incl. 764, 712) + 5 deepseek constance PRs (incl. 500).
+    # 10 sonnet widget PRs (incl. 764, 712) + 5 deepseek globex PRs (incl. 500).
     merged = {
-        "vivy": {n: {"producer_model": "claude-sonnet-4-6", "merged_at": "2026-07-01T00:00:00Z",
+        "widget": {n: {"producer_model": "claude-sonnet-4-6", "merged_at": "2026-07-01T00:00:00Z",
                      "producer_agent": "coder"} for n in [764, 712] + list(range(701, 709))},
-        "constance": {n: {"producer_model": "deepseek/deepseek-chat", "merged_at": "2026-07-01T00:00:00Z",
+        "globex": {n: {"producer_model": "deepseek/deepseek-chat", "merged_at": "2026-07-01T00:00:00Z",
                           "producer_agent": "coder"} for n in [500] + list(range(501, 505))},
     }
     monkeypatch.setattr(warrant_scorecard, "merged_agent_prs", lambda days: merged)
@@ -67,7 +68,7 @@ def test_build_report_unwarranted_rate_is_headline(warrant_scorecard, monkeypatc
     _fake_merged(monkeypatch, warrant_scorecard)
     rep = warrant_scorecard.build_report(_reverts(), 90)
     o = rep["overall"]
-    assert o["merged_prs"] == 15                     # 10 vivy + 5 constance
+    assert o["merged_prs"] == 15                     # 10 widget + 5 globex
     assert o["reverted"] == 3
     assert o["unwarranted"] == 1                      # only 764
     assert o["unwarranted_rate"] == round(100 * 1 / 15, 1)
@@ -91,9 +92,9 @@ def test_build_report_most_severe_reason_wins_per_pr(warrant_scorecard, monkeypa
     _fake_merged(monkeypatch, warrant_scorecard)
     # PR 764 reverted twice — once bug, once unwarranted; unwarranted (more severe) wins.
     reverts = [
-        {"repo": "vivy", "original_pr": 764, "revert_pr": 765, "reason": "bug",
+        {"repo": "widget", "original_pr": 764, "revert_pr": 765, "reason": "bug",
          "producer_model": "claude-sonnet-4-6", "revert_state": "MERGED"},
-        {"repo": "vivy", "original_pr": 764, "revert_pr": 767, "reason": "unwarranted",
+        {"repo": "widget", "original_pr": 764, "revert_pr": 767, "reason": "unwarranted",
          "producer_model": "claude-sonnet-4-6", "revert_state": "MERGED"},
     ]
     rep = warrant_scorecard.build_report(reverts, 90)
@@ -107,7 +108,7 @@ def test_build_report_open_revert_is_not_counted(warrant_scorecard, monkeypatch)
     # PR 764 has an OPEN revert PR — a proposal, not yet an undo. It must not
     # register until that revert actually merges (the #773-still-open case).
     reverts = [
-        {"repo": "vivy", "original_pr": 764, "revert_pr": 765, "reason": "unwarranted",
+        {"repo": "widget", "original_pr": 764, "revert_pr": 765, "reason": "unwarranted",
          "producer_model": "claude-sonnet-4-6", "revert_state": "OPEN"},
     ]
     rep = warrant_scorecard.build_report(reverts, 90)
@@ -149,6 +150,7 @@ def test_merged_agent_prs_excludes_a_run_with_a_forged_qualified_repo(
     assert out["homebrew-tap"][2]["producer_agent"] == "bug-fixer"
 
 
+@pytest.mark.rich_registry
 def test_find_reverts_queries_the_registered_owner_for_homebrew_tap(
         warrant_scorecard, monkeypatch):
     """Round-1 review (PR #881, comment 6150937461): `find_reverts` built
@@ -156,13 +158,93 @@ def test_find_reverts_queries_the_registered_owner_for_homebrew_tap(
     everywhere else."""
     captured = {}
 
-    def fake_gh_json(args):
+    def fake_gh_json(args, env):
         captured["args"] = args
         return []
 
     monkeypatch.setattr(warrant_scorecard, "_gh_json", fake_gh_json)
-    warrant_scorecard.find_reverts("homebrew-tap")
+    warrant_scorecard.find_reverts("brewcask-tap", {})
 
     assert captured["args"] and "--repo" in captured["args"]
     repo_arg = captured["args"][captured["args"].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap"
+    assert repo_arg == "caskforge/brewcask-tap"
+
+
+# --- the GitHub credential seam (company/decisions/0027): every `gh` call
+# runs on a token minted from the install's own GitHub App, never the
+# operator's `gh` login ------------------------------------------------------
+
+def test_harvest_threads_the_minted_tokens_env_into_find_reverts(
+        warrant_scorecard, monkeypatch):
+    """Drives `harvest`'s real `GA.read_token_env` (only `GA.installed_app`
+    and `GA.mint_token` are stubbed — `GA.gh_env` runs for real): the minted
+    token lands in `GH_TOKEN`, and `GH_CONFIG_DIR` is an empty, throwaway
+    directory, on the one `gh` call `find_reverts` makes for the repo."""
+    from contextlib import contextmanager
+    from pathlib import Path
+
+    monkeypatch.setattr(warrant_scorecard, "merged_agent_prs",
+                        lambda days: {"widget": {1: {"producer_agent": "bug-fixer",
+                                                      "producer_model": "m",
+                                                      "merged_at": "2026-01-01T00:00:00Z"}}})
+    monkeypatch.setattr(
+        warrant_scorecard.GA, "installed_app",
+        lambda: warrant_scorecard.GA.InstalledApp(app_id="1", key_path=Path("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(warrant_scorecard.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = Path(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(warrant_scorecard.subprocess, "run", fake_run)
+    rows = warrant_scorecard.harvest(90)
+    assert rows == []
+    assert captured, "gh must have been called with the minted token's environment"
+
+
+def test_a_mint_failure_runs_no_gh_process_for_that_repo(
+        warrant_scorecard, monkeypatch, capsys):
+    """A repo whose token cannot be minted is never queried: `find_reverts`'s
+    own `gh` call must not run, and the failure is named on stderr rather
+    than silently dropping the repo's reverts from the harvest."""
+    monkeypatch.setattr(warrant_scorecard, "merged_agent_prs",
+                        lambda days: {"widget": {1: {"producer_agent": "bug-fixer",
+                                                      "producer_model": "m",
+                                                      "merged_at": "2026-01-01T00:00:00Z"}}})
+
+    class _FailingReadTokenEnv:
+        def __init__(self, repo_slug):
+            pass
+
+        def __enter__(self):
+            raise warrant_scorecard.GA.Unreadable("no App key configured at .../app.pem")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(warrant_scorecard.GA, "read_token_env", _FailingReadTokenEnv)
+    calls = []
+    monkeypatch.setattr(warrant_scorecard.subprocess, "run",
+                        lambda *a, **k: calls.append((a, k)))
+
+    rows = warrant_scorecard.harvest(90)
+    assert rows == []
+    assert calls == [], "a mint failure must never fall back to running gh"
+    err = capsys.readouterr().err
+    assert "cannot mint a GitHub token for widget" in err
+    assert "no App key configured" in err

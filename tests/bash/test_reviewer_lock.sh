@@ -47,11 +47,18 @@ for pkg in mcp PyYAML cryptography; do
         "tools/build-reviewer-lock.sh's $pkg pin matches requirements.txt's"
 done
 
-# --- 1: a fresh venv installs the real lock with --require-hashes ----------
+# the header this script writes into requirements-reviewer.lock.txt documents
+# the wheel-only install root actually runs, so a regeneration doesn't
+# silently drop the flag from the file humans read before editing a pin.
+header_heredoc=$(awk '/^cat > "\$OUT" <<HEADER$/{p=1;next} p&&/^HEADER$/{p=0;next} p' "$BUILD_SCRIPT")
+assert_contains "$header_heredoc" "--only-binary :all:" \
+    "tools/build-reviewer-lock.sh's header heredoc documents --only-binary :all:"
+
+# --- 1: a fresh venv installs the real lock wheel-only ----------------------
 python3.11 -m venv "$WORK/good" >/dev/null 2>"$WORK/good-venv.log"
-install_out=$("$WORK/good/bin/python" -m pip install --quiet --require-hashes -r "$LOCK" 2>&1)
+install_out=$("$WORK/good/bin/python" -m pip install --quiet --require-hashes --only-binary :all: -r "$LOCK" 2>&1)
 install_rc=$?
-assert_rc 0 "$install_rc" "pip install --require-hashes -r requirements-reviewer.lock.txt succeeds into a from-scratch venv"
+assert_rc 0 "$install_rc" "pip install --require-hashes --only-binary :all: -r requirements-reviewer.lock.txt succeeds into a from-scratch venv (every pin resolves to a wheel; no sdist build needed)"
 [ "$install_rc" -eq 0 ] || echo "  (pip output: $install_out)"
 
 # --- 2: the tooling's entry modules import from THAT venv's own interpreter -

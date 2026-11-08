@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _dir_listable
+
 LIB = Path(__file__).resolve().parent.parent / "lib" / "agent-platform"
 
 # Rendering a document runs the md-serial renderer, which lives in the knowledge
@@ -43,7 +45,12 @@ _NODE_FOR_TESTS = any(
     for p in ("/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node")
 )
 needs_renderer = pytest.mark.skipif(
-    not (_KNOWLEDGE_REPO_FOR_TESTS.is_dir() and _NODE_FOR_TESTS),
+    # `.is_dir()` alone is not enough (epic E33 slice 2): a dispatched run's
+    # sandbox can leave that METADATA read open on the real knowledge checkout
+    # while denying the DATA reads the renderer subprocess needs, so a present
+    # but unreadable checkout must skip here too, not run and hit a loud
+    # `RuntimeError` from the renderer instead.
+    not (_dir_listable(_KNOWLEDGE_REPO_FOR_TESTS) and _NODE_FOR_TESTS),
     reason=(
         "needs the md-serial renderer: the knowledge repo at "
         f"{_KNOWLEDGE_REPO_FOR_TESTS} and a node binary. Both exist on the mini; "
@@ -229,7 +236,7 @@ def test_a_task_notification_is_not_attributed_to_you(SV):
     """THE PANE PUT WORDS IN THE OPERATOR'S MOUTH. A task notification is an ordinary user
     record — no `toolUseResult`, no `isMeta` — so it rendered as a full-width turn
     labelled "you", and the reader saw the output attributed to them, apparently writing XML. Measured on
-    a live selector transcript: 19 harness records against 5 real prompts."""
+    a live session transcript: 19 harness records against 5 real prompts."""
     rows = SV.classify({"type": "user", "message": {"content":
         "<task-notification>\n<task-id>b5e6478q2</task-id>\n"
         "<status>completed</status>\n"

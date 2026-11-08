@@ -56,7 +56,7 @@ ALLOWED: dict[tuple[str, str], str] = {
         "_FILING_DENY: the tool names a dispatched session is denied; a deny list, not a call",
     ("bin/agentctl", "# cannot reach this field. `issue_create`'s `topics` only seeds a NEW item"):
         "comment",
-    ("bin/co", "# `issue_create` and `kb_create` in reach (nothing leaked — the directory was private"):
+    ("bin/co", "# with `issue_create` and `kb_create` in reach (nothing leaked — the directory was"):
         "comment",
     ("bin/create-lab-app", "work items and files them (`issue_create`). **Every other session files nothing:**"):
         "prose the script writes into a bead for a person or session to act on; the script calls nothing",
@@ -64,6 +64,22 @@ ALLOWED: dict[tuple[str, str], str] = {
         "comment",
     ("bin/issues-waiting", 'url = vault_plane.url(f"/api/issues?{urllib.parse.urlencode(params)}")'):
         "GET read: a urllib request with no body",
+    ("individuator/Sources/IndividuatorDaemonCore/ForwardingAllowlist.swift",
+     "/// `GET`/`POST` routes under `/items` and `/courses` are called from BOTH"):
+        "comment",
+    ("individuator/Sources/IndividuatorDaemonCore/ForwardingAllowlist.swift",
+     '// --- work items ("/items"; Orient-shaped "/api/issues" on the wire'):
+        "comment",
+    ("individuator/Sources/IndividuatorDaemonCore/ForwardingAllowlist.swift",
+     'ForwardingRouteEntry(route: ForwardingRoute(method: "GET", path: "/items"), destination: .library),'):
+        "a forwarding-allowlist entry: data naming a route the Individuator forwards to the "
+        "Library, not a call this process makes — the GET read mcp-ops-server's issue_list and "
+        "issue_client.py's list_open_issues already perform",
+    ("individuator/Sources/IndividuatorDaemonCore/ForwardingAllowlist.swift",
+     'ForwardingRouteEntry(route: ForwardingRoute(method: "POST", path: "/items"), destination: .library),'):
+        "a forwarding-allowlist entry: data naming a route the Individuator forwards to the "
+        "Library, not a call this process makes — the POST mcp-ops-server's own issue_create "
+        "tool already performs, which EXCLUDED_FILES already exempts in that file",
     ("lib/agent-platform/issue_client.py", "orient's /api/bugs path aliases — and will be removed after all callers migrate."):
         "docstring",
     ("lib/agent-platform/issue_client.py", 'return f"/api/issues/{urllib.parse.quote(issue_id, safe=\'\')}/{action}"'):
@@ -99,7 +115,7 @@ ALLOWED: dict[tuple[str, str], str] = {
      "# tests/test_vault_plane.py show the Library serves `/items`, Orient serves"):
         "comment",
     ("scripts/ci/runner-isolation-probe.sh",
-     "# `/api/issues`. convivy-open's `/health` (tools/convivy-open/install-laptop.sh)"):
+     "# `/api/issues`. Every other port below (a product repo, a black-box crew, a"):
         "comment",
     ("scripts/ci/runner-isolation-probe.sh", '8100) echo "/items" ;;                 # Library, derived: vault_plane.py'):
         "GET probe route: the CI isolation probe requests it unauthenticated and discards the body; creates nothing",

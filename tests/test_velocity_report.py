@@ -1,6 +1,20 @@
 """Tests for bin/velocity-report (the engineering-velocity rollup) — the pure
 aggregation, derived rates, regexes, and bucketing config."""
 
+from contextlib import contextmanager
+
+import pytest
+
+import projects
+
+
+@contextmanager
+def _fake_read_token_env(repo_slug):
+    """Stands in for `GA.read_token_env` in a test that drives the real
+    `gh_pr_metrics`/`prs_total` and stubs only `_gh_json`: yields a plain
+    dict rather than reaching the install's GitHub App."""
+    yield {}
+
 
 def test_derived_rates(velocity_report):
     m = velocity_report
@@ -65,14 +79,20 @@ def test_build_alltime_aggregates_per_bucket_and_total(velocity_report, monkeypa
     assert at["total"] == {"loc_now": 160, "commits_total": 9, "prs_total": 6, "pr_stale": False}
 
 
+@pytest.mark.rich_registry
 def test_bucketing_config_and_gh_owner(velocity_report):
     m = velocity_report
     assert set(m.BUCKETS) == {
-        "Vivy", "Constance", "Sous Chef", "Hollis", "Selector", "App Kit",
-        "Orient", "Convivy general", "Engineering-internal",
-        # three NYH projects, one bucket each (ARCH-426 amendment) — NYH Studio is
-        # the PRODUCT they build, which is not a velocity bucket
-        "NYH Arch Tools", "East Texas Circle", "Park Villa",
+        "Finch", "Harbor", "Galley", "Atlas", "Beacon", "Harness Kit",
+        "Orient", "General", "Engineering-internal",
+        # three physical-architecture projects, one bucket each (ARCH-426 amendment) —
+        # Acme Studio is the PRODUCT they build, which is not a velocity bucket
+        "Acme Arch Tools", "Cedar Ridge Circle", "Orchard Lane",
+        # Zephyr Guest + Zephyr Marketing + Zephyr Properties (2026-10-21/22): the
+        # business-area crews registered alongside the three
+        # physical-architecture projects under the same <root>/acme/ umbrella,
+        # each added with its BUCKETS row and registry entry in one change.
+        "Zephyr Guest", "Zephyr Marketing", "Zephyr Properties",
         # The Keel's two halves plus the steward, split apart on 2026-08-17 (the operator).
         # ARCH-426 read the Keel's repos as four projects sharing a co; 2026-08-06
         # merged them into one; this splits them again on a different line. The cut
@@ -81,37 +101,46 @@ def test_bucketing_config_and_gh_owner(velocity_report):
         # can move in parallel instead of queueing behind one co. "Keel" is a scope
         # now — nothing is built at it, so nothing rolls up to it.
         "Library", "Bosun", "Steward", "Deck",
-        # placard (2026-09-05): property instruction pages reached by a QR code
+        # signpost (2026-09-05): property instruction pages reached by a QR code
         # at the property. Listed here in the same change as BUCKETS and the
         # config/projects.json entry, which is the point of this assertion — it
         # is the ONE drift check in a registration chain that otherwise spans
         # seven hand-maintained lists across three repos, and it is the reason
         # the velocity side did not become another forgotten copy.
-        "Placard",
-        # shipwright (2026-09-06): the crew working the company bead, added with
+        "Signpost",
+        # outfitter (2026-09-06): the crew working the company bead, added with
         # its BUCKETS row and registry entry in one change for the same reason.
-        "Shipwright",
-        # signals (2026-09-16): the internal product crew, registered with its
+        "Outfitter",
+        # telemetry (2026-09-16): the internal product crew, registered with its
         # BUCKETS row in one change.
-        "Signals",
-        # archy (2026-10-02): the small-business agentic ops product, registered
+        "Telemetry",
+        # cartographer (2026-10-02): the small-business agentic ops product, registered
         # with its BUCKETS row and registry entry in one change.
-        "Archy",
+        "Cartographer",
+        # northwind-concierge (2026-10-22): the captive-portal product for hosts'
+        # guests, registered with its BUCKETS row and registry entry in one change.
+        "Northwind Concierge",
         "Write Better"}
     # every repo appears in exactly one bucket
     flat = [r for repos in m.BUCKETS.values() for r in repos]
     assert len(flat) == len(set(flat))
-    # each NYH project reports for itself; "NYH Studio" is no longer a bucket
-    assert m.BUCKETS["NYH Arch Tools"] == ["nyh-arch-tools"]
-    assert m.BUCKETS["East Texas Circle"] == ["nyh-etc"]
-    assert m.BUCKETS["Park Villa"] == ["nyh-park-villa"]
-    assert "NYH Studio" not in m.BUCKETS
-    # the shared KB slice still has to land somewhere — an ADR under `nyh-studio`
+    # each physical-architecture project reports for itself; "Acme Studio" is no longer a bucket
+    assert m.BUCKETS["Acme Arch Tools"] == ["oak-arch-tools"]
+    assert m.BUCKETS["Cedar Ridge Circle"] == ["oak-etc"]
+    assert m.BUCKETS["Orchard Lane"] == ["oak-park-villa"]
+    assert "Acme Studio" not in m.BUCKETS
+    # the shared KB slice still has to land somewhere — an ADR under `oak-studio`
     # cannot be attributed to one property, so it counts for the studio-wide project
-    assert m.ADR_PROJECT_BUCKET["nyh-studio"] == "NYH Arch Tools"
-    # nyh resolves to the configured github_login; everything else to convivy
-    assert m.gh_full("nyh-arch-tools") == "operator-login/nyh-arch-tools"
-    assert m.gh_full("vivy") == "convivy/vivy"
+    assert m.ADR_PROJECT_BUCKET["oak-studio"] == "Acme Arch Tools"
+    # oak-arch-tools resolves to the configured github_login; everything else
+    # to convivy, except oak-guest and oak-marketing, which resolve to the
+    # registry's own `github_owner` (2026-10-21, relayed by the steward)
+    # rather than to github_login, since that is a different owner.
+    assert m.gh_full("oak-arch-tools") == "operator-login/oak-arch-tools"
+    assert m.gh_full("oak-guest") == f"{projects.get('oak-guest')['github_owner']}/oak-guest"
+    assert m.gh_full("oak-marketing") == \
+        f"{projects.get('oak-marketing')['github_owner']}/oak-marketing"
+    assert m.gh_full("finch") == "convivy/finch"
 
 
 def test_engineering_internal_survives_with_no_repos_as_the_adr_fallback(velocity_report):
@@ -137,21 +166,110 @@ def test_the_sunsetted_kit_repos_are_gone_from_every_bucket(velocity_report):
     assert not (flat & gone), f"sunsetted repos still bucketed: {flat & gone}"
 
 
-def test_repo_path_maps_nyh_umbrella_subdir(velocity_report):
+@pytest.mark.rich_registry
+def test_repo_path_maps_acme_umbrella_subdir(velocity_report):
     m = velocity_report
-    # NYH Studio repos live one level down under the umbrella, not flat under ~/Convivy —
+    # Acme Studio repos live one level down under the umbrella, not flat under ~/Convivy —
     # the bug that read 0 commits/LOC for them (the operator, 2026-07-01).
-    assert m.repo_path("nyh-park-villa") == m.CONVIVY / "nyh-architecture" / "nyh-park-villa"
-    assert m.repo_path("nyh-arch-tools") == m.CONVIVY / "nyh-architecture" / "nyh-arch-tools"
+    assert m.repo_path("oak-park-villa") == m.CONVIVY / "acme" / "oak-park-villa"
+    assert m.repo_path("oak-arch-tools") == m.CONVIVY / "acme" / "oak-arch-tools"
     # a flat repo is unchanged
-    assert m.repo_path("vivy") == m.CONVIVY / "vivy"
+    assert m.repo_path("finch") == m.CONVIVY / "finch"
 
 
-def test_adr_project_routing_matches_explanations_buckets(velocity_report):
-    # an ADR's project decides its bucket (a constance ADR counts for Constance)
+def test_repo_path_accepts_an_ordinary_bare_name(velocity_report):
     m = velocity_report
-    assert m.ADR_PROJECT_BUCKET["constance"] == "Constance"
-    assert m.ADR_PROJECT_BUCKET["hollis"] == "Hollis"
+    assert m.repo_path("acme-widgets") == m.CONVIVY / "acme-widgets"
+
+
+def test_repo_subpaths_derives_from_a_crafted_registry(velocity_report, tmp_path, monkeypatch):
+    """`_repo_subpaths()` reads the shape `REPO_SUBPATH` used to hand-maintain —
+    a single-repo unit whose `home_dir` resolves outside <root>/<repo-name> —
+    straight from a temporary registry with made-up names, so a newly
+    registered project with a non-flat home needs no edit to this file."""
+    m = velocity_report
+    raw = {
+        "acme-nested": {
+            "class": "project", "display": "Acme Nested", "owner": "convivy",
+            "home_dir": "<root>/umbrella/acme-nested", "dirs": [],
+            "crew": "acme-nested", "lifecycle": "active", "products": [],
+            "repos": ["acme-nested"], "aliases": [], "kb": "local",
+        },
+        "acme-flat": {
+            "class": "project", "display": "Acme Flat", "owner": "convivy",
+            "home_dir": "<root>/acme-flat", "dirs": [],
+            "crew": "acme-flat", "lifecycle": "active", "products": [],
+            "repos": ["acme-flat"], "aliases": [], "kb": "local",
+        },
+        "acme-multi": {
+            "class": "project", "display": "Acme Multi", "owner": "convivy",
+            "home_dir": "<root>/acme-multi", "dirs": [],
+            "crew": "acme-multi", "lifecycle": "active", "products": [],
+            "repos": ["acme-multi-a", "acme-multi-b"], "aliases": [], "kb": "local",
+        },
+        "_scopes": {}, "_products": {},
+    }
+    path = tmp_path / "projects.json"
+    path.write_text(__import__("json").dumps(raw))
+    monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+    projects._load_raw.cache_clear()
+    try:
+        assert m._repo_subpaths() == {"acme-nested": "umbrella/acme-nested"}
+    finally:
+        projects._load_raw.cache_clear()
+
+
+def test_gh_owner_reads_github_owner_private_and_single_repo_owner(
+        velocity_report, tmp_path, monkeypatch):
+    """`GH_OWNER`'s construction, pinned against a crafted registry: a unit's own
+    `github_owner` populates a single-repo unit's entry; `github_owner_private`
+    takes the operator's local config instead and is skipped when that config
+    has no login; a multi-repo unit contributes nothing, matching every call
+    site's behaviour before this table existed."""
+    m = velocity_report
+    raw = {
+        "acme-owned": {
+            "class": "project", "display": "Acme Owned", "owner": "convivy",
+            "home_dir": "<root>/acme-owned", "dirs": [],
+            "crew": "acme-owned", "lifecycle": "active", "products": [],
+            "repos": ["acme-owned"], "aliases": [], "kb": "local",
+            "github_owner": "acme-org",
+        },
+        "acme-private": {
+            "class": "project", "display": "Acme Private", "owner": "convivy",
+            "home_dir": "<root>/acme-private", "dirs": [],
+            "crew": "acme-private", "lifecycle": "active", "products": [],
+            "repos": ["acme-private"], "aliases": [], "kb": "local",
+            "github_owner_private": True,
+        },
+        "acme-multi": {
+            "class": "project", "display": "Acme Multi", "owner": "convivy",
+            "home_dir": "<root>/acme-multi", "dirs": [],
+            "crew": "acme-multi", "lifecycle": "active", "products": [],
+            "repos": ["acme-multi-a", "acme-multi-b"], "aliases": [], "kb": "local",
+            "github_owner": "acme-multi-org",
+        },
+        "_scopes": {}, "_products": {},
+    }
+    path = tmp_path / "projects.json"
+    path.write_text(__import__("json").dumps(raw))
+    monkeypatch.setattr(projects, "PROJECTS_JSON", path)
+    projects._load_raw.cache_clear()
+    try:
+        got = m._gh_owners()
+        assert got["acme-owned"] == "acme-org"
+        assert got["acme-private"] == "operator-login"  # tests/conftest.py's fake login
+        assert "acme-multi-a" not in got and "acme-multi-b" not in got
+    finally:
+        projects._load_raw.cache_clear()
+
+
+@pytest.mark.rich_registry
+def test_adr_project_routing_matches_explanations_buckets(velocity_report):
+    # an ADR's project decides its bucket (a harbor ADR counts for Harbor)
+    m = velocity_report
+    assert m.ADR_PROJECT_BUCKET["harbor"] == "Harbor"
+    assert m.ADR_PROJECT_BUCKET["atlas"] == "Atlas"
     assert "shared" not in m.ADR_PROJECT_BUCKET  # falls through to Engineering-internal
 
 
@@ -187,7 +305,7 @@ def test_the_arch_log_is_attributed_to_a_live_bucket(velocity_report, monkeypatc
     assert len(owning) == 1, f"substrate must sit in exactly one bucket, found {owning}"
     arch_bucket = owning[0]
 
-    monkeypatch.setattr(m, "BUCKETS", {arch_bucket: ["substrate"], "Other": ["vivy"]})
+    monkeypatch.setattr(m, "BUCKETS", {arch_bucket: ["substrate"], "Other": ["widget"]})
     _stub_window_deps(m, monkeypatch)
     monkeypatch.setattr(m, "arch_entries", lambda s, u=None: 42)
     monkeypatch.setattr(m, "gh_pr_metrics", lambda r, s, u=None: {})
@@ -202,24 +320,36 @@ def test_the_arch_log_is_attributed_to_a_live_bucket(velocity_report, monkeypatc
 # --- transient-failure hardening (the operator 2026-06-30): never let a failed GitHub fetch
 # masquerade as no-GitHub / a false 0; carry the last-known-good value forward -------
 
-import pytest  # noqa: E402
+
+@pytest.mark.parametrize("repo", [
+    "../../etc",
+    "acme/../../etc",
+    "/etc/passwd",
+])
+def test_repo_path_refuses_a_repo_string_shaped_like_a_path(velocity_report, repo):
+    """`repos` is a registry field a crew-register write can put anything into
+    (crew_registration.build_row() only requires a non-empty string) — a value
+    with '/' or '..', or an absolute path, must never reach the `git -C`
+    read-only join against CONVIVY (security-reviewer, PR #987)."""
+    with pytest.raises(ValueError):
+        velocity_report.repo_path(repo)
 
 
 def test_is_on_github_distinguishes_clone_remote_from_gh_only(velocity_report, monkeypatch, tmp_path):
     m = velocity_report
-    # not cloned locally → assumed on GitHub (gh-only repos like nyh); a failed query
+    # not cloned locally → assumed on GitHub (gh-only repos like finch); a failed query
     # is then a transient error to carry forward, not a false "no remote".
     monkeypatch.setattr(m, "repo_path", lambda r: tmp_path / "absent")
-    assert m._is_on_github("nyh") is True
+    assert m._is_on_github("finch") is True
     # cloned with a github origin → True
-    p = tmp_path / "vivy"
+    p = tmp_path / "widget"
     (p / ".git").mkdir(parents=True)
     monkeypatch.setattr(m, "repo_path", lambda r: p)
-    monkeypatch.setattr(m, "_git", lambda r, a: "git@github.com:convivy/vivy.git")
-    assert m._is_on_github("vivy") is True
+    monkeypatch.setattr(m, "_git", lambda r, a: "git@github.com:convivy/widget.git")
+    assert m._is_on_github("widget") is True
     # cloned, no github origin → False (a local-only *-commercial site)
     monkeypatch.setattr(m, "_git", lambda r, a: None)
-    assert m._is_on_github("vivy-commercial") is False
+    assert m._is_on_github("widget-commercial") is False
 
 
 def test_gh_pr_metrics_raises_on_fetch_error_but_none_for_no_gh(velocity_report, monkeypatch):
@@ -227,12 +357,83 @@ def test_gh_pr_metrics_raises_on_fetch_error_but_none_for_no_gh(velocity_report,
     monkeypatch.setattr(m, "_is_on_github", lambda r: False)
     assert m.gh_pr_metrics("commercial", "2026-06-01") is None          # no remote → None
     monkeypatch.setattr(m, "_is_on_github", lambda r: True)
+    monkeypatch.setattr(m.GA, "read_token_env", _fake_read_token_env)
     monkeypatch.setattr(m, "_gh_json", lambda *a, **k: None)             # retries exhausted
     with pytest.raises(m.FetchError):
-        m.gh_pr_metrics("vivy", "2026-06-01")
+        m.gh_pr_metrics("widget", "2026-06-01")
     monkeypatch.setattr(m, "_gh_json",
                         lambda *a, **k: [{"title": "feat: x"}, {"title": "fix: y"}])
-    assert m.gh_pr_metrics("vivy", "2026-06-01") == {"prs_merged": 2, "features": 1}
+    assert m.gh_pr_metrics("widget", "2026-06-01") == {"prs_merged": 2, "features": 1}
+
+
+# --- the GitHub credential seam (company/decisions/0027): every `gh` call
+# runs on a token minted from the install's own GitHub App, never the
+# operator's `gh` login ------------------------------------------------------
+
+def test_gh_pr_metrics_threads_the_minted_tokens_env_into_the_gh_call(
+        velocity_report, monkeypatch):
+    """Drives the real `GA.read_token_env` (only `GA.installed_app` and
+    `GA.mint_token` are stubbed — `GA.gh_env` runs for real): the minted
+    token lands in `GH_TOKEN`, and `GH_CONFIG_DIR` is an empty, throwaway
+    directory, on the `gh pr list` call `gh_pr_metrics` makes."""
+    from pathlib import Path
+
+    m = velocity_report
+    monkeypatch.setattr(m, "_is_on_github", lambda r: True)
+    monkeypatch.setattr(
+        m.GA, "installed_app",
+        lambda: m.GA.InstalledApp(app_id="1", key_path=Path("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(m.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = Path(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    assert m.gh_pr_metrics("widget", "2026-06-01") == {"prs_merged": 0, "features": 0}
+    assert captured, "gh must have been called with the minted token's environment"
+
+
+def test_gh_pr_metrics_a_mint_failure_runs_no_gh_process(velocity_report, monkeypatch):
+    """A repo whose token cannot be minted never runs `gh`, and the failure
+    takes the same `FetchError` path a failed `gh pr list` already takes —
+    carried forward by the caller rather than written as a false 0 — but
+    naming the mint's reason rather than 'after retries'."""
+    m = velocity_report
+    monkeypatch.setattr(m, "_is_on_github", lambda r: True)
+
+    class _FailingReadTokenEnv:
+        def __init__(self, repo_slug):
+            pass
+
+        def __enter__(self):
+            raise m.GA.Unreadable("no App key configured at .../app.pem")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(m.GA, "read_token_env", _FailingReadTokenEnv)
+    calls = []
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+
+    with pytest.raises(m.FetchError, match="cannot mint a GitHub token"):
+        m.gh_pr_metrics("widget", "2026-06-01")
+    assert calls == [], "a mint failure must never fall back to running gh"
 
 
 def _stub_window_deps(m, monkeypatch):
@@ -247,7 +448,7 @@ def _stub_window_deps(m, monkeypatch):
 def test_build_window_carries_forward_prs_on_fetch_error(velocity_report, monkeypatch):
     from datetime import datetime, timezone
     m = velocity_report
-    monkeypatch.setattr(m, "BUCKETS", {"Vivy": ["vivy"]})
+    monkeypatch.setattr(m, "BUCKETS", {"Widget": ["widget"]})
     _stub_window_deps(m, monkeypatch)
 
     def boom(r, s, u=None):
@@ -255,8 +456,8 @@ def test_build_window_carries_forward_prs_on_fetch_error(velocity_report, monkey
     monkeypatch.setattr(m, "gh_pr_metrics", boom)
     now = datetime(2026, 6, 30, tzinfo=timezone.utc)
 
-    prev = {"windows": {"30": {"buckets": {"Vivy": {"prs_merged": 243, "features": 10}}}}}
-    v = m.build_window(30, now, prev)["buckets"]["Vivy"]
+    prev = {"windows": {"30": {"buckets": {"Widget": {"prs_merged": 243, "features": 10}}}}}
+    v = m.build_window(30, now, prev)["buckets"]["Widget"]
     assert v["prs_merged"] == 243 and v["features"] == 10   # last-known-good, NOT a false 0
     assert v["pr_stale"] is True
     assert m.build_window(30, now, prev)  # (sanity: no crash)
@@ -264,14 +465,14 @@ def test_build_window_carries_forward_prs_on_fetch_error(velocity_report, monkey
     assert m.build_window(30, now, prev)["total"]["pr_stale"] is True
     # with no prior snapshot it can't fabricate — stays 0 but is still flagged stale,
     # so the page shows "—/stale", never a confident 0.
-    v0 = m.build_window(30, now, {})["buckets"]["Vivy"]
+    v0 = m.build_window(30, now, {})["buckets"]["Widget"]
     assert v0["prs_merged"] == 0 and v0["pr_stale"] is True
 
 
 def test_build_alltime_carries_forward_prs_total_on_fetch_error(velocity_report, monkeypatch):
     import pathlib
     m = velocity_report
-    monkeypatch.setattr(m, "BUCKETS", {"Vivy": ["vivy"]})
+    monkeypatch.setattr(m, "BUCKETS", {"Widget": ["widget"]})
     monkeypatch.setattr(m, "loc_now", lambda r: 100)
     monkeypatch.setattr(m, "commits_total", lambda r: 5)
     monkeypatch.setattr(m, "repo_path", lambda r: pathlib.Path("/nope") / r)
@@ -280,13 +481,13 @@ def test_build_alltime_carries_forward_prs_total_on_fetch_error(velocity_report,
         raise m.FetchError("gh down")
     monkeypatch.setattr(m, "prs_total", boom)
 
-    prev = {"alltime": {"buckets": {"Vivy": {"repos": [{"repo": "vivy", "prs_total": 600}]}}}}
+    prev = {"alltime": {"buckets": {"Widget": {"repos": [{"repo": "widget", "prs_total": 600}]}}}}
     at = m.build_alltime(prev)
-    row = at["buckets"]["Vivy"]["repos"][0]
+    row = at["buckets"]["Widget"]["repos"][0]
     assert row["prs_total"] == 600         # carried forward, not flipped to 0/no_gh
     assert row["pr_stale"] is True and row["no_gh"] is False
     # staleness propagates to the bucket + grand total (symmetric with build_window)
-    assert at["buckets"]["Vivy"]["pr_stale"] is True and at["total"]["pr_stale"] is True
+    assert at["buckets"]["Widget"]["pr_stale"] is True and at["total"]["pr_stale"] is True
 
 
 def test_is_on_github_rejects_lookalike_host(velocity_report, monkeypatch, tmp_path):
@@ -298,7 +499,7 @@ def test_is_on_github_rejects_lookalike_host(velocity_report, monkeypatch, tmp_p
     monkeypatch.setattr(m, "repo_path", lambda r: p)
     monkeypatch.setattr(m, "_git", lambda r, a: "https://github.com.evil.example/x/y.git")
     assert m._is_on_github("r") is False
-    monkeypatch.setattr(m, "_git", lambda r, a: "ssh://git@github.com/convivy/vivy.git")
+    monkeypatch.setattr(m, "_git", lambda r, a: "ssh://git@github.com/convivy/widget.git")
     assert m._is_on_github("r") is True
 
 
@@ -354,16 +555,16 @@ def test_velocity_index_none_when_no_basis(velocity_report):
 def test_attach_index_writes_score_into_buckets_and_total(velocity_report):
     m = velocity_report
     windows = {"7": {
-        "buckets": {"Vivy": {"prs_merged": 20, "features": 4, "survival_pct": 100.0,
+        "buckets": {"Widget": {"prs_merged": 20, "features": 4, "survival_pct": 100.0,
                              "ci_first_pass_pct": 100.0, "change_failure_rate": 0.0}},
         "total": {"prs_merged": 20, "features": 4, "survival_pct": 100.0,
                   "ci_first_pass_pct": 100.0, "change_failure_rate": 0.0},
     }}
-    baseline = {"per_week": {"Vivy": {"prs_merged": 10.0, "features": 2.0},
+    baseline = {"per_week": {"Widget": {"prs_merged": 10.0, "features": 2.0},
                              "TOTAL": {"prs_merged": 10.0, "features": 2.0}}}
     m.attach_index(windows, baseline)
     # every component maxed (2× baseline throughput/features, 100% quality) → 100.
-    assert windows["7"]["buckets"]["Vivy"]["velocity_index"]["score"] == 100.0
+    assert windows["7"]["buckets"]["Widget"]["velocity_index"]["score"] == 100.0
     assert windows["7"]["total"]["velocity_index"]["score"] == 100.0
 
 
@@ -379,13 +580,13 @@ def test_iso_week_start_is_the_monday(velocity_report):
 def test_history_point_extracts_scores_and_stale(velocity_report):
     m = velocity_report
     window = {
-        "buckets": {"Vivy": {"velocity_index": {"score": 72.0}},
-                    "Constance": {"velocity_index": {"score": 55.5}}},
+        "buckets": {"Widget": {"velocity_index": {"score": 72.0}},
+                    "Globex": {"velocity_index": {"score": 55.5}}},
         "total": {"velocity_index": {"score": 66.0}, "pr_stale": True},
     }
     pt = m._history_point(window, "2026-06-29", "2026-06-30")
     assert pt == {"week": "2026-06-29", "date": "2026-06-30", "total": 66.0,
-                  "buckets": {"Vivy": 72.0, "Constance": 55.5}, "pr_stale": True}
+                  "buckets": {"Widget": 72.0, "Globex": 55.5}, "pr_stale": True}
 
 
 def test_upsert_history_replaces_same_week_and_sorts(velocity_report, tmp_path):
@@ -413,7 +614,7 @@ def test_backfill_skips_existing_and_stale_weeks(velocity_report, monkeypatch, t
         # the oldest reconstructed week's fetch "failed" (stale) → must be skipped.
         stale = asof.date().isoformat() == "2026-06-08"
         vi = {"velocity_index": {"score": 70.0}}
-        return {"buckets": {"Vivy": dict(vi)},
+        return {"buckets": {"Widget": dict(vi)},
                 "total": {**vi, "pr_stale": stale}}
     monkeypatch.setattr(m, "build_window", fake_build_window)
     monkeypatch.setattr(m, "attach_index", lambda w, b: None)   # scores already stubbed in
@@ -432,15 +633,16 @@ def test_backfill_skips_existing_and_stale_weeks(velocity_report, monkeypatch, t
 def test_gh_pr_metrics_until_bounds_the_merged_range(velocity_report, monkeypatch):
     m = velocity_report
     monkeypatch.setattr(m, "_is_on_github", lambda r: True)
+    monkeypatch.setattr(m.GA, "read_token_env", _fake_read_token_env)
     seen = {}
 
-    def capture(args, tries=3):
+    def capture(args, env, tries=3):
         seen["args"] = args
         return []
     monkeypatch.setattr(m, "_gh_json", capture)
-    m.gh_pr_metrics("vivy", "2026-06-01")
+    m.gh_pr_metrics("widget", "2026-06-01")
     assert "merged:>=2026-06-01" in seen["args"]              # live: open-ended
-    m.gh_pr_metrics("vivy", "2026-06-01", "2026-06-08")
+    m.gh_pr_metrics("widget", "2026-06-01", "2026-06-08")
     assert "merged:2026-06-01..2026-06-08" in seen["args"]    # as-of: bounded both ends
 
 
@@ -493,7 +695,7 @@ def test_the_exclusion_spares_code_that_merely_sits_beside_prose(velocity_report
     too, and that is intended. What must NOT go is the code around it, which is
     the failure mode of excluding a repo or a directory instead of a filetype.
     """
-    p = _tiny_repo(tmp_path / "svc", {
+    p = _tiny_repo(tmp_path / "widget", {
         "README.md": "readme\n" * 200,
         "src/app.py": "y = 2\n" * 30,
         "docs/guide.md": "guide\n" * 80,
@@ -501,8 +703,8 @@ def test_the_exclusion_spares_code_that_merely_sits_beside_prose(velocity_report
     monkeypatch.setattr(velocity_report, "repo_path", lambda r: p)
     monkeypatch.setattr(velocity_report, "main_ref", lambda r: "main")
 
-    assert velocity_report.git_metrics("svc", "2000-01-01T00:00:00Z")["loc_added"] == 30
-    assert velocity_report.loc_now("svc") == 30
+    assert velocity_report.git_metrics("widget", "2000-01-01T00:00:00Z")["loc_added"] == 30
+    assert velocity_report.loc_now("widget") == 30
 
 
 def test_a_stale_base_branch_does_not_get_its_content_counted_twice(velocity_report,
@@ -590,7 +792,7 @@ def test_work_merged_inside_the_window_counts_even_if_its_commit_predates_it(
     third instance in this PR of a green test meaning less than its name.
     """
     import subprocess
-    p = tmp_path / "svc"
+    p = tmp_path / "widget"
     p.mkdir()
 
     def run(*a, when=None):
@@ -623,7 +825,7 @@ def test_work_merged_inside_the_window_counts_even_if_its_commit_predates_it(
     monkeypatch.setattr(velocity_report, "repo_path", lambda r: p)
     monkeypatch.setattr(velocity_report, "main_ref", lambda r: "main")
 
-    added = velocity_report.git_metrics("svc", "2026-06-01T00:00:00Z")["loc_added"]
+    added = velocity_report.git_metrics("widget", "2026-06-01T00:00:00Z")["loc_added"]
     assert added == 30, (
         "the branch's 20 lines reached main inside the window; a full traversal "
         "filters its commit out by date and reports 10")

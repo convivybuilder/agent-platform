@@ -7,13 +7,13 @@ Fixture layout (all under tmp_path):
     bin/
         post-changelog         # --help → known flags only
         post-release-note      # same
-    vivy/
+    finch/
         scripts/...
-    constance/
+    harbor/
         scripts/...
-    selector/
+    beacon/
         scripts/...
-    selector-backend/
+    beacon-backend/
         scripts/...
 """
 from __future__ import annotations
@@ -65,14 +65,23 @@ def _subprocess_env() -> dict:
     resolves its credential from signal_client.token(): the AGENT_SIGNAL_TOKEN env
     var, or else the 0600 file $HOME/.orient-control/agent-platform-token. Copying
     os.environ wholesale used to carry a real token straight into the subprocess
-    on a machine that holds one, sending `--no-slack` breaches into vivy's and
-    selector's live signal streams on every test run. AGENT_SIGNAL_TOKEN is stripped and
+    on a machine that holds one, sending `--no-slack` breaches into finch's and
+    beacon's live signal streams on every test run. AGENT_SIGNAL_TOKEN is stripped and
     HOME is repointed at an empty directory so neither source can resolve to a
     real credential; VAULTS_ON_LIBRARY/LIBRARY_BASE_URL/ORIENT_BASE_URL are
     stripped too, as defense in depth, so even a would-be post has nowhere real
     to go. A missing credential makes signal_client.post_alert return
     "skip" before any network call, so detection and reporting on
     stdout/stderr are unaffected.
+
+    `check-cli-contracts` reads `_TOOL_CALLERS` from the registry
+    (projects.tool_callers) at import, via `projects.load()` — CQ·563: with
+    PROJECTS_JSON unset, that call reaches the Library's registry endpoint
+    instead of a local file, which CI has no token for. PROJECTS_JSON is
+    pointed at the rich test fixture instead (CQ·565 — config/projects.json
+    is gone; not copied from the parent's live value, which TestToolCallers
+    below pins against anyway) so the subprocess resolves the same caller
+    map.
     """
     env = dict(os.environ)
     lib = str(REPO / "lib" / "agent-platform")
@@ -82,6 +91,7 @@ def _subprocess_env() -> dict:
                 "ORIENT_BASE_URL"):
         env.pop(var, None)
     env["HOME"] = _FAKE_HOME
+    env["PROJECTS_JSON"] = str(REPO / "tests" / "fixtures" / "rich_registry.json")
     return env
 
 # --help output for fake bin/ tools. Self-contained — tests do not depend on
@@ -191,28 +201,28 @@ def _run(convivy_root, bin_dir, *args):
 def test_unknown_flag_detected(setup):
     """A caller passing a flag the tool does not accept must be detected.
 
-    vivy has two callers (post-changelog and post-release-note), both
-    passing --no-slack. constance is clean. Result: 2 breach lines.
+    finch has two callers (post-changelog and post-release-note), both
+    passing --no-slack. harbor is clean. Result: 2 breach lines.
     """
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy", "--no-slack"]
+        cmd = [str(tool), "--product", "finch", "--no-slack"]
         subprocess.run(cmd)
     """))
-    _make_script(vivy, "cut_release.sh", textwrap.dedent("""\
+    _make_script(finch, "cut_release.sh", textwrap.dedent("""\
         #!/bin/bash
-        "$HOME/.local/bin/post-release-note" --product vivy --version v1 --file /tmp/n --no-slack
+        "$HOME/.local/bin/post-release-note" --product finch --version v1 --file /tmp/n --no-slack
     """))
 
-    constance = convivy_root / "constance"
-    constance.mkdir()
-    _make_script(constance, "post_changelog.sh", textwrap.dedent("""\
+    harbor = convivy_root / "harbor"
+    harbor.mkdir()
+    _make_script(harbor, "post_changelog.sh", textwrap.dedent("""\
         tool=post-changelog
-        cmd="$tool --product constance --file /tmp/x"
+        cmd="$tool --product harbor --file /tmp/x"
         eval "$cmd"
     """))
 
@@ -225,19 +235,19 @@ def test_unknown_flag_detected(setup):
 def test_all_flags_known_pass(setup):
     """Callers passing only accepted flags → pass."""
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy"]
+        cmd = [str(tool), "--product", "finch"]
         subprocess.run(cmd)
     """))
-    constance = convivy_root / "constance"
-    constance.mkdir()
-    _make_script(constance, "post_changelog.sh", textwrap.dedent("""\
+    harbor = convivy_root / "harbor"
+    harbor.mkdir()
+    _make_script(harbor, "post_changelog.sh", textwrap.dedent("""\
         tool=post-changelog
-        cmd="$tool --product constance --file /tmp/x"
+        cmd="$tool --product harbor --file /tmp/x"
         eval "$cmd"
     """))
 
@@ -252,14 +262,14 @@ def test_all_flags_known_pass(setup):
 def test_comment_is_not_false_positive(setup):
     """A comment line mentioning an unknown flag must not be flagged."""
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
-        # This script calls post-changelog --no-slack --product vivy
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
+        # This script calls post-changelog --no-slack --product finch
         # but these are just comments — the real call uses valid flags.
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy"]
+        cmd = [str(tool), "--product", "finch"]
         subprocess.run(cmd)
     """))
 
@@ -271,12 +281,12 @@ def test_comment_is_not_false_positive(setup):
 def test_inline_comment_not_false_positive(setup):
     """An inline comment with an unknown flag must be stripped."""
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy"]  # --no-slack was here
+        cmd = [str(tool), "--product", "finch"]  # --no-slack was here
         subprocess.run(cmd)
     """))
 
@@ -301,18 +311,99 @@ def test_missing_bin_tool_graceful(setup):
     (bd / "post-release-note").unlink()
 
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy"]
+        cmd = [str(tool), "--product", "finch"]
         subprocess.run(cmd)
     """))
 
     stdout, stderr, rc = _run(setup["convivy_root"], setup["bin_dir"])
     assert rc == 0, f"expected pass (missing tool skipped), got rc={rc}\nstderr: {stderr}"
     assert "[SKIP] post-release-note" in stderr
+
+
+# -- fail-closed: an empty registry-sourced caller map is not a pass ---------
+# `_TOOL_CALLERS` is read from the registry at import time (projects.tool_callers);
+# a hand edit that drops or empties every unit's `calls_shared_tools` must not
+# read as "no breaches found" with nothing checked — the same completeness-
+# audit failure class `check-primary-checkouts` already guards against for its
+# own declared list (reviewer, PR #985 round 2).
+
+
+def test_main_fails_closed_when_every_caller_list_is_empty(capsys):
+    mod = _load_check_module()
+    mod._TOOL_CALLERS = {"post-changelog": [], "post-release-note": []}
+    rc = mod.main([])
+    assert rc == 1
+    assert "nothing to check" in capsys.readouterr().err
+
+
+def test_main_passes_when_at_least_one_caller_list_is_non_empty(tmp_path, capsys):
+    """The fail-closed check is about ALL lists being empty, not any one of
+    them — a tool with no declared caller is still the conservative default
+    (`tool_callers`'s own docstring)."""
+    mod = _load_check_module()
+    mod._TOOL_CALLERS = {"post-changelog": [], "post-release-note": ["acme"]}
+    rc = mod.main(["--convivy-root", str(tmp_path), "--bin-dir", str(tmp_path),
+                   "--no-report"])
+    assert rc == 0
+    assert "nothing to check" not in capsys.readouterr().err
+
+
+# -- a caller name shaped to escape convivy_root is refused loudly, not ------
+# -- silently skipped --------------------------------------------------------
+# A caller is a REPO name joined directly under convivy_root — it is not a
+# registered unit's own `home_dir`, so `home_path()` does not apply, and
+# `projects.valid_name` is what stands between a crafted registry row and the
+# join (security-reviewer, PR #985 round 2). A rejected name is a corrupted
+# or hostile registry row, not a missing checkout, so it counts toward
+# `_invalid_name_failures` rather than disappearing the way a merely-absent
+# checkout does — otherwise a registry writer could shape every caller to
+# fail `valid_name()` (or drop just one into an otherwise-clean list) and get
+# a reported-clean run with nothing, or one fewer call, actually checked
+# (security-reviewer, PR #985 round 3).
+
+
+def test_check_tool_fails_loudly_on_a_caller_name_shaped_to_escape_convivy_root(
+        fake_bin_dir, capsys):
+    mod = _load_check_module()
+    breaches = mod.check_tool(
+        "post-changelog", ["../../etc/passwd"], pathlib.Path("/tmp"), fake_bin_dir,
+        False, day="2030-01-01", dry_run=True,
+    )
+    assert breaches == 0
+    assert mod._invalid_name_failures == 1
+    assert "not a safe product name" in capsys.readouterr().err
+
+
+def test_main_fails_when_every_caller_name_is_invalid(fake_bin_dir, tmp_path, capsys):
+    mod = _load_check_module()
+    mod._TOOL_CALLERS = {
+        "post-changelog": ["../../etc/passwd"],
+        "post-release-note": ["../etc/shadow"],
+    }
+    rc = mod.main(["--convivy-root", str(tmp_path), "--bin-dir", str(fake_bin_dir),
+                   "--no-report"])
+    assert rc == 1
+    assert "rejected by valid_name" in capsys.readouterr().err
+
+
+def test_main_fails_when_a_single_caller_name_is_invalid(fake_bin_dir, tmp_path, capsys):
+    """One invalid-shaped name among otherwise-clean callers fails the whole
+    run — a non-empty `_TOOL_CALLERS` with every actual check passing is not
+    enough to call the run clean when one declared caller went unchecked."""
+    mod = _load_check_module()
+    mod._TOOL_CALLERS = {
+        "post-changelog": ["acme", "../../etc/passwd"],
+        "post-release-note": [],
+    }
+    rc = mod.main(["--convivy-root", str(tmp_path), "--bin-dir", str(fake_bin_dir),
+                   "--no-report"])
+    assert rc == 1
+    assert "rejected by valid_name" in capsys.readouterr().err
 
 
 # -- safety --------------------------------------------------------------------
@@ -337,12 +428,12 @@ def test_no_real_work_tool(setup):
     trap_path.chmod(0o755)
 
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy"]
+        cmd = [str(tool), "--product", "finch"]
         subprocess.run(cmd)
     """))
 
@@ -371,7 +462,7 @@ def test_breach_never_posts_even_with_a_parent_token(setup, monkeypatch):
     Regression test for issue_01M3VM4X01JGV79V2B6557SV4T: _subprocess_env()
     used to copy os.environ wholesale, so on a machine that holds a real ops
     token, every test run in this file filed real `--no-slack` breach issues
-    into vivy's and selector's live queues. AGENT_SIGNAL_TOKEN and the vault
+    into finch's and beacon's live queues. AGENT_SIGNAL_TOKEN and the vault
     URL variables are set here, in the PARENT process, exactly as they would
     be on such a machine; the stub server stands in for the real signal store
     so proving the leak (or its absence) never touches one.
@@ -388,12 +479,12 @@ def test_breach_never_posts_even_with_a_parent_token(setup, monkeypatch):
         monkeypatch.setenv("ORIENT_BASE_URL", stub_url)
 
         convivy_root = pathlib.Path(setup["convivy_root"])
-        vivy = convivy_root / "vivy"
-        vivy.mkdir()
-        _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+        finch = convivy_root / "finch"
+        finch.mkdir()
+        _make_script(finch, "post_changelog.py", textwrap.dedent("""\
             import subprocess, pathlib
             tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-            cmd = [str(tool), "--product", "vivy", "--no-slack"]
+            cmd = [str(tool), "--product", "finch", "--no-slack"]
             subprocess.run(cmd)
         """))
 
@@ -418,9 +509,9 @@ def test_breach_never_posts_even_with_a_parent_token(setup, monkeypatch):
 def test_call_with_no_long_flags_is_not_a_breach(setup):
     """A bare `post-changelog \"message\"` with no --flags is skipped."""
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess
         subprocess.run(["post-changelog", "a message"])
     """))
@@ -436,26 +527,26 @@ def test_call_with_no_long_flags_is_not_a_breach(setup):
 def test_mixed_clean_and_breached(setup):
     """One product clean, another breached → breach reported."""
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy"]
+        cmd = [str(tool), "--product", "finch"]
         subprocess.run(cmd)
     """))
-    selector = convivy_root / "selector"
-    selector.mkdir()
-    _make_script(selector, "post_changelog.py", textwrap.dedent("""\
+    beacon = convivy_root / "beacon"
+    beacon.mkdir()
+    _make_script(beacon, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "selector", "--no-slack"]
+        cmd = [str(tool), "--product", "beacon", "--no-slack"]
         subprocess.run(cmd)
     """))
 
     stdout, stderr, rc = _run(setup["convivy_root"], setup["bin_dir"])
     assert rc == 2, f"expected breach, got rc={rc}\nstderr: {stderr}"
-    assert "selector" in stderr and "--no-slack" in stderr
+    assert "beacon" in stderr and "--no-slack" in stderr
 
 
 # -- flag-parsing unit tests ---------------------------------------------------
@@ -508,7 +599,7 @@ class TestFlagParsing:
         the options section. ``parse_accepted_flags`` must not extract it.
         """
         text = FAKE_HELP_POST_CHANGELOG + (
-            "\nExample: post-changelog --product vivy --now-obsolete\n"
+            "\nExample: post-changelog --product finch --now-obsolete\n"
         )
         flags = self.mod.parse_accepted_flags(text)
         assert "--now-obsolete" not in flags, (
@@ -619,23 +710,23 @@ def test_no_report_flag_skips_filing(setup):
     API (which would post a real signal).
     """
     convivy_root = pathlib.Path(setup["convivy_root"])
-    vivy = convivy_root / "vivy"
-    vivy.mkdir()
-    _make_script(vivy, "post_changelog.py", textwrap.dedent("""\
+    finch = convivy_root / "finch"
+    finch.mkdir()
+    _make_script(finch, "post_changelog.py", textwrap.dedent("""\
         import subprocess, pathlib
         tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-        cmd = [str(tool), "--product", "vivy", "--no-slack"]
+        cmd = [str(tool), "--product", "finch", "--no-slack"]
         subprocess.run(cmd)
     """))
-    _make_script(vivy, "cut_release.sh", textwrap.dedent("""\
+    _make_script(finch, "cut_release.sh", textwrap.dedent("""\
         #!/bin/bash
-        "$HOME/.local/bin/post-release-note" --product vivy --version v1 --file /tmp/n --no-slack
+        "$HOME/.local/bin/post-release-note" --product finch --version v1 --file /tmp/n --no-slack
     """))
-    constance = convivy_root / "constance"
-    constance.mkdir()
-    _make_script(constance, "post_changelog.sh", textwrap.dedent("""\
+    harbor = convivy_root / "harbor"
+    harbor.mkdir()
+    _make_script(harbor, "post_changelog.sh", textwrap.dedent("""\
         tool=post-changelog
-        cmd="$tool --product constance --file /tmp/x"
+        cmd="$tool --product harbor --file /tmp/x"
         eval "$cmd"
     """))
 
@@ -648,7 +739,7 @@ def test_no_report_flag_skips_filing(setup):
 
 # -- the caller map ------------------------------------------------------------
 # Declared rather than discovered, so an omission is invisible: the check reports
-# "no problems found" across the callers it happens to know about. convivy-app-kit
+# "no problems found" across the callers it happens to know about. foundry-kit
 # was left out on the reasoning that its --no-slack breach was "already fixed" —
 # but so was every other caller's, and being fixed is not the same as ceasing to
 # call the tool. The map exists to catch the NEXT contract change.
@@ -663,11 +754,11 @@ class TestToolCallers:
 
     def test_all_known_post_changelog_callers_are_declared(self):
         assert set(self.mod._TOOL_CALLERS["post-changelog"]) == {
-            "vivy", "constance", "selector", "selector-backend", "convivy-app-kit",
+            "finch", "harbor", "beacon", "beacon-backend", "foundry-kit",
         }
 
     def test_post_release_note_callers_are_declared(self):
-        assert set(self.mod._TOOL_CALLERS["post-release-note"]) == {"vivy"}
+        assert set(self.mod._TOOL_CALLERS["post-release-note"]) == {"finch"}
 
     def test_every_declared_caller_actually_has_a_scripts_dir(self):
         """A caller named here but absent on disk reads as "checkout missing" and
@@ -709,7 +800,7 @@ def test_lib_path_insert_is_idempotent():
 _CLI_BREACH = textwrap.dedent("""\
     import subprocess, pathlib
     tool = pathlib.Path.home() / ".local" / "bin" / "post-changelog"
-    cmd = [str(tool), "--product", "vivy", "--no-slack"]
+    cmd = [str(tool), "--product", "finch", "--no-slack"]
     subprocess.run(cmd)
 """)
 _CLI_CLEAN = _CLI_BREACH.replace(', "--no-slack"', "")
@@ -724,13 +815,22 @@ def _cli_keys(setup, monkeypatch, *, day, breach):
     monkeypatch.setattr(mod, "_post_signal",
                         lambda product, title, body, dedup_key, **k:
                         keys.append(dedup_key) or {"status": "stub"})
-    vivy = pathlib.Path(setup["convivy_root"]) / "vivy"
-    vivy.mkdir(exist_ok=True)
-    _make_script(vivy, "post_changelog.py", _CLI_BREACH if breach else _CLI_CLEAN)
+    finch = pathlib.Path(setup["convivy_root"]) / "finch"
+    finch.mkdir(exist_ok=True)
+    _make_script(finch, "post_changelog.py", _CLI_BREACH if breach else _CLI_CLEAN)
     mod.main(["--convivy-root", setup["convivy_root"], "--bin-dir", setup["bin_dir"]])
     return keys
 
 
+# `_cli_keys` runs `check-cli-contracts`' `main()` in-process against the
+# module's own `_TOOL_CALLERS` (built from `projects.tool_callers("post-changelog")`
+# at `_load_check_module()` time), checking a real caller name from the registry
+# for a breach — so each of these needs `projects.PROJECTS_JSON` pointed at the
+# committed registry, not the synthetic default `_default_projects_registry`
+# installs for every non-opted-in test (CQ-546): the synthetic registry
+# declares no callers for post-changelog, so `_TOOL_CALLERS` comes back empty
+# and `main()` fails closed with nothing to check.
+@pytest.mark.rich_registry
 def test_cli_contract_key_is_scoped_to_the_utc_day(setup, monkeypatch):
     day_one = _cli_keys(setup, monkeypatch, day="2030-01-01", breach=True)
     day_two = _cli_keys(setup, monkeypatch, day="2030-01-02", breach=True)
@@ -739,12 +839,14 @@ def test_cli_contract_key_is_scoped_to_the_utc_day(setup, monkeypatch):
     assert day_one[0].endswith(":2030-01-01") and day_two[0].endswith(":2030-01-02")
 
 
+@pytest.mark.rich_registry
 def test_cli_contract_two_runs_on_one_day_give_one_key(setup, monkeypatch):
     first = _cli_keys(setup, monkeypatch, day="2030-01-01", breach=True)
     second = _cli_keys(setup, monkeypatch, day="2030-01-01", breach=True)
     assert first == second and len(first) == 1
 
 
+@pytest.mark.rich_registry
 def test_cli_contract_present_absent_present_logs_again_on_the_later_day(setup, monkeypatch):
     present = _cli_keys(setup, monkeypatch, day="2030-01-01", breach=True)
     absent = _cli_keys(setup, monkeypatch, day="2030-01-02", breach=False)

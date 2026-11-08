@@ -18,7 +18,9 @@ document and a document to BOTH sides of a changed file. A file it cannot
 classify is reported as unclassifiable, and every caller treats that as a
 person's merge.
 
-The module does no I/O except `policy_text_at_origin_main`.
+The module does no I/O except `policy_text_at_origin_main` and, through
+`_audience_split`, a read of the Library's live roster (`knowledge.audience_roster`,
+cached there for `knowledge.ROSTER_TTL_S`).
 """
 from __future__ import annotations
 
@@ -29,14 +31,10 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# The knowledge repo's audience vocabulary, defined once in lib/knowledge/knowledge.py. Appended,
-# not inserted, so that directory's builder_root.py cannot shadow lib/agent-platform's.
+# knowledge.py is defined once in lib/knowledge/knowledge.py. Appended, not inserted,
+# so that directory's builder_root.py cannot shadow lib/agent-platform's.
 sys.path.append(str(Path(__file__).resolve().parent.parent / "knowledge"))
-from knowledge import ALLOWED_AUDIENCE, NON_AGENT_AUDIENCE  # noqa: E402
-
-# The agent roles an audience can name: the vocabulary less the people and groups. The vocabulary
-# mirrors `ALLOWED_AUDIENCE` in the knowledge repo's scripts/validate.py, which the two files keep equal.
-ALLOWED_AGENTS = ALLOWED_AUDIENCE - NON_AGENT_AUDIENCE
+import knowledge  # noqa: E402
 
 POLICY_PATH = "projects/platform/policy/agent-policy.yaml"
 POLICY_DIR = "projects/platform/policy"
@@ -168,25 +166,13 @@ def load(origin_main_text: str | None) -> Policy | Fallback:
     return Policy(**values)  # type: ignore[arg-type]
 
 
-def review_round_cap_sentence(policy: Policy | Fallback) -> str:
-    """The review-round cap as the drain briefs state it: both caps and which pull request takes each.
-
-    Every brief that speaks of pull requests of both kinds reads this one sentence, so the
-    wording and the rules (a pull request that touches code or an instruction file takes the
-    code cap) live in one place. When the code cap exceeds the document cap, the sentence
-    also states the progress condition for the rounds past the document cap: no finding in
-    the latest round repeats one an earlier round raised (platform/decisions/0083). When the
-    two caps are equal, as with the fallback, no round runs past the document cap, so the
-    condition is not stated.
-    """
-    sentence = (f"The review-round cap is {policy.review_rounds_code} rounds for a pull request that changes code "
-                f"or any file an agent is instructed to act on, and {policy.review_rounds_per_role} rounds for one "
-                f"that changes only documents.")
-    if policy.review_rounds_code > policy.review_rounds_per_role:
-        sentence += (f" A pull request that changes code or any file an agent is instructed to act on runs rounds "
-                     f"past {policy.review_rounds_per_role} only "
-                     f"while no finding in the latest round repeats one an earlier round raised.")
-    return sentence
+# A module constant, not a literal in the two calls below, so a caller whose
+# `Popen` is patched process-wide (a test's `subprocess.Popen` stub meant for
+# an unrelated spawn, which this function's own `subprocess.run` calls inherit
+# since it is the same module-level name) can bound the wait it is thereby
+# accidentally exposed to, by patching this name down rather than waiting out
+# the real 30s.
+GIT_READ_TIMEOUT_S = 30
 
 
 def policy_text_at_origin_main(repo_path: str) -> str | None:
@@ -213,7 +199,7 @@ def policy_text_at_origin_main(repo_path: str) -> str | None:
         ref = subprocess.run(
             [*base, "show-ref", "--verify", "--hash", "refs/remotes/origin/main"],
             capture_output=True,
-            timeout=30,
+            timeout=GIT_READ_TIMEOUT_S,
             env=env,
         )
         sha = ref.stdout.decode("ascii", "replace").strip()
@@ -222,7 +208,7 @@ def policy_text_at_origin_main(repo_path: str) -> str | None:
         done = subprocess.run(
             [*base, "show", f"{sha}:{POLICY_PATH}"],
             capture_output=True,
-            timeout=30,
+            timeout=GIT_READ_TIMEOUT_S,
             env=env,
         )
     except (OSError, subprocess.SubprocessError):
@@ -464,12 +450,24 @@ def _audience_split(audience: str | None) -> tuple[list[str], list[str]]:
     """The audience entries that name an agent role, and the entries that are in neither the role
     set nor the people and groups. An entry outside the vocabulary cannot be told, so the caller
     takes the tie-break whenever `unknown` is non-empty. `_read_front_matter` has already checked
-    the value's shape, so it is a bracketed list of `a, b` entries."""
+    the value's shape, so it is a bracketed list of `a, b` entries.
+
+    The vocabulary is the Library's live roster (`knowledge.audience_roster()`), read fresh on
+    every call rather than cached at import: a crew's agent reaches the roster through
+    `PUT /roster/{name}`, and a copy taken at import would miss it until this process restarts.
+    When the roster cannot be read, every entry is unknown — the existing "cannot tell" rule —
+    never "no agent role", since that would misreport a transient read failure as a settled answer.
+    """
     if audience is None:
         return [], []
     entries = audience[1:-1].split(", ")
-    roles = [e for e in entries if e in ALLOWED_AGENTS]
-    unknown = [e for e in entries if e not in ALLOWED_AUDIENCE]
+    try:
+        roster = knowledge.audience_roster()
+    except knowledge.RosterUnavailable:
+        return [], list(entries)
+    allowed_agents = roster - knowledge.NON_AGENT_AUDIENCE
+    roles = [e for e in entries if e in allowed_agents]
+    unknown = [e for e in entries if e not in roster]
     return roles, unknown
 
 

@@ -66,6 +66,18 @@ def _write_doc(root: Path, slug: str, *, title: str = "A doc", body: str = "Body
     return path
 
 
+def _admit_library_post(path, name, body):
+    """Default stub for `agentctl._library_post`: admits every
+    `/reference/admission` ask (CQ·531), so the tests in this module — about
+    origin topology and commit identity, not the admission gate — keep
+    testing exactly what they tested before that gate existed, with no
+    network call and no real credential read."""
+    assert path == "/reference/admission", f"unexpected Library POST: {path}"
+    return 200, {"may_land": True, "errors": [],
+                "clauses_checked": ["frontmatter", "checkout"], "clauses_refused": [],
+                "clauses_waived": []}
+
+
 def _patch_indexer_and_writes(monkeypatch, agentctl, checkout: Path, tmp_path: Path) -> Path:
     """Every test here drives `cmd_kb_sync` and/or `cmd_kb_apply`, and both touch
     the KB index and the leases db on the way — pointed at throwaway files so
@@ -78,6 +90,7 @@ def _patch_indexer_and_writes(monkeypatch, agentctl, checkout: Path, tmp_path: P
     monkeypatch.setattr(agentctl, "_kb_indexer", lambda: indexer)
     monkeypatch.setattr(kw, "DB", tmp_path / "kb-writes.db")
     monkeypatch.setattr(agentctl, "_kb_writes", lambda: kw)
+    monkeypatch.setattr(agentctl, "_library_post", _admit_library_post)
     kw.ensure_db()
     return db
 

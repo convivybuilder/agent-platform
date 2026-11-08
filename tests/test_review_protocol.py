@@ -110,6 +110,22 @@ def test_gate_fails_on_stale_approve():
     assert any("security-reviewer" in x and "stale" in x for x in r.reasons)
 
 
+def test_gate_fails_on_a_stamp_pinned_to_a_prs_round_1_head_once_the_head_moves_on():
+    """A review dispatched with `--pr N --review-sha S` (a shadow review of a
+    fixed past commit, e.g. a PR's round-1 head) posts a stamp whose
+    reviewed-commit is S, never the PR's live head. Once the head has moved
+    past S, that stamp reads as stale here exactly like any other out-of-date
+    APPROVE, and is never recorded as an approval of the live head — a review
+    of an old commit must not count as current just because it was dispatched
+    deliberately rather than by accident."""
+    round_1_head, live_head = "a" * 40, "f" * 40
+    r = RP.evaluate_gate(head=live_head, stamps=[_stamp("reviewer", round_1_head)],
+                         required_agents=["reviewer"], ci_green=True)
+    assert not r.ok
+    assert any("reviewer" in x and "stale" in x for x in r.reasons)
+    assert "reviewer" not in r.approvals
+
+
 def test_gate_fails_when_a_required_reviewer_missing():
     head = "f" * 40
     r = RP.evaluate_gate(head=head, stamps=[_stamp("reviewer", head)],
@@ -174,12 +190,13 @@ def test_gate_latest_approve_clears_an_earlier_request_changes():
 # --- the gate and internal-app crews (ARCH-177) -----------------------------
 # THE BUG THIS PINS. The gate keyed `latest` on the stamp's raw agent name while
 # `required_agents` held the unprefixed roles, so a `sel-reviewer` APPROVE was
-# invisible to it. Every prefixed crew — hollis, selector, svc, legacy pa — was
-# unmergeable by construction: `review-status` said "no review posted by reviewer"
+# invisible to it. Every prefixed crew — galley, beacon, relay, the legacy aide
+# prefix — was unmergeable by construction: `review-status` said "no review posted by reviewer"
 # at a PR carrying two valid APPROVEs, and because `_mark_pr_ready` runs the same
 # function (ARCH-364), the PR never left draft and its full suite never ran.
 
-@pytest.mark.parametrize("prefix", RP.INTERNAL_APP_PREFIXES)
+@pytest.mark.rich_registry
+@pytest.mark.parametrize("prefix", RP.internal_app_prefixes())
 def test_gate_passes_for_every_internal_app_crew_prefix(prefix):
     """Parametrized over the prefix tuple itself, so a crew added later is covered
     the moment its prefix lands — the 2026-07-12 drift went unnoticed precisely
@@ -211,20 +228,22 @@ def test_gate_still_fails_a_prefixed_crew_with_one_reviewer_missing():
     assert any("no review posted by security-reviewer" in x for x in r.reasons)
 
 
+@pytest.mark.rich_registry
 def test_gate_still_fails_a_stale_prefixed_approve():
     head, old = "f" * 40, "a" * 40
-    stamps = [_stamp("hollis-reviewer", head),
-              _stamp("hollis-security-reviewer", old)]
+    stamps = [_stamp("atlas-reviewer", head),
+              _stamp("atlas-security-reviewer", old)]
     r = RP.evaluate_gate(head=head, stamps=stamps, required_agents=REQ, ci_green=True)
     assert not r.ok
     assert any("security-reviewer" in x and "stale" in x for x in r.reasons)
 
 
+@pytest.mark.rich_registry
 def test_gate_prefixed_request_changes_overrides_an_earlier_prefixed_approve():
     head = "f" * 40
-    stamps = [_stamp("svc-reviewer", head, "APPROVE"),
-              _stamp("svc-reviewer", head, "REQUEST_CHANGES"),
-              _stamp("svc-security-reviewer", head, "APPROVE")]
+    stamps = [_stamp("relay-reviewer", head, "APPROVE"),
+              _stamp("relay-reviewer", head, "REQUEST_CHANGES"),
+              _stamp("relay-security-reviewer", head, "APPROVE")]
     r = RP.evaluate_gate(head=head, stamps=stamps, required_agents=REQ, ci_green=True)
     assert not r.ok
     assert any("reviewer latest verdict is REQUEST_CHANGES" in x for x in r.reasons)
@@ -270,18 +289,20 @@ def test_authenticate_passes_for_a_real_reviewer_run():
     assert RP.authenticate(s, _facts("reviewer", posted_verdict="APPROVE", posted_pr="7"), pr="7", review_agents=REVIEW_AGENTS) is None
 
 
+@pytest.mark.rich_registry
 def test_authenticate_passes_for_pa_review_variant():
-    # pa-reviewer is review-class once the pa- prefix is stripped (ARCH-177).
-    s = _stamp("pa-reviewer", "f" * 40, run_id="run-real")
-    assert RP.authenticate(s, _facts("pa-reviewer", posted_verdict="APPROVE", posted_pr="7"), pr="7", review_agents=REVIEW_AGENTS) is None
+    # aide-reviewer is review-class once the aide- prefix is stripped (ARCH-177).
+    s = _stamp("aide-reviewer", "f" * 40, run_id="run-real")
+    assert RP.authenticate(s, _facts("aide-reviewer", posted_verdict="APPROVE", posted_pr="7"), pr="7", review_agents=REVIEW_AGENTS) is None
 
 
 def test_authenticate_passes_for_every_internal_app_crew():
     """ARCH-193's authenticity gate is the check of record for a review stamp. Its
-    _review_base once stripped only `pa-`, while agentctl's prefix list had grown
-    `hollis-` — so the gate rejected EVERY Hollis review stamp as "not a review-class
-    agent", silently, on a live crew. Pin every crew's review pair through the gate."""
-    for prefix in RP.INTERNAL_APP_PREFIXES:
+    _review_base once stripped only `aide-`, while agentctl's prefix list had grown
+    a new crew's own prefix — so the gate rejected EVERY one of that crew's review
+    stamps as "not a review-class agent", silently, on a live crew. Pin every
+    crew's review pair through the gate."""
+    for prefix in RP.internal_app_prefixes():
         for role in ("reviewer", "security-reviewer"):
             agent = f"{prefix}{role}"
             s = _stamp(agent, "f" * 40, run_id="run-real")
@@ -291,15 +312,15 @@ def test_authenticate_passes_for_every_internal_app_crew():
 
 
 def test_authenticate_accepts_a_prefixed_run_stamping_the_bare_role():
-    """THE AUTO-DISPATCH GAP (hollis co, 2026-07-23). An auto-dispatched review RUNS
+    """THE AUTO-DISPATCH GAP (a crew's co, 2026-07-23). An auto-dispatched review RUNS
     as the product-prefixed crew member but STAMPS the bare roster role. That is the
-    same reviewer, so it must authenticate — hollis PR #550 carried two genuine
+    same reviewer, so it must authenticate — a real PR carried two genuine
     APPROVEs while the gate reported "no review posted by security-reviewer", and the
     PR could not clear until someone re-ran a review that had already passed.
 
     Third instance of this bug class: the membership check above and `evaluate_gate`
     both already normalize on `_review_base`; this equality did not."""
-    for prefix in RP.INTERNAL_APP_PREFIXES:
+    for prefix in RP.internal_app_prefixes():
         for role in ("reviewer", "security-reviewer"):
             s = _stamp(role, "f" * 40, run_id="run-real")          # stamped bare
             assert RP.authenticate(
@@ -309,31 +330,32 @@ def test_authenticate_accepts_a_prefixed_run_stamping_the_bare_role():
 
 def test_authenticate_accepts_a_bare_run_stamping_the_prefixed_role():
     """The mirror case, so the normalization is not accidentally one-directional."""
-    for prefix in RP.INTERNAL_APP_PREFIXES:
+    for prefix in RP.internal_app_prefixes():
         s = _stamp(f"{prefix}reviewer", "f" * 40, run_id="run-real")
         assert RP.authenticate(
             s, _facts("reviewer", posted_verdict="APPROVE", posted_pr="7"), pr="7", review_agents=REVIEW_AGENTS) is None, prefix
 
 
+@pytest.mark.rich_registry
 def test_authenticate_accepts_the_same_role_across_two_crews():
     """Documents a boundary this change deliberately moved. Normalizing on
-    `_review_base` means a `hollis-reviewer` run stamping `pa-reviewer` also
+    `_review_base` means a `atlas-reviewer` run stamping `aide-reviewer` also
     authenticates — different crew, same ROLE.
 
     Intentional, and it grants nothing: both names collapse to the same required
     slot in `evaluate_gate`, so a cross-crew label buys no reviewer the item did not
     already have. Pinned so a future tightening has to be a deliberate decision
     rather than a silent one (reviewer, #222)."""
-    s = _stamp("pa-reviewer", "f" * 40, run_id="run-real")
+    s = _stamp("aide-reviewer", "f" * 40, run_id="run-real")
     assert RP.authenticate(
-        s, _facts("hollis-reviewer", posted_verdict="APPROVE", posted_pr="7"), pr="7", review_agents=REVIEW_AGENTS) is None
+        s, _facts("atlas-reviewer", posted_verdict="APPROVE", posted_pr="7"), pr="7", review_agents=REVIEW_AGENTS) is None
 
 
 def test_authenticate_still_rejects_a_crew_member_claiming_the_OTHER_role():
     """The normalization must strip the PREFIX only. A run that reviewed as
-    `hollis-reviewer` must never be able to satisfy the security-reviewer slot —
+    `atlas-reviewer` must never be able to satisfy the security-reviewer slot —
     that would let one dispatch stand in for both required reviewers."""
-    for prefix in RP.INTERNAL_APP_PREFIXES:
+    for prefix in RP.internal_app_prefixes():
         s = _stamp("security-reviewer", "f" * 40, run_id="run-real")
         reason = RP.authenticate(s, _facts(f"{prefix}reviewer"),
                                  pr="7", review_agents=REVIEW_AGENTS)
@@ -347,20 +369,11 @@ def test_authenticate_still_rejects_a_crew_member_claiming_the_OTHER_role():
 def test_authenticate_still_rejects_a_worker_from_any_crew():
     """The prefix strip must not smuggle a worker onto the review surface: a
     <crew>-coder stamp is still 'not a review-class agent'."""
-    for prefix in RP.INTERNAL_APP_PREFIXES:
+    for prefix in RP.internal_app_prefixes():
         agent = f"{prefix}coder"
         s = _stamp(agent, "f" * 40, run_id="run-real")
         reason = RP.authenticate(s, _facts(agent), pr="7", review_agents=REVIEW_AGENTS)
         assert reason and "not a review-class agent" in reason, agent
-
-
-def test_agentctl_and_review_protocol_prefixes_match(agentctl):
-    """The two lists drifted once and both halves failed silently (2026-07-12):
-    agentctl denied the svc-/sel- reviewers the PR surface, and review_protocol's
-    gate rejected every hollis- review stamp. They cannot be one shared constant
-    (agentctl imports libs from the deployed ~/.local path, so a branch's agentctl
-    sees main's review_protocol) — so this test IS the seam that holds them."""
-    assert tuple(agentctl._INTERNAL_APP_PREFIXES) == tuple(RP.INTERNAL_APP_PREFIXES)
 
 
 def test_agentctl_and_review_protocol_stale_replay_marker_match(agentctl):
@@ -381,11 +394,65 @@ def test_agentctl_and_review_protocol_review_agents_match(agentctl):
     assert tuple(agentctl._REVIEW_AGENTS) == tuple(RP.REVIEW_AGENTS)
 
 
+def test_agentctl_and_review_protocol_shadow_review_agents_match(agentctl):
+    """Same seam as the sync test above, for the shadow review (CQ·526):
+    `_authenticated_stamps`/`_run_facts_mismatch_reason` in bin/agentctl and
+    `run_verdict.target_for` both widen their own `review_agents` with this
+    tuple so a genuine shadow stamp authenticates; a drift here would let one
+    side authenticate a shadow run the other refuses to post for."""
+    assert tuple(agentctl._SHADOW_REVIEW_AGENTS) == tuple(RP.SHADOW_REVIEW_AGENTS)
+    assert not set(RP.SHADOW_REVIEW_AGENTS) & set(RP.REVIEW_AGENTS), (
+        "the shadow role must stay out of the required-reviewer default")
+
+
+def test_evaluate_gate_ignores_a_shadow_stamp_in_either_direction():
+    """`evaluate_gate` only ever looks up `required_agents` — a stamp for any
+    other role, present or absent, APPROVE or REQUEST_CHANGES, changes nothing
+    about the PASS/FAIL decision (CQ·526)."""
+    head = "f" * 40
+    gating = [_stamp("reviewer", head), _stamp("security-reviewer", head)]
+
+    passing = RP.evaluate_gate(
+        head=head, stamps=gating + [_stamp("shadow-reviewer", head, verdict="REQUEST_CHANGES")],
+        required_agents=REQ, ci_green=True)
+    assert passing.ok
+
+    still_failing = RP.evaluate_gate(
+        head=head,
+        stamps=[_stamp("reviewer", head, verdict="REQUEST_CHANGES"),
+               _stamp("security-reviewer", head),
+               _stamp("shadow-reviewer", head)],
+        required_agents=REQ, ci_green=True)
+    assert not still_failing.ok
+
+    shadow_alone = RP.evaluate_gate(head=head, stamps=[_stamp("shadow-reviewer", head)],
+                                    required_agents=REQ, ci_green=True)
+    assert not shadow_alone.ok
+
+
+def test_latest_non_required_stamps_reports_the_shadow_role_only():
+    head = "f" * 40
+    stamps = [_stamp("reviewer", head), _stamp("security-reviewer", head),
+             _stamp("shadow-reviewer", head, verdict="REQUEST_CHANGES")]
+    informational = RP.latest_non_required_stamps(stamps=stamps, required_agents=REQ)
+    assert set(informational) == {"shadow-reviewer"}
+    assert informational["shadow-reviewer"].verdict == "REQUEST_CHANGES"
+
+
+def test_latest_non_required_stamps_takes_the_latest_per_role():
+    head, old = "f" * 40, "a" * 40
+    stamps = [_stamp("shadow-reviewer", old, verdict="REQUEST_CHANGES", run_id="run-1"),
+             _stamp("shadow-reviewer", head, verdict="APPROVE", run_id="run-2")]
+    informational = RP.latest_non_required_stamps(stamps=stamps, required_agents=REQ)
+    assert informational["shadow-reviewer"].verdict == "APPROVE"
+    assert informational["shadow-reviewer"].reviewed_commit == head
+
+
 def test_is_review_class_applies_the_same_rule_authenticate_does():
     """`is_review_class` is `authenticate()`'s membership check extracted to a named
     function (issue_01M2K5HRWWVPWTC90NQTFEA8RK) — a bare or crew-prefixed reviewer
     role passes, a bare or crew-prefixed non-review role does not."""
-    for prefix in ("",) + RP.INTERNAL_APP_PREFIXES:
+    for prefix in ("",) + RP.internal_app_prefixes():
         for role in ("reviewer", "security-reviewer"):
             assert RP.is_review_class(f"{prefix}{role}", REVIEW_AGENTS), f"{prefix}{role}"
         assert not RP.is_review_class(f"{prefix}coder", REVIEW_AGENTS)
@@ -425,25 +492,25 @@ def test_authenticate_rejects_repo_replay():
 
 
 def test_authenticate_accepts_owner_name_vs_short_repo_form():
-    """ARCH-198 fix: a reviewer stamps `convivy/constance` (owner/name, from
-    `gh pr view`) but the run registry records the short `constance` (`--on`).
+    """ARCH-198 fix: a reviewer stamps `convivy/globex` (owner/name, from
+    `gh pr view`) but the run registry records the short `globex` (`--on`).
     Basename normalization must authenticate these as the same repo — without it
     EVERY overnight PR failed the stamp gate despite a valid APPROVE."""
-    s = _stamp("reviewer", "f" * 40, repo="convivy/constance", run_id="run-1")
-    reason = RP.authenticate(s, _facts("reviewer", repo="constance", posted_verdict="APPROVE", posted_pr="7"),
+    s = _stamp("reviewer", "f" * 40, repo="convivy/globex", run_id="run-1")
+    reason = RP.authenticate(s, _facts("reviewer", repo="globex", posted_verdict="APPROVE", posted_pr="7"),
                              pr="7", review_agents=REVIEW_AGENTS)
     assert reason is None  # authentic — owner prefix tolerated
     # and the reverse form pairing is equally fine
-    s2 = _stamp("reviewer", "f" * 40, repo="constance", run_id="run-1")
-    assert RP.authenticate(s2, _facts("reviewer", repo="convivy/constance", posted_verdict="APPROVE", posted_pr="7"),
+    s2 = _stamp("reviewer", "f" * 40, repo="globex", run_id="run-1")
+    assert RP.authenticate(s2, _facts("reviewer", repo="convivy/globex", posted_verdict="APPROVE", posted_pr="7"),
                            pr="7", review_agents=REVIEW_AGENTS) is None
 
 
 def test_authenticate_still_rejects_cross_repo_with_owner_forms():
     """The basename normalization must NOT weaken the cross-repo-replay guard:
     different repo names (even with matching owners) still fail."""
-    s = _stamp("reviewer", "f" * 40, repo="convivy/vivy", run_id="run-x")
-    reason = RP.authenticate(s, _facts("reviewer", repo="constance"),
+    s = _stamp("reviewer", "f" * 40, repo="convivy/widget", run_id="run-x")
+    reason = RP.authenticate(s, _facts("reviewer", repo="globex"),
                              pr="7", review_agents=REVIEW_AGENTS)
     assert reason and "repo" in reason
 
@@ -593,7 +660,7 @@ def test_resolve_run_facts_reads_the_posted_verdict_and_pr(tmp_path, monkeypatch
 
 
 # --- SHA abbreviation normalization (_sha_match) ----------------------------
-# THE BUG THIS PINS (sous-chef PR #380, 2026-07-27). `agentctl review-post`
+# THE BUG THIS PINS (initech PR #380, 2026-07-27). `agentctl review-post`
 # stamped `reviewed-commit: 018b9e141` (a 9-char git abbreviation). The run's
 # pinned review_sha was the full 40-char form. String equality failed, the stamp
 # was declared a stale replay, and its REQUEST_CHANGES was thrown away.
@@ -651,7 +718,7 @@ def test_authenticate_rejects_empty_reviewed_commit_even_with_matching_review_sh
 def test_authenticate_mismatch_message_renders_shas_distinguishably():
     """Rejection message must render both SHAs so they read differently.
 
-    THE BUG THIS PINS (vivy PR #1084, 2026-07-28). Two SHAs share a long
+    THE BUG THIS PINS (widget PR #1084, 2026-07-28). Two SHAs share a long
     common prefix but diverge at character 22. Both sides were truncated to
     [:9] for display, so the rejection printed the same 9-char value on each
     side of '!=' — 'X != X' — making the guard look broken when it was correct.

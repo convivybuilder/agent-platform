@@ -79,8 +79,8 @@ A review report with two sections:
    - `suggestion` = an idea worth considering — "have you thought about extracting this?" / "consider matching the naming in the adjacent module." Coder is encouraged but not expected to incorporate; skipping a suggestion is fine.
    - `substance` = correctness, safety, or "this would actually be worse in practice."
    - `style` = naming, structure, idiomatic preference, taste calls.
-   - **Don't downgrade a latent gap because a *current* caller happens to cover it.** A missing service-layer authz/ownership check, or a secret written to logs, is `substance` — and usually `blocking` — even when an upstream gate covers every caller today: that protection is one new caller or one refactor away from being bypassed. This is the defense-in-depth class that leaked through constance #465 (a `peer_handoff` service-layer ownership gap guarded only by the router) and #461 (a per-device-secret `endpoint` logged), which is what motivated ARCH-322.
-2. **Verdict** — thumbs-up or thumbs-down. **Thumbs-down (→ `REQUEST_CHANGES`) whenever any finding is `blocking`, OR any finding is `non-blocking` + `category: substance`.** Reserve thumbs-up (→ `APPROVE`) for a review whose only findings are `suggestion`s or `non-blocking` + `style`, or none at all. A real correctness or safety finding must drive a revise round even when you don't rate it a hard blocker: the auto-cycle then incorporates it and re-reviews, rather than terminating on APPROVE and shipping it as an un-actioned note (the ARCH-322 fix for the leak in constance #465/#461). Optional `suggestion`s and pure `style` nits never hold the cycle.
+   - **Don't downgrade a latent gap because a *current* caller happens to cover it.** A missing service-layer authz/ownership check, or a secret written to logs, is `substance` — and usually `blocking` — even when an upstream gate covers every caller today: that protection is one new caller or one refactor away from being bypassed. This is the defense-in-depth class that leaked through acme #465 (a `peer_handoff` service-layer ownership gap guarded only by the router) and #461 (a per-device-secret `endpoint` logged), which is what motivated ARCH-322.
+2. **Verdict** — thumbs-up or thumbs-down. **Thumbs-down (→ `REQUEST_CHANGES`) whenever any finding is `blocking`, OR any finding is `non-blocking` + `category: substance`.** Reserve thumbs-up (→ `APPROVE`) for a review whose only findings are `suggestion`s or `non-blocking` + `style`, or none at all. A real correctness or safety finding must drive a revise round even when you don't rate it a hard blocker: the auto-cycle then incorporates it and re-reviews, rather than terminating on APPROVE and shipping it as an un-actioned note (the ARCH-322 fix for the leak in acme #465/#461). Optional `suggestion`s and pure `style` nits never hold the cycle.
 
 ## Read the CI rollup before you decide (ARCH-345)
 
@@ -111,7 +111,7 @@ Your findings are posted to a **public** PR comment, so two rules govern how you
 
 Name the failing check and say why it fails. A red check is a finding, not a formality, and the coder needs the cause, not the notification.
 
-This exists because it went wrong. On constance #502 the cycle ran three rounds and recorded APPROVE at every one while `Backend tests (shard 3/4)` was red the whole time: three tests in `tests/test_push.py` were 401ing against the PR's new issuer validation. **That file was not in the diff.** Every reviewer read the diff, found it internally coherent, and approved — which is exactly the failure a diff-only read produces. Your diff is not the blast radius; the test suite is. `agentctl review-post` now refuses to record an APPROVE over red CI, so an approve verdict here is rejected — but arriving at it means you have already missed the finding you were dispatched to catch.
+This exists because it went wrong. On acme #502 the cycle ran three rounds and recorded APPROVE at every one while `Backend tests (shard 3/4)` was red the whole time: three tests in `tests/test_push.py` were 401ing against the PR's new issuer validation. **That file was not in the diff.** Every reviewer read the diff, found it internally coherent, and approved — which is exactly the failure a diff-only read produces. Your diff is not the blast radius; the test suite is. `agentctl review-post` now refuses to record an APPROVE over red CI, so an approve verdict here is rejected — but arriving at it means you have already missed the finding you were dispatched to catch.
 
 Don't pad the report. Three real findings beats twelve half-findings, and three real suggestions beats a wishlist. If you can't find anything wrong and have no suggestions, say so explicitly and approve.
 
@@ -218,7 +218,7 @@ exactly as it always did. Build from it. Do NOT treat a missing section as groun
 **Question a document only when the document itself shows the gap**: it names a threshold it
 never states, its argument turns on a number that is not there, or it says detail lives in a
 build plan that does not carry it. That is evidence inside the text, and it is the signal an
-absent section is not. On Selector's ADR-0118 a rank
+absent section is not. On Acme's ADR-0118 a rank
 cutoff was cut with no destination; the plan was written from the rewritten ADR, the coder
 implemented the only definition still visible, and the harness shipped grading with the exact
 instrument that ADR exists to reject. Every gate passed. The plan was faithful to the ADR, the

@@ -59,7 +59,7 @@ def _path_for(subject: str, prov: str = "") -> str:
     slug = subject[:20].replace(" ", "-").replace("/", "-")
     if prov.startswith("generated"):
         return f"projects/company/briefs/{slug}.md"
-    return f"projects/vivy/decisions/{slug}.md"
+    return f"projects/acme/decisions/{slug}.md"
 
 
 def _commit(repo: Path, subject: str, body_tmpl: str = "", *, prov: str = "",
@@ -78,7 +78,7 @@ def _commit(repo: Path, subject: str, body_tmpl: str = "", *, prov: str = "",
 
 
 def test_a_cage_commit_is_recognised_by_its_trailer():
-    out = kb_audit.classify("docs: x", TRAILER.format(ref="projects/vivy/decisions/0001-x.md", prov="in-session", holder="run-7"),
+    out = kb_audit.classify("docs: x", TRAILER.format(ref="projects/acme/decisions/0001-x.md", prov="in-session", holder="run-7"),
                             is_merge=False)
     assert out["path"] == "cage"
     assert out["provenance"] == "in-session"
@@ -93,7 +93,7 @@ def test_a_holder_with_spaces_is_still_recognised_by_its_trailer():
     bypass report on a legitimate write."""
     out = kb_audit.classify(
         "docs: x",
-        TRAILER.format(ref="projects/vivy/decisions/0001-x.md", prov="in-session",
+        TRAILER.format(ref="projects/acme/decisions/0001-x.md", prov="in-session",
                        holder="Pat Holder"),
         is_merge=False)
     assert out["path"] == "cage"
@@ -125,7 +125,7 @@ def test_a_legacy_steward_or_keel_trailer_is_still_recognised_by_its_trailer(pro
     on 2026-09-13, but the audit judges a commit by the policy in force when it was
     made — not by today's policy. Neither value's history changes retroactively."""
     out = kb_audit.classify(
-        "docs: x", TRAILER.format(ref="projects/vivy/decisions/0001-x.md",
+        "docs: x", TRAILER.format(ref="projects/acme/decisions/0001-x.md",
                                    prov=prov, holder="run-7"),
         is_merge=False)
     assert out["path"] == "cage"
@@ -194,7 +194,7 @@ def test_an_unreadable_ref_reports_rather_than_raising(repo):
 
 def test_a_forged_generated_claim_on_a_path_no_generator_owns_is_a_bypass(repo):
     """The evasion named in review: claim `generated`, land in no list."""
-    rel = "projects/vivy/decisions/smuggled.md"
+    rel = "projects/acme/decisions/smuggled.md"
     (repo / rel).parent.mkdir(parents=True, exist_ok=True)
     (repo / rel).write_text("smuggled content")
     _git(repo, "add", "-A")
@@ -237,13 +237,13 @@ def test_an_honest_generated_write_to_a_registered_brief_path_is_sanctioned(repo
 def test_a_trailer_naming_a_file_the_commit_did_not_touch_is_a_bypass(repo):
     """A forger's easiest move is to name some innocuous doc while changing
     something else. The claim is checkable against the commit itself."""
-    rel = "projects/vivy/decisions/actually-changed.md"
+    rel = "projects/acme/decisions/actually-changed.md"
     (repo / rel).parent.mkdir(parents=True, exist_ok=True)
     (repo / rel).write_text("the real change")
     _git(repo, "add", "-A")
     _git(repo, "commit", "--quiet", "-m",
          "docs: looks fine\n\n" + TRAILER.format(
-             ref="projects/vivy/decisions/something-else.md",
+             ref="projects/acme/decisions/something-else.md",
              prov="verifier-pass", holder="run-fake"))
 
     res = kb_audit.audit(since="30.days", ref="main", root=repo)
@@ -305,8 +305,8 @@ def test_a_second_file_smuggled_beside_a_legitimate_ref_is_a_bypass(repo):
     written by one. Confirmed across 60 days of the real corpus (security review,
     #248).
     """
-    named = "projects/vivy/decisions/legitimate.md"
-    smuggled = "projects/vivy/decisions/smuggled.md"
+    named = "projects/acme/decisions/legitimate.md"
+    smuggled = "projects/acme/decisions/smuggled.md"
     for rel in (named, smuggled):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text("content")
@@ -324,7 +324,7 @@ def test_a_signature_on_an_empty_commit_is_not_accepted(repo):
     """It wrote nothing, so no content bypassed anything — but the signature is
     still a false claim, and the audit should not accept one."""
     _git(repo, "commit", "--quiet", "--allow-empty", "-m",
-         "docs: nothing\n\n" + TRAILER.format(ref="projects/vivy/decisions/x.md",
+         "docs: nothing\n\n" + TRAILER.format(ref="projects/acme/decisions/x.md",
                                               prov="verifier-pass", holder="run-fake"))
     res = kb_audit.audit(since="30.days", ref="main", root=repo)
     assert res["unsigned"] and "changed no files" in res["unsigned"][0]["why"]
@@ -334,7 +334,7 @@ def test_an_unsigned_commit_is_not_relabelled_by_the_single_file_check(repo):
     """An already-unsigned commit must keep its own reason. Reporting "a cage
     commit stages one file" for something carrying no signature at all would
     describe the wrong problem."""
-    for rel in ("projects/vivy/decisions/a.md", "projects/vivy/decisions/b.md"):
+    for rel in ("projects/acme/decisions/a.md", "projects/acme/decisions/b.md"):
         (repo / rel).parent.mkdir(parents=True, exist_ok=True)
         (repo / rel).write_text("x")
     _git(repo, "add", "-A")
@@ -487,11 +487,15 @@ def test_a_clean_window_says_so_rather_than_printing_nothing(repo):
 # `audit_access` never touches the network itself — `get` is injected, so
 # these tests stub GitHub's responses and make no network call of their own
 # (the task's own gate). `FakeGitHub` models exactly the recorded-baseline
-# state from issue_01KZQA9FK7F6GZS4E4NCQRH0YB's comments 298 and 307, so the
-# "everything matches" test is the control every drift test perturbs by
-# exactly one fact.
+# state from issue_01KZQA9FK7F6GZS4E4NCQRH0YB's comments 298 and 307 (the
+# real org/repo those comments verified), against a made-up org/repo pair —
+# `audit_access` takes both as required arguments, so nothing here needs the
+# real names to pin the mechanism. The "everything matches" test is the
+# control every drift test perturbs by exactly one fact.
 
 _CLEAN_WORKFLOW_YAML = "name: ci\non: [push]\njobs:\n  build:\n    runs-on: ubuntu-latest\n"
+AUDIT_ORG = "acme"
+AUDIT_REPO = "acme/vault"
 
 
 class FakeGitHub:
@@ -526,29 +530,29 @@ class FakeGitHub:
         for prefix, response in self.overrides.items():
             if path.startswith(prefix):
                 return response
-        if path == "/repos/convivy/knowledge/collaborators":
+        if path == f"/repos/{AUDIT_REPO}/collaborators":
             return 200, self.collaborators
-        if path == "/repos/convivy/knowledge/teams":
+        if path == f"/repos/{AUDIT_REPO}/teams":
             return 200, self.teams
-        if path == "/repos/convivy/knowledge/actions/permissions/workflow":
+        if path == f"/repos/{AUDIT_REPO}/actions/permissions/workflow":
             return 200, self.workflow_permissions
-        if path == "/repos/convivy/knowledge":
+        if path == f"/repos/{AUDIT_REPO}":
             return 200, {"default_branch": self.default_branch}
-        if path == f"/repos/convivy/knowledge/contents/.github/workflows?ref={self.default_branch}":
+        if path == f"/repos/{AUDIT_REPO}/contents/.github/workflows?ref={self.default_branch}":
             return 200, [{"name": name} for name in self.workflow_files]
-        if path.startswith("/repos/convivy/knowledge/contents/.github/workflows/"):
+        if path.startswith(f"/repos/{AUDIT_REPO}/contents/.github/workflows/"):
             name = path.split("/workflows/", 1)[1].split("?", 1)[0]
             content = self.workflow_files.get(name)
             if content is None:
                 return 404, {"message": "Not Found"}
             return 200, {"content": base64.b64encode(content.encode()).decode()}
-        if path == "/orgs/convivy/installations?per_page=100":
+        if path == f"/orgs/{AUDIT_ORG}/installations?per_page=100":
             return 200, {"total_count": len(self.installations), "installations": self.installations}
         raise AssertionError(f"FakeGitHub: unexpected path {path!r}")
 
 
 def test_access_audit_passes_when_everything_matches_the_recorded_expectation():
-    res = kb_audit.audit_access(FakeGitHub().get)
+    res = kb_audit.audit_access(FakeGitHub().get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert res["findings"] == []
     assert res["unreadable"] == []
 
@@ -556,7 +560,7 @@ def test_access_audit_passes_when_everything_matches_the_recorded_expectation():
 def test_an_added_collaborator_is_reported():
     gh = FakeGitHub()
     gh.collaborators.append({"login": "someone-else", "role_name": "write"})
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any("collaborators" in f["surface"] for f in res["findings"])
     assert res["unreadable"] == []
 
@@ -566,7 +570,7 @@ def test_a_missing_github_login_reports_collaborators_unconfigured_not_clean(mon
     cfg.write_text(json.dumps({"excluded_crews": [], "roster_crew": "x", "operator_marker": "x"}))
     monkeypatch.setenv("CONVIVY_OPERATOR_CONFIG", str(cfg))
     gh = FakeGitHub()
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any("collaborators" in u["surface"] for u in res["unreadable"])
     assert not any("collaborators" in f["surface"] for f in res["findings"])
 
@@ -574,7 +578,7 @@ def test_a_missing_github_login_reports_collaborators_unconfigured_not_clean(mon
 def test_a_team_with_repository_access_is_reported():
     gh = FakeGitHub()
     gh.teams = [{"slug": "engineering"}]
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any(f["surface"] == "teams" and "engineering" in f["why"] for f in res["findings"])
 
 
@@ -585,7 +589,7 @@ def test_a_team_with_repository_access_is_reported():
 def test_a_workflow_permission_flip_is_reported(flip):
     gh = FakeGitHub()
     gh.workflow_permissions.update(flip)
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any(f["surface"] == "workflow permissions" for f in res["findings"])
 
 
@@ -597,14 +601,14 @@ def test_a_workflow_permission_flip_is_reported(flip):
 def test_a_workflow_granting_contents_write_is_reported(yaml_text):
     gh = FakeGitHub()
     gh.workflow_files["ci.yml"] = yaml_text
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any(f["surface"] == "workflow files" and "ci.yml" in f["why"] for f in res["findings"])
 
 
 def test_an_unparseable_workflow_files_multiline_yaml_error_renders_on_one_line():
     """`yaml.safe_load`'s own error text is multi-line by design (it quotes
     the offending snippet with a `^` marker on its own line) — real content
-    from a workflow file in convivy/knowledge, which only someone who already
+    from a workflow file in the audited repo, which only someone who already
     has write access to the audited repo could plant. Collapsed before
     `render_access` sees it, so the rendered report cannot be made to look
     like several lines of the audit's own output (security-reviewer, PR #803
@@ -612,7 +616,7 @@ def test_an_unparseable_workflow_files_multiline_yaml_error_renders_on_one_line(
     gh = FakeGitHub()
     gh.workflow_files["ci.yml"] = ("name: ci\non: [push]\njobs:\n  build:\n"
                                    "    runs-on: ubuntu-latest\n  bad: [unterminated")
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     hit = next(u for u in res["unreadable"] if u["surface"] == "workflow files")
     assert "\n" not in hit["why"]
     text = kb_audit.render_access(res)
@@ -653,7 +657,7 @@ def test_a_workflow_files_name_containing_a_line_separator_byte_renders_on_one_l
     gh.workflow_files["evil\x1cfile.yml"] = ("name: ci\non: [push]\npermissions:\n"
                                               "  contents: write\njobs:\n  build:\n"
                                               "    runs-on: ubuntu-latest\n")
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     hit = next(f for f in res["findings"] if f["surface"] == "workflow files")
     assert len(hit["why"].splitlines()) == 1
     text = kb_audit.render_access(res)
@@ -670,26 +674,26 @@ def test_a_workflow_granting_contents_read_is_not_reported():
     gh = FakeGitHub()
     gh.workflow_files["ci.yml"] = ("name: ci\non: [push]\npermissions:\n  contents: read\n"
                                    "jobs:\n  build:\n    runs-on: ubuntu-latest\n")
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert res["findings"] == []
 
 
 def test_a_repo_with_no_workflows_directory_is_not_unreadable():
     gh = FakeGitHub()
-    gh.overrides[f"/repos/convivy/knowledge/contents/.github/workflows?ref={gh.default_branch}"] = \
+    gh.overrides[f"/repos/{AUDIT_REPO}/contents/.github/workflows?ref={gh.default_branch}"] = \
         (404, {"message": "Not Found"})
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert res["unreadable"] == []
     assert res["findings"] == []
 
 
 def test_a_new_installation_is_reported_whatever_its_permissions():
     gh = FakeGitHub()
-    gh.installations.append({"app_slug": "convivy-bosun", "id": 99,
+    gh.installations.append({"app_slug": "acme-bot", "id": 99,
                              "repository_selection": "all",
                              "permissions": {"contents": "read"}, "suspended_at": None})
-    res = kb_audit.audit_access(gh.get)
-    assert any("new installation" in f["why"] and "convivy-bosun" in f["why"]
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
+    assert any("new installation" in f["why"] and "acme-bot" in f["why"]
               for f in res["findings"])
 
 
@@ -697,7 +701,7 @@ def test_a_widened_installation_permission_is_reported():
     gh = FakeGitHub()
     render = next(i for i in gh.installations if i["app_slug"] == "render")
     render["permissions"]["contents"] = "write"
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any(f["surface"] == "installations" and "render" in f["why"]
               and "permissions.contents" in f["why"] for f in res["findings"])
 
@@ -706,7 +710,7 @@ def test_an_unsuspended_claude_is_reported_as_critical_and_sorts_first():
     gh = FakeGitHub()
     claude = next(i for i in gh.installations if i["app_slug"] == "claude")
     claude["suspended_at"] = None
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     hit = [f for f in res["findings"] if f["surface"] == "installations" and "claude" in f["why"]
           and "suspended" in f["why"]]
     assert hit and hit[0].get("critical") is True
@@ -714,21 +718,21 @@ def test_an_unsuspended_claude_is_reported_as_critical_and_sorts_first():
     # Add an unrelated, non-critical drift too, so the ordering claim is real
     # rather than coincidental with only one finding present.
     gh.teams = [{"slug": "engineering"}]
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     text = kb_audit.render_access(res)
     assert text.index("UN-SUSPENDED") < text.index("teams:")
 
 
 @pytest.mark.parametrize("surface,path", [
-    ("collaborators", "/repos/convivy/knowledge/collaborators"),
-    ("teams", "/repos/convivy/knowledge/teams"),
-    ("workflow permissions", "/repos/convivy/knowledge/actions/permissions/workflow"),
-    ("installations", "/orgs/convivy/installations?per_page=100"),
+    ("collaborators", f"/repos/{AUDIT_REPO}/collaborators"),
+    ("teams", f"/repos/{AUDIT_REPO}/teams"),
+    ("workflow permissions", f"/repos/{AUDIT_REPO}/actions/permissions/workflow"),
+    ("installations", f"/orgs/{AUDIT_ORG}/installations?per_page=100"),
 ])
 def test_an_unreadable_surface_is_reported_not_passed(surface, path):
     gh = FakeGitHub()
     gh.overrides[path] = (403, {"message": "Resource not accessible by integration"})
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert res["unreadable"] and res["unreadable"][0]["surface"] == surface
     # An unreadable surface must never also present as a clean (no-finding)
     # pass — `render_access` has to say so, not just the structured result.
@@ -736,35 +740,35 @@ def test_an_unreadable_surface_is_reported_not_passed(surface, path):
     assert "COULD NOT READ" in text
 
 
-def test_the_org_installations_endpoint_being_unreachable_is_exactly_what_the_convivy_bosun_app_sees_live():
-    """Not a stub of a hypothetical: `GET /orgs/convivy/installations` with a
-    live convivy-bosun installation token returns exactly this 403 today
-    (verified 2026-10-07) — the App holds no organization-level permission.
-    Pinning the real shape here, rather than a generic 403, keeps this test
-    from silently drifting away from what the credential this job actually
-    uses can and cannot read."""
+def test_the_org_installations_endpoint_being_unreachable_is_exactly_what_this_jobs_app_sees_live():
+    """Not a stub of a hypothetical: `GET /orgs/<org>/installations` with this
+    job's own live installation token returns exactly this 403 today
+    (verified 2026-10-07, against the real org/repo `main()` audits) — the App
+    holds no organization-level permission. Pinning the real shape here,
+    rather than a generic 403, keeps this test from silently drifting away
+    from what the credential this job actually uses can and cannot read."""
     gh = FakeGitHub()
-    gh.overrides["/orgs/convivy/installations?per_page=100"] = (
+    gh.overrides[f"/orgs/{AUDIT_ORG}/installations?per_page=100"] = (
         403, {"message": "Resource not accessible by integration",
              "documentation_url": "https://docs.github.com/rest/orgs/orgs"
                                    "#list-app-installations-for-an-organization",
              "status": "403"})
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert res["unreadable"] == [{"surface": "installations",
-                                  "why": "GET /orgs/convivy/installations returned 403"}]
+                                  "why": f"GET /orgs/{AUDIT_ORG}/installations returned 403"}]
 
 
 def test_a_truncated_installations_page_is_unreadable_not_silently_short():
     gh = FakeGitHub()
-    gh.overrides["/orgs/convivy/installations?per_page=100"] = (
+    gh.overrides[f"/orgs/{AUDIT_ORG}/installations?per_page=100"] = (
         200, {"total_count": 7, "installations": gh.installations})  # 4 real entries, claims 7
-    res = kb_audit.audit_access(gh.get)
+    res = kb_audit.audit_access(gh.get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any(u["surface"] == "installations" and "unread page" in u["why"]
               for u in res["unreadable"])
 
 
 def test_render_access_says_everything_matched_when_nothing_is_wrong():
-    text = kb_audit.render_access(kb_audit.audit_access(FakeGitHub().get))
+    text = kb_audit.render_access(kb_audit.audit_access(FakeGitHub().get, org=AUDIT_ORG, repo=AUDIT_REPO))
     assert "nothing to review" in text
     assert "COULD NOT READ" not in text
     assert "DRIFT" not in text
@@ -781,11 +785,11 @@ def test_a_network_error_on_one_surface_is_unreadable_not_a_crash():
     real_get = gh.get
 
     def flaky_get(path: str):
-        if path == "/repos/convivy/knowledge/teams":
+        if path == f"/repos/{AUDIT_REPO}/teams":
             raise urllib.error.URLError("Connection refused")
         return real_get(path)
 
-    res = kb_audit.audit_access(flaky_get)
+    res = kb_audit.audit_access(flaky_get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any(u["surface"] == "teams" and "network error" in u["why"]
               for u in res["unreadable"])
     # The surface that raised is reported unreadable, not silently clean, and
@@ -808,11 +812,11 @@ def test_a_read_phase_timeout_on_one_surface_is_unreadable_not_a_crash():
     real_get = gh.get
 
     def flaky_get(path: str):
-        if path == "/repos/convivy/knowledge/teams":
+        if path == f"/repos/{AUDIT_REPO}/teams":
             raise TimeoutError("timed out")
         return real_get(path)
 
-    res = kb_audit.audit_access(flaky_get)
+    res = kb_audit.audit_access(flaky_get, org=AUDIT_ORG, repo=AUDIT_REPO)
     assert any(u["surface"] == "teams" and "network error" in u["why"]
               for u in res["unreadable"])
     assert not any(f["surface"] == "teams" for f in res["findings"])
@@ -832,6 +836,9 @@ def test_main_scopes_the_minted_token_to_knowledge_with_read_only_permissions(mo
     """
     import github_app as GA
 
+    monkeypatch.setattr(GA, "installed_app",
+                        lambda: GA.InstalledApp(app_id="1234567", key_path=Path("/dev/null"),
+                                                slug="test-app"))
     monkeypatch.setattr(GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(GA, "app_jwt", lambda *a, **k: "stub-jwt")
     monkeypatch.setattr(GA, "installation_for_owner", lambda *a, **k: {"id": 123})
@@ -865,6 +872,9 @@ def test_main_resolves_the_convivy_bosun_apps_own_installation_with_two_installe
     lookup, not a stand-in for it."""
     import github_app as GA
 
+    monkeypatch.setattr(GA, "installed_app",
+                        lambda: GA.InstalledApp(app_id="1234567", key_path=Path("/dev/null"),
+                                                slug="test-app"))
     monkeypatch.setattr(GA, "key_problem", lambda *a, **k: None)
     monkeypatch.setattr(GA, "app_jwt", lambda *a, **k: "stub-jwt")
     monkeypatch.setattr(GA, "installation_token", lambda *a, **k: "stub-token")

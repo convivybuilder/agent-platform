@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+import usage_window
+
 REPO = Path(__file__).resolve().parent.parent
 HOOK = REPO / "tools" / "usage-window-context.py"
 # The hook imports both lazily (inside main(), after a sys.path.insert) rather
@@ -58,12 +60,14 @@ def _future_resets_at(seconds_from_now: int = 3600) -> int:
 
 def _seed_reading(tmp_path, *, utilization, resets_at=None, run_id="run-seed",
                   seven_day_utilization=0.10, seven_day_resets_at=None,
-                  with_seven_day=True, is_using_overage=False):
+                  with_seven_day=True, is_using_overage=False, account=None):
     """One dispatched-run transcript reporting *utilization* for the
     five-hour window (and, unless `with_seven_day` is false, the weekly window
     at *seven_day_utilization*, default quiet), under the scratch
     `BUILDER_ROOT` `_run` points at. `is_using_overage` sets the account-level
-    `isUsingOverage` flag on the line."""
+    `isUsingOverage` flag on the line. *account*, when given, is written to the
+    run's own `claude_account` file (`usage_window.record_account`'s shape),
+    so the readers' account filter sees this run as recorded under it."""
     if resets_at is None:
         resets_at = _future_resets_at()
     if seven_day_resets_at is None:
@@ -84,6 +88,8 @@ def _seed_reading(tmp_path, *, utilization, resets_at=None, run_id="run-seed",
         },
     })
     (run_dir / "transcript.jsonl").write_text(line + "\n")
+    if account is not None:
+        (run_dir / usage_window.ACCOUNT_FILE).write_text(account + "\n")
 
 
 # Runs the hook file with `time.time` pinned to argv[1], so a test can seed real
@@ -99,10 +105,29 @@ _PINNED_CLOCK_RUNNER = (
 
 
 def _run(tmp_path, payload, *, tmux="/tmp/tmux-test,1,0", agentctl_run_id=None,
-        hook=None, clock=None):
+        hook=None, clock=None, oauth_email=None, claude_sub_dir=None):
+    """*oauth_email*, when given, is written to the child's own `~/.claude.json`
+    as `oauthAccount.emailAddress`, so `usage_window.live_account()` — now
+    called for real inside the hook's own subprocess — resolves to its digest
+    instead of either hitting this machine's real `claude-sub` (reads the
+    Keychain) or the real `~/.claude.json`. `PATH` is narrowed to exclude it
+    for the same reason: `claude-sub` is checked first and, found on this
+    machine's real `PATH`, would otherwise answer with the real live slot.
+
+    *claude_sub_dir*, when given, is prepended back onto that narrowed `PATH`
+    — a directory holding a fake `claude-sub` (see `_claude_sub_counter`),
+    used to count the hook's own `live_account()` calls from outside its
+    subprocess, which an in-process monkeypatch on this test's own
+    `usage_window` import cannot reach."""
     env = dict(os.environ)
     env["HOME"] = str(tmp_path)
     env["BUILDER_ROOT"] = str(tmp_path / "data-root")
+    env["PATH"] = "/usr/bin:/bin"
+    if claude_sub_dir is not None:
+        env["PATH"] = f"{claude_sub_dir}:{env['PATH']}"
+    if oauth_email is not None:
+        (tmp_path / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": oauth_email}}))
     if tmux is None:
         env.pop("TMUX", None)
     else:
@@ -165,24 +190,32 @@ def test_below_hold_cutoff_shows_the_short_line(tmp_path):
     assert ctx == f"Usage: five-hour window 62%, resets {_mst_string(resets_at)}"
 
 
-def test_at_or_above_hold_cutoff_shows_the_full_text_with_mst_reset(tmp_path):
+def test_five_hour_overage_shows_the_full_text_with_mst_reset(tmp_path):
+    """The five-hour window's only hold condition is overage — the five-hour
+    limit the operator's plan used to carry is gone
+    (issue_01M6ABPVXQM5HVWR29JQYZKWMP)."""
     resets_at = _future_resets_at()
-    _seed_reading(tmp_path, utilization=0.93, resets_at=resets_at)
+    _seed_reading(tmp_path, utilization=0.20, resets_at=resets_at, is_using_overage=True)
     proc = _run(tmp_path, _payload("s1", "UserPromptSubmit"))
     assert proc.returncode == 0
     ctx = _context(proc)
     assert ctx == (
-        f"Five-hour window at 93%, resets {_mst_string(resets_at)}. New dispatches will wait "
-        "until then, and extra usage is off for autonomous work. Finish open "
-        "work before starting new work."
+        f"Five-hour window at 20%, resets {_mst_string(resets_at)}. Every dispatch waits "
+        f"until {_mst_string(resets_at)}, revise rounds and reviews included, and extra "
+        "usage is off for autonomous work."
     )
 
 
-def test_exactly_at_hold_cutoff_is_the_hold_text_not_the_short_line(tmp_path):
-    _seed_reading(tmp_path, utilization=0.90)
+def test_five_hour_utilization_at_95_without_overage_is_the_short_line_not_hold(tmp_path):
+    """Against the unfixed code, 0.95 crossed the five-hour hold cutoff. With
+    the cutoff gone, it stays a short line — no overage, no hold."""
+    resets_at = _future_resets_at()
+    _seed_reading(tmp_path, utilization=0.95, resets_at=resets_at)
     proc = _run(tmp_path, _payload("s1", "UserPromptSubmit"))
     ctx = _context(proc)
-    assert ctx.startswith("Five-hour window at 90%")
+    assert ctx == f"Usage: five-hour window 95%, resets {_mst_string(resets_at)}"
+    assert "New dispatches will wait" not in ctx
+    assert "Every dispatch waits" not in ctx
 
 
 def test_exactly_at_short_cutoff_shows_the_short_line_not_silence(tmp_path):
@@ -230,14 +263,15 @@ def test_posttooluse_reinjects_at_once_on_crossing_into_hold(tmp_path):
     _seed_reading(tmp_path, utilization=0.62)
     first = _run(tmp_path, _payload("s1", "PostToolUse"))
     assert first.stdout.strip() != ""
-    # Same session, band now crosses into hold — re-seed the scratch runs
-    # root with a fresh reading rather than mutating the first run's
-    # transcript, so the freshest-mtime scan in `usage_window` picks it up.
-    _seed_reading(tmp_path, utilization=0.95, run_id="run-seed-2")
+    # Same session, band now crosses into hold (overage — the five-hour
+    # window's only hold condition) — re-seed the scratch runs root with a
+    # fresh reading rather than mutating the first run's transcript, so the
+    # freshest-mtime scan in `usage_window` picks it up.
+    _seed_reading(tmp_path, utilization=0.20, is_using_overage=True, run_id="run-seed-2")
     second = _run(tmp_path, _payload("s1", "PostToolUse"))
     assert second.returncode == 0
     ctx = _context(second)
-    assert ctx.startswith("Five-hour window at 95%")
+    assert ctx.startswith("Five-hour window at 20%")
 
 
 def test_posttooluse_does_not_reinject_on_a_change_that_stays_below_hold(tmp_path):
@@ -295,6 +329,124 @@ def test_a_reading_past_its_resets_at_emits_nothing(tmp_path):
     proc = _run(tmp_path, _payload("s1", "UserPromptSubmit"))
     assert proc.returncode == 0
     assert proc.stdout.strip() == ""
+
+
+# --- only the live account's reading (CQ·517) ----------------------------------
+
+_ACCOUNT_A_EMAIL = "account-a@example.com"
+_ACCOUNT_B_EMAIL = "account-b@example.com"
+_ACCOUNT_A = usage_window._account_digest(_ACCOUNT_A_EMAIL)
+_ACCOUNT_B = usage_window._account_digest(_ACCOUNT_B_EMAIL)
+
+
+def test_hook_reports_the_live_accounts_reading_not_the_freshest_one(tmp_path):
+    """Two accounts each have a run on disk: A's is the fresher one and sits
+    at the weekly hold (99%); B's is older and quiet (10%). This is CQ·517's
+    occurrence — a subscription switch left the old account's 99% weekly
+    window as the freshest reading on disk while the new account sat at a
+    low, unheld utilization — so the hook must report the reading recorded
+    under the account the session is actually running under, never whichever
+    reading on disk is newest."""
+    weekly_reset = _six_days_out()
+    _seed_reading(tmp_path, utilization=0.31, seven_day_utilization=0.10,
+                  seven_day_resets_at=weekly_reset, run_id="run-b", account=_ACCOUNT_B)
+    _seed_reading(tmp_path, utilization=0.31, seven_day_utilization=0.99,
+                  seven_day_resets_at=weekly_reset, run_id="run-a", account=_ACCOUNT_A)
+
+    stubbed_to_b = _run(tmp_path, _payload("s1", "UserPromptSubmit"), oauth_email=_ACCOUNT_B_EMAIL)
+    assert stubbed_to_b.returncode == 0
+    assert stubbed_to_b.stdout.strip() == ""
+
+    stubbed_to_a = _run(tmp_path, _payload("s2", "UserPromptSubmit"), oauth_email=_ACCOUNT_A_EMAIL)
+    assert stubbed_to_a.returncode == 0
+    ctx = _context(stubbed_to_a)
+    assert ctx == (
+        f"Seven-day window at 99%, resets {_weekday_string(weekly_reset)}."
+        + _weekly_hold_tail(weekly_reset)
+    )
+
+
+# --- the PostToolUse account cache (round-1 finding on this PR) ----------------
+#
+# `main()` used to call `UW.live_account()` on every invocation, before
+# `_should_emit` decides whether to print — a `claude-sub current` and
+# `claude-sub list` pair, each with its own 5s timeout, on every PostToolUse
+# in every co session, including the many the throttle then prints nothing
+# for. A PostToolUse firing now reuses the session's last-resolved account
+# when it is under 60 seconds old.
+
+
+def _claude_sub_counter(tmp_path):
+    """A directory holding a fake `claude-sub` that logs each invocation's
+    first argument to *tmp_path*/`claude-sub-calls.log` and otherwise answers
+    with no slot (empty stdout), so `live_account()` always falls through to
+    the (here, absent) `~/.claude.json` fallback. Counts `live_account()`
+    calls made inside the hook's own subprocess, which an in-process
+    monkeypatch on this test file's `usage_window` import cannot reach."""
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir(exist_ok=True)
+    log_path = tmp_path / "claude-sub-calls.log"
+    stub = bin_dir / "claude-sub"
+    stub.write_text(f'#!/bin/sh\necho "$1" >> "{log_path}"\n')
+    stub.chmod(0o755)
+    return bin_dir, log_path
+
+
+def _live_account_call_count(log_path) -> int:
+    if not log_path.exists():
+        return 0
+    return sum(1 for line in log_path.read_text().splitlines() if line.strip() == "current")
+
+
+def test_two_posttooluse_firings_10s_apart_resolve_the_account_once(tmp_path):
+    _seed_reading(tmp_path, utilization=0.10)  # quiet: a window exists, nothing is shown
+    bin_dir, log_path = _claude_sub_counter(tmp_path)
+    now = time.time()
+    first = _run(tmp_path, _payload("s1", "PostToolUse"), claude_sub_dir=bin_dir, clock=now)
+    assert first.returncode == 0
+    second = _run(tmp_path, _payload("s1", "PostToolUse"), claude_sub_dir=bin_dir, clock=now + 10)
+    assert second.returncode == 0
+    assert _live_account_call_count(log_path) == 1
+
+
+def test_a_posttooluse_firing_61s_later_resolves_the_account_again(tmp_path):
+    _seed_reading(tmp_path, utilization=0.10)
+    bin_dir, log_path = _claude_sub_counter(tmp_path)
+    now = time.time()
+    first = _run(tmp_path, _payload("s1", "PostToolUse"), claude_sub_dir=bin_dir, clock=now)
+    assert first.returncode == 0
+    assert _live_account_call_count(log_path) == 1
+    second = _run(tmp_path, _payload("s1", "PostToolUse"), claude_sub_dir=bin_dir, clock=now + 61)
+    assert second.returncode == 0
+    assert _live_account_call_count(log_path) == 2
+
+
+def test_userpromptsubmit_resolves_the_account_regardless_of_the_cache(tmp_path):
+    """A fresh PostToolUse cache (seeded one second earlier, well inside the
+    60s window) does not stop `UserPromptSubmit` from resolving fresh —
+    it fires once per human turn and always shows the live reading."""
+    _seed_reading(tmp_path, utilization=0.10)
+    bin_dir, log_path = _claude_sub_counter(tmp_path)
+    now = time.time()
+    first = _run(tmp_path, _payload("s1", "PostToolUse"), claude_sub_dir=bin_dir, clock=now)
+    assert first.returncode == 0
+    assert _live_account_call_count(log_path) == 1
+    second = _run(tmp_path, _payload("s1", "UserPromptSubmit"), claude_sub_dir=bin_dir,
+                  clock=now + 1)
+    assert second.returncode == 0
+    assert _live_account_call_count(log_path) == 2
+
+
+def test_the_state_file_holds_the_account_digest_and_no_email(tmp_path):
+    email = "digest-check@example.com"
+    _seed_reading(tmp_path, utilization=0.10, account=usage_window._account_digest(email))
+    proc = _run(tmp_path, _payload("s1", "PostToolUse"), oauth_email=email)
+    assert proc.returncode == 0
+    state_path = tmp_path / ".cache" / "co-session-health" / "usage-window-s1.json"
+    raw = state_path.read_text()
+    assert email not in raw
+    state = json.loads(raw)
+    assert state["account"] == usage_window._account_digest(email)
 
 
 # --- a failed import fails open ------------------------------------------------
@@ -393,8 +545,8 @@ def test_weekly_alone_short_shows_its_own_line_with_weekday_reset(tmp_path):
 
 
 def test_weekly_at_96_percent_is_a_short_line_not_a_hold(tmp_path):
-    """The weekly hold cutoff is 0.99 (the operator, 2026-10-08), not the five-hour 0.9
-    or its own former 0.96: 96% weekly is inside the short band."""
+    """The weekly hold cutoff is 0.99 (the operator, 2026-10-08), not its own
+    former 0.96: 96% weekly is inside the short band."""
     weekly_reset = _six_days_out()
     _seed_reading(tmp_path, utilization=0.31, seven_day_utilization=0.96,
                   seven_day_resets_at=weekly_reset)
@@ -427,46 +579,44 @@ def test_both_windows_short_shows_both_lines_with_their_own_resets(tmp_path):
 
 
 @pytest.mark.parametrize("five_hour_later", [False, True])
-def test_both_windows_held_names_the_weekly_wait_and_the_five_hour_reset_apart(
-        tmp_path, five_hour_later):
-    """Every dispatch waits on the weekly reset. A new dispatch waits on the
-    later of the two held resets, whichever window that is: the weekly reset
-    when it falls after the five-hour one, the five-hour reset when it falls
-    after the weekly one (a weekly reset under five hours away). When the
-    weekly reset is the later one, the every-dispatch sentence already names it,
-    so no new-dispatch sentence follows."""
+def test_both_windows_held_names_the_later_reset(tmp_path, five_hour_later):
+    """Every dispatch waits for the LATER of the two held resets, whichever
+    window that is: the weekly reset when it falls after the five-hour one,
+    the five-hour reset when it falls after the weekly one (a weekly reset
+    under five hours away). The five-hour window holds here only via
+    overage; utilization alone is never a hold condition."""
     if five_hour_later:
         weekly_reset = int(time.time()) + 1800
         five_reset = int(time.time()) + 3600
-        new_dispatch = f" New dispatches will wait until {_mst_string(five_reset)}."
+        later = _mst_string(five_reset)
     else:
         five_reset = int(time.time()) + 3600
         weekly_reset = _six_days_out()
-        new_dispatch = ""
-    _seed_reading(tmp_path, utilization=0.93, resets_at=five_reset,
+        later = _weekday_string(weekly_reset)
+    _seed_reading(tmp_path, utilization=0.10, resets_at=five_reset, is_using_overage=True,
                   seven_day_utilization=0.99, seven_day_resets_at=weekly_reset)
     ctx = _context(_run(tmp_path, _payload("s1", "UserPromptSubmit")))
     assert ctx == (
-        f"Five-hour window at 93%, resets {_mst_string(five_reset)}; "
-        f"seven-day window at 99%, resets {_weekday_string(weekly_reset)}."
-        + _weekly_hold_tail(weekly_reset)
-        + new_dispatch
+        f"Five-hour window at 10%, resets {_mst_string(five_reset)}; "
+        f"seven-day window at 99%, resets {_weekday_string(weekly_reset)}. "
+        f"Every dispatch waits until {later}, revise rounds and reviews included, "
+        "and extra usage is off for autonomous work."
     )
 
 
-def test_five_hour_held_and_weekly_short_waits_for_the_five_hour_reset(tmp_path):
-    """Only the five-hour window holds, so the wait ends at its reset, and the
-    weekly line is still shown with its own reset."""
+def test_five_hour_overage_and_weekly_short_waits_for_the_five_hour_reset(tmp_path):
+    """Only the five-hour window holds (via overage), so the wait ends at its
+    reset, and the weekly line is still shown with its own reset."""
     five_reset = int(time.time()) + 3600
     weekly_reset = _six_days_out()
-    _seed_reading(tmp_path, utilization=0.93, resets_at=five_reset,
+    _seed_reading(tmp_path, utilization=0.10, resets_at=five_reset, is_using_overage=True,
                   seven_day_utilization=0.72, seven_day_resets_at=weekly_reset)
     ctx = _context(_run(tmp_path, _payload("s1", "UserPromptSubmit")))
     assert ctx == (
-        f"Five-hour window at 93%, resets {_mst_string(five_reset)}; "
+        f"Five-hour window at 10%, resets {_mst_string(five_reset)}; "
         f"seven-day window at 72%, resets {_weekday_string(weekly_reset)}."
-        f" New dispatches will wait until {_mst_string(five_reset)}, and extra "
-        "usage is off for autonomous work. Finish open work before starting new work."
+        f" Every dispatch waits until {_mst_string(five_reset)}, revise rounds and "
+        "reviews included, and extra usage is off for autonomous work."
     )
 
 
@@ -561,14 +711,13 @@ def test_five_hour_low_utilization_without_overage_stays_silent(tmp_path):
 def test_hook_names_the_release_time_the_hold_decision_uses(tmp_path, agentctl):
     """The hook does not import `bin/agentctl` (a 15k-line CLI, too heavy for a
     per-prompt hook), so it restates the overage rule. This holds the two to
-    the same time: the reset `_rate_limit_hold_decision` holds a `--pr` run to
+    the same time: the reset `_rate_limit_hold_decision` holds a dispatch to
     must be the one the hook names, for the real case's readings."""
     now = datetime.fromtimestamp(REAL_PINNED_NOW, tz=timezone.utc)
     five_hour = {"utilization": 0.03, "resets_at": REAL_FIVE_HOUR_RESET,
                  "status": None, "is_using_overage": True}
     seven_day = {"utilization": 1.0, "resets_at": REAL_WEEKLY_RESET, "status": None}
-    held = agentctl._rate_limit_hold_decision(five_hour, now=now, pr_round_fix=True,
-                                              seven_day=seven_day)
+    held = agentctl._rate_limit_hold_decision(five_hour, now=now, seven_day=seven_day)
     assert held is not None
     held_until = int(held[0].timestamp())
     _seed_reading(tmp_path, utilization=0.03, resets_at=REAL_FIVE_HOUR_RESET,
@@ -579,13 +728,13 @@ def test_hook_names_the_release_time_the_hold_decision_uses(tmp_path, agentctl):
     assert f"Every dispatch waits until {_mst_string(held_until)}" in _context(proc)
 
 
-# --- the hook's restated cutoffs and held set, against the hold decision -------
+# --- the hook's restated cutoff and held set, against the hold decision -------
 #
-# The hook cannot import bin/agentctl, so it restates both hold cutoffs and the
-# held set. These tests pin each restatement to the decision it mirrors: the
-# constants by equality, and every window state, in both orders of the two
-# resets, by comparing the hook's text with `_rate_limit_hold_decision` for a
-# `--pr` run and for a fresh one.
+# The hook cannot import bin/agentctl, so it restates the weekly hold cutoff
+# and the held set (the five-hour window has no cutoff to restate: it holds
+# only on overage). These tests pin each restatement to the decision it
+# mirrors: the constant by equality, and every window state, in both orders
+# of the two resets, by comparing the hook's text with `_rate_limit_hold_decision`.
 
 @pytest.fixture(scope="module")
 def hook_module():
@@ -597,21 +746,21 @@ def hook_module():
     return module
 
 
-def test_hook_cutoffs_are_the_agentctl_hold_constants(hook_module, agentctl):
-    """Each hook cutoff equals the constant its hold decision reads, so moving one
-    side alone fails here before any text does."""
-    assert hook_module.HOLD_CUTOFF == agentctl.RATE_LIMIT_HOLD_UTILIZATION
+def test_hook_cutoff_is_the_agentctl_weekly_hold_constant(hook_module, agentctl):
+    """The hook's weekly cutoff equals the constant its hold decision reads, so
+    moving one side alone fails here before any text does."""
     assert hook_module.WEEKLY_HOLD_CUTOFF == agentctl.WEEKLY_HOLD_UTILIZATION
 
 
 # Window states the hook bands, as `usage_window` returns them. The five-hour
 # state is (utilization, is_using_overage); the seven-day state is utilization.
-# "between-cutoffs" is 0.93: above the five-hour cutoff, below the weekly one.
+# "high-no-overage" is 0.95: this used to be the five-hour hold cutoff
+# (issue_01M6ABPVXQM5HVWR29JQYZKWMP) — it must never hold now, overage apart.
 FIVE_HOUR_STATES = {
     "absent": None,
     "quiet": (0.10, False),
     "short": (0.62, False),
-    "at-cutoff": (0.90, False),
+    "high-no-overage": (0.95, False),
     "overage": (0.03, True),
 }
 SEVEN_DAY_STATES = {
@@ -647,8 +796,7 @@ def _hook_clock(instant: datetime, five_reset: int, weekly_reset: int) -> str:
 def test_hook_and_hold_decision_agree_on_every_window_state(
         hook_module, agentctl, five_hour, seven_day, order):
     """For each combination: the hook shows a hold exactly when the decision
-    holds a fresh run; it says every dispatch waits exactly when the decision
-    holds a `--pr` run; and each time it prints is the time the decision returns."""
+    holds a dispatch, and the time it prints is the time the decision returns."""
     five_reset, weekly_reset = RESET_ORDERS[order]
     five = None
     if FIVE_HOUR_STATES[five_hour] is not None:
@@ -660,28 +808,16 @@ def test_hook_and_hold_decision_agree_on_every_window_state(
         seven = {"utilization": SEVEN_DAY_STATES[seven_day],
                  "resets_at": weekly_reset, "status": None}
     band, text = hook_module._compose([
-        ("five-hour", five, hook_module.HOLD_CUTOFF, hook_module.FIVE_HOUR_RESET_FMT),
+        ("five-hour", five, None, hook_module.FIVE_HOUR_RESET_FMT),
         ("seven-day", seven, hook_module.WEEKLY_HOLD_CUTOFF, hook_module.SEVEN_DAY_RESET_FMT),
     ])
-    fresh = agentctl._rate_limit_hold_decision(five, now=MATRIX_NOW, pr_round_fix=False,
-                                               seven_day=seven)
-    revise = agentctl._rate_limit_hold_decision(five, now=MATRIX_NOW, pr_round_fix=True,
-                                                seven_day=seven)
+    decision = agentctl._rate_limit_hold_decision(five, now=MATRIX_NOW, seven_day=seven)
 
-    assert (band == "hold") == (fresh is not None)
-    revise_match = re.search(r"Every dispatch waits until ([^,]+), revise rounds", text)
-    assert (revise_match is not None) == (revise is not None)
-    if revise is not None:
-        assert revise_match.group(1) == _hook_clock(revise[0], five_reset, weekly_reset)
-    if fresh is not None:
-        fresh_match = re.search(r"New dispatches will wait until ([^,.]+)[,.]", text)
-        named = (fresh_match or revise_match).group(1)
-        if named == "then":
-            # One window is shown, and "then" names its reset: the five-hour one,
-            # the only window that holds a fresh run without holding a `--pr` run.
-            assert _hook_clock(fresh[0], five_reset, weekly_reset) == _mst_string(five_reset)
-        else:
-            assert named == _hook_clock(fresh[0], five_reset, weekly_reset)
+    assert (band == "hold") == (decision is not None)
+    match = re.search(r"Every dispatch waits until ([^,]+), revise rounds", text)
+    assert (match is not None) == (decision is not None)
+    if decision is not None:
+        assert match.group(1) == _hook_clock(decision[0], five_reset, weekly_reset)
 
 
 def test_weekly_reset_later_than_overage_reset_names_the_weekly_reset(tmp_path):

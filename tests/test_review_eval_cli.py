@@ -16,6 +16,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
@@ -214,6 +216,7 @@ def test_score_on_empty_results_writes_an_empty_report(review_eval_cli, tmp_path
     assert json.loads(audit.read_text()) == {"judged_real": [], "judged_false": []}
 
 
+@pytest.mark.rich_registry
 def test_merged_head_via_gh_uses_the_registered_owner_for_homebrew_tap(
         review_eval_cli, monkeypatch):
     """Round-1 review (PR #881, comment 6150937461): `_merged_head_via_gh`
@@ -221,7 +224,7 @@ def test_merged_head_via_gh_uses_the_registered_owner_for_homebrew_tap(
     same pattern the PR centralizes everywhere else, and an 8th occurrence its
     "seven sites... now share one function" claim missed. `corpus build`
     resolves a past review round's merged head through this, and a
-    homebrew-tap round would otherwise query convivy/homebrew-tap (wrong
+    brewcask-tap round would otherwise query convivy/brewcask-tap (wrong
     owner), silently dropping that round from corpus eligibility. Fails
     against a build that still reads `f"convivy/{repo}"` literally."""
     import subprocess
@@ -236,14 +239,78 @@ def test_merged_head_via_gh_uses_the_registered_owner_for_homebrew_tap(
 
     monkeypatch.setattr(review_eval_cli.subprocess, "run", fake_run)
 
-    head = review_eval_cli._merged_head_via_gh("homebrew-tap", "1")
+    merged_head = review_eval_cli._make_merged_head_via_gh(lambda repo_slug: {})
+    head = merged_head("brewcask-tap", "1")
 
     assert head == head_oid
     assert calls and "--repo" in calls[0]
     repo_arg = calls[0][calls[0].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap", (
-        f"_merged_head_via_gh must query convivybuilder/homebrew-tap, "
+    assert repo_arg == "caskforge/brewcask-tap", (
+        f"_merged_head_via_gh must query caskforge/brewcask-tap, "
         f"not {repo_arg!r}")
+
+
+def test_merged_head_via_gh_a_mint_failure_runs_no_gh_process(
+        review_eval_cli, monkeypatch):
+    """A repo whose token cannot be minted is never queried: the `gh pr
+    view` call must not run, and the failure is named on stderr rather than
+    silently resolving to 'not merged'."""
+    calls = []
+    monkeypatch.setattr(review_eval_cli.subprocess, "run",
+                        lambda *a, **k: calls.append((a, k)))
+
+    def failing_env_for(repo_slug):
+        raise review_eval_cli.GA.Unreadable("no App key configured at .../app.pem")
+
+    merged_head = review_eval_cli._make_merged_head_via_gh(failing_env_for)
+    head = merged_head("widget", "1")
+
+    assert head is None
+    assert calls == [], "a mint failure must never fall back to running gh"
+
+
+def test_merged_head_via_gh_threads_the_minted_tokens_env_into_the_gh_call(
+        review_eval_cli, monkeypatch):
+    """Drives the real `GA.read_token_pool` (only `GA.installed_app` and
+    `GA.mint_token` are stubbed — `GA.gh_env` runs for real): the minted
+    token lands in `GH_TOKEN`, and `GH_CONFIG_DIR` is an empty, throwaway
+    directory, on the `gh pr view` call."""
+    from contextlib import contextmanager
+
+    monkeypatch.setattr(
+        review_eval_cli.GA, "installed_app",
+        lambda: review_eval_cli.GA.InstalledApp(
+            app_id="1", key_path=Path("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(review_eval_cli.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = Path(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        return subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"state": "MERGED", "headRefOid": "a" * 40}))
+
+    monkeypatch.setattr(review_eval_cli.subprocess, "run", fake_run)
+
+    with review_eval_cli.GA.read_token_pool() as gh_env_for:
+        merged_head = review_eval_cli._make_merged_head_via_gh(gh_env_for)
+        head = merged_head("widget", "1")
+
+    assert head == "a" * 40
+    assert captured, "gh must have been called with the minted token's environment"
 
 
 def test_anthropic_judge_call_routes_its_env_through_the_credential_guard(
@@ -257,6 +324,11 @@ def test_anthropic_judge_call_routes_its_env_through_the_credential_guard(
 
     monkeypatch.setenv("GH_TOKEN", "ghp_secret")
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_secret")
+    # DE.dispatch_env()'s own git-identity probe (sixth gap, its docstring) is a
+    # real `subprocess.run` call too — unmocked, it would be counted as a second
+    # call below, against `fake_run`'s own `len(calls) == 1` contract. `True`
+    # matches this test's real environment.
+    monkeypatch.setattr(review_eval_cli.DE, "_git_identity_resolves", lambda env, cwd: True)
     calls = []
 
     def fake_run(argv, **kwargs):

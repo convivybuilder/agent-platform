@@ -63,9 +63,10 @@ _venv_marker_mtime() { # <path>
 _seed_repo() { # <path> <tool body>
     local repo=$1 tool_body=$2
     # eval/ is in the fixture because it is in the installer's required set:
-    # bin/kb-eval resolves eval/kb-golden.jsonl against its OWN tree, so a deploy
-    # without it raises FileNotFoundError at the next scheduled run. config/ is
-    # NOT required — projects.py reads the registry from an absolute path into
+    # bin/kb-eval resolves eval/kb-golden.example.jsonl against its OWN tree
+    # whenever the install has no golden set of its own, so a deploy without it
+    # raises FileNotFoundError at the next scheduled run. config/ is NOT
+    # required — projects.py reads the registry from an absolute path into
     # the live checkout, deliberately, so no deploy carries a copy.
     mkdir -p "$repo/bin" "$repo/lib/agent-platform" "$repo/lib/knowledge" \
              "$repo/eval" "$repo/gateway" "$repo/tools/review-eval/variant-agents" \
@@ -81,9 +82,9 @@ _seed_repo() { # <path> <tool body>
     echo "INDEXER = 'v1'" > "$repo/lib/knowledge/indexer.py"
     echo "KNOWLEDGE = 'v1'" > "$repo/lib/knowledge/knowledge.py"
     echo "TELEMETRY = 'v1'" > "$repo/lib/knowledge/kb_telemetry.py"
-    echo '{"q": "seed"}' > "$repo/eval/kb-golden.jsonl"
+    echo '{"q": "seed"}' > "$repo/eval/kb-golden.example.jsonl"
     # bin/review-eval (agent-platform#807) resolves both of these against its
-    # own tree root, the same reason eval/kb-golden.jsonl is seeded above —
+    # own tree root, the same reason eval/kb-golden.example.jsonl is seeded above —
     # DEPLOY_PATHS now requires both to exist at the installed commit, or the
     # installer's preflight refuses before archiving anything.
     echo "model_list: []" > "$repo/gateway/config.yaml"
@@ -145,12 +146,13 @@ assert_eq "0" "$(test -L "$H$DEPLOY/lib/agent-platform/helper.py" && echo 1 || e
 
 # Same reasoning as the registry assertion in the run-register-api suite: the
 # fixture seeding these only proves the archive did not fail on them. Both are
-# resolved by deployed code against its OWN tree — bin/kb-eval reads the golden
-# set, lib/agent-platform/projects.py reads the registry — so a path silently
-# dropped from DEPLOY_PATHS is a nightly job failing forever against a current
-# DEPLOYED_COMMIT, which is the outage this suite now covers.
-assert_eq "1" "$(test -f "$H$DEPLOY/eval/kb-golden.jsonl" && echo 1 || echo 0)" \
-    "the KB golden set is deployed, not left behind in the checkout"
+# resolved by deployed code against its OWN tree — bin/kb-eval reads the
+# synthetic example set, lib/agent-platform/projects.py reads the registry —
+# so a path silently dropped from DEPLOY_PATHS is a nightly job failing
+# forever against a current DEPLOYED_COMMIT, which is the outage this suite
+# now covers.
+assert_eq "1" "$(test -f "$H$DEPLOY/eval/kb-golden.example.jsonl" && echo 1 || echo 0)" \
+    "the KB synthetic example golden set is deployed, not left behind in the checkout"
 assert_eq "1" "$(test -x "$H$DEPLOY/venv/bin/python3" && echo 1 || echo 0)" \
     "a pinned interpreter is built inside the deploy area (rule 4)"
 

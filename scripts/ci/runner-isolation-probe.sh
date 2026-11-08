@@ -16,8 +16,8 @@
 #          below) and GET "/" on any extra listener that enumeration finds
 #          outside the fixed list. Every result reports ONLY port / route /
 #          HTTP status / response byte count. A response body is NEVER
-#          printed, saved, or uploaded: Selector's /status returns the
-#          operator's Spotify name and listening history, and CI logs are not
+#          printed, saved, or uploaded: one product's /status returns the
+#          operator's own account name and usage history, and CI logs are not
 #          a place user data may go. GET only, never POST/PUT/DELETE.
 #   d.     Confirm ap-runner cannot reach the operator's own data: list
 #          the operator's home directory, read the operator's `.claude`,
@@ -58,7 +58,7 @@ echo
 # confirmed listening at the same moment by a different uid (issue comment,
 # 2026-10-07) — enumeration is a visibility aid here, never the thing that
 # decides what gets probed.
-FIXED_PORTS="4000 8100 8099 8787 8000 5151 4100 8765 8300 8080 8081 20241 50406 8321 8322 8323 8324 8325 8326 8327 8328 8329 8330"
+FIXED_PORTS="4000 8100 8099 8787 8000 5151 4100 8300 8080 8081 20241 50406 8321 8322 8323 8324 8325 8326 8327 8328 8329 8330"
 
 is_fixed_port() {
     case " $FIXED_PORTS " in
@@ -115,26 +115,24 @@ echo
 # known/likely Convivy service on that port.
 #
 # Ports named explicitly in the CQ-417 work item use the route(s) it names
-# (LiteLLM, Selector, cloudflared). Library and Orient use the real route
+# (LiteLLM, a product repo, cloudflared). Library and Orient use the real route
 # this repo's own client code sends — lib/agent-platform/vault_plane.py and
 # tests/test_vault_plane.py show the Library serves `/items`, Orient serves
-# `/api/issues`. convivy-open's `/health` (tools/convivy-open/install-laptop.sh)
-# is this repo's only other confirmed route, and covers :8765. Every other
-# port below (Ask, CFO, convivy-services, the tennis app's 8321-8330,
-# sous-chef, Docker, prisma) has no source in this repo to read a route
-# from, so each is a GUESS, marked inline — `/health` where that convention
-# is plausible elsewhere in this repo, else the service's own root.
+# `/api/issues`. Every other port below (a product repo, a black-box crew, a
+# two-repo crew's service, the tennis app's 8321-8330, another product repo,
+# Docker, prisma) has no source in this repo to read a route from, so each is
+# a GUESS, marked inline — `/health` where that convention is plausible
+# elsewhere in this repo, else the service's own root.
 route_for_port() {
     case "$1" in
         4000) echo "/v1/models /key/info" ;;  # LiteLLM, from the work item
         8100) echo "/items" ;;                 # Library, derived: vault_plane.py
         8099) echo "/api/issues" ;;            # Orient, derived: vault_plane.py
-        8787) echo "/health" ;;                # Ask — GUESSED, no source in this repo
-        8000) echo "/status" ;;                # Selector, from the work item
-        5151) echo "/health" ;;                # CFO — GUESSED
-        4100) echo "/health" ;;                # convivy-services — GUESSED
-        8765) echo "/health" ;;                # convivy-open, derived: install-laptop.sh
-        8300) echo "/health" ;;                # sous-chef — GUESSED
+        8787) echo "/health" ;;                # a product repo — GUESSED, no source in this repo
+        8000) echo "/status" ;;                # a product repo, from the work item
+        5151) echo "/health" ;;                # a black-box crew — GUESSED
+        4100) echo "/health" ;;                # a two-repo crew's service — GUESSED
+        8300) echo "/health" ;;                # a product repo — GUESSED
         8080|8081) echo "/version" ;;          # Docker — GUESSED (Engine API convention)
         20241) echo "/metrics" ;;              # cloudflared, from the work item
         50406) echo "/" ;;                     # prisma — GUESSED, no plausible non-root route found

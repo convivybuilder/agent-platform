@@ -34,6 +34,13 @@ artifacts + `gh`.
   bar (ARCH-107) needs the Phase-2 look-back (reverts / follow-up bugs); this writes
   `merged` + `merged_at` so Phase 2 can finalize `survived` later.
 
+  The above is membership in THIS local quality ledger only. The separate post to
+  the Library's spend ledger (`report_to_ledger`, `POST /ledger-entries`) is wider:
+  it is also `bin/agentctl`'s own at-finish backstop, and `ledger_post_rows` feeds
+  it every finished run in the window, not only a `pr-link.json` member — a run
+  `report_to_ledger` itself skips once a prior pass (this sweep's or agentctl's own
+  at-finish post) has marked it `ledger_post_status: "recorded"` on meta.json.
+
 CLI: `--days N` (window, default 14), `--no-write` (don't update the ledger),
 `--ledger PATH` (override), `--report` (print the per-(agent,model) summary).
 """
@@ -42,6 +49,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import re
 import subprocess
 import sys
@@ -55,9 +63,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-p
 import telemetry as T  # noqa: E402
 import signal_client   # noqa: E402  (structured Reports signal, ARCH-353 Build 2c)
 import issue_client    # noqa: E402  (POST /ledger-entries, the Bosun's first ledger writer)
+import ledger as LG     # noqa: E402  (shared lane classifier, now also agentctl's)
+import cost_join as CJ  # noqa: E402  (item_for_pr — the shared PR-match rule, E16)
 import dispatch_env as DE  # noqa: E402
 import projects         # noqa: E402
 import review_protocol as RP  # noqa: E402
+import github_app as GA  # noqa: E402
 
 import builder_root as BR
 RUNS_ROOT = BR.runs_root()
@@ -84,24 +95,15 @@ is_codex_model = _AC.is_codex_model
 
 
 def ledger_lane(model: str | None) -> str | None:
-    """The Library's ledger lane for `model` — "gateway", "subscription", or
-    None when it cannot be determined (E1·6).
-
-    None covers two cases: no model on the row at all, and a Codex model
-    (`is_codex_model`). Codex runs are billed at OpenAI's API rates
-    (`telemetry.CODEX_BILLING_SOURCE`, kept a distinct `billing_source` from
-    both `subscription_credit` and the gateway's `provider_api:*` for exactly
-    this reason — the operator's 2026-09-23 decision), so labelling one
-    "subscription" would mix OpenAI-billed spend into the Anthropic
-    subscription total, the exact cross-lane mixing this field exists to
-    prevent; the Library's ledger has no third lane to hold it instead."""
-    if not model:
-        return None
-    if is_gateway_model(model):
-        return "gateway"
-    if is_codex_model(model):
-        return None
-    return "subscription"
+    """The Library's ledger lane for `model` — see `ledger.ledger_lane`'s
+    docstring (`lib/agent-platform/ledger.py`), the shared implementation
+    `bin/agentctl`'s own at-finish ledger post now also calls, so the two
+    writers can't drift on which lane a model belongs to. This wrapper exists
+    only to bind this module's own `is_gateway_model`/`is_codex_model` (loaded
+    off `bin/agentctl` via `_load_agentctl` above) without every call site
+    here having to pass them."""
+    return LG.ledger_lane(model, is_gateway_model=is_gateway_model,
+                          is_codex_model=is_codex_model)
 
 
 # Phase 3 (T3) — sampled LLM judge. Sonnet, not Opus: judging is moderate-leverage,
@@ -122,12 +124,15 @@ JUDGE_SAMPLE = 3
 JUDGE_DIFF_CAP = 30000
 CLAUDE_BIN = str(Path.home() / ".local" / "bin" / "claude")  # absolute: launchd thin PATH
 
-# CI workflow file per repo (the "Frontend type check" + suite live here, ARCH-106).
-# hollis (formerly personal-assistant, ARCH-290) runs its own ci.yml (ruff + pytest)
-# — harvested GitHub-only (its dev crew runs via the Task tool, not agentctl, so
-# emits no run telemetry).
-CI_WORKFLOW = {"vivy": "ci.yml", "constance": "ci.yml", "sous-chef": "ci.yml",
-               "hollis": "ci.yml"}
+# CI workflow file per repo (the "Frontend type check" + suite live here, ARCH-106):
+# every registry shared-coverage product, plus every own-coverage product (ARCH-290,
+# runs its own ci.yml — ruff + pytest — harvested GitHub-only, since its dev
+# crew runs via the Task tool, not agentctl, and so emits no run telemetry).
+# All of them run plain `ci.yml`
+# today; a product needing a different workflow file here would need its own
+# entry.
+CI_WORKFLOW = {slug: "ci.yml" for slug
+               in projects.shared_coverage_products() + projects.own_coverage_products()}
 
 # The success bar (ARCH-107): a merged PR "survives" if within this many days it is
 # neither reverted (Phase 2) nor followed by a bug it plausibly caused (Phase 2b).
@@ -217,8 +222,17 @@ def build_row(run: dict, pr: dict | None, ci_first_pass,
     used to be documented as a three-way linked/reconstructed/unresolved, which
     sent a reader looking for a reconstructed branch/PR-ref path that has been
     deliberately removed. It remains the coverage metric Phase 0's pr-link.json
-    is meant to move."""
+    is meant to move.
+
+    `pr_number`/`pr_url` are taken from `run["pr_link"]` (the raw stamp), not
+    from `pr` (the gh-resolved object): membership already guarantees a valid
+    `pr_link`, but `pr` is None whenever the `gh pr view` lookup itself missed
+    (a transient API hiccup, a PR outside `gh pr list`'s own window) even
+    though a real link exists — `report_to_ledger`'s PR match (E16) needs the
+    raw link either way, so it isn't lost to a gh-side miss. `pr`'s own
+    `number`, when it resolved, overrides below with the identical value."""
     meta, cost = run["meta"], run["cost"]
+    pr_link = run.get("pr_link") or {}
     started = meta.get("started_at") or ""
     row = {
         "run_id": run["run_id"],
@@ -229,11 +243,13 @@ def build_row(run: dict, pr: dict | None, ci_first_pass,
         "repo": meta.get("repo"),
         # The work item the dispatch named (`agentctl spawn --issue`), carried through
         # to `report_to_ledger` so the ledger's own `epic_id` (derived server-side from
-        # this) lets a Course's per-epic cost reconcile against it (E16·5).
+        # this) lets a Course's per-epic cost reconcile against it (E16·5). When absent,
+        # `report_to_ledger` resolves one from `pr_url`/`pr_number` below instead (E16).
         "item_id": meta.get("issue"),
         "cost_usd": round(float(cost.get("usd", 0.0) or 0.0), 6),
         "exit_status": run["outcome"].get("exit_status"),
-        "pr_number": None,
+        "pr_number": linked_pr_number(pr_link),
+        "pr_url": pr_link.get("pr_url"),
         "pr_state": None,        # OPEN / MERGED / CLOSED / unresolved
         "join_source": join_source if pr is not None else "unresolved",
         "merged": None,
@@ -327,32 +343,98 @@ def report_to_ledger(rows: list[dict]) -> dict:
     collides at the Library and is answered with the existing entry rather
     than double-counted.
 
-    `item_id` is sent only when `build_row` recorded one (`meta.issue`
-    at dispatch time) — E16·5, the counterpart `cost_join.reconcile_epic_cost`
-    reads against. A run dispatched before this change, or with no work item
-    named, posts exactly as it did before: no `item_id`, `epic_id: null` at
-    the Library, and it reconciles as the ledger's own "run only in the run
-    records" bucket rather than a mismatch.
+    `item_id` is `build_row`'s own `meta.issue` (`--issue` at dispatch time)
+    when the row carries one — E16·5, the counterpart `cost_join.
+    reconcile_epic_cost` reads against. When it doesn't, but the row names a
+    PR (`pr_url`/`pr_number`, from `build_row`'s own `pr-link.json` fields),
+    one attempt resolves it instead, through the identical PR-match rule
+    `cost_join.build_item_costs` applies on the run-cost side
+    (`ledger.resolve_item_id`'s own `cost_join.item_for_pr`, called here
+    directly against an item corpus this function fetches once for the whole
+    pass — see `item_corpus` above) — the attribution-split fix E16 calls for,
+    so a run's meta.issue-less ledger post and its run-cost report agree. A
+    row with neither a meta.issue nor a resolvable PR, or whose item fetch
+    itself fails (recorded on the run's own meta.json as `LG.
+    ITEM_LOOKUP_ERROR_FIELD`, never blocking this post), posts with no
+    `item_id` at all: `epic_id: null` at the Library, reconciling as the
+    ledger's own "run only in the run records" bucket rather than a mismatch.
 
-    `lane` (`ledger_lane`, "gateway" or "subscription") is computed from each
-    row's `model` and sent on every posted entry (E1·6). A row whose lane
-    can't be determined is never posted — the Library refuses to mix gateway
-    and subscription totals, so guessing a lane would risk exactly that — and
-    is counted into `errors` instead, with status `"skip:no-lane"` and a
-    reason naming the model, the same way the harvest's other skips are
-    reported.
+    `lane` (`ledger_lane`, "gateway", "subscription" or "openai-subscription")
+    is computed from each row's `model` and sent on every posted entry (E1·6).
+    A row whose lane can't be determined (no model at all) is never posted —
+    the Library refuses to mix lanes together, so guessing one would risk
+    exactly that — and is counted into `errors` instead, with status
+    `"skip:no-lane"` and a reason naming the model, the same way the
+    harvest's other skips are reported.
+
+    **A row whose run already carries `ledger_post_status: "recorded"` on
+    meta.json is skipped outright (status `"skip:already-recorded"`), before
+    every other check below.** That mark is set here, on every row whose run
+    dir resolves, for whatever status this pass's post actually got — the
+    same mark `bin/agentctl`'s own at-finish post leaves on a run the moment
+    it finishes (`ledger.post_run_ledger_entry`). This is what lets this
+    function widen from ledger members to every finished run in the harvest
+    window (`model-scorecard`'s `main`) without re-posting a run the at-finish
+    path, or an earlier pass of this same sweep, already recorded.
+
+    **The row's `cost_usd` is then reduced by whatever is already posted for
+    this lane, read FRESH from the Library's OWN ledger** (`ledger.
+    remaining_after_live`, fed by `ledger.read_live_ledger_state(run_id)` —
+    CQ·446 round 2; never a cumulative figure cached on the run's own
+    meta.json, which is writable by the run being measured — security
+    review, PR #1018 round 1), BEFORE every check and the post itself — the
+    same subtraction `ledger.post_run_ledger_entry` makes before its own
+    at-finish post, so a run whose at-finish post failed outright (the only
+    way a finished run reaches this backstop sweep with live-reported spend
+    still unaccounted for) is not counted twice between the live deltas and
+    this sweep's own entry. A row reduced to zero or negative posts nothing,
+    with status `"skip:already-reported-live"`; so does a row whose ledger
+    read itself fails (`issue_client.IssueQueueUnavailable`) or finds a
+    faulty entry (`ValueError`), with status `"error:ledger-read-*"` — in
+    both cases nothing is lost, since a LATER pass of this same sweep
+    re-reads the ledger from scratch rather than trusting a cached figure.
+    Doing this FIRST, ahead of the `"disproportionate"` check below, is what
+    keeps that check sound across passes: the Library's own ledger for a
+    FINISHED run only grows if something posts to it again, and nothing
+    posts live to a finished run, so this reduction reproduces the SAME
+    figure on every later pass as long as nothing else posts in between —
+    comparing against that figure, not the row's raw `cost_usd`, is what
+    makes `"skip:refused-unchanged"` below a comparison against the figure
+    this function actually sent, not one it never sent at all.
 
     **A `"disproportionate"` refusal (E1·9, Clause 6 of the budget-enforcement
-    epic) is recorded on the run's OWN meta.json — `ledger_report_refused_usd`
-    and `ledger_report_refused_reason` — and never resubmitted unchanged.**
-    Before posting, a row whose run dir resolves is checked against that mark:
-    an identical `cost_usd` is skipped (status `"skip:refused-unchanged"`)
-    rather than sent again, since it is the same figure the Library already
-    refused for this run. A row whose cost has since been corrected (a
-    different figure) posts as usual — only an exact repeat of the refused
-    figure is held back. A row whose run dir can't be resolved (a synthetic
-    row with no real run directory, or one that has aged off disk) is posted
-    unconditionally, the same as before this mark existed.
+    epic) is recorded through `ledger.record_disproportionate_refusal`
+    (`poster="sweep"`, `dedup_key=run_id` — the same key the post itself
+    used) and never resubmitted unchanged.** Before posting, a row whose run
+    dir resolves is checked against that record (`ledger.
+    refused_figure_unchanged` — the same comparison `ledger.
+    post_run_ledger_entry` makes on agentctl's side, so the two posters can't
+    drift on what counts as "the same figure"; round 2, PR #1021: the
+    decision reads `run_id`'s own refusal marker under the account's state
+    tree, never the run's meta.json, which a dispatched run can write for
+    its whole execution window): an identical (post-live-reduction)
+    `cost_usd` is skipped (status `"skip:refused-unchanged"`) rather than
+    sent again, since it is the same figure the Library already refused for
+    this run. A row whose cost has since been corrected (a different
+    figure) posts as usual — only an exact repeat of the refused figure is
+    held back. A row whose run dir can't be resolved (a synthetic row with
+    no real run directory, or one that has aged off disk) is posted
+    unconditionally, the same as before this mark existed — this function
+    only reads the Library's ledger for a row whose run dir resolves, so
+    such a row's `cost_usd` is never reduced.
+
+    `cost_usd` is validated finite and non-negative before any of the above
+    (the same boundary `ledger.post_run_ledger_entry` applies to the same
+    figure on its own side): an invalid value is counted as
+    `"error:invalid-cost"` and never reaches the subtraction or the post.
+
+    `day` (`r.get("day")`, the row's finish-day bucket — see
+    `telemetry.platform_day_for`) is sent on every row that carries one, and
+    omitted for one that doesn't (the local ledger's own rows, built by
+    `build_row`, carry no `day` field; `main` attaches one before calling this
+    function). The Library refuses a `day` more than one calendar day from
+    its own date with 422 — a row this stale when this sweep reaches it is
+    refused and counted below, never retried.
 
     Best-effort over the WHOLE set: one row's refusal or an unreachable
     Library never stops the rest, and never undoes the local upsert this
@@ -366,6 +448,15 @@ def report_to_ledger(rows: list[dict]) -> dict:
     recorded = 0
     not_recorded = 0
     errors: list[tuple[str, str, str]] = []
+    # E16: the item corpus for resolving a row's work item from its PR
+    # (`ledger.resolve_item_id`'s own match, `cost_join.item_for_pr`) when the
+    # row carries no `item_id` — fetched at most ONCE for the whole sweep pass,
+    # lazily, rather than per row: most rows in a window need this (meta.issue
+    # is the rare case), and a per-row fetch would read the whole corpus once
+    # for every such run every pass.
+    item_corpus: list[dict] | None = None
+    item_corpus_error: str | None = None
+    item_corpus_fetched = False
     for r in rows:
         run_id = r["run_id"]
         model = r.get("model")
@@ -374,34 +465,150 @@ def report_to_ledger(rows: list[dict]) -> dict:
             errors.append((run_id, "skip:no-lane", f"no ledger lane for model {model!r}"))
             continue
         cost_usd = r.get("cost_usd")
+        try:
+            cost_usd = float(cost_usd)
+        except (TypeError, ValueError):
+            errors.append((run_id, "error:invalid-cost", f"non-numeric cost_usd {cost_usd!r}"))
+            continue
+        if not math.isfinite(cost_usd) or cost_usd < 0:
+            errors.append((run_id, "error:invalid-cost",
+                          f"non-finite or negative cost_usd {cost_usd!r}"))
+            continue
         run_dir = _ledger_report_run_dir(run_id)
+        prior_meta: dict = {}
         if run_dir is not None:
             try:
                 prior_meta = T.read_meta(run_dir)
             except (FileNotFoundError, json.JSONDecodeError):
                 prior_meta = {}
-            refused_usd = prior_meta.get("ledger_report_refused_usd")
-            if refused_usd is not None and refused_usd == cost_usd:
+            if prior_meta.get("ledger_post_status") == "recorded":
+                errors.append((run_id, "skip:already-recorded", ""))
+                continue
+            try:
+                state = LG.read_live_ledger_state(run_id)
+            except (issue_client.IssueQueueUnavailable, ValueError) as e:
+                errors.append((run_id, f"error:ledger-read-{e.__class__.__name__}", str(e)))
+                continue
+            cost_usd = LG.remaining_after_live(cost_usd, state["lane_totals"], lane)
+            if cost_usd <= 0:
+                errors.append((run_id, "skip:already-reported-live", ""))
+                continue
+            if LG.refused_figure_unchanged(cost_usd, run_id=run_id):
                 errors.append((run_id, "skip:refused-unchanged",
                                prior_meta.get("ledger_report_refused_reason") or ""))
                 continue
+        item_id = r.get("item_id")
+        if not item_id and (r.get("pr_url") or r.get("pr_number") is not None):
+            if not item_corpus_fetched:
+                item_corpus_fetched = True
+                try:
+                    item_corpus = issue_client.list_all_items()
+                except issue_client.IssueQueueUnavailable as e:
+                    item_corpus_error = f"{e.__class__.__name__}: {e}"
+            if item_corpus is not None:
+                item_id = CJ.item_for_pr(
+                    r.get("pr_url"), r.get("pr_number"), r.get("repo"), item_corpus)
+            elif item_corpus_error and run_dir is not None:
+                try:
+                    T.update_meta(run_dir, **{LG.ITEM_LOOKUP_ERROR_FIELD: item_corpus_error})
+                except (OSError, ValueError):
+                    pass
         kwargs = {"agent": r.get("agent"), "model": model}
-        if r.get("item_id"):
-            kwargs["item_id"] = r["item_id"]
+        if item_id:
+            kwargs["item_id"] = item_id
+        if r.get("day"):
+            kwargs["day"] = r["day"]
         res = issue_client.post_ledger_entry(
             r.get("repo"), cost_usd, run_id=run_id, dedup_key=run_id,
             lane=lane, **kwargs)
         status = res.get("status")
+        if run_dir is not None:
+            try:
+                T.update_meta(run_dir, ledger_post_status=status)
+            except (OSError, ValueError):
+                pass
         if status == "recorded":
             recorded += 1
         elif status == "not-recorded":
             not_recorded += 1
         else:
             if status == "disproportionate" and run_dir is not None:
-                T.update_meta(run_dir, ledger_report_refused_usd=cost_usd,
-                              ledger_report_refused_reason=res.get("error"))
+                LG.record_disproportionate_refusal(
+                    run_dir, usd=cost_usd, reason=res.get("error"),
+                    poster="sweep", dedup_key=run_id)
             errors.append((run_id, status, res.get("error", "")))
     return {"recorded": recorded, "not_recorded": not_recorded, "errors": errors}
+
+
+def _run_finish_day(run_dir: Path) -> str | None:
+    """The local-day bucket (`telemetry.platform_day_for`) for `run_dir`'s
+    recorded finish instant (meta.json's `ended_at`), or None when the run
+    hasn't finished yet or the timestamp is missing/unparseable. None is a
+    safe fallback here, not a new failure mode: `issue_client.
+    post_ledger_entry` already sends no `day` at all when it isn't given, and
+    the Library buckets a dayless entry to its own arrival date the same way
+    it did before this parameter existed."""
+    try:
+        meta = T.read_meta(run_dir)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    m = _parse_iso(meta.get("ended_at"))
+    return T.platform_day_for(m) if m is not None else None
+
+
+def ledger_post_rows(days: int, fresh: list[dict], finished: set[str]) -> list[dict]:
+    """Every row this pass should attempt to post to the Library — ledger
+    members AND every other finished run in the window, each tagged with its
+    own finish `day`.
+
+    `report_to_ledger` itself is what skips a run already marked
+    `ledger_post_status: "recorded"` on meta.json (whether that mark was left
+    by an earlier pass of this same sweep or by `bin/agentctl`'s at-finish
+    post) — not this gathering step — so a run posted once is read off disk
+    and never fetched here a second time just to be dropped there; this
+    function's only job is naming every candidate.
+
+    Starts from `fresh`/`finished` — the ledger-member rows `harvest` already
+    built (carrying the PR-join fields the LOCAL ledger wants) — then unions
+    in every other finished run in the window via `list_candidate_runs(days,
+    include_close_loop=True)`: the reviewer, security-reviewer, scout,
+    planner and architect runs `is_ledger_member` was never built to cover
+    (no `pr-link.json`, by design), which is the coverage gap this function
+    closes for the Library post specifically. The LOCAL ledger's own
+    membership (`is_ledger_member`, `harvest`'s `rows`/`fresh`) is unchanged
+    by this — only the Library post widens."""
+    rows = []
+    seen = set()
+    for r in fresh:
+        if r["run_id"] not in finished:
+            continue
+        run_dir = _ledger_report_run_dir(r["run_id"])
+        day = _run_finish_day(run_dir) if run_dir is not None else None
+        rows.append({**r, "day": day})
+        seen.add(r["run_id"])
+    for run in list_candidate_runs(days, include_close_loop=True):
+        run_id = run["run_id"]
+        if run_id in seen:
+            continue
+        cost = read_final_cost(run)
+        if cost is None:
+            continue  # still in flight — see read_final_cost's docstring
+        meta = run["meta"]
+        pr_link = run.get("pr_link") or {}
+        rows.append({
+            "run_id": run_id,
+            "model": meta.get("model"),
+            "agent": meta.get("agent"),
+            "repo": meta.get("repo"),
+            # Same as build_row's fields: when meta.issue is absent,
+            # report_to_ledger resolves an item from pr_url/pr_number instead (E16).
+            "item_id": meta.get("issue"),
+            "pr_number": linked_pr_number(pr_link),
+            "pr_url": pr_link.get("pr_url"),
+            "cost_usd": round(float(cost.get("usd", 0.0) or 0.0), 6),
+            "day": _run_finish_day(run["dir"]),
+        })
+    return rows
 
 
 def summarize(rows: list[dict]) -> dict:
@@ -436,11 +643,18 @@ def summarize(rows: list[dict]) -> dict:
 # --- impure: gh joins + ledger IO -------------------------------------------
 
 
-def _gh_json(args: list[str]) -> list | dict | None:
+def _gh_json(args: list[str], env: dict | None = None) -> list | dict | None:
     """Run a `gh` command returning JSON; None on any failure (read-only harvester
-    must degrade, never crash, on a gh/network hiccup)."""
+    must degrade, never crash, on a gh/network hiccup).
+
+    `env` is the one `read`-scoped token's environment minted for this call's
+    repo (company/decisions/0027) — one mint per repo per pass
+    (`GA.read_token_pool`), never minted in here. Left `None` only at
+    `had_follow_up_bug`'s `gh search issues` call: a repo-scoped `read` token
+    cannot run `gh search` (see that function's own docstring), so that one
+    call is unmoved and still runs on whatever credential `gh` finds ambient."""
     try:
-        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False, env=env)
         if cp.returncode != 0 or not cp.stdout.strip():
             return None
         return json.loads(cp.stdout)
@@ -448,15 +662,15 @@ def _gh_json(args: list[str]) -> list | dict | None:
         return None
 
 
-def pr_maps(repo: str, limit: int = 300) -> dict:
+def pr_maps(repo: str, env: dict, limit: int = 300) -> dict:
     """pr_number → PR record for a repo, from one `gh pr list` call."""
     data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
                      "--limit", str(limit), "--json",
-                     "number,headRefName,state,mergedAt"]) or []
+                     "number,headRefName,state,mergedAt"], env) or []
     return {p["number"]: p for p in data}
 
 
-def ci_first_pass(repo: str, branch: str):
+def ci_first_pass(repo: str, branch: str, env: dict):
     """True/False if CI's first pull_request run on the branch passed; None when
     indeterminate (no runs / gh failure). The earliest pull_request run is the
     opener — ARCH-106's CI-first-pass signal."""
@@ -464,7 +678,7 @@ def ci_first_pass(repo: str, branch: str):
     if not wf or not branch:
         return None
     data = _gh_json(["run", "list", "--repo", projects.repo_github_slug(repo), "--branch", branch,
-                     "--workflow", wf, "--json", "conclusion,event,createdAt"]) or []
+                     "--workflow", wf, "--json", "conclusion,event,createdAt"], env) or []
     pr_runs = [d for d in data if d.get("event") == "pull_request" and d.get("createdAt")]
     if not pr_runs:
         return None
@@ -493,13 +707,13 @@ def revert_in_window(matches: list[dict], pr_number: int, merged_at: str) -> boo
     return False
 
 
-def was_reverted(repo: str, pr_number: int, merged_at: str) -> bool | None:
+def was_reverted(repo: str, pr_number: int, merged_at: str, env: dict) -> bool | None:
     """True if a PR reverting #pr_number merged within SURVIVAL_DAYS of the merge.
     None on gh failure / unparseable time."""
     if not pr_number or _parse_iso(merged_at) is None:
         return None
     data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
-                     "--search", f"Reverts #{pr_number}", "--json", "number,title,mergedAt"])
+                     "--search", f"Reverts #{pr_number}", "--json", "number,title,mergedAt"], env)
     if data is None:
         return None
     return revert_in_window(data, pr_number, merged_at)
@@ -561,7 +775,13 @@ def had_follow_up_bug(repo: str, pr_number: int, merged_at: str) -> bool | None:
     """True if a bug-typed issue/PR referencing #pr_number was filed within
     SURVIVAL_DAYS of its merge. None on gh failure / unparseable merge time.
     The gh search narrows by repo + created-date; `follow_up_bug_in_window` does
-    the precise reference + bug-type filtering."""
+    the precise reference + bug-type filtering.
+
+    UNMOVED (company/decisions/0027): `gh search issues` calls GitHub's Search
+    API, which an installation token scoped to one repository's `read`
+    permissions cannot drive — a site this move names and leaves as is,
+    still running on whatever credential `gh` finds ambient, rather than
+    minting a wider token to work around it."""
     m = _parse_iso(merged_at)
     if not pr_number or m is None:
         return None
@@ -593,12 +813,19 @@ def write_ledger(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(r, separators=(",", ":")) + "\n" for r in rows))
 
 
-def list_candidate_runs(days: int) -> list[dict]:
+def list_candidate_runs(days: int, *, include_close_loop: bool = False) -> list[dict]:
     """Load every non-close-loop run (any agent) started within the last `days`,
     each annotated with its pr_link (pr-link.json, or None). Ledger membership
     is decided later by is_ledger_member (link presence, nothing else) — this
     only excludes close-loop, which by design has no PR to join and must never
     enter the ledger or the skip report.
+
+    `include_close_loop=True` keeps a close-loop run in the result instead —
+    for the Library spend-ledger post (`main`'s `ledger_post_rows`), which
+    posts every finished run's real cost regardless of PR-producing shape;
+    close-loop is a ledger-row/skip-report exclusion, not a "this run cost
+    nothing" one. Every other caller (ledger-row/skip-report membership) must
+    keep the default.
 
     `run["cost"]` is left at its `{}` default here, not read eagerly: a run's
     cost.json can be written at any point between this scan and `harvest`'s
@@ -618,7 +845,7 @@ def list_candidate_runs(days: int) -> list[dict]:
             run = {"run_id": p.name, "dir": p, "meta": {}, "outcome": {}, "cost": {}}
             try: run["meta"] = T.read_meta(p)
             except (FileNotFoundError, json.JSONDecodeError): continue
-            if is_close_loop(run["meta"]):
+            if is_close_loop(run["meta"]) and not include_close_loop:
                 continue
             started = run["meta"].get("started_at")
             try:
@@ -964,10 +1191,13 @@ def render_judge_report(judge_rows: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _gh_text(args: list[str]) -> str | None:
-    """A `gh` call returning raw text (e.g. `pr diff`); None on failure."""
+def _gh_text(args: list[str], env: dict) -> str | None:
+    """A `gh` call returning raw text (e.g. `pr diff`); None on failure.
+
+    `env` is the one `read`-scoped token's environment minted for this call's
+    repo (company/decisions/0027), never minted in here."""
     try:
-        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False, env=env)
         return cp.stdout if cp.returncode == 0 else None
     except OSError:
         return None
@@ -986,15 +1216,16 @@ def _fmt_reviews(meta: dict) -> str:
     return "\n".join(out) or "(none)"
 
 
-def fetch_pr_context(repo: str, pr_number: int, task: str, diff_cap: int = JUDGE_DIFF_CAP) -> dict | None:
+def fetch_pr_context(repo: str, pr_number: int, task: str, env: dict,
+                     diff_cap: int = JUDGE_DIFF_CAP) -> dict | None:
     """Gather the diff + reviews + title for one PR. None when the diff is
     unavailable (the judge needs the diff; without it there's nothing to score)."""
     full = projects.repo_github_slug(repo)
-    diff = _gh_text(["pr", "diff", str(pr_number), "--repo", full])
+    diff = _gh_text(["pr", "diff", str(pr_number), "--repo", full], env)
     if diff is None:
         return None
     meta = _gh_json(["pr", "view", str(pr_number), "--repo", full, "--json",
-                     "title,reviews,comments"]) or {}
+                     "title,reviews,comments"], env) or {}
     capped = diff[:diff_cap] + ("\n…(diff truncated)…" if len(diff) > diff_cap else "")
     return {"task": task, "title": meta.get("title", ""),
             "reviews": _fmt_reviews(meta), "diff": capped}
@@ -1007,7 +1238,8 @@ def run_judge(prompt: str, model: str) -> dict | None:
         # No explicit env means a bare inherit, which carries the launching
         # session's tmux identity straight through — dispatch_env() drops it
         # (issue_01M2EG40BSYN7MXM2EWBT9VKBN).
-        cp = subprocess.run([CLAUDE_BIN, "-p", "--output-format", "json", "--model", model],
+        cp = subprocess.run([CLAUDE_BIN, "-p", "--output-format", "json", "--model", model,
+                            "--tools", ""],
                             input=prompt, capture_output=True, text=True, check=False,
                             env=DE.dispatch_env())
     except OSError:
@@ -1053,32 +1285,43 @@ def judge_sample(rows: list[dict], judge_path: Path, *, sample: int, model: str,
         print("judge: no un-judged merged PRs in the trailing window.", file=sys.stderr)
         return []
     new_rows = []
-    for r in picks:
-        # `r["repo"]` reached this ledger row from a run's own meta.json (see
-        # build_row) — the same run-writable field `_validated_run_repo` guards
-        # in harvest(); fetch_pr_context calls gh, so this call site needs the
-        # same check (security-reviewer, PR #881 round 2).
-        if projects.registered_repo_github_slug(r.get("repo")) is None:
-            print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): "
-                  f"unregistered repo {r.get('repo')!r}.", file=sys.stderr)
-            continue
-        ctx = fetch_pr_context(r["repo"], r["pr_number"], _task_for_run(r["run_id"]))
-        if ctx is None:
-            print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): no diff.", file=sys.stderr)
-            continue
-        res = run_judge(build_judge_prompt(r, ctx), model)
-        if res is None:
-            print(f"judge: skip {r['run_id']}: judge call failed.", file=sys.stderr)
-            continue
-        verdict = parse_verdict(res["text"])
-        if verdict is None:
-            print(f"judge: skip {r['run_id']}: unparseable verdict.", file=sys.stderr)
-            continue
-        jr = build_judge_row(r, verdict, res["cost_usd"], model, T.now_iso())
-        new_rows.append(jr)
-        print(f"judge: {r.get('agent')}/{r.get('model')} PR #{r['pr_number']} → "
-              f"review {verdict['review_thoroughness']}/5, fix {verdict['fix_quality']}/5 "
-              f"(${jr['judge_cost_usd']:.4f})", file=sys.stderr)
+    # One `read`-scoped token per repo across this whole sample (company/
+    # decisions/0027): `picks` is sorted/sampled across repos, not grouped by
+    # one, so a pool that mints at most once per repo — however many picks
+    # revisit it — replaces what would otherwise be a mint per PR.
+    with GA.read_token_pool() as gh_env_for:
+        for r in picks:
+            # `r["repo"]` reached this ledger row from a run's own meta.json (see
+            # build_row) — the same run-writable field `_validated_run_repo` guards
+            # in harvest(); fetch_pr_context calls gh, so this call site needs the
+            # same check (security-reviewer, PR #881 round 2).
+            if projects.registered_repo_github_slug(r.get("repo")) is None:
+                print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): "
+                      f"unregistered repo {r.get('repo')!r}.", file=sys.stderr)
+                continue
+            try:
+                env = gh_env_for(projects.repo_github_slug(r["repo"]))
+            except GA.Unreadable as e:
+                print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): cannot mint "
+                      f"a GitHub token for {r['repo']} ({e}).", file=sys.stderr)
+                continue
+            ctx = fetch_pr_context(r["repo"], r["pr_number"], _task_for_run(r["run_id"]), env)
+            if ctx is None:
+                print(f"judge: skip {r['run_id']} (PR #{r['pr_number']}): no diff.", file=sys.stderr)
+                continue
+            res = run_judge(build_judge_prompt(r, ctx), model)
+            if res is None:
+                print(f"judge: skip {r['run_id']}: judge call failed.", file=sys.stderr)
+                continue
+            verdict = parse_verdict(res["text"])
+            if verdict is None:
+                print(f"judge: skip {r['run_id']}: unparseable verdict.", file=sys.stderr)
+                continue
+            jr = build_judge_row(r, verdict, res["cost_usd"], model, T.now_iso())
+            new_rows.append(jr)
+            print(f"judge: {r.get('agent')}/{r.get('model')} PR #{r['pr_number']} → "
+                  f"review {verdict['review_thoroughness']}/5, fix {verdict['fix_quality']}/5 "
+                  f"(${jr['judge_cost_usd']:.4f})", file=sys.stderr)
     if write and new_rows:
         write_ledger(judge_path, upsert_ledger(judged, new_rows))
     return new_rows
@@ -1101,142 +1344,72 @@ def harvest(days: int) -> tuple[list[dict], dict, set[str]]:
     runs = list_candidate_runs(days)
     members = [r for r in runs if is_ledger_member(r["meta"], r.get("pr_link"))]
     repos = {repo for r in members if (repo := _validated_run_repo(r["meta"]))}
-    pr_by_number = {repo: pr_maps(repo) for repo in repos}
-    now = datetime.now(timezone.utc)
-    ci_cache: dict = {}
-    revert_cache: dict = {}
-    follow_up_cache: dict = {}
-    rows = []
-    finished = set()
-    for run in members:
-        repo = _validated_run_repo(run["meta"])
-        linked = linked_pr_number(run["pr_link"])
-        pr = pr_by_number.get(repo, {}).get(linked)
-        cfp = None
-        if pr is not None:
-            branch = pr.get("headRefName")
-            key = (repo, branch)
-            if key not in ci_cache:
-                ci_cache[key] = ci_first_pass(repo, branch)
-            cfp = ci_cache[key]
-        final_cost = read_final_cost(run)
-        if final_cost is not None:
-            run = {**run, "cost": final_cost}
-        row = build_row(run, pr, cfp)
-        # Survival (Phase 2): only resolve once a merged PR's 7-day window has
-        # elapsed — bounds the revert lookups to the 7–14d-old slice of the window.
-        if row["merged"] and row["merged_at"]:
-            m = _parse_iso(row["merged_at"])
-            if m is not None and (now - m) >= timedelta(days=SURVIVAL_DAYS):
-                rk = (repo, row["pr_number"])
-                if rk not in revert_cache:
-                    revert_cache[rk] = was_reverted(repo, row["pr_number"], row["merged_at"])
-                # follow-up-bug lookup only when the revert check would otherwise
-                # pass (saves a gh call on already-failed survivals).
-                follow_up = False
-                if revert_cache[rk] is False:
-                    if rk not in follow_up_cache:
-                        follow_up_cache[rk] = had_follow_up_bug(repo, row["pr_number"], row["merged_at"])
-                    follow_up = follow_up_cache[rk]
-                row["survived"] = survival_status(True, row["merged_at"], revert_cache[rk], now,
-                                                  follow_up=follow_up)
-        rows.append(row)
-        if final_cost is not None:
-            finished.add(run["run_id"])
+    # One `read`-scoped token per repo across this whole pass (company/
+    # decisions/0027): `members` below revisits a repo out of order as it
+    # walks runs rather than repos, so a pool that mints at most once per
+    # repo replaces what would otherwise be a mint per `pr_maps`/
+    # `ci_first_pass`/`was_reverted` call.
+    with GA.read_token_pool() as gh_env_for:
+        def _gh_env_or_none(repo: str) -> dict | None:
+            try:
+                return gh_env_for(projects.repo_github_slug(repo))
+            except GA.Unreadable:
+                return None
+
+        def _pr_maps_or_empty(repo: str) -> dict:
+            env = _gh_env_or_none(repo)
+            if env is None:
+                print(f"model-scorecard: cannot mint a GitHub token for {repo}; "
+                      f"its CI/PR state is unresolved this pass.", file=sys.stderr)
+                return {}
+            return pr_maps(repo, env)
+
+        pr_by_number = {repo: _pr_maps_or_empty(repo) for repo in repos}
+        now = datetime.now(timezone.utc)
+        ci_cache: dict = {}
+        revert_cache: dict = {}
+        follow_up_cache: dict = {}
+        rows = []
+        finished = set()
+        for run in members:
+            repo = _validated_run_repo(run["meta"])
+            linked = linked_pr_number(run["pr_link"])
+            pr = pr_by_number.get(repo, {}).get(linked)
+            cfp = None
+            if pr is not None:
+                branch = pr.get("headRefName")
+                key = (repo, branch)
+                if key not in ci_cache:
+                    env = _gh_env_or_none(repo)
+                    ci_cache[key] = ci_first_pass(repo, branch, env) if env is not None else None
+                cfp = ci_cache[key]
+            final_cost = read_final_cost(run)
+            if final_cost is not None:
+                run = {**run, "cost": final_cost}
+            row = build_row(run, pr, cfp)
+            # Survival (Phase 2): only resolve once a merged PR's 7-day window has
+            # elapsed — bounds the revert lookups to the 7–14d-old slice of the window.
+            if row["merged"] and row["merged_at"]:
+                m = _parse_iso(row["merged_at"])
+                if m is not None and (now - m) >= timedelta(days=SURVIVAL_DAYS):
+                    rk = (repo, row["pr_number"])
+                    if rk not in revert_cache:
+                        env = _gh_env_or_none(repo)
+                        revert_cache[rk] = (was_reverted(repo, row["pr_number"], row["merged_at"], env)
+                                            if env is not None else None)
+                    # follow-up-bug lookup only when the revert check would otherwise
+                    # pass (saves a gh call on already-failed survivals).
+                    follow_up = False
+                    if revert_cache[rk] is False:
+                        if rk not in follow_up_cache:
+                            follow_up_cache[rk] = had_follow_up_bug(repo, row["pr_number"], row["merged_at"])
+                        follow_up = follow_up_cache[rk]
+                    row["survived"] = survival_status(True, row["merged_at"], revert_cache[rk], now,
+                                                      follow_up=follow_up)
+            rows.append(row)
+            if final_cost is not None:
+                finished.add(run["run_id"])
     return rows, skip_counts(runs), finished
-
-
-# --- GitHub-only repo scorecard (telemetry-less crews, e.g. hollis) -----------
-# Some products' dev crews run via the Task tool, not `agentctl`, so they emit no
-# run telemetry — but their PR *quality* (merge / CI-first-pass / survival) is all
-# in GitHub. This harvests a repo's decided PRs directly, no run join. No per-agent
-# cost/attribution (that needs telemetry the Task-tool flow doesn't produce); the
-# crew's *runtime* LLM cost lives in its own local ledger (PA: data/llm-spend.jsonl).
-
-
-def _model_from_labels(pr: dict):
-    """The producing model id from a `model:<id>` GitHub label, or None. A
-    telemetry-less repo (e.g. PA) can't join a run, so its orchestrator stamps the
-    model it dispatched the producer with as a PR label (substrate ARCH-169). The id
-    is the raw resolved model id (e.g. claude-sonnet-4-6), no friendly name. One
-    label per PR by contract; if more than one is present, take the first sorted so
-    the pick is deterministic."""
-    ids = sorted(
-        (lab.get("name") if isinstance(lab, dict) else str(lab) or "")[len("model:"):]
-        for lab in (pr.get("labels") or [])
-        if (lab.get("name") if isinstance(lab, dict) else str(lab) or "").startswith("model:")
-    )
-    return ids[0] if ids else None
-
-
-def build_repo_row(pr: dict, repo: str, crew_label: str, ci_first_pass, survived) -> dict:
-    """One quality row from a GitHub PR (no agent/cost — telemetry-less). Model is
-    read from a `model:` PR label when present (ARCH-169), else None."""
-    merged = pr.get("state") == "MERGED"
-    return {
-        # synthetic run_id so the shared upsert_ledger (keyed by run_id) works and
-        # a PR is re-resolved on later passes as its state evolves.
-        "run_id": f"{repo}#{pr.get('number')}",
-        "pr_number": pr.get("number"),
-        "date": (pr.get("createdAt") or "")[:10],
-        "agent": crew_label,
-        "model": _model_from_labels(pr),
-        "repo": repo,
-        "cost_usd": None,          # dev-crew cost not attributable from GitHub alone
-        "source": "github-pr",
-        "pr_state": pr.get("state"),
-        "merged": merged,
-        "merged_at": pr.get("mergedAt"),
-        "ci_first_pass": ci_first_pass,
-        "survived": survived,
-        "title": pr.get("title"),
-        "author": (pr.get("author") or {}).get("login"),
-    }
-
-
-def render_repo_report(rows: list[dict]) -> str:
-    """Quality table for a telemetry-less crew (no cost columns — those are N/A
-    from GitHub alone)."""
-    agg = summarize(rows)
-    if not agg:
-        return "No decided PRs in window.\n"
-    lines = ["| Crew | Decided | Merged | Merge% | Survived (7d) | CI-1st% |",
-             "|---|---|---|---|---|---|"]
-    for (agent, _model), a in sorted(agg.items(), key=_agg_key_order):
-        merge_pct = f"{100*a['merged']/a['resolved']:.0f}%" if a["resolved"] else "—"
-        ci_pct = f"{100*a['ci_first_pass']/a['ci_runs']:.0f}%" if a["ci_runs"] else "—"
-        surv = f"{a['survived']}/{a['scored']}" if a["scored"] else "—"
-        lines.append(f"| {agent} | {a['resolved']} | {a['merged']} | {merge_pct} "
-                     f"| {surv} | {ci_pct} |")
-    return "\n".join(lines) + "\n"
-
-
-def harvest_repo_prs(repo: str, days: int, crew_label: str) -> list[dict]:
-    """Quality rows for a repo's *decided* (merged/closed) PRs created within the
-    window. Open PRs are skipped — no quality verdict yet. Reuses the shared CI +
-    revert + follow-up-bug logic."""
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(days=days)
-    data = _gh_json(["pr", "list", "--repo", projects.repo_github_slug(repo), "--state", "all",
-                     "--limit", "200", "--json",
-                     "number,headRefName,state,mergedAt,createdAt,title,author,labels"]) or []
-    rows = []
-    for pr in data:
-        created = _parse_iso(pr.get("createdAt"))
-        if created is None or created < cutoff:
-            continue
-        if pr.get("state") not in ("MERGED", "CLOSED"):
-            continue  # still open — no verdict yet
-        cfp = ci_first_pass(repo, pr.get("headRefName"))
-        survived = None
-        if pr.get("state") == "MERGED" and pr.get("mergedAt"):
-            m = _parse_iso(pr["mergedAt"])
-            if m is not None and (now - m) >= timedelta(days=SURVIVAL_DAYS):
-                rev = was_reverted(repo, pr["number"], pr["mergedAt"])
-                fu = had_follow_up_bug(repo, pr["number"], pr["mergedAt"]) if rev is False else False
-                survived = survival_status(True, pr["mergedAt"], rev, now, follow_up=fu)
-        rows.append(build_repo_row(pr, repo, crew_label, cfp, survived))
-    return rows
 
 
 def main(argv=None) -> int:
@@ -1258,29 +1431,7 @@ def main(argv=None) -> int:
                    help=f"model for the judge (default {JUDGE_MODEL})")
     p.add_argument("--judge-report", action="store_true",
                    help="print the per-(agent, model) judge-score summary from judge.jsonl")
-    p.add_argument("--repo-scorecard", default=None, metavar="REPO",
-                   help="GitHub-only quality scorecard for a telemetry-less crew's repo "
-                        "(e.g. hollis): harvest decided PRs from gh, no run join, "
-                        "→ scorecard/<repo>.jsonl. No per-agent cost.")
-    p.add_argument("--crew-label", default=None,
-                   help="crew label for --repo-scorecard rows (default: the repo name)")
     args = p.parse_args(argv)
-
-    # GitHub-only repo scorecard — a separate data source (no run telemetry) and a
-    # separate ledger, kept apart from the agent×model run ledger (also keeps a
-    # data-local product like hollis out of the shared ledger).
-    if args.repo_scorecard:
-        repo = args.repo_scorecard
-        crew = args.crew_label or repo
-        repo_rows = harvest_repo_prs(repo, args.days, crew)
-        repo_path = Path(args.ledger).parent / f"{repo}.jsonl"
-        out_rows = upsert_ledger(load_ledger(repo_path), repo_rows)
-        if not args.no_write:
-            write_ledger(repo_path, out_rows)
-        print(f"repo-scorecard {repo}: harvested {len(repo_rows)} decided PRs → ledger "
-              f"{len(out_rows)} rows at {repo_path}", file=sys.stderr)
-        sys.stdout.write(render_repo_report(out_rows))
-        return 0
 
     ledger_path = Path(args.ledger)
     fresh, skipped, finished = harvest(args.days)
@@ -1288,10 +1439,12 @@ def main(argv=None) -> int:
     ledger_report = None
     if not args.no_write:
         write_ledger(ledger_path, merged)
-        # Only a finished run's row goes to the Library — a run still in flight
-        # has no cost.json yet, so its row carries a $0.00 placeholder that
-        # must never be posted under dedup_key=run_id (see is_cost_final).
-        ledger_report = report_to_ledger([r for r in fresh if r["run_id"] in finished])
+        # Every finished run in the window, ledger member or not — a run
+        # still in flight has no cost.json yet, so its row carries a $0.00
+        # placeholder that must never be posted under dedup_key=run_id (see
+        # is_cost_final); ledger_post_rows only ever includes a run
+        # read_final_cost actually priced.
+        ledger_report = report_to_ledger(ledger_post_rows(args.days, fresh, finished))
 
     by_src = defaultdict(int)
     for r in fresh:

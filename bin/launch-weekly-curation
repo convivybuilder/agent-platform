@@ -64,7 +64,23 @@ LOG_DIR="$DATA_ROOT/agent-runs"
 LOG_FILE="$LOG_DIR/weekly-curation-launcher.log"
 mkdir -p "$LOG_DIR"
 AGENTCTL="$SCRIPT_DIR/agentctl"
-AUDIT_PRODUCTS="constance vivy sous-chef"   # customer-facing products with real threat surface (ARCH-122)
+# Customer-facing products with real threat surface (ARCH-122) — the registry's
+# shared-coverage products (ARCH-358), read through lib/agent-platform/projects.py
+# rather than a literal copy that goes stale the moment a product joins or
+# leaves the shared coverage.
+AUDIT_PRODUCTS=$(PYTHONPATH="$SCRIPT_DIR/../lib/agent-platform" python3 -c '
+import projects
+print(" ".join(projects.shared_coverage_products()))
+') && [ -n "$AUDIT_PRODUCTS" ] \
+    || { echo "launch-weekly-curation: cannot read the shared-coverage product list from the registry" >&2; exit 1; }
+# The one project flagged `shared_job_host` — the repo the cross-cutting
+# scribe + curator dispatches below run against, since a co always needs some
+# repo as its working directory even for work that spans every product.
+SHARED_JOB_HOST=$(PYTHONPATH="$SCRIPT_DIR/../lib/agent-platform" python3 -c '
+import projects
+print(projects.shared_job_host() or "")
+') && [ -n "$SHARED_JOB_HOST" ] \
+    || { echo "launch-weekly-curation: no project is registered as the shared-job host" >&2; exit 1; }
 DATE="$(date +%F)"
 AUDIT_DIR="$LOG_DIR/audits/$DATE"
 OBS_FILE="$LOG_DIR/observations/$DATE.jsonl"
@@ -81,9 +97,8 @@ DRY_RUN=0
 
 log() { printf '[%s] %s\n' "$(date -Iseconds)" "$*" >> "$LOG_FILE"; }
 
-# Self-alert on launcher failure (mirrors launch-overnight's ARCH-083 trap): a
-# non-zero exit is otherwise silent — the pipeline just doesn't run and the
-# curator's inputs stay stale.
+# Self-alert on launcher failure (ARCH-083): a non-zero exit is otherwise
+# silent — the pipeline just doesn't run and the curator's inputs stay stale.
 _on_exit() {
     local rc=$?
     [ "$rc" -eq 0 ] && return 0
@@ -130,7 +145,7 @@ else
 fi
 
 # --- Stage 1: security-auditor, one per product (sequential) -----------------
-# Per-product so each loads its own threat model (the agent has constance/vivy
+# Per-product so each loads its own threat model (some products have
 # overrides under projects/<product>/agents/security-auditor.md).
 for product in $AUDIT_PRODUCTS; do
     run_agent security-auditor "$product" "$product/daytime" \
@@ -138,11 +153,11 @@ for product in $AUDIT_PRODUCTS; do
 done
 
 # --- Stage 2: observability-scribe (after the audits land) --------------------
-run_agent observability-scribe sous-chef shared/daytime \
+run_agent observability-scribe "$SHARED_JOB_HOST" shared/daytime \
 "Weekly observation sweep (ARCH-122). Read this week's agent-run telemetry under $LOG_DIR (costs, tool failures, timeouts, review-blockage counts, budget wind-downs) AND the security-auditor reports just written under $AUDIT_DIR/, and emit structured observations to $OBS_FILE for the curator. You are a FILTER, not a logger — surface only what's worth a curator proposal, with concrete evidence_refs."
 
 # --- Stage 3: curator (after the scribe's observations land) ------------------
-run_agent curator sous-chef shared/daytime \
+run_agent curator "$SHARED_JOB_HOST" shared/daytime \
 "Weekly curator pass (ARCH-122) — now dispatched deterministically, no longer via the overnight-orchestrator handoff. Read this week's observations ($OBS_FILE and recent days under $LOG_DIR/observations/), the security-audit reports under $AUDIT_DIR/, and the PRs merged across the three products this week. Produce your weekly proposal batch per your prompt: a standard targeted sweep (quarterly holistic only on its scheduled first-Sunday). Honor the evidence thresholds (>=2 observations to mutate a prompt; one substantive observation suffices for an ADR/reference). Open the batch as a PR to the knowledge repo for the operator; no autonomous merge (ARCH-020)."
 
 log "===== weekly curation pipeline done ($DATE): ok=$ok, failed=$failed ====="

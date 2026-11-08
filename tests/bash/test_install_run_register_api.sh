@@ -43,8 +43,9 @@ _seed_repo() { # <path> <run-register-api body> <registry body>
     # the fixture repo can't be archived at all, not just "imports wrong".
     for dep in private_crew.py projects.py session_lifecycle.py session_state.py \
                session_input.py rollover_policy.py claude_trust.py tmux_transcript.py \
-               signal_client.py vault_plane.py builder_root.py review_protocol.py agent_policy.py \
-               fetched_documents.py crew_key.py slate.py; do
+               signal_client.py vault_plane.py builder_root.py forwarding_transport.py \
+               review_protocol.py agent_policy.py \
+               fetched_documents.py crew_key.py slate.py app_prefixes.py; do
         echo "# $dep" > "$repo/lib/agent-platform/$dep"
     done
     cat > "$repo/launchd/com.convivy.run-register-api.plist" <<'PLIST'

@@ -6,8 +6,8 @@
 # untargeted command to the CURRENT session and its ACTIVE window rather than to
 # the pane running it, so a co launched that way restyled a session it was not
 # in and renamed a window it was not in. On 2026-09-06 a spawned Back chat
-# renamed the operator's main Ask window, which Deck drew as that session being lost
-# (issue_01M1VTRHKRERY7MJEYCF4WR2G2).
+# renamed the operator's main walled-off-crew window, which Deck drew as that
+# session being lost (issue_01M1VTRHKRERY7MJEYCF4WR2G2).
 #
 # THE FIX pins every call to `$TMUX_PANE`: tmux resolves a session option set
 # against a pane to that pane's session and a rename to that pane's window
@@ -52,7 +52,7 @@ run_co() {
     local home=$1; shift
     local log; log=$(mktemp)
     ( cd "$home/Convivy/agent-platform" && HOME="$home" PATH="$home/stubbin:$PATH" \
-      TMUX_SPY_LOG="$log" env "$@" /bin/zsh "$CO" --root-config "$(co_root_config "$home")" >/dev/null 2>&1 )
+      TMUX_SPY_LOG="$log" env "$@" /bin/zsh "$CO" --root-config "$(co_root_config "$home" "$REPO_ROOT/tests/fixtures/rich_registry.json")" >/dev/null 2>&1 )
     TMUX_CALLS=$(cat "$log")
     rm -f "$log"
 }
@@ -69,17 +69,19 @@ assert_contains "$TMUX_CALLS" "rename-window -t %7 Bosun" "the rename targets th
 assert_contains "$TMUX_CALLS" "set-option -t %7 allow-passthrough on" "allow-passthrough targets this pane"
 assert_contains "$TMUX_CALLS" "set-option -t %7 status-left " "status-left targets this pane's session"
 
-# --- 1b. a black box's colours reach tmux: EA is gold with brown text ------------
-# The operator named the pair on 2026-09-06; the hex values are the code's. The foreground is
-# explicit because the default white is unreadable on a light accent, the same
-# reason Orient and Library pass one. The status line is where the pair is visible.
-mkdir -p "$H/Convivy/EA"
+# --- 1b. a black box's colours reach tmux: Satchel is purple with pale text -----
+# The fixture's invented private-crew row (CQ-565 round 1: fictionalized away from
+# the real crew entry it used to copy, and CQ·598 finished the job by inventing a
+# synthetic repo name too). The foreground is explicit because the
+# default white is unreadable on a light accent, the same reason Orient and
+# Library pass one. The status line is where the pair is visible.
+mkdir -p "$H/Convivy/SATCHEL"
 log=$(mktemp)
-( cd "$H/Convivy/EA" && HOME="$H" PATH="$H/stubbin:$PATH" TMUX_SPY_LOG="$log" \
-  env TMUX=/tmp/tmux-spy/default,1,0 TMUX_PANE=%7 /bin/zsh "$CO" --root-config "$(co_root_config "$H")" >/dev/null 2>&1 )
-ea_calls=$(cat "$log"); rm -f "$log"
-assert_contains "$ea_calls" "status-style bg=#c8a24a,fg=#5a3e1b" "EA's status line is gold with brown text"
-assert_contains "$ea_calls" "rename-window -t %7 EA" "EA's window carries its display name"
+( cd "$H/Convivy/SATCHEL" && HOME="$H" PATH="$H/stubbin:$PATH" TMUX_SPY_LOG="$log" \
+  env TMUX=/tmp/tmux-spy/default,1,0 TMUX_PANE=%7 /bin/zsh "$CO" --root-config "$(co_root_config "$H" "$REPO_ROOT/tests/fixtures/rich_registry.json")" >/dev/null 2>&1 )
+satchel_calls=$(cat "$log"); rm -f "$log"
+assert_contains "$satchel_calls" "status-style bg=#7a4fae,fg=#f2e9ff" "Satchel's status line is purple with pale text"
+assert_contains "$satchel_calls" "rename-window -t %7 Satchel" "Satchel's window carries its display name"
 
 # --- 2. inside tmux with no pane id, NOTHING is called --------------------------
 # THIS TEST PREVIOUSLY ASSERTED THE DEFECT AS CORRECT. It required all six calls
@@ -92,7 +94,8 @@ assert_contains "$ea_calls" "rename-window -t %7 EA" "EA's window carries its di
 # session's window was renamed `operator.com` while the Bosun session inside it
 # was healthy, and earlier that evening `bosun:1` wore the label `Shipwright`
 # (issue_01M2PXARYZ2HA08G9MJ4QPQYW9). It was first read as a failed rollover.
-# The same mechanism had already renamed the operator's main Ask window on 2026-09-06
+# The same mechanism had already renamed the operator's main walled-off-crew
+# window on 2026-09-06
 # (issue_01M1VTRHKRERY7MJEYCF4WR2G2) — `$TMUX_PANE` was the fix then, and it
 # closed only the case where the variable is present.
 #

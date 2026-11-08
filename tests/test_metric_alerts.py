@@ -13,10 +13,48 @@ import pytest
 NOW = datetime(2026, 6, 10, tzinfo=timezone.utc)
 
 
+# --- OWN_COVERAGE_LEDGERS is registry-derived, not a hardcoded product list -
+
+
+@pytest.mark.rich_registry
+def test_own_coverage_ledgers_matches_the_registrys_own_coverage_products(metric_alerts):
+    """Pinned against the registry's own accessor, not a copy of the slugs —
+    fails red if OWN_COVERAGE_LEDGERS drifts back to a single hardcoded path."""
+    import projects
+    expected = [metric_alerts.SCORECARD_DIR / f"{slug}.jsonl"
+                for slug in projects.own_coverage_products()]
+    assert metric_alerts.OWN_COVERAGE_LEDGERS == expected
+
+
+def test_own_coverage_ledgers_skips_a_slug_shaped_to_escape_scorecard_dir(monkeypatch):
+    """A registry KEY carries no `home_dir` of its own, so `valid_name` is what
+    stands between it and a direct join under SCORECARD_DIR."""
+    from conftest import _load_cli
+    import projects
+    monkeypatch.setattr(projects, "own_coverage_products",
+                         lambda: ["acme", "../../etc/passwd"])
+    mod = _load_cli("metric-alerts")
+    assert mod.OWN_COVERAGE_LEDGERS == [mod.SCORECARD_DIR / "acme.jsonl"]
+
+
+def test_own_drain_rows_unions_every_own_drain_ledger(metric_alerts, tmp_path, monkeypatch):
+    first = tmp_path / "acme.jsonl"
+    second = tmp_path / "globex.jsonl"
+    first.write_text('{"a": 1}\n')
+    second.write_text('{"b": 2}\n')
+    monkeypatch.setattr(metric_alerts, "OWN_COVERAGE_LEDGERS", [first, second])
+    assert metric_alerts._own_drain_rows() == [{"a": 1}, {"b": 2}]
+
+
+def test_own_drain_rows_empty_when_no_ledgers_exist(metric_alerts, tmp_path, monkeypatch):
+    monkeypatch.setattr(metric_alerts, "OWN_COVERAGE_LEDGERS", [tmp_path / "no-such.jsonl"])
+    assert metric_alerts._own_drain_rows() == []
+
+
 # --- code_health_alerts ------------------------------------------------------
 
 
-def _repo(name="vivy", **kw):
+def _repo(name="widget", **kw):
     # ci_*_main are the alert basis (ARCH-179); ci_* (all-branch) are dashboard-only.
     base = {"repo": name, "ci_last": "success", "ci_pass_rate": 0.95,
             "ci_last_main": "success", "ci_pass_rate_main": 0.95,
@@ -31,12 +69,12 @@ def test_healthy_repo_no_alerts(metric_alerts):
 
 def test_ci_failure_alerts(metric_alerts):
     alerts = metric_alerts.code_health_alerts([_repo(ci_last_main="failure")])
-    assert any(a["key"] == "ci-red:vivy" and a["severity"] == "high" for a in alerts)
+    assert any(a["key"] == "ci-red:widget" and a["severity"] == "high" for a in alerts)
 
 
 def test_low_pass_rate_alerts(metric_alerts):
     alerts = metric_alerts.code_health_alerts([_repo(ci_pass_rate_main=0.5)])
-    assert any(a["key"] == "ci-low:vivy" for a in alerts)
+    assert any(a["key"] == "ci-low:widget" for a in alerts)
     # at/above the floor → no alert
     assert metric_alerts.code_health_alerts([_repo(ci_pass_rate_main=0.70)]) == []
 
@@ -54,7 +92,7 @@ def test_pr_branch_noise_does_not_alert(metric_alerts):
 def test_reverts_and_stale_pr_alert(metric_alerts):
     alerts = metric_alerts.code_health_alerts([_repo(reverts_recent=2, oldest_open_days=20)])
     keys = {a["key"] for a in alerts}
-    assert "reverts:vivy" in keys and "stale-pr:vivy" in keys
+    assert "reverts:widget" in keys and "stale-pr:widget" in keys
 
 
 def test_none_metrics_dont_alert(metric_alerts):
@@ -193,7 +231,7 @@ def test_configured_models_reads_frontmatter(metric_alerts, tmp_path):
     (tmp_path / "coder.md").write_text('---\nmodel: "deepseek"\n---\nbody\n')  # quoted scalar → unwrapped
     (tmp_path / "explainer.md").write_text("---\nid: x\ntools: []\n---\nbody\n")  # no model: → omitted
     assert metric_alerts.configured_models(tmp_path) == {
-        "refactorer": "moonshot/kimi-k2.7-code", "coder": "deepseek/deepseek-v4-flash"}
+        "refactorer": "moonshot/kimi-k2.7-code", "coder": "deepseek/deepseek-flash"}
 
 
 def test_configured_models_missing_dir_is_empty(metric_alerts, tmp_path):
@@ -264,11 +302,11 @@ def test_kb_eval_missing_summary_silent(metric_alerts):
 
 
 def test_edge_trigger_new_sustained_recovered(metric_alerts):
-    a1 = [{"key": "ci-red:vivy", "text": "x"}, {"key": "reverts:vivy", "text": "y"}]
+    a1 = [{"key": "ci-red:widget", "text": "x"}, {"key": "reverts:widget", "text": "y"}]
     # first run: both are new
     new, recovered, active = metric_alerts.edge_trigger(a1, active=[])
-    assert {a["key"] for a in new} == {"ci-red:vivy", "reverts:vivy"} and recovered == []
-    assert set(active) == {"ci-red:vivy", "reverts:vivy"}
+    assert {a["key"] for a in new} == {"ci-red:widget", "reverts:widget"} and recovered == []
+    assert set(active) == {"ci-red:widget", "reverts:widget"}
 
     # second run: same breaches, already active → nothing new, nothing recovered
     new2, recovered2, active2 = metric_alerts.edge_trigger(a1, active=active)
@@ -276,12 +314,12 @@ def test_edge_trigger_new_sustained_recovered(metric_alerts):
 
     # third run: ci-red cleared, reverts persists → ci-red recovers, nothing new
     new3, recovered3, active3 = metric_alerts.edge_trigger(
-        [{"key": "reverts:vivy", "text": "y"}], active=active2)
-    assert new3 == [] and recovered3 == ["ci-red:vivy"] and active3 == ["reverts:vivy"]
+        [{"key": "reverts:widget", "text": "y"}], active=active2)
+    assert new3 == [] and recovered3 == ["ci-red:widget"] and active3 == ["reverts:widget"]
 
 
 def test_channel_routing(metric_alerts):
-    assert metric_alerts._channel_of("ci-red:vivy") == metric_alerts.CH_HEALTH
+    assert metric_alerts._channel_of("ci-red:widget") == metric_alerts.CH_HEALTH
     assert metric_alerts._channel_of("stale-pr:knowledge") == metric_alerts.CH_HEALTH
     assert metric_alerts._channel_of("survival:bug-fixer:x") == metric_alerts.CH_COST
     assert metric_alerts._channel_of("gate:bug-fixer:x") == metric_alerts.CH_COST
@@ -304,7 +342,7 @@ def _ovr_log(tmp_path, rows):
         hours_ago, model, origin, *rest = row
         reason = rest[0] if rest else None
         ts = (NOW - timedelta(hours=hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        record = {"ts": ts, "agent": "reviewer", "repo": "vivy",
+        record = {"ts": ts, "agent": "reviewer", "repo": "widget",
                   "model": model, "origin": origin, "run_id": "run-x"}
         if reason is not None:
             record["reason"] = reason
@@ -394,12 +432,12 @@ def test_post_emits_a_structured_alert(metric_alerts, monkeypatch):
                         lambda stream, body, **kw: alerts.append((stream, body, kw)) or "ok")
 
     ma._post(ma.CH_HEALTH, "*Code-health alerts*",
-             [{"text": "vivy: coverage fell below 70%"}], ["constance: ci-red"])
+             [{"text": "widget: coverage fell below 70%"}], ["globex: ci-red"])
 
     assert len(alerts) == 1, "_post must emit exactly one structured alert"
     stream, body, kw = alerts[0]
     assert stream == ma.CH_HEALTH
     assert "coverage fell below 70%" in body          # the finding is in the prose
-    assert "recovered: constance: ci-red" in body     # recoveries too
-    assert kw["meta"]["new"] == ["vivy: coverage fell below 70%"]
-    assert kw["meta"]["recovered"] == ["constance: ci-red"]
+    assert "recovered: globex: ci-red" in body     # recoveries too
+    assert kw["meta"]["new"] == ["widget: coverage fell below 70%"]
+    assert kw["meta"]["recovered"] == ["globex: ci-red"]

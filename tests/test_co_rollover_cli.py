@@ -416,7 +416,7 @@ def test_a_park_inside_a_black_box_crew_logs_no_signal_and_says_so_in_the_state(
     session's own text, so the gate comes before the post. The park still happens."""
     mod, calls = spawn_env
     monkeypatch.setattr(mod.CR, "verify_up", lambda *a, **k: (False, "still zsh\n"))
-    monkeypatch.setattr(mod, "private_home_for", lambda cwd: "/crews/CFO")
+    monkeypatch.setattr(mod, "private_home_for", lambda cwd: "/crews/LEDGER")
     posted, parked = _stub_park_reporting(mod, monkeypatch, post_status="created")
 
     rc = mod._cmd_spawn(argparse.Namespace(product="repo"))

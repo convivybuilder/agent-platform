@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
+from contextlib import contextmanager
 
 import pytest
 
@@ -25,6 +26,14 @@ def _load():
 
 
 dr = _load()
+
+
+@contextmanager
+def _stub_read_token_env(repo_slug):
+    """Stands in for `GA.read_token_env` in a test that drives `main()` end to
+    end without minting anything real: yields a plain dict rather than
+    reaching the install's GitHub App."""
+    yield {}
 
 
 # --- parsing --------------------------------------------------------------
@@ -146,7 +155,7 @@ def _pr(n=1, sha="a" * 40):
 
 
 def test_changelog_task_tells_the_reviewer_to_be_brief_and_not_merge():
-    task = dr._task("vivy", _pr(), [], [],
+    task = dr._task("widget", _pr(), [], [],
                     [("pytest", "8.1.0", "8.1.1")], security=False)
     assert "CHANGELOG PASS" in task
     assert "do not merge" in task.lower()
@@ -154,7 +163,7 @@ def test_changelog_task_tells_the_reviewer_to_be_brief_and_not_merge():
 
 
 def test_security_task_names_the_surface_and_forbids_fast_bail():
-    task = dr._task("vivy", _pr(),
+    task = dr._task("widget", _pr(),
                     ["uvicorn terminates HTTP on the request path"], [],
                     [("uvicorn", "0.51.0", "0.52.0")], security=True)
     assert "terminates HTTP on the request path" in task
@@ -165,7 +174,7 @@ def test_security_task_names_the_surface_and_forbids_fast_bail():
 def test_breaking_task_asks_for_migration_notes_and_says_no_security_pass_ran():
     # A reviewer sent at a major must know a security-reviewer did NOT run, so it
     # can flag a surface the classifier missed rather than assuming it is covered.
-    task = dr._task("vivy", _pr(), [],
+    task = dr._task("widget", _pr(), [],
                     ["lucide-react is a MAJOR bump (0.441.0 to 1.27.0)"],
                     [("lucide-react", "0.441.0", "1.27.0")], security=False)
     assert "BREAKING CHANGES" in task
@@ -174,7 +183,7 @@ def test_breaking_task_asks_for_migration_notes_and_says_no_security_pass_ran():
 
 
 def test_the_reviewer_on_a_security_pr_still_gets_the_breaking_note_if_both_apply():
-    task = dr._task("vivy", _pr(),
+    task = dr._task("widget", _pr(),
                     ["cryptography implements the crypto primitives"],
                     ["cryptography is a MAJOR bump (42.0.0 to 43.0.0)"],
                     [("cryptography", "42.0.0", "43.0.0")], security=True)
@@ -182,7 +191,7 @@ def test_the_reviewer_on_a_security_pr_still_gets_the_breaking_note_if_both_appl
 
 
 def test_every_task_lists_the_packages_it_covers():
-    task = dr._task("vivy", _pr(), [], [],
+    task = dr._task("widget", _pr(), [], [],
                     [("pytest", "8.1.0", "8.1.1"), ("ruff", "0.5.0", "0.5.1")],
                     security=False)
     assert "pytest: 8.1.0 -> 8.1.1" in task
@@ -207,7 +216,7 @@ def test_pending_ci_is_reported_as_pending(monkeypatch):
             {"status": "COMPLETED", "conclusion": "SUCCESS"},
             {"status": "IN_PROGRESS", "conclusion": None},
         ]}))
-    assert dr.ci_state("vivy", 1) == "pending"
+    assert dr.ci_state("widget", 1, {}) == "pending"
 
 
 def test_a_failing_check_is_red(monkeypatch):
@@ -216,7 +225,7 @@ def test_a_failing_check_is_red(monkeypatch):
             {"status": "COMPLETED", "conclusion": "SUCCESS"},
             {"status": "COMPLETED", "conclusion": "FAILURE"},
         ]}))
-    assert dr.ci_state("vivy", 1) == "red"
+    assert dr.ci_state("widget", 1, {}) == "red"
 
 
 def test_all_complete_and_successful_is_green(monkeypatch):
@@ -225,7 +234,7 @@ def test_all_complete_and_successful_is_green(monkeypatch):
             {"status": "COMPLETED", "conclusion": "SUCCESS"},
             {"status": "COMPLETED", "conclusion": "SKIPPED"},
         ]}))
-    assert dr.ci_state("vivy", 1) == "green"
+    assert dr.ci_state("widget", 1, {}) == "green"
 
 
 def test_no_checks_at_all_is_unknown_not_green(monkeypatch):
@@ -233,26 +242,26 @@ def test_no_checks_at_all_is_unknown_not_green(monkeypatch):
     # been created yet must not read as a pass.
     monkeypatch.setattr(dr, "_gh", lambda *a, **k: json.dumps(
         {"statusCheckRollup": []}))
-    assert dr.ci_state("vivy", 1) == "unknown"
+    assert dr.ci_state("widget", 1, {}) == "unknown"
 
 
 def test_a_gh_failure_is_unknown_and_does_not_raise(monkeypatch):
     monkeypatch.setattr(dr, "_gh", lambda *a, **k: "")
-    assert dr.ci_state("vivy", 1) == "unknown"
+    assert dr.ci_state("widget", 1, {}) == "unknown"
 
 
 def test_red_ci_makes_diagnosis_the_reviewer_s_job():
     # The night this shipped, the one red PR produced the most useful review of
     # the lot (lucide-react 1.x adding aria-hidden broke a nav test). Red earns a
     # review; pending does not.
-    task = dr._task("vivy", _pr(), [], ["x is a MAJOR bump (0.4 to 1.2)"],
+    task = dr._task("widget", _pr(), [], ["x is a MAJOR bump (0.4 to 1.2)"],
                     [("x", "0.4", "1.2")], security=False, ci="red")
     assert "CI IS RED" in task
     assert "Do not simply" in task
 
 
 def test_green_ci_adds_no_red_preamble():
-    task = dr._task("vivy", _pr(), [], [], [("x", "1.0", "1.1")],
+    task = dr._task("widget", _pr(), [], [], [("x", "1.0", "1.1")],
                     security=False, ci="green")
     assert "CI IS RED" not in task
 
@@ -281,24 +290,24 @@ def test_gh_failure_returns_None_and_is_not_an_empty_result(monkeypatch):
                         lambda *a, **k: type("P", (), {"returncode": 1,
                                                        "stdout": "",
                                                        "stderr": "bad credentials"})())
-    assert dr._gh(["pr", "list"], "vivy") is None
+    assert dr._gh(["pr", "list"], "widget", {}) is None
 
 
 def test_a_failed_listing_is_None_rather_than_zero_prs(monkeypatch):
     # The difference that matters: None means "unreviewed and unknown", [] means
     # "genuinely nothing to do". Conflating them hid a fleet-wide auth failure.
     monkeypatch.setattr(dr, "_gh", lambda *a, **k: None)
-    assert dr.open_prs("vivy") is None
+    assert dr.open_prs("widget", {}) is None
 
 
 def test_an_empty_listing_is_an_empty_list(monkeypatch):
     monkeypatch.setattr(dr, "_gh", lambda *a, **k: "[]")
-    assert dr.open_prs("vivy") == []
+    assert dr.open_prs("widget", {}) == []
 
 
 def test_unparseable_listing_json_is_None(monkeypatch):
     monkeypatch.setattr(dr, "_gh", lambda *a, **k: "not json")
-    assert dr.open_prs("vivy") is None
+    assert dr.open_prs("widget", {}) is None
 
 
 # --- rollup shapes --------------------------------------------------------
@@ -314,7 +323,7 @@ def test_a_pending_StatusContext_is_pending_not_green(monkeypatch):
             {"__typename": "StatusContext", "status": None,
              "conclusion": None, "state": "PENDING"},
         ]}))
-    assert dr.ci_state("vivy", 1) == "pending"
+    assert dr.ci_state("widget", 1, {}) == "pending"
 
 
 def test_a_failed_StatusContext_is_red(monkeypatch):
@@ -323,7 +332,7 @@ def test_a_failed_StatusContext_is_red(monkeypatch):
             {"__typename": "StatusContext", "status": None,
              "conclusion": None, "state": "FAILURE"},
         ]}))
-    assert dr.ci_state("vivy", 1) == "red"
+    assert dr.ci_state("widget", 1, {}) == "red"
 
 
 def test_a_successful_StatusContext_is_green(monkeypatch):
@@ -332,7 +341,7 @@ def test_a_successful_StatusContext_is_green(monkeypatch):
             {"__typename": "StatusContext", "status": None,
              "conclusion": None, "state": "SUCCESS"},
         ]}))
-    assert dr.ci_state("vivy", 1) == "green"
+    assert dr.ci_state("widget", 1, {}) == "green"
 
 
 @pytest.mark.parametrize("pkg", [
@@ -396,7 +405,8 @@ def test_the_printed_gate_names_the_reviewers_dispatched_for_each_tier(monkeypat
     # command must pass --required for exactly the reviewers dispatched, so the
     # operator checks the gate the tier actually asked for.
     monkeypatch.setattr(dr, "is_dispatch_target", lambda r: True)
-    monkeypatch.setattr(dr, "open_prs", lambda repo: [
+    monkeypatch.setattr(dr.GA, "read_token_env", _stub_read_token_env)
+    monkeypatch.setattr(dr, "open_prs", lambda repo, env: [
         {"number": 1109, "title": "deps: bump the routine group",
          "body": "Updates `pytest` from 8.1.0 to 8.1.1",
          "headRefOid": "a" * 40, "labels": [], "isDraft": False},
@@ -409,14 +419,14 @@ def test_the_printed_gate_names_the_reviewers_dispatched_for_each_tier(monkeypat
     ])
     monkeypatch.setattr(dr, "reviewed_at_head", lambda *a, **k: False)
     monkeypatch.setattr(dr, "ci_state", lambda *a, **k: "green")
-    assert dr.main(["--repo", "vivy", "--dry-run"]) == 0
+    assert dr.main(["--repo", "widget", "--dry-run"]) == 0
     out = capsys.readouterr().out
     assert ("would-be gate: agentctl review-status --pr 1109 "
-            "--repo convivy/vivy --required reviewer") in out
+            "--repo convivy/widget --required reviewer") in out
     assert ("would-be gate: agentctl review-status --pr 1110 "
-            "--repo convivy/vivy --required reviewer") in out
+            "--repo convivy/widget --required reviewer") in out
     assert ("would-be gate: agentctl review-status --pr 1111 "
-            "--repo convivy/vivy --required reviewer --required security-reviewer") in out
+            "--repo convivy/widget --required reviewer --required security-reviewer") in out
 
 
 def test_a_failed_security_reviewer_dispatch_drops_it_from_the_gate(monkeypatch, capsys):
@@ -425,7 +435,8 @@ def test_a_failed_security_reviewer_dispatch_drops_it_from_the_gate(monkeypatch,
     # printed command must not claim it, or the operator's check would PASS on
     # a security review that never happened.
     monkeypatch.setattr(dr, "is_dispatch_target", lambda r: True)
-    monkeypatch.setattr(dr, "open_prs", lambda repo: [
+    monkeypatch.setattr(dr.GA, "read_token_env", _stub_read_token_env)
+    monkeypatch.setattr(dr, "open_prs", lambda repo, env: [
         {"number": 1111, "title": "deps: bump uvicorn",
          "body": "Updates `uvicorn` from 0.51.0 to 0.52.0",
          "headRefOid": "c" * 40, "labels": [], "isDraft": False},
@@ -439,30 +450,99 @@ def test_a_failed_security_reviewer_dispatch_drops_it_from_the_gate(monkeypatch,
         return agent == "reviewer"  # the security-reviewer spawn fails
 
     monkeypatch.setattr(dr, "dispatch", fake_dispatch)
-    assert dr.main(["--repo", "vivy"]) == 0
+    assert dr.main(["--repo", "widget"]) == 0
     out = capsys.readouterr().out
     assert attempted == ["reviewer", "security-reviewer"]
-    assert ("gate: agentctl review-status --pr 1111 --repo convivy/vivy "
+    assert ("gate: agentctl review-status --pr 1111 --repo convivy/widget "
             "--required reviewer") in out
+
+
+# --- the GitHub credential seam (company/decisions/0027): every `gh` call
+# runs on a token minted from the install's own GitHub App, never the
+# operator's `gh` login ------------------------------------------------------
+
+def test_main_threads_the_minted_tokens_env_into_every_gh_call(monkeypatch):
+    """Drives `main`'s real `GA.read_token_env` (only `GA.installed_app` and
+    `GA.mint_token` are stubbed — `GA.gh_env` runs for real), so this pins
+    the actual environment a `gh` subprocess receives: the minted token under
+    `GH_TOKEN`, and an empty, throwaway `GH_CONFIG_DIR`."""
+    monkeypatch.setattr(dr, "is_dispatch_target", lambda r: True)
+    monkeypatch.setattr(
+        dr.GA, "installed_app",
+        lambda: dr.GA.InstalledApp(app_id="1", key_path=pathlib.Path("/dev/null"), slug=None))
+
+    @contextmanager
+    def fake_mint_token(repo_slug, verb, *, key_path, app_id,
+                        label="the install's GitHub App", opener=None):
+        assert repo_slug == "convivy/widget"
+        assert verb == "read"
+        yield "ghs_minted_token"
+
+    monkeypatch.setattr(dr.GA, "mint_token", fake_mint_token)
+
+    captured = []
+
+    def fake_run(argv, **kwargs):
+        env = kwargs.get("env")
+        assert env["GH_TOKEN"] == "ghs_minted_token"
+        config_dir = pathlib.Path(env["GH_CONFIG_DIR"])
+        assert config_dir.is_dir()
+        assert list(config_dir.iterdir()) == []
+        captured.append(env)
+        return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
+
+    monkeypatch.setattr(dr.subprocess, "run", fake_run)
+    assert dr.main(["--repo", "widget"]) == 0
+    assert captured, "gh must have been called with the minted token's environment"
+
+
+def test_a_mint_failure_runs_no_gh_process_and_is_counted_as_failed(monkeypatch, capsys):
+    """A repo whose token cannot be minted takes the same failure path a
+    failed `gh pr list` already takes (counted, shouted on stderr, reflected
+    in the exit code) — and, unlike that path, no `gh` process ever runs."""
+    monkeypatch.setattr(dr, "is_dispatch_target", lambda r: True)
+
+    class _FailingReadTokenEnv:
+        def __init__(self, repo_slug):
+            pass
+
+        def __enter__(self):
+            raise dr.GA.Unreadable("no App key configured at .../app.pem")
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(dr.GA, "read_token_env", _FailingReadTokenEnv)
+    calls = []
+    monkeypatch.setattr(dr.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+
+    assert dr.main(["--repo", "widget"]) == 1
+    assert calls == [], "a mint failure must never fall back to running gh"
+    err = capsys.readouterr().err
+    assert "widget: COULD NOT MINT A GITHUB TOKEN" in err
+    assert "no App key configured" in err
 
 
 # --- homebrew-tap: the registered owner is convivybuilder, not convivy ---
 
+@pytest.mark.rich_registry
 def test_task_names_the_registered_owner_for_homebrew_tap():
     """Round-1 review (PR #881, comment 6150937461): `_task` built
     `convivy/{repo}` directly — the same pattern the PR centralizes
     everywhere else."""
-    task = dr._task("homebrew-tap", _pr(), [], [],
+    task = dr._task("brewcask-tap", _pr(), [], [],
                     [("pytest", "8.1.0", "8.1.1")], security=False)
-    assert "convivybuilder/homebrew-tap" in task
+    assert "caskforge/brewcask-tap" in task
 
 
+@pytest.mark.rich_registry
 def test_gate_command_names_the_registered_owner_for_homebrew_tap():
-    assert dr._gate_command("homebrew-tap", 1, ["reviewer"]) == (
-        "agentctl review-status --pr 1 --repo convivybuilder/homebrew-tap "
+    assert dr._gate_command("brewcask-tap", 1, ["reviewer"]) == (
+        "agentctl review-status --pr 1 --repo caskforge/brewcask-tap "
         "--required reviewer")
 
 
+@pytest.mark.rich_registry
 def test_gh_queries_the_registered_owner_for_homebrew_tap(monkeypatch):
     calls = []
 
@@ -471,8 +551,8 @@ def test_gh_queries_the_registered_owner_for_homebrew_tap(monkeypatch):
         return type("P", (), {"returncode": 0, "stdout": "[]", "stderr": ""})()
 
     monkeypatch.setattr(dr.subprocess, "run", fake_run)
-    dr._gh(["pr", "list"], "homebrew-tap")
+    dr._gh(["pr", "list"], "brewcask-tap", {})
 
     assert calls and "--repo" in calls[0]
     repo_arg = calls[0][calls[0].index("--repo") + 1]
-    assert repo_arg == "convivybuilder/homebrew-tap"
+    assert repo_arg == "caskforge/brewcask-tap"

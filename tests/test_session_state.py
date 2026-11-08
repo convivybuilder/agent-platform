@@ -57,7 +57,7 @@ def _isolated_slate_home(tmp_path, monkeypatch):
 
 
 def test_a_simple_enqueue_dequeue_pair_empties_the_queue(SS):
-    """Real pair, hollis session 48ad3b41-d2f8-4009-8d6c-09254f8952a7, one
+    """Real pair, galley session 48ad3b41-d2f8-4009-8d6c-09254f8952a7, one
     millisecond apart: the dispatch prompt landed at an idle agent and was
     consumed immediately. `[]` is "nothing held, positively known", not None —
     the queue really did go to empty."""
@@ -65,7 +65,7 @@ def test_a_simple_enqueue_dequeue_pair_empties_the_queue(SS):
         {"type": "queue-operation", "operation": "enqueue",
          "timestamp": "2026-07-27T17:51:27.045Z",
          "sessionId": "48ad3b41-d2f8-4009-8d6c-09254f8952a7",
-         "content": "Task: Drain the in-box issue queue for hollis end-to-end."},
+         "content": "Task: Drain the in-box issue queue for galley end-to-end."},
         {"type": "queue-operation", "operation": "dequeue",
          "timestamp": "2026-07-27T17:51:27.046Z",
          "sessionId": "48ad3b41-d2f8-4009-8d6c-09254f8952a7"},
@@ -682,7 +682,7 @@ def test_session_states_batch_never_carries_held(SS, monkeypatch):
     """`session_states` always asks for `brief`, so `held` is never read on that
     path — and the hand-built failure entry has to agree, the same trap that once
     left `agents` absent from exactly this path (see its own docstring)."""
-    def fake(name, days=3, brief=False, table=None):
+    def fake(name, days=3, brief=False, table=None, client_table=None, machine_name=None):
         assert brief is True
         if name == "boom":
             raise RuntimeError("no such session")
@@ -717,3 +717,382 @@ def test_session_states_batch_shares_one_list_sessions_call(SS, monkeypatch):
     assert set(got) == {"alpha", "beta"}
     assert calls["list-sessions"] == 1, (
         "one `list-sessions` for the whole batch, not one per session")
+
+
+# MARK: - clients: who is attached to this session's tmux (CQ·521)
+#
+# Synthetic addresses and device names throughout (never a real one): the
+# documentation ranges 192.0.2.0/24 and 198.51.100.0/24 (RFC 5737) stand in
+# for Tailscale addresses, "laptop-a" / "phone-b" for device names. A sshd's
+# own local bind address is 192.0.2.5 in every case below; the remote peer is
+# 198.51.100.10 for the Deck case, 198.51.100.20 for a hand-typed ssh attach,
+# 198.51.100.99 for a peer Tailscale cannot resolve.
+
+
+def _fake_client_world(processes=None, cmdlines=None, peers=None, whois=None,
+                        list_clients_out="", machine_name="workstation-a"):
+    """A fake `TT.run`/`TT._run` covering every subprocess `clients_for_session`
+    reaches: the one batched `tmux list-clients`, the `ps` ancestor walk, the
+    `ps` full-command read, `lsof`'s TCP peer, `tailscale whois`, and
+    `scutil`'s read of this machine's own name.
+
+    `processes`: client-or-ancestor pid -> `(ppid, comm)`, i.e. what
+    `ps -o ppid=,comm= -p <pid>` reports for that pid's own comm and its
+    parent's pid. `cmdlines`: pid -> full command line (`ps -o command=`).
+    `peers`: sshd pid -> `lsof -Fn` raw output (None fails the read).
+    `whois`: ip -> `tailscale whois --json` raw output (None fails the read).
+    `machine_name`: this machine's own `scutil --get ComputedName` answer, a
+    synthetic default so a test exercising a local client never depends on
+    the real machine running it.
+    """
+    processes = processes or {}
+    cmdlines = cmdlines or {}
+    peers = peers or {}
+    whois = whois or {}
+
+    def fake(argv, stdin=None):
+        if argv[:2] == ["tmux", "list-clients"]:
+            return list_clients_out
+        if argv == ["scutil", "--get", "ComputedName"]:
+            return machine_name
+        if argv[:2] == ["ps", "-o"] and argv[2] == "ppid=,comm=":
+            pid = int(argv[-1])
+            if pid not in processes:
+                return None
+            ppid, comm = processes[pid]
+            return f"{ppid} {comm}"
+        if argv[:2] == ["ps", "-o"] and argv[2] == "command=":
+            return cmdlines.get(int(argv[-1]))
+        if argv[:2] == ["lsof", "-a"]:
+            pid = int(argv[argv.index("-p") + 1])
+            return peers.get(pid)
+        if argv[:2] == ["tailscale", "whois"]:
+            return whois.get(argv[-1])
+        return None
+    return fake
+
+
+def _patch_client_world(SS, monkeypatch, **kwargs):
+    fake = _fake_client_world(**kwargs)
+    monkeypatch.setattr(SS.TT, "run", fake)
+    monkeypatch.setattr(SS.TT, "_run", fake)
+
+
+def test_deck_attach_from_a_known_device_is_labelled_deck_on_device(SS, monkeypatch, tmp_path):
+    """Rule 2: Deck's exact attach argv, over an `sshd-session` ancestor whose
+    peer resolves, reads `Deck on <device>`."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={501: (500, "tmux"), 500: (100, "zsh"), 100: (50, "sshd-session")},
+        cmdlines={501: f"tmux new-session -A -D -s deck -c {tmp_path}"},
+        peers={100: "p100\nn192.0.2.5:22->198.51.100.10:53214\n"},
+        whois={"198.51.100.10": json.dumps({"Node": {"ComputedName": "laptop-a"}})},
+    )
+    via, label = SS._client_via_label(501, SS._full_command(501), "workstation-a")
+    assert (via, label) == ("ssh", "Deck on laptop-a")
+
+
+def test_a_hand_typed_ssh_attach_is_labelled_ssh_from_device(SS, monkeypatch):
+    """Rule 2's other half: any other remote client, e.g. a hand `tmux attach
+    -d` from a phone, reads `SSH from <device>` rather than the Deck label."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={601: (600, "tmux"), 600: (101, "zsh"), 101: (51, "sshd-session")},
+        cmdlines={601: "tmux attach -d -t deck"},
+        peers={101: "p101\nn192.0.2.5:22->198.51.100.20:40111\n"},
+        whois={"198.51.100.20": json.dumps({"Node": {"ComputedName": "phone-b"}})},
+    )
+    via, label = SS._client_via_label(601, SS._full_command(601), "workstation-a")
+    assert (via, label) == ("ssh", "SSH from phone-b")
+
+
+def test_a_local_client_with_no_sshd_ancestor_is_a_terminal_on_the_machine(SS, monkeypatch):
+    """Rule 3: no `sshd`/`sshd-session` anywhere in the ancestor chain means
+    local, and the walk reaching the root (pid 1) is the confident answer,
+    not an inconclusive one. The label names whatever machine name the
+    caller resolved and handed down, never one this function invents."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={701: (700, "tmux"), 700: (1, "zsh")},
+    )
+    via, label = SS._client_via_label(701, SS._full_command(701), "workstation-a")
+    assert (via, label) == ("local", "a terminal on workstation-a")
+
+
+def test_a_local_client_is_unlabelled_when_the_machine_name_could_not_be_read(SS, monkeypatch):
+    """Both `scutil` and the hostname fallback failing (CQ·521's rule) is
+    `machine_name: None`, which must degrade the local label to `None`
+    rather than rendering "a terminal on None"."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={702: (700, "tmux"), 700: (1, "zsh")},
+    )
+    via, label = SS._client_via_label(702, SS._full_command(702), None)
+    assert (via, label) == ("local", None)
+
+
+def test_a_peer_tailscale_cannot_resolve_falls_back_to_the_raw_ip(SS, monkeypatch):
+    """Rule 2: 'a peer that tailscale cannot resolve is SSH from <ip>' — a
+    failed/empty `tailscale whois` is not the same failure as a failed `lsof`
+    and must not null the label out."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={801: (800, "tmux"), 800: (102, "sshd-session")},
+        cmdlines={801: "tmux attach -t deck"},
+        peers={800: "p800\nn192.0.2.5:22->198.51.100.99:12345\n"},
+        whois={},  # tailscale has nothing for this peer
+    )
+    via, label = SS._client_via_label(801, SS._full_command(801), "workstation-a")
+    assert (via, label) == ("ssh", "SSH from 198.51.100.99")
+
+
+def test_an_lsof_failure_nulls_the_label_but_keeps_via(SS, monkeypatch):
+    """Rule 4: a failed step yields `label: None` with `via` set as far as
+    the walk got — `via` is already known (`ssh`, from the sshd ancestor)
+    before the failing step, and that answer survives the failure below it."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={901: (900, "tmux"), 900: (103, "sshd-session")},
+        cmdlines={901: "tmux attach -t deck"},
+        peers={},  # lsof finds nothing for pid 103: the read failed
+    )
+    via, label = SS._client_via_label(901, SS._full_command(901), "workstation-a")
+    assert (via, label) == ("ssh", None)
+
+
+def test_ps_failing_partway_through_the_walk_cannot_tell_local_from_remote(SS, monkeypatch):
+    """`_ssh_ancestor`'s third outcome: `ps` itself failing partway through
+    the walk is not the same as reaching the root with no sshd ancestor —
+    the caller cannot tell local from remote at all, so both come back
+    None rather than guessing `local`."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={1001: (1000, "tmux")},  # pid 1000 itself unreadable by `ps`
+    )
+    via, label = SS._client_via_label(1001, SS._full_command(1001), "workstation-a")
+    assert (via, label) == (None, None)
+
+
+def test_ssh_ancestor_breaks_a_cycle_rather_than_looping_forever(SS, monkeypatch):
+    """`_ssh_ancestor`'s `current in seen` branch: a `ppid` cycle must not
+    spin the walk forever, and reaching one is treated the same as reaching
+    the root with no `sshd`/`sshd-session` ancestor — the confident `local`
+    answer, not `ok=False`."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={2001: (2002, "zsh"), 2002: (2001, "zsh")},
+    )
+    assert SS._ssh_ancestor(2001) == (True, None)
+
+
+def test_ssh_ancestor_gives_up_at_max_depth_with_no_sshd_found(SS, monkeypatch):
+    """A parent chain deeper than `max_depth` with no `sshd`/`sshd-session`
+    anywhere in it exhausts the walk's budget — the `for` loop falling
+    through to its own `return True, None` — rather than climbing forever;
+    still the confident `local` answer."""
+    processes = {3000 + i: (3000 + i + 1, "zsh") for i in range(25)}
+    _patch_client_world(SS, monkeypatch, processes=processes)
+    assert SS._ssh_ancestor(3000) == (True, None)
+
+
+def test_ssh_ancestor_recognizes_the_plain_sshd_name_too(SS, monkeypatch):
+    """`_SSHD_NAMES` has two entries, `sshd` and `sshd-session`; every other
+    fixture in this file only exercises `sshd-session`."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={4001: (4000, "zsh"), 4000: (49, "sshd")},
+    )
+    assert SS._ssh_ancestor(4001) == (True, 4000)
+
+
+def test_ssh_peer_ip_requests_numeric_output_and_parses_a_bracketed_ipv6_literal(SS, monkeypatch):
+    """`-n -P` keep `lsof` from resolving the peer to a hostname or the port
+    to a service name (PR #956 round-1 security review, non-blocking
+    finding), and the bracketed-literal branch parses an IPv6 peer — RFC
+    3849's documentation prefix `2001:db8::/32`, never a real address."""
+    seen = []
+
+    def fake(argv, stdin=None):
+        seen.append(argv)
+        return "p5001\nn[2001:db8::5]:22->[2001:db8::99]:443\n"
+
+    monkeypatch.setattr(SS.TT, "run", fake)
+    assert SS._ssh_peer_ip(5001) == "2001:db8::99"
+    assert "-n" in seen[0] and "-P" in seen[0]
+
+
+def test_ssh_peer_ip_nulls_a_value_that_does_not_parse_as_an_ip(SS, monkeypatch):
+    """A `lsof` line whose address field is not actually an IPv4/IPv6
+    literal — e.g. `-n` did not fully suppress a resolved name — must not
+    be handed on as though it were one."""
+    monkeypatch.setattr(SS.TT, "run", lambda argv, stdin=None: (
+        "p5002\nn192.0.2.5:22->peer.example.invalid:443\n"))
+    assert SS._ssh_peer_ip(5002) is None
+
+
+def test_a_hostname_shaped_peer_never_reaches_the_whois_argv(SS, monkeypatch):
+    """End to end through `_client_via_label`: a peer `_ssh_peer_ip` could
+    not validate as an IP nulls the label the same way a failed `lsof` read
+    does (rule 4), and `tailscale whois` is never invoked with it."""
+    whois_calls = []
+    base_fake = _fake_client_world(
+        processes={910: (900, "tmux"), 900: (104, "zsh"), 104: (50, "sshd-session")},
+        cmdlines={910: "tmux attach -t deck"},
+        peers={104: "p104\nn192.0.2.5:22->peer.example.invalid:443\n"},
+    )
+
+    def fake(argv, stdin=None):
+        if argv[:2] == ["tailscale", "whois"]:
+            whois_calls.append(argv)
+        return base_fake(argv, stdin)
+
+    monkeypatch.setattr(SS.TT, "run", fake)
+    monkeypatch.setattr(SS.TT, "_run", fake)
+    via, label = SS._client_via_label(910, SS._full_command(910), "workstation-a")
+    assert (via, label) == ("ssh", None)
+    assert whois_calls == []
+
+
+def test_clients_for_session_keeps_a_client_whose_label_failed(SS, monkeypatch):
+    """Rule 4, at the list level: a client a failed step could not label is
+    kept in the list, never dropped."""
+    _patch_client_world(
+        SS, monkeypatch,
+        processes={901: (900, "tmux"), 900: (103, "sshd-session")},
+        cmdlines={901: "tmux attach -t deck"},
+        peers={},
+    )
+    table = {"deck": [{"pid": 901, "tty": "/dev/ttys001",
+                        "termname": "xterm-256color", "activity": "0"}]}
+    got = SS.clients_for_session("deck", table)
+    assert got == [{"pid": 901, "via": "ssh", "label": None}]
+
+
+def test_clients_for_session_is_empty_for_a_session_with_no_clients(SS, monkeypatch):
+    """A session absent from a SUCCESSFULLY read table has positively no
+    clients — `[]`, not `None`."""
+    got = SS.clients_for_session("lonely", {"deck": []})
+    assert got == []
+
+
+def test_clients_for_session_is_none_when_the_table_could_not_be_read(SS, monkeypatch):
+    """Distinct from the empty-list case above: `table=None` means the batch's
+    own `tmux list-clients` failed outright, not that nobody is attached."""
+    got = SS.clients_for_session("deck", None)
+    assert got is None
+
+
+def test_session_state_carries_clients_even_when_no_claude_pane_is_found(SS, monkeypatch):
+    """`clients` does not wait on `TT.claude_pane`/`meta_for_pid`: a tmux
+    client is attached to the session whether or not a claude process is
+    running in any of its panes, so it must still appear on the earliest
+    return path."""
+    def _no_pane(name):
+        raise SS.TT.JoinError("no claude process found")
+    monkeypatch.setattr(SS.TT, "claude_pane", _no_pane)
+    monkeypatch.setattr(
+        SS, "clients_for_session",
+        lambda name, table=SS._UNSET, machine_name=SS._UNSET, whois_cache=SS._UNSET: [
+            {"pid": 1, "via": "local", "label": "a terminal on workstation-a"}])
+
+    got = SS.session_state("deck")
+    assert got["state"] == "unknown"
+    assert got["clients"] == [{"pid": 1, "via": "local", "label": "a terminal on workstation-a"}]
+
+
+def test_session_state_clients_is_none_when_unreadable_even_on_the_early_path(SS, monkeypatch):
+    def _no_pane(name):
+        raise SS.TT.JoinError("no claude process found")
+    monkeypatch.setattr(SS.TT, "claude_pane", _no_pane)
+    monkeypatch.setattr(SS, "clients_for_session",
+                         lambda name, table=SS._UNSET, machine_name=SS._UNSET,
+                         whois_cache=SS._UNSET: None)
+
+    got = SS.session_state("deck")
+    assert got["clients"] is None
+
+
+def test_session_states_batch_shares_one_list_clients_call(SS, monkeypatch):
+    """The same one-call-per-batch rule as `list-sessions`
+    (`test_session_states_batch_shares_one_list_sessions_call` above),
+    here for `TT.client_table()`."""
+    calls = {"list-clients": 0}
+
+    def fake_run(argv, stdin=None):
+        if argv[:2] == ["tmux", "list-sessions"]:
+            return "$1 alpha\n$2 beta"
+        if argv[:2] == ["tmux", "list-clients"]:
+            calls["list-clients"] += 1
+            return ""
+        return None  # no panes for either: both entries settle on JoinError
+
+    monkeypatch.setattr(SS.TT, "_run", fake_run)
+    monkeypatch.setattr(SS.TT, "run", fake_run)
+
+    got = SS.session_states(["alpha", "beta"])
+
+    assert set(got) == {"alpha", "beta"}
+    assert calls["list-clients"] == 1, (
+        "one `list-clients` for the whole batch, not one per session")
+    assert got["alpha"]["clients"] == [], "a successful empty read is [], not None"
+    assert got["beta"]["clients"] == []
+
+
+def test_session_states_batch_shares_one_tailscale_whois_call_for_the_same_peer(SS, monkeypatch):
+    """PR #956 round-1 review (reviewer finding): two sessions whose
+    attached clients both ssh in from the same Tailscale device must cost
+    one `tailscale whois`, not one per client — the same one-call-per-batch
+    treatment `table`/`client_table`/`machine_name` already get."""
+    whois_calls = []
+
+    def fake(argv, stdin=None):
+        if argv[:2] == ["tmux", "list-sessions"]:
+            return "$1 alpha\n$2 beta"
+        if argv[:2] == ["tmux", "list-clients"]:
+            return "alpha|501\nbeta|601\n"
+        if argv == ["scutil", "--get", "ComputedName"]:
+            return "workstation-a"
+        if argv[:2] == ["ps", "-o"] and argv[2] == "ppid=,comm=":
+            chain = {501: (500, "tmux"), 500: (105, "zsh"), 105: (50, "sshd-session"),
+                     601: (600, "tmux"), 600: (106, "zsh"), 106: (51, "sshd-session")}
+            info = chain.get(int(argv[-1]))
+            return f"{info[0]} {info[1]}" if info else None
+        if argv[:2] == ["ps", "-o"] and argv[2] == "command=":
+            return {501: "tmux attach -t alpha", 601: "tmux attach -t beta"}.get(int(argv[-1]))
+        if argv[:2] == ["lsof", "-a"]:
+            pid = int(argv[argv.index("-p") + 1])
+            # Both sshd processes have the same peer, deliberately: the one
+            # device attached to both sessions in this batch.
+            return {105: "p105\nn192.0.2.5:22->198.51.100.42:11111\n",
+                    106: "p106\nn192.0.2.5:22->198.51.100.42:22222\n"}.get(pid)
+        if argv[:2] == ["tailscale", "whois"]:
+            whois_calls.append(argv)
+            return json.dumps({"Node": {"ComputedName": "laptop-a"}})
+        return None  # no panes for either: both entries settle on JoinError
+
+    monkeypatch.setattr(SS.TT, "_run", fake)
+    monkeypatch.setattr(SS.TT, "run", fake)
+
+    got = SS.session_states(["alpha", "beta"])
+
+    assert got["alpha"]["clients"] == [{"pid": 501, "via": "ssh", "label": "SSH from laptop-a"}]
+    assert got["beta"]["clients"] == [{"pid": 601, "via": "ssh", "label": "SSH from laptop-a"}]
+    assert len(whois_calls) == 1, (
+        "the same peer address across two sessions in one batch must cost one whois call")
+
+
+def test_session_states_hand_built_failure_entry_carries_clients(SS, monkeypatch):
+    """The same trap `held`/`agents` document on this hand-built path: a
+    field session_state() always carries must be matched here too, or the
+    rail's primary consumer is the one path that never sees it."""
+    def fake(name, days=3, brief=False, table=None, client_table=None, machine_name=None,
+             whois_cache=None):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(SS, "session_state", fake)
+    monkeypatch.setattr(SS.TT, "session_table", lambda: {})
+    monkeypatch.setattr(SS.TT, "client_table", lambda valid_sessions=None: {})
+    monkeypatch.setattr(SS.TT, "local_machine_name", lambda: "workstation-a")
+
+    got = SS.session_states(["boom"])
+    assert "clients" in got["boom"]
+    assert got["boom"]["clients"] is None

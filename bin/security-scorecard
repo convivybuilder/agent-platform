@@ -49,6 +49,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib" / "agent-platform"))
 import projects         # noqa: E402
 import review_protocol as RP  # noqa: E402
+import github_app as GA  # noqa: E402
 
 import builder_root as BR
 RUNS_ROOT = BR.runs_root()
@@ -60,7 +61,7 @@ REPORT_PATH = RUNS_ROOT / "scorecard" / "security-report.json"  # the rollup ori
 # (the time series); the report is the trailing-window view the dashboard shows.
 REPORT_WINDOW_DAYS = 30
 
-SECURITY_AGENTS = {"security-reviewer", "hollis-security-reviewer"}
+SECURITY_REVIEW_ROLE = "security-reviewer"
 
 # A finding line in the ARCH-033 format leads with a bolded severity+category tag:
 #   - **Blocking — substance:** <attack vector> — `file:line`
@@ -70,11 +71,15 @@ SECURITY_AGENTS = {"security-reviewer", "hollis-security-reviewer"}
 _FINDING_RE = re.compile(r"\*\*\s*(non-blocking|blocking)\b", re.IGNORECASE)
 
 
-def _gh_json(args: list[str]) -> list | dict | None:
+def _gh_json(args: list[str], env: dict) -> list | dict | None:
     """Run a `gh` command returning JSON; None on any failure (a read-only harvester
-    degrades, never crashes, on a gh/network hiccup)."""
+    degrades, never crashes, on a gh/network hiccup).
+
+    `env` is the one `read`-scoped token's environment minted for this call's
+    repo (company/decisions/0027) — one mint per repo per pass, reused across
+    every call that repo makes, never minted in here."""
     try:
-        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False)
+        cp = subprocess.run(["gh", *args], capture_output=True, text=True, check=False, env=env)
         if cp.returncode != 0 or not cp.stdout.strip():
             return None
         return json.loads(cp.stdout)
@@ -154,10 +159,10 @@ def _authentic_security_stamp(stamp, pr) -> bool:
     comment. Counting that as a genuine clean round would understate the vuln rate,
     so — like the merge gate — the harvester trusts a stamp only when its run-id
     resolves to a review-class run for the same repo/commit (ARCH-193)."""
-    if not stamp or stamp.agent not in SECURITY_AGENTS:
+    if not stamp or not RP.is_review_class(stamp.agent, (SECURITY_REVIEW_ROLE,)):
         return False
     return RP.authenticate(stamp, _resolve_run_facts(stamp.run_id), pr=str(pr),
-                           review_agents=tuple(SECURITY_AGENTS)) is None
+                           review_agents=(SECURITY_REVIEW_ROLE,)) is None
 
 
 def _count_findings(body: str) -> tuple[int, int]:
@@ -171,10 +176,10 @@ def _count_findings(body: str) -> tuple[int, int]:
     return blocking, non_blocking
 
 
-def harvest_pr(repo: str, pr: int, ctx: dict) -> list[dict]:
+def harvest_pr(repo: str, pr: int, ctx: dict, env: dict) -> list[dict]:
     """Rows for one PR: one per security-reviewer review round, chronological."""
     view = _gh_json(["pr", "view", str(pr), "--repo", projects.repo_github_slug(repo), "--json",
-                     "additions,deletions,createdAt,mergedAt,state,comments"])
+                     "additions,deletions,createdAt,mergedAt,state,comments"], env)
     if not view:
         return []
     additions = view.get("additions") or 0
@@ -344,8 +349,16 @@ def main() -> int:
     prs = agent_prs(args.days)
     fresh: list[dict] = []
     for repo, prmap in prs.items():
-        for pr, ctx in prmap.items():
-            fresh.extend(harvest_pr(repo, pr, ctx))
+        # One `read`-scoped token per repo per pass (company/decisions/0027):
+        # minted once here, reused by every PR this repo harvests below,
+        # revoked before the loop moves to the next repo.
+        try:
+            with GA.read_token_env(projects.repo_github_slug(repo)) as env:
+                for pr, ctx in prmap.items():
+                    fresh.extend(harvest_pr(repo, pr, ctx, env))
+        except GA.Unreadable as e:
+            print(f"security-scorecard: cannot mint a GitHub token for {repo} ({e}); "
+                  f"its agent PRs are unreviewed this pass.", file=sys.stderr)
 
     ledger = load_ledger(args.ledger)
     merged = upsert(ledger, fresh) if fresh else ledger

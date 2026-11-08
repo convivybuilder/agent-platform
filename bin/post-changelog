@@ -19,8 +19,8 @@ a changelog it is unusable. Compare the two for the same merge:
 The co-authored form is the one worth keeping (the operator, 2026-07-23), so the site now
 takes the same entry the co writes, and the git-derived feed is retired.
 
-ONE IMPLEMENTATION, NOT ONE PER REPO. Only vivy and sous-chef ever had a
-`scripts/post_changelog.py`; the other six products had nothing, so "every co
+ONE IMPLEMENTATION, NOT ONE PER REPO. Only two products ever had their own
+`scripts/post_changelog.py`; the other six had nothing, so "every co
 posts its own entry" would otherwise mean writing the script six more times and
 watching the copies drift. That is the ARCH-340 lesson (a rule copy-pasted into
 two launchers is a rule that drifts) applied before the copies exist rather than
@@ -30,8 +30,8 @@ FAIL-SAFE. The signal write is the deliverable, so a signal failure is a non-zer
 exit the caller sees.
 
 Usage:
-    post-changelog --product vivy "*Merged:* … #1032"
-    post-changelog --product vivy --file /tmp/entry.md
+    post-changelog --product acme "*Merged:* … #1032"
+    post-changelog --product acme --file /tmp/entry.md
 """
 from __future__ import annotations
 
@@ -53,8 +53,9 @@ for _libdir in ((pathlib.Path(__file__).resolve().parent.parent / "lib" / "agent
 import signal_client as SC  # noqa: E402
 
 # A changelog entry without a PR link has no click-through to the work it
-# describes, which is most of what makes the log worth keeping. vivy's script
-# enforced this and the habit is worth carrying, not re-litigating.
+# describes, which is most of what makes the log worth keeping. The original
+# per-product script enforced this and the habit is worth carrying, not
+# re-litigating.
 _PR_LINK_RE = re.compile(r"#\d+|/pull/\d+")
 
 
@@ -126,7 +127,7 @@ def main(argv: list[str] | None = None) -> int:
     # flag in each caller.
     ap = argparse.ArgumentParser(prog="post-changelog", description=__doc__)
     ap.add_argument("message", nargs="?", help="the entry text")
-    ap.add_argument("--product", required=True, help="product/repo name, e.g. vivy")
+    ap.add_argument("--product", required=True, help="product/repo name, e.g. acme")
     ap.add_argument("--file", help="read the entry from this UTF-8 file instead")
     ap.add_argument("--pr", help="PR number, used for the idempotency key")
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])

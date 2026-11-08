@@ -394,7 +394,10 @@ def _registered_dirname(M, slug: str) -> str:
     """The sanitized `~/.claude/projects/<dir>` name `slug`'s registered home
     directory produces — a REAL registry entry, not a fabricated one, since
     `TC.resolve_product` must actually resolve it (mirrors
-    `tests/test_transcript_capture.py`'s own `_home_prefix` helper)."""
+    `tests/test_transcript_capture.py`'s own `_home_prefix` helper). Every
+    caller of this helper, and every other call site reading
+    `projects.private_slugs()` directly for the same reason, carries the
+    `rich_registry` marker (CQ-546)."""
     return M.TC._sanitize(M.projects.home_path(slug))
 
 
@@ -414,6 +417,7 @@ def test_collect_transcripts_excludes_an_unregistered_directory_unopened(M, tmp_
     assert found == []
 
 
+@pytest.mark.rich_registry
 def test_collect_transcripts_excludes_a_private_directory_even_if_the_denylist_is_bypassed(
     M, tmp_path, monkeypatch,
 ):
@@ -463,6 +467,7 @@ def test_dispatched_session_ids_empty_when_runs_root_missing(M, tmp_path):
 # --- dispatched_session_ids: a private run's transcript is never opened ----
 
 
+@pytest.mark.rich_registry
 def test_a_private_runs_transcript_is_never_opened(M, tmp_path, monkeypatch):
     """PR #558 round 2, security-reviewer: before this fix, every dispatched
     run's `transcript.jsonl` was opened with no privacy check at all,
@@ -537,6 +542,7 @@ def test_private_dispatch_exclusions_skips_a_public_run(M, tmp_path):
     assert result.unplaceable_count == 0
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_applies_margin_and_falls_back_to_now(M, tmp_path):
     """A private run with no `ended_at` (still running, or abandoned) gets a
     window open-ended toward `now`, not one that silently closes at
@@ -573,6 +579,7 @@ def test_private_dispatch_exclusions_applies_margin_and_falls_back_to_now(M, tmp
     assert end > started  # fell back to "now" + margin, not started_at alone
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_counts_a_run_with_no_worktree_as_unplaceable(M, tmp_path):
     private_slug = sorted(M.projects.private_slugs())[0]
     runs_root = tmp_path / "agent-runs"
@@ -587,6 +594,7 @@ def test_private_dispatch_exclusions_counts_a_run_with_no_worktree_as_unplaceabl
     assert result.unplaceable_count == 1
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_counts_unresolvable_worktree_as_unplaceable(M, tmp_path):
     """A `worktree` that sanitizes to a dirname with no matching directory
     under `projects_root` at all — there is nothing to fail closed AGAINST,
@@ -620,6 +628,7 @@ def test_private_dispatch_exclusions_counts_unreadable_meta_as_unplaceable(M, tm
     assert result.unplaceable_count == 1
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_fails_closed_on_unparseable_started_at(M, tmp_path):
     """PR #558 round 5, security-reviewer: an unparseable `started_at`
     previously contributed NO window at all (`continue`), silently admitting
@@ -640,6 +649,7 @@ def test_private_dispatch_exclusions_fails_closed_on_unparseable_started_at(M, t
     assert result.unplaceable_count == 0
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_fails_closed_on_garbage_ended_at(M, tmp_path):
     """`ended_at` PRESENT but unparseable is a worse signal than the field
     being genuinely absent (which legitimately falls back to `now` above) —
@@ -658,6 +668,7 @@ def test_private_dispatch_exclusions_fails_closed_on_garbage_ended_at(M, tmp_pat
     assert result.full_exclude_dirs == {dirname}
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_fails_closed_when_ended_precedes_started(M, tmp_path):
     private_slug = sorted(M.projects.private_slugs())[0]
     projects_root, dirname = _existing_projects_root(M, tmp_path)
@@ -673,6 +684,7 @@ def test_private_dispatch_exclusions_fails_closed_when_ended_precedes_started(M,
     assert result.full_exclude_dirs == {dirname}
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_fails_closed_when_window_exceeds_24_hours(M, tmp_path):
     private_slug = sorted(M.projects.private_slugs())[0]
     projects_root, dirname = _existing_projects_root(M, tmp_path)
@@ -688,6 +700,7 @@ def test_private_dispatch_exclusions_fails_closed_when_window_exceeds_24_hours(M
     assert result.full_exclude_dirs == {dirname}
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_exclusions_accepts_a_window_just_under_24_hours(M, tmp_path):
     """The 24-hour bound is a sanity check on implausible metadata, not a
     trap for a real, merely long-running dispatch — a window just under the
@@ -739,6 +752,7 @@ def test_created_within_windows_treats_an_unstatable_file_as_inside(M, tmp_path)
     assert M._created_within_windows(tmp_path / "gone.jsonl", windows) is True
 
 
+@pytest.mark.rich_registry
 def test_private_dispatch_into_a_public_worktree_excludes_its_transcript_unopened(
     M, tmp_path, monkeypatch,
 ):
@@ -803,6 +817,7 @@ def test_private_dispatch_into_a_public_worktree_excludes_its_transcript_unopene
     assert leaked_path not in opened
 
 
+@pytest.mark.rich_registry
 def test_a_private_run_dispatched_into_public_worktree_with_no_matching_window_is_kept(
     M, tmp_path, monkeypatch,
 ):
@@ -841,6 +856,7 @@ def test_a_private_run_dispatched_into_public_worktree_with_no_matching_window_i
 # --- end to end: collect + analyze + report ---------------------------------
 
 
+@pytest.mark.rich_registry
 def test_dispatched_run_excludes_only_its_own_session_not_the_whole_directory(M, tmp_path):
     """PR #558 round 1, reviewer 2026-09-13 01:1x: `kb-sync-verifier` targets
     a product's PRIMARY checkout by design, so a dispatched run's own session
@@ -871,6 +887,7 @@ def test_dispatched_run_excludes_only_its_own_session_not_the_whole_directory(M,
     assert [p.name for p in found] == ["interactive-session.jsonl"]
 
 
+@pytest.mark.rich_registry
 def test_build_report_reflects_the_measured_numbers(M, tmp_path):
     projects_root = tmp_path / "claude-projects"
     session_dir = projects_root / _registered_dirname(M, "library")
@@ -893,6 +910,7 @@ def test_build_report_reflects_the_measured_numbers(M, tmp_path):
 # --- fail-closed on implausible metadata: whole-directory exclusion --------
 
 
+@pytest.mark.rich_registry
 def test_collect_transcripts_excludes_every_file_in_a_directory_with_implausible_metadata(
     M, tmp_path,
 ):
@@ -910,7 +928,7 @@ def test_collect_transcripts_excludes_every_file_in_a_directory_with_implausible
     number a reader can't tell apart from a few stray files."""
     private_slug = sorted(M.projects.private_slugs())[0]
     projects_root = tmp_path / "claude-projects"
-    dirname = _registered_dirname(M, "vivy")
+    dirname = _registered_dirname(M, "finch")
     product_dir = projects_root / dirname
     product_dir.mkdir(parents=True)
     _write_transcript(product_dir / "session-a.jsonl", [_assistant("a1", input_tokens=10)])
@@ -921,8 +939,8 @@ def test_collect_transcripts_excludes_every_file_in_a_directory_with_implausible
     run_dir.mkdir(parents=True)
     agent_source = str(M.projects.home_path(private_slug) / ".claude" / "agents" / "coder.md")
     (run_dir / "meta.json").write_text(json.dumps({
-        "repo": "vivy", "agent_source": agent_source,
-        "worktree": str(M.projects.home_path("vivy")),
+        "repo": "finch", "agent_source": agent_source,
+        "worktree": str(M.projects.home_path("finch")),
         "started_at": "not-a-timestamp",
     }))
 
@@ -933,6 +951,7 @@ def test_collect_transcripts_excludes_every_file_in_a_directory_with_implausible
     assert counts.implausible_metadata == 2
 
 
+@pytest.mark.rich_registry
 def test_collect_transcripts_populates_exclusion_counts_for_each_rule(M, tmp_path, monkeypatch):
     """Every population-exclusion rule ends up as its own count, and only
     its own — the fixture below is built so each rule fires on a file (or
@@ -954,11 +973,11 @@ def test_collect_transcripts_populates_exclusion_counts_for_each_rule(M, tmp_pat
                        [_assistant("w1", input_tokens=1)])
     _write_transcript(library_dir / "kept.jsonl", [_assistant("k1", input_tokens=1)])
 
-    vivy_dirname = _registered_dirname(M, "vivy")
-    vivy_dir = projects_root / vivy_dirname
-    vivy_dir.mkdir(parents=True)
-    _write_transcript(vivy_dir / "imp1.jsonl", [_assistant("i1", input_tokens=1)])
-    _write_transcript(vivy_dir / "imp2.jsonl", [_assistant("i2", input_tokens=1)])
+    widget_dirname = _registered_dirname(M, "finch")
+    widget_dir = projects_root / widget_dirname
+    widget_dir.mkdir(parents=True)
+    _write_transcript(widget_dir / "imp1.jsonl", [_assistant("i1", input_tokens=1)])
+    _write_transcript(widget_dir / "imp2.jsonl", [_assistant("i2", input_tokens=1)])
 
     runs_root = tmp_path / "agent-runs"
 
@@ -981,15 +1000,15 @@ def test_collect_transcripts_populates_exclusion_counts_for_each_rule(M, tmp_pat
     implausible_run = runs_root / "2026-09-12" / "run-implausible"
     implausible_run.mkdir(parents=True)
     (implausible_run / "meta.json").write_text(json.dumps({
-        "repo": "vivy", "agent_source": agent_source,
-        "worktree": str(M.projects.home_path("vivy")),
+        "repo": "finch", "agent_source": agent_source,
+        "worktree": str(M.projects.home_path("finch")),
         "started_at": "not-a-timestamp",
     }))
 
     unplaceable_run = runs_root / "2026-09-12" / "run-unplaceable"
     unplaceable_run.mkdir(parents=True)
     (unplaceable_run / "meta.json").write_text(json.dumps({
-        "repo": "cfo", "agent_source": str(M.projects.home_path("cfo") / ".claude" / "agents" / "coder.md"),
+        "repo": "ledger", "agent_source": str(M.projects.home_path("ledger") / ".claude" / "agents" / "coder.md"),
     }))
 
     def fake_created_at(path):
@@ -1055,6 +1074,7 @@ def test_build_report_omits_the_exclusion_line_when_counts_not_supplied(M):
     assert "private-or-unregistered directory" not in report
 
 
+@pytest.mark.rich_registry
 def test_report_never_names_the_session_or_directory_a_privacy_rule_excluded(M, tmp_path):
     """PR #558 round 5, security-reviewer: confirm end-to-end that excluding
     a transcript by any privacy rule never leaks its session id or directory
@@ -1072,7 +1092,7 @@ def test_report_never_names_the_session_or_directory_a_privacy_rule_excluded(M, 
         _assistant("a2", input_tokens=900_000),
     ])
 
-    excluded_dirname = _registered_dirname(M, "vivy")
+    excluded_dirname = _registered_dirname(M, "finch")
     excluded_dir = projects_root / excluded_dirname
     excluded_dir.mkdir(parents=True)
     excluded_session_id = "excluded-session-9999"
@@ -1084,8 +1104,8 @@ def test_report_never_names_the_session_or_directory_a_privacy_rule_excluded(M, 
     run_dir.mkdir(parents=True)
     agent_source = str(M.projects.home_path(private_slug) / ".claude" / "agents" / "coder.md")
     (run_dir / "meta.json").write_text(json.dumps({
-        "repo": "vivy", "agent_source": agent_source,
-        "worktree": str(M.projects.home_path("vivy")),
+        "repo": "finch", "agent_source": agent_source,
+        "worktree": str(M.projects.home_path("finch")),
         "started_at": "not-a-timestamp",
     }))
 
